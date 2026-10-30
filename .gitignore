@@ -1,0 +1,13 @@
+
+._*
+.DS_Store
+*.exe
+*.out
+*.test
+/tmp/
+# Binaries
+# macOS
+# Tests & coverage
+bin/
+zero-memcp
+zmcp

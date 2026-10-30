@@ -1,0 +1,75 @@
+# zero-memcp 示例配置
+# 
+# 默认路径：~/.zero-memcp/zero-memcp.toml
+# 用法：zero-memcp -config /path/to/zero-memcp.toml
+
+[server]
+# 数据根：<data>/system/ 放密钥与吊销名单，<data>/repos/<name>.git 放裸仓库
+data     = "~/.zero-memcp/data"
+endpoint = "local"
+
+# 定期 gc：松散对象打包（可选，服务不依赖它）
+[gc]
+interval = "24h"
+
+# ── 端口策略 ──────────────────────────────────────────────────
+# 
+# 权限落在 socket 上，不落在代码里的 if：
+# 一个端口没配写动词，它的路由里就没有写代码可走。
+
+# 端口 1：本机全能力端口（开发机常用）
+#   回环地址（127.0.0.1）在此端口上自动获得 root 权限
+[[listen]]
+addr  = "127.0.0.1:1729"
+allow = ["*"]
+
+# 端口 2：只读 HTTP Git 端点（可选）
+#   供中心节点或其他设备用原生 git clone / git pull 拉取记忆
+#   即使在回环地址也强制要求 Token（可走 Basic Auth 或 Bearer）
+# [[listen]]
+# addr  = "0.0.0.0:1730"
+# allow = ["git-upload-pack"]
+
+# 端口 3：受限只读 MCP 端口（可选，给非受信网络）
+#   只允许查询类动词，拒绝所有写入；强制验签
+# [[listen]]
+# addr    = "10.10.0.0:1731"
+# allow   = ["read", "ls", "recall", "grep", "log", "status"]
+# require = "bearer"
+
+# ── 用户声明 ──────────────────────────────────────────────────
+
+[[user]]
+name = "zero"
+root = true
+
+[[user]]
+name   = "chat"
+groups = ["agents"]
+
+[[group]]
+name    = "agents"
+members = ["chat"]
+
+# ── 项目声明（归属与默认权限）──────────────────────────────────
+#
+# 权限归项目，不归文件：
+# 声明 Owner、Group 与 Unix 风格的 mode（rwxrwxrwx）
+
+[[project]]
+name  = "blackegg/me"
+owner = "zero"
+mode  = "rwx------"
+
+[[project]]
+name  = "blackegg/daily"
+owner = "zero"
+mode  = "rwx------"
+
+# ── 显式授权规则 ──────────────────────────────────────────────
+
+# 给 chat 用户只读 daily 的权限（不能读 me，也不能写 daily）
+[[access]]
+user    = "chat"
+project = "blackegg/daily"
+perm    = "r"

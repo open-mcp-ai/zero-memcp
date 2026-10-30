@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>zero-memcp</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root {
+    --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#c9d1d9;
+    --muted:#8b949e; --accent:#58a6ff; --green:#3fb950; --gold:#d29922; --dim:#484f58;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font:13px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",monospace;padding:14px}
+  .header{display:flex;align-items:baseline;justify-content:space-between;border-bottom:1px solid var(--border);padding-bottom:9px;margin-bottom:11px}
+  h1{font-size:15px;font-weight:600;color:#f0f6fc}
+  .stats{color:var(--muted);font-size:12px}
+  .stats b{color:var(--green)}
+  .layout{display:grid;grid-template-columns:440px 1fr;gap:12px;height:calc(100vh - 68px)}
+  .panel{background:var(--card);border:1px solid var(--border);border-radius:6px;display:flex;flex-direction:column;overflow:hidden}
+  .panel-head{padding:7px 11px;background:rgba(255,255,255,.02);border-bottom:1px solid var(--border);font-weight:600;font-size:12px}
+  .tree{flex:1;overflow:auto;padding:6px 0;font-family:ui-monospace,Menlo,monospace;font-size:12px}
+  .search-bar{display:flex;gap:6px;padding:7px 9px;border-bottom:1px solid var(--border);background:var(--bg)}
+  .search-bar input{flex:1;background:var(--card);border:1px solid var(--border);color:#fff;padding:5px 9px;border-radius:4px;font-size:12px}
+  .search-bar input:focus{outline:none;border-color:var(--accent)}
+  .search-bar button{background:var(--accent);border:none;color:#0d1117;padding:5px 12px;border-radius:4px;font-size:12px;cursor:pointer;font-weight:600}
+  .search-bar button:hover{filter:brightness(1.15)}
+  .hit{background:rgba(210,153,34,.08)}
+  .score{color:var(--gold);font-size:10px}
+  .node{display:flex;align-items:center;padding:2px 8px;cursor:pointer;white-space:nowrap;user-select:none}
+  .node:hover{background:rgba(255,255,255,.04)}
+  .node.active{background:rgba(88,166,255,.15);border-left:2px solid var(--accent)}
+  .caret{width:12px;color:var(--muted);font-size:9px;flex-shrink:0}
+  .icon{width:15px;text-align:center;margin-right:4px;flex-shrink:0}
+  .nm{flex:1;overflow:hidden;text-overflow:ellipsis}
+  .dir .nm{color:var(--gold);font-weight:600}
+  .sz{color:var(--dim);font-size:10px;margin-left:6px}
+  .tags{display:flex;gap:3px;margin-left:6px}
+  .tg{font-size:9px;padding:0 3px;border-radius:2px;line-height:14px}
+  .t-inj{background:rgba(63,185,80,.18);color:var(--green)}
+  .t-no{background:rgba(139,148,158,.15);color:var(--muted)}
+  .viewer{flex:1;padding:13px;overflow:auto;white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;font-size:12px;line-height:1.65;color:#e6edf3}
+  .empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted)}
+  .meta{padding:7px 11px;border-top:1px solid var(--border);color:var(--muted);font-size:11px;display:flex;gap:14px;flex-wrap:wrap}
+  .meta span b{color:var(--text);font-weight:500}
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>zero-memcp · 文件系统</h1>
+  <div class="stats" id="stats">连接中…</div>
+</div>
+
+<div class="layout">
+  <div class="panel">
+    <div class="search-bar">
+      <input type="text" id="q" placeholder="语义搜索（走 BM25 索引）…" onkeydown="if(event.key==='Enter')doSearch();if(event.key==='Escape')clearSearch()">
+      <button onclick="doSearch()">搜</button>
+    </div>
+    <div class="panel-head" id="tree-head">目录树</div>
+    <div class="tree" id="tree"><div class="empty">加载中…</div></div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head" id="title">选择一个文件</div>
+    <div class="viewer" id="viewer"><div class="empty">点击左侧文件查看内容</div></div>
+    <div class="meta" id="meta"></div>
+  </div>
+</div>
+
+<script>
+let currentAddr = "";
+const collapsed = new Set();
+
+async function refreshStats(){
+  try{
+    const d = await (await fetch("/api")).json();
+    document.getElementById("stats").innerHTML =
+      `<b>${d.docs}</b> 块 · <b>${d.terms}</b> 词项`;
+  }catch(e){}
+}
+
+let searching = false;
+
+async function doSearch(){
+  const q = document.getElementById("q").value.trim();
+  if(!q){ clearSearch(); return; }
+  searching = true;
+  const el = document.getElementById("tree");
+  document.getElementById("tree-head").innerText = "搜索结果（BM25 索引）";
+  el.innerHTML = '<div class="empty">搜索中…</div>';
+  try{
+    const d = await (await fetch("/recall", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({text:q, limit:20})
+    })).json();
+    const hits = d.hits || [];
+    if(!hits.length){ el.innerHTML='<div class="empty">无命中</div>'; return; }
+    el.innerHTML = hits.map(h => `
+      <div class="node hit" onclick="openFile('${h.addr}','${h.addr}')">
+        <span class="icon">📄</span>
+        <span class="nm">${h.addr}</span>
+        <span class="score">${h.score.toFixed(1)}</span>
+      </div>
+    `).join("");
+  }catch(e){
+    el.innerHTML = '<div class="empty">搜索失败: '+e+'</div>';
+  }
+}
+
+function clearSearch(){
+  document.getElementById("q").value = "";
+  searching = false;
+  document.getElementById("tree-head").innerText = "目录树";
+  loadTree();
+}
+
+async function loadTree(){
+  if(searching) return;
+  try{
+    const roots = await (await fetch("/api?action=tree")).json();
+    const el = document.getElementById("tree");
+    if(!roots || !roots.length){ el.innerHTML='<div class="empty">无内容</div>'; return; }
+    el.innerHTML = roots.map(r => renderNode(r, "", 0, true)).join("");
+  }catch(e){
+    document.getElementById("tree").innerHTML='<div class="empty">加载失败</div>';
+  }
+}
+
+// rootDepth：根节点（me/ daily/）只用来显示分组，不算进 addr。
+// zero-memcp 的 addr 是相对扫描根的路径，例如 skills/01-me/04-names.md。
+function renderNode(n, pathPrefix, depth, isRoot){
+  const treePath = pathPrefix ? pathPrefix + "/" + n.name : n.name;
+  const pad = "padding-left:" + (8 + depth*14) + "px";
+
+  if(n.type === "dir"){
+    const isOpen = !collapsed.has(treePath);
+    const caret = isOpen ? "▼" : "▶";
+    let html = `<div class="node dir" style="${pad}" onclick="toggle('${treePath}')">
+      <span class="caret">${caret}</span>
+      <span class="icon">📁</span>
+      <span class="nm">${n.name}</span>
+    </div>`;
+    if(isOpen && n.children){
+      html += n.children.map(c => renderNode(c, treePath, depth+1, false)).join("");
+    }
+    return html;
+  }
+
+  const tags = [];
+  if(n.inject) tags.push('<span class="tg t-inj">注入</span>');
+  if(n.index === false) tags.push('<span class="tg t-no">无索引</span>');
+  if(n.recall === false) tags.push('<span class="tg t-no">不可读</span>');
+  const tagHtml = tags.length ? `<span class="tags">${tags.join("")}</span>` : "";
+  const size = n.size > 1024 ? (n.size/1024).toFixed(1)+"K" : n.size+"B";
+
+  // 直接用服务端给的 n.addr 读取，显示用 treePath
+  return `<div class="node ${currentAddr===n.addr?'active':''}" style="${pad}" onclick="openFile('${n.addr}','${treePath}')">
+    <span class="caret"></span>
+    <span class="icon">📄</span>
+    <span class="nm">${n.name}</span>
+    ${tagHtml}
+    <span class="sz">${size}</span>
+  </div>`;
+}
+
+function toggle(path){
+  if(collapsed.has(path)) collapsed.delete(path); else collapsed.add(path);
+  loadTree();
+}
+
+async function openFile(path, shown){
+  currentAddr = path;
+  document.getElementById("title").innerText = shown || path;
+  document.getElementById("viewer").innerText = "读取中…";
+  document.getElementById("meta").innerHTML = "";
+  try{
+    const d = await (await fetch("/api?action=read&addr="+encodeURIComponent(path))).json();
+    if(d.content !== undefined){
+      document.getElementById("viewer").innerText = d.content;
+    }else{
+      document.getElementById("viewer").innerText = "(无法读取)";
+    }
+  }catch(e){
+    document.getElementById("viewer").innerText = "读取失败: "+e;
+  }
+  loadTree();
+}
+
+refreshStats();
+loadTree();
+setInterval(refreshStats, 5000);
+</script>
+</body>
+</html>

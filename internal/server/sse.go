@@ -4,11 +4,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
 
-// Broadcaster 广播 SSE 事件。
+const dataPrefix = "data: "
+
+// Broadcaster 把服务端事件扇出给所有在线的 SSE 订阅者。
+//
+// 它只是传输层：事件该不该给某个人看见，由 handleEvents 在写出之前判定。
 type Broadcaster struct {
 	mu          sync.RWMutex
 	subscribers map[chan []byte]struct{}
@@ -45,8 +50,18 @@ func (b *Broadcaster) Send(event, data string) {
 	}
 }
 
-// handleEvents 提供 SSE 订阅通道，给 pi 插件做实时唤醒。
+// handleEvents 提供 SSE 通道。
+//
+// 只推送调用者通过 remind 锚定的树变更——树路径就是订阅语义：
+// 没锚定的人不该知道那棵树动过，而不是收到后自己忽略。
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
+	caller, authErr := s.authenticate(r)
+	if authErr != nil {
+		w.Header().Set("WWW-Authenticate", `Bearer realm="zero-memcp"`)
+		http.Error(w, authErr.Error(), http.StatusUnauthorized)
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -60,7 +75,6 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	ch, cancel := s.bcast.subscribe()
 	defer cancel()
 
-	// 连上立刻推一条当前时钟作为握手
 	curr := fmt.Sprintf(`{"clock":%d,"at":%d}`, s.Clock(), time.Now().Unix())
 	_, _ = fmt.Fprintf(w, "event: clock\ndata: %s\n\n", curr)
 	flusher.Flush()
@@ -74,12 +88,14 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		case <-notify:
 			return
 		case msg := <-ch:
+			if !s.eventAllowed(string(msg), caller) {
+				continue
+			}
 			if _, err := w.Write(msg); err != nil {
 				return
 			}
 			flusher.Flush()
 		case <-heartbeat.C:
-			// 维持连接防中间代理超时
 			if _, err := fmt.Fprintf(w, ": keepalive\n\n"); err != nil {
 				return
 			}
@@ -88,8 +104,33 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// BroadcastMail 把一封新信广播给所有在线的客户端。
-func (s *Server) broadcastMail(m Mail) {
-	data, _ := json.Marshal(m)
-	s.bcast.Send("mail", string(data))
+// eventAllowed 判定一条已序列化的 SSE 帧能否发给某个身份。
+//
+// 只有 clock 与 tree 两类事件存在。tree 事件的放行规则：
+// 调用者必须关注过对应的树路径，且对该项目/分支有读权限。
+// 关注关系就是授权——没关注的人不该知道那棵树动过。
+func (s *Server) eventAllowed(frame string, caller Caller) bool {
+	switch {
+	case strings.HasPrefix(frame, "event: clock\n"):
+		return true
+	case strings.HasPrefix(frame, "event: tree\n"):
+		body := strings.TrimPrefix(frame, "event: tree\n")
+		if !strings.HasPrefix(body, dataPrefix) {
+			return false
+		}
+		payload := strings.TrimPrefix(body, dataPrefix)
+		payload = strings.TrimSuffix(payload, "\n\n")
+		var ev TreeEvent
+		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+			return false
+		}
+		if !s.treeWatch.Matches(caller.Identity, ev) {
+			return false
+		}
+		return s.allowed(caller, ev.Project, ev.Branch, configBitRead)
+	default:
+		return false
+	}
 }
+
+// broadcastTreeEvent 在 tree_events.go 里定义。

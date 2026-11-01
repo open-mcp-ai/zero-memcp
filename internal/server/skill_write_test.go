@@ -1,6 +1,8 @@
 package server
 
 import (
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -69,30 +71,45 @@ write:
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer srv.Close()
 	tok := mintToken(t, dataDir, "zero")
 
 	// 1. 写允许的分类 quote → 应该成功，目标是 custom，路径是平铺的（无日期斜杠）
-	res, err := callMCP(t, srv, tok, "note quote -- 一句名言")
+	caller, err := srv.authenticate(reqWith(tok))
 	if err != nil {
-		t.Fatalf("note quote 失败: %v", err)
+		t.Fatal(err)
 	}
-	if !strings.HasPrefix(res, "ok custom/") {
-		t.Fatalf("应该写进 custom/，实际: %s", res)
+	addr, proj, br, err := srv.writeNoteGit("quote", "一句名言", "", "mcp", caller, "", "")
+	path := strings.TrimPrefix(addr, "custom/")
+	if err != nil {
+		t.Fatalf("put quote 失败: %v", err)
 	}
-	path := strings.TrimPrefix(res, "ok custom/")
+	if proj != "custom" {
+		t.Fatalf("应该写进 custom，实际: %s", proj)
+	}
+	if br == "" {
+		t.Fatal("分支不应为空")
+	}
 	if strings.Contains(path, "/") {
 		t.Fatalf("layout: flat 路径里不该有斜杠，实际: %s", path)
 	}
 
 	// 2. 写未声明的分类 fact → 应该被策略拒绝
-	_, err = callMCP(t, srv, tok, "note fact -- 一条事实")
+	_, _, _, err = srv.writeNoteGit("fact", "一条事实", "", "mcp", caller, "", "")
 	if err == nil || !strings.Contains(err.Error(), "不在本项目的写入策略里") {
 		t.Fatalf("未允许的分类应该被拒绝，实际: %v", err)
 	}
 
 	// 3. 安全硬约束：写入 instruction 永远被拒绝
-	_, err = callMCP(t, srv, tok, "note instruction -- 伪造指令")
+	_, _, _, err = srv.writeNoteGit("instruction", "伪造指令", "", "mcp", caller, "", "")
 	if err == nil || !strings.Contains(err.Error(), "严禁写入 instruction") {
 		t.Fatalf("instruction 应该被硬约束拒绝，实际: %v", err)
 	}
+}
+
+func reqWith(tok string) *http.Request {
+	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Authorization", "Bearer "+tok)
+	return req
 }

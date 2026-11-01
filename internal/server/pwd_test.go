@@ -63,6 +63,7 @@ mode  = "rwx------"
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer srv.Close()
 
 	zeroTok := mintToken(t, dataDir, "zero")
 	subTok := mintToken(t, dataDir, "subagent")
@@ -142,6 +143,7 @@ mode  = "rwxrwxrwx"
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer srv.Close()
 
 	botTok := mintToken(t, dataDir, "bot")
 

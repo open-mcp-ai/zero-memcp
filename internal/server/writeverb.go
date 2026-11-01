@@ -11,10 +11,10 @@ import (
 //
 //	write <project>[@<branch>]/<path> -- <内容>
 //
-// 与 note 的区别：note 写的是「切片」（自动生成时间戳文件名、自动加
+// 与 put 的区别：put 写的是「切片」（自动生成时间戳文件名、自动加
 // frontmatter），write 写的是「这个路径上就该是这段内容」。
 // 它存在的理由是规则文件：SKILL.md 的 frontmatter 决定注入与索引，
-// 而那不可能靠 note 的自动命名表达。
+// 而那不可能靠 put 的自动命名表达。
 //
 // 仅 root：一个能改 SKILL.md 的人可以改「谁看见什么」，
 // 那比改内容本身危险。
@@ -36,6 +36,12 @@ func (s *Server) execWrite(rest string, c Caller, persona string) (string, error
 	// HasPrefix(data, "---") 判定失败，inject: every_turn 全部失效——
 	// 写成功了、也索引了，但一个字都不注入，静默得很彻底。
 	content = strings.TrimPrefix(content, " ")
+	// 正文可能是通过 $BODY 传进来的原子词，必须在这里还原。
+	//
+	// 漏掉这一行的后果不是「格式不对」：marker 会原样落盘，
+	// 用户看到的是 "~ZMEMARG~5rOV...~END~"，而写入回显还报「已写入 xx 字节」。
+	// 数据没丢，但内容变成了噪声，且没有任何一处报错。
+	content = restorePayload(content)
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
 		return "", fmt.Errorf("缺写入路径")

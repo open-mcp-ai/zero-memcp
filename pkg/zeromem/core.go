@@ -96,12 +96,18 @@ type ToolFunc func(ctx context.Context, args json.RawMessage) (string, error)
 // call 执行 mem 工具。
 func (c *Core) call(ctx context.Context, args json.RawMessage) (string, error) {
 	var a struct {
-		Cmd string `json:"cmd"`
+		Cmd  string            `json:"cmd"`
+		Args []string          `json:"args"`
+		Vars map[string]string `json:"vars"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("解析 mem 参数: %w", err)
 	}
-	return c.srv.ExecLine(ctx, a.Cmd)
+	cmd, err := server.ExpandArgs(a.Cmd, a.Vars, a.Args)
+	if err != nil {
+		return "", err
+	}
+	return c.srv.ExecLine(ctx, cmd)
 }
 
 // Close 停止后台维护并释放资源。

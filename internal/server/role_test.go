@@ -126,7 +126,7 @@ func TestPerMountCap(t *testing.T) {
 		},
 	})
 
-	if _, err := callMCP(t, srv, tok, "note fact -- 写进 me"); err != nil {
+	if _, err := callMCP(t, srv, tok, "put -- 写进 me"); err != nil {
 		t.Fatalf("挂载点 cap=rw 应能写: %v", err)
 	}
 
@@ -199,6 +199,7 @@ perm    = "r"
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer srv.Close()
 
 	tok := mintRestricted(t, dataDir, auth.Claims{
 		Sub:     "zero",
@@ -218,7 +219,7 @@ perm    = "r"
 	}
 
 	// chat 写：TOML 明确只给 r，即使 sub=zero 也必须被拦下
-	_, err = callWithRole(t, srv, tok, "chat", "note fact -- 试写")
+	_, err = callWithRole(t, srv, tok, "chat", "put -- 试写")
 	if err == nil {
 		t.Fatal("chat 角色只有 r 权限，写 daily 必须被拒绝")
 	}
@@ -227,7 +228,7 @@ perm    = "r"
 	}
 
 	// 显式指定 blackegg/daily 也必须被拒绝，并说清缺少 w
-	_, err = callWithRole(t, srv, tok, "chat", "note fact blackegg/daily -- 试写")
+	_, err = callWithRole(t, srv, tok, "chat", "put blackegg/daily -- 试写")
 	if err == nil {
 		t.Fatal("显式指定目标也必须被拒绝")
 	}
@@ -239,7 +240,7 @@ perm    = "r"
 // recall 必须按命中自己所在的分支判权限。
 //
 // 踩过的坑：handleRecall 一律拿 s.persona 去判，于是「不在人格分支上」
-// 的命中被权限层静默过滤。症状是 chat 角色 note 写进去、read 读得到、
+// 的命中被权限层静默过滤。症状是 chat 角色 put 写进去、read 读得到、
 // log 看得到，recall 却永远无命中——不报错，只是搜不到。
 func TestRecallUsesHitBranch(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
@@ -254,7 +255,7 @@ func TestRecallUsesHitBranch(t *testing.T) {
 	})
 
 	// chat 角色写一条自己的记录
-	if _, err := callWithRole(t, srv, tok, "chat", "note fact -- 群友张三喜欢 Rust"); err != nil {
+	if _, err := callWithRole(t, srv, tok, "chat", "put -- 群友张三喜欢 Rust"); err != nil {
 		t.Fatalf("chat 写入失败: %v", err)
 	}
 

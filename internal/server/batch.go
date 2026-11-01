@@ -8,13 +8,13 @@ import (
 
 // BatchOp 是决议单里的一个动作。
 type BatchOp struct {
-	// Action: "note" | "cp" | "mv" | "delete" | "tag" | "commit"
+	// Action: "put" | "cp" | "mv" | "delete" | "tag" | "commit"
 	Action string `json:"action"`
 
 	// 各动作的参数
-	Target  string `json:"target,omitempty"`  // note / commit 的目标（如 t@zero）
-	Kind    string `json:"kind,omitempty"`    // note 的分类
-	Text    string `json:"text,omitempty"`    // note 的正文
+	Target  string `json:"target,omitempty"`  // put / commit 的目标（如 t@zero）
+	Kind    string `json:"kind,omitempty"`    // 旧结构兼容字段（put 忽略）
+	Text    string `json:"text,omitempty"`    // put 的正文
 	From    string `json:"from,omitempty"`    // cp / mv 的源
 	To      string `json:"to,omitempty"`      // cp / mv 的目标
 	Path    string `json:"path,omitempty"`    // delete 的路径
@@ -66,13 +66,13 @@ func (s *Server) execBatch(body string, c Caller, persona string) (string, error
 	for i, op := range req.Ops {
 		idx := i + 1
 		switch strings.ToLower(op.Action) {
-		case "note":
+		case "put":
 			target := op.Target
 			addr, _, _, err := s.writeNote(op.Kind, op.Text, "", "auditor", c, target)
 			if err != nil {
-				return "", fmt.Errorf("op[%d] note 失败: %w", idx, err)
+				return "", fmt.Errorf("op[%d] put 失败: %w", idx, err)
 			}
-			journal = append(journal, fmt.Sprintf("[%d] note: %s", idx, addr))
+			journal = append(journal, fmt.Sprintf("[%d] put: %s", idx, addr))
 
 		case "cp", "mv":
 			isMove := strings.ToLower(op.Action) == "mv"
@@ -87,6 +87,9 @@ func (s *Server) execBatch(body string, c Caller, persona string) (string, error
 			proj, br, path, err := s.parseBranchAddr(op.Target)
 			if err != nil {
 				return "", fmt.Errorf("op[%d] delete 地址非法: %w", idx, err)
+			}
+			if !s.allowed(c, proj, br, configBitWrite) {
+				return "", fmt.Errorf("op[%d] delete 被拒绝: %s", idx, s.denyReason(c, proj, br, configBitWrite))
 			}
 			repo, err := s.projects.Get(proj)
 			if err != nil {
@@ -118,7 +121,7 @@ func (s *Server) execBatch(body string, c Caller, persona string) (string, error
 			journal = append(journal, fmt.Sprintf("[%d] commit: %s", idx, res))
 
 		default:
-			return "", fmt.Errorf("op[%d] 未知动作 %q（允许 note/cp/mv/delete/tag/commit）", idx, op.Action)
+			return "", fmt.Errorf("op[%d] 未知动作 %q（允许 put/cp/mv/delete/tag/commit）", idx, op.Action)
 		}
 	}
 

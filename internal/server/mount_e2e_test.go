@@ -91,6 +91,7 @@ mode  = "rwx------"
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = srv.Close() })
 	return srv, dataDir
 }
 
@@ -166,8 +167,8 @@ func TestCapCannotWiden(t *testing.T) {
 
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Cap: "r"})
 
-	_, err := callMCP(t, srv, tok, "note fact -- 想写的")
-	if err == nil || !strings.Contains(err.Error(), "没有任何可写的仓库") {
+	_, err := callMCP(t, srv, tok, "put -- 想写的")
+	if err == nil || !strings.Contains(err.Error(), "没有任何可写的仓库") && !strings.Contains(err.Error(), "凭证缺少 w 能力") {
 		t.Fatalf("无 w 能力应被拒绝，实际: %v", err)
 	}
 }

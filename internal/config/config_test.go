@@ -360,3 +360,130 @@ mode  = "rwx---r--"
 		t.Fatal("属主应可写")
 	}
 }
+
+// 独立 bus 配置已退役：遗留配置必须明确报未知，而非静默接受。
+func TestStandaloneBusConfigRejected(t *testing.T) {
+	for _, raw := range []string{
+		"[bus]\nmax_messages = 10\n",
+		"[[bus_topic]]\npattern = \"x.>\"\n",
+		"[[bus_access]]\nuser = \"a\"\n",
+	} {
+		if _, err := ParseFile([]byte(raw)); err == nil {
+			t.Errorf("独立 bus 配置应报错: %s", raw)
+		}
+	}
+}
+
+func TestRemoteConfigParsingAndCredentialRejection(t *testing.T) {
+	f, err := ParseFile([]byte(`
+[[user]]
+name = "zero"
+root = true
+
+[[remote]]
+project = "blackegg/daily"
+name = "github"
+url = "git@github.com:private/daily.git"
+push = ["main", "chat"]
+
+[[remote]]
+project = "blackegg/me"
+name = "blackbox"
+url = "http://10.0.0.1:1729/repos/blackegg/me.git"
+fetch_only = true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Remotes) != 2 {
+		t.Fatalf("应解析两个 remote，实际 %d", len(f.Remotes))
+	}
+	if f.Remotes[0].Project != "blackegg/daily" || len(f.Remotes[0].Push) != 2 {
+		t.Fatalf("daily remote 配置异常: %+v", f.Remotes[0])
+	}
+	if !f.Remotes[1].FetchOnly {
+		t.Fatal("blackbox remote 应为 fetch-only")
+	}
+
+	_, err = ParseFile([]byte(`
+[[user]]
+name = "zero"
+root = true
+
+[[remote]]
+project = "blackegg/me"
+name = "github"
+url = "https://user:secret@example.invalid/private/me.git"
+`))
+	if err == nil || !strings.Contains(err.Error(), "不能内嵌密码") {
+		t.Fatalf("内嵌凭证必须在配置解析期拒绝，实际: %v", err)
+	}
+}
+
+// SSH push 的凭证不进 TOML：只存私钥名与 host key 指纹。
+func TestRemoteSSHKeyAndHostKeyParsing(t *testing.T) {
+	raw := `
+[server]
+data = "/tmp/d"
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name = "me"
+owner = "zero"
+mode = "rwx------"
+
+[[remote]]
+project  = "me"
+name     = "origin"
+url      = "git@example.invalid:org/me.git"
+push     = ["zero"]
+ssh_key  = "deploy"
+host_key = "SHA256:abc"
+`
+	f, err := ParseFile([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Remotes) != 1 {
+		t.Fatalf("应有 1 个远端: %d", len(f.Remotes))
+	}
+	if f.Remotes[0].SSHKey != "deploy" || f.Remotes[0].HostKey != "SHA256:abc" {
+		t.Fatalf("ssh_key/host_key 解析失败: %+v", f.Remotes[0])
+	}
+}
+
+func TestRemoteSSHKeyRejectsBadValues(t *testing.T) {
+	base := `
+[server]
+data = "/tmp/d"
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name = "me"
+owner = "zero"
+mode = "rwx------"
+
+[[remote]]
+project = "me"
+name    = "origin"
+url     = "git@example.invalid:org/me.git"
+`
+	cases := map[string]string{
+		"路径分隔符":  base + "ssh_key = \"../escape\"\n",
+		"空指纹前缀":  base + "host_key = \"abc\"\n",
+		"私钥内容传入": base + "ssh_key = \"-----BEGIN OPENSSH PRIVATE KEY-----\"\n",
+	}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := ParseFile([]byte(raw)); err == nil {
+				t.Fatal("应当在配置解析期失败")
+			}
+		})
+	}
+}

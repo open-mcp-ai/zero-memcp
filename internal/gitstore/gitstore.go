@@ -11,22 +11,20 @@
 //   - 外面的人用 `git log` / `git clone` 依然能看这个仓库
 //   - 格式简单到用标准库三十行就能写对
 //
-// 唯一的代价：读 packfile 需要额外实现。所以 gc 走的是「不打包」策略
-// （见 maintain），松散对象长期保留。松散对象多到影响性能时，
-// 调用外部 git gc 是可选优化，不是正确性依赖。
+// 打包与 Pack 还原全部纯 Go 内置（repack.go / pack.go / ingest.go）：
+// 松散对象通过 Repack 打包为 pack + .idx v2，并能无缝被 git fsck 校验；
+// 远端推送来的 packfile 在 IngestPack 展开为松散对象或由 pack 读取器直接按索引检索。
 package gitstore
 
 import (
-	"bytes"
+	"context"
 	"fmt"
-	"hash/crc32"
-	"io"
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -67,21 +65,43 @@ type Repo struct {
 	// Path 是仓库目录（通常以 .git 结尾）。
 	Path string
 
+	// mu 保护下面那些非脏层的共享状态（commitTok 等）。
 	mu sync.Mutex
-	// pending 按分支隔离：ref -> path -> data。
+
+	// dirtyMu 是脏层的两把锁之一：
 	//
-	// 为什么必须按分支隔离：同一仓库的不同分支可以并发写入，
-	// 如果 key 只有 path，两个分支写同名文件就会后写覆盖先写——
-	// 而那正是「chat 和 dev 在同一天记录」时的真实场景。
-	pending map[string]map[string][]byte
-	pmode   map[string]map[string]Mode
-	// pdeleted 记墓碑：ref -> 路径集合。
+	//	改脏    RLock + 该目录的脏文件锁
+	//	提交    Lock（全局独占）
+	//	读      RLock
 	//
-	// 删除必须和写入一样走「待提交区 → 提交」这条路，不能直接改树。
-	// 否则「删一条」会变成一次独立的即时提交，而写入是攒批的——
-	// 两者交错时，先攒的写入会被后到的删除提交覆盖掉。
-	pdeleted map[string]map[string]bool
+	// 锁序恒为「先 dirtyMu 后脏文件锁」，任何路径不得反过来，
+	// 否则提交与写入会互相等成死锁。
+	dirtyMu sync.RWMutex
+
+	// commitTok 串行化同一 ref 的提交请求。
+	commitTok sync.Map
+
+	// writer 是单线程脏层写者。Write/Delete 只把任务投递进队列就返回；
+	// Read/List/Commit 会排一个 barrier，保证此前已接受的任务先处理完。
+	writerOnce sync.Once
+	writerCh   chan dirtyTask
+	writerMu   sync.Mutex // 串行化入队与关闭；barrier 必须排在先前写入之后
+	writerSize atomic.Int64
+	writerErr  error         // worker 累积的异步错误，下一次 barrier 返回并清空
+	writerDown chan struct{} // worker 退出后关闭，Close 等它
+	writerDead bool          // 队列已关，不再接受新投递
+
+	// nodeLocks 是每个脏目录一把互斥锁。
+	//
+	// 放在实例而不是包级：包级的 map 会随仓库数量永久增长，
+	// 而一个进程里打开过又关掉的仓库不该留下任何东西。
+	nodeLocks sync.Map // 脏文件路径 -> *sync.Mutex
 }
+
+const (
+	dirtyQueueCapacity = 256
+	dirtyQueueMaxBytes = 64 << 20
+)
 
 // Open 打开一个裸仓库。目录不存在时报错，不自动创建——
 // 「项目存在」是一个需要人明确决定的事，不该由一次读操作顺手造就。
@@ -99,9 +119,10 @@ func Open(path string) (*Repo, error) {
 		}
 	}
 	r := &Repo{Path: abs}
-	// 上次进程如果被强杀，这里把没来得及折叠进树的内容捡回来。
-	// 失败不影响打开——最坏情况是那一批写入留在悬空对象里。
-	_, _ = r.ReplayWAL()
+	// 脏层本身就是持久层，重启后直接生效；这里只清掉孤儿脏层
+	// （所属分支已不存在）并统计还有多少改动等着折叠。
+	// 失败不影响打开：脏层文件读不出来最多让那个目录退回干净层。
+	_, _ = r.Recover()
 	return r, nil
 }
 
@@ -151,8 +172,14 @@ func (r *Repo) refPath(ref string) string {
 }
 
 // Refs 列出全部 ref，按名字排序。
+//
+// 松散 ref（refs/ 下的文件）与打包 ref（packed-refs）合并返回。
+// 只看目录是错的：git clone --bare、git gc、git pack-refs 都会把
+// 分支从 refs/heads/* 文件挪进 packed-refs，目录当场变空——
+// 而症状是「仓库明明有提交，服务报 0 个块」，不报错、不告警。
 func (r *Repo) Refs(prefix string) ([]string, error) {
-	var out []string
+	out := map[string]bool{}
+
 	root := filepath.Join(r.Path, "refs")
 	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
@@ -170,15 +197,45 @@ func (r *Repo) Refs(prefix string) ([]string, error) {
 		}
 		name := filepath.ToSlash(rel)
 		if strings.HasPrefix(name, prefix) {
-			out = append(out, name)
+			out[name] = true
 		}
 		return nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	sort.Strings(out)
-	return out, nil
+
+	for _, name := range r.packedRefs() {
+		if strings.HasPrefix(name, prefix) {
+			out[name] = true
+		}
+	}
+
+	list := make([]string, 0, len(out))
+	for name := range out {
+		list = append(list, name)
+	}
+	sort.Strings(list)
+	return list, nil
+}
+
+// packedRefs 读出 packed-refs 里的 ref 名（不含 peeled 行）。
+func (r *Repo) packedRefs() []string {
+	b, err := os.ReadFile(filepath.Join(r.Path, "packed-refs"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "^") {
+			continue
+		}
+		if _, name, ok := strings.Cut(line, " "); ok {
+			out = append(out, name)
+		}
+	}
+	return out
 }
 
 // Resolve 把一个 ref 名解析成 commit SHA。解析不到返回空串与 nil。
@@ -221,17 +278,68 @@ func (r *Repo) Resolve(ref string) (string, error) {
 	return "", nil
 }
 
+// commitTokenTimeout 等待同分支提交排队的上限。
+//
+// 提交通常是毫秒级；等 30 秒说明前一个提交遭遇了致命阻塞
+// （比如底层磁盘卡死），宁可报错放弃也不要无限期挂住调用者。
+const commitTokenTimeout = 30 * time.Second
+
+// acquireCommitToken 获取某分支的提交令牌（带超时）。
+//
+// 令牌是一槽 channel：没人在提时立刻拿到；有人在提时排队等；
+// 超时后报错，调用者退回错误而不是死等。
+func (r *Repo) acquireCommitToken(normRef string) (func(), error) {
+	return r.acquireCommitTokenFor(normRef, commitTokenTimeout)
+}
+
+func (r *Repo) acquireCommitTokenFor(normRef string, timeout time.Duration) (func(), error) {
+	v, _ := r.commitTok.LoadOrStore(normRef, make(chan struct{}, 1))
+	ch := v.(chan struct{})
+
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	// 一槽 channel 本来是空的：投递成功就是拿到令牌，
+	// 持有期间 channel 满，其他提交无法再投递；释放时从同一 channel 取出。
+	select {
+	case ch <- struct{}{}:
+		var releaseOnce sync.Once
+		return func() {
+			releaseOnce.Do(func() { <-ch })
+		}, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("分支 %s 提交排队超时（上一个提交占用超过 %v）", normRef, timeout)
+	}
+}
+
 // updateRef 原子地更新一个 ref。
 func (r *Repo) updateRef(ref, sha string) error {
 	p := r.refPath(ref)
-	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+	dir := filepath.Dir(p)
+	if err := os.MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	tmp := p + ".lock"
-	if err := os.WriteFile(tmp, []byte(sha+"\n"), 0o644); err != nil {
+	// 临时文件必须用唯一名：固定名 .lock 在两条更新碰在一起时
+	// 会先被 A rename 走，然后 B rename 时报 no such file or directory。
+	tmp, err := os.CreateTemp(dir, ".ref-*")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, p)
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+
+	if _, err := tmp.WriteString(sha + "\n"); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, p)
 }
 
 // ── 读 ────────────────────────────────────────────────────────
@@ -252,60 +360,67 @@ func (r *Repo) commitOf(ref string) (commitObj, error) {
 	return parseCommit(body), nil
 }
 
-// List 列出某个分支下的全部条目。
+// List 列出某个分支下的全部条目（干净树 + 脏层覆盖）。
 func (r *Repo) List(ref string) ([]Entry, error) {
+	if err := r.syncDirtyWriter(); err != nil {
+		return nil, fmt.Errorf("处理脏写入队列: %w", err)
+	}
 	c, err := r.commitOf(ref)
 	if err != nil {
 		return nil, err
 	}
-	// 分支还没有任何提交时不能提前返回：待提交区可能躺着刚写完
-	// 就被强杀的内容，它们必须出现在列表里（也因此会进倒排索引）。
+	baseTree := c.Tree
+
+	// 干净层：分支可能还没有任何提交，那就从空树开始。
 	out := map[string]Entry{}
-	if c.Tree != "" {
-		if err := r.loadTree(c.Tree, "", out); err != nil {
+	if baseTree != "" {
+		if err := r.loadTree(baseTree, "", out); err != nil {
 			return nil, err
 		}
 	}
+
+	// 脏层：把每个被改过的目录覆盖上去。
+	//
+	// 只在目录粒度做覆盖，不展开成路径 map：脏文件里存的是
+	// 「这个目录下的哪些名字被换成了什么」，与干净层一一对应。
+	r.dirtyMu.RLock()
+	dirs, err := r.listDirtyDirs(ref)
+	if err != nil {
+		r.dirtyMu.RUnlock()
+		return nil, err
+	}
+	for _, dir := range dirs {
+		n, err := r.loadDirtyNode(ref, dir)
+		if err != nil || n == nil {
+			continue
+		}
+		prefix := ""
+		if dir != "" {
+			prefix = dir + "/"
+		}
+		// 目录被整体替换时，先把干净层里该目录下的旧条目清掉。
+		for name := range n.set {
+			delete(out, prefix+name)
+		}
+		for name, e := range n.set {
+			path := prefix + name
+			out[path] = Entry{
+				Path: path,
+				Mode: e.Mode,
+				Hash: e.SHA,
+				Time: r.objectTime(e.SHA),
+			}
+		}
+		for name := range n.del {
+			delete(out, prefix+name)
+		}
+	}
+	r.dirtyMu.RUnlock()
+
 	list := make([]Entry, 0, len(out))
 	for _, e := range out {
 		list = append(list, e)
 	}
-	sort.Slice(list, func(i, j int) bool { return list[i].Path < list[j].Path })
-
-	// 合并待提交区
-	seen := map[string]bool{}
-	for _, e := range list {
-		seen[e.Path] = true
-	}
-	normRef := normalizeRef(ref)
-	r.mu.Lock()
-	// 待提交的删除先从列表里剔除
-	if gone := r.pdeleted[normRef]; len(gone) > 0 {
-		filtered := list[:0]
-		for _, e := range list {
-			if !gone[e.Path] {
-				filtered = append(filtered, e)
-			}
-		}
-		list = filtered
-	}
-	if refMap, ok := r.pending[normRef]; ok {
-		for p, data := range refMap {
-			if !seen[p] {
-				list = append(list, Entry{
-					Path: p,
-					Mode: r.pmode[normRef][p],
-					Hash: sha1OfBlob(data),
-					Size: int64(len(data)),
-					// 用对象文件的 mtime 当作这条记忆的时间。
-					// 崩溃重启后它必须还在——否则召回权重里「越新越重」
-					// 会把刚写的记忆按 1970 年算，排到最后。
-					Time: r.objectTime(sha1OfBlob(data)),
-				})
-			}
-		}
-	}
-	r.mu.Unlock()
 	sort.Slice(list, func(i, j int) bool { return list[i].Path < list[j].Path })
 
 	// 补上大小与提交时间
@@ -321,22 +436,42 @@ func (r *Repo) List(ref string) ([]Entry, error) {
 	return list, nil
 }
 
-// Read 读出一个文件的全部内容。
+// Read 读出一个文件的全部内容（脏层优先）。
 func (r *Repo) Read(ref, path string) ([]byte, error) {
-	// 待提交区优先：刚写下还没提交的内容也必须读得到。
-	// 记忆服务最常见的动作就是「写一条，马上读回来确认」。
+	if err := r.syncDirtyWriter(); err != nil {
+		return nil, fmt.Errorf("处理脏写入队列: %w", err)
+	}
 	normRef := normalizeRef(ref)
-	r.mu.Lock()
-	if refMap, ok := r.pending[normRef]; ok {
-		if data, ok := refMap[path]; ok {
-			cp := make([]byte, len(data))
-			copy(cp, data)
-			r.mu.Unlock()
-			return cp, nil
+	dir, name := splitDirName(path)
+
+	// ① 脏层优先：刚投递的内容也必须读得到。
+	//    记忆服务最常见的动作就是「写一条，马上读回来确认」。
+	r.dirtyMu.RLock()
+	n, err := r.loadDirtyNode(normRef, dir)
+	if err != nil {
+		r.dirtyMu.RUnlock()
+		return nil, err
+	}
+	if n != nil {
+		if gone := n.del[name]; gone {
+			r.dirtyMu.RUnlock()
+			return nil, fmt.Errorf("%s 不存在（已删除，尚未提交）", path)
+		}
+		if e, ok := n.set[name]; ok && e.Mode != "40000" {
+			r.dirtyMu.RUnlock()
+			typ, body, err := r.readObject(e.SHA)
+			if err != nil {
+				return nil, err
+			}
+			if typ != "blob" {
+				return nil, fmt.Errorf("%s 不是文件，而是 %s", path, typ)
+			}
+			return body, nil
 		}
 	}
-	r.mu.Unlock()
+	r.dirtyMu.RUnlock()
 
+	// ② 干净层
 	c, err := r.commitOf(ref)
 	if err != nil {
 		return nil, err
@@ -359,6 +494,15 @@ func (r *Repo) Read(ref, path string) ([]byte, error) {
 		return nil, fmt.Errorf("%s 不是文件，而是 %s", path, typ)
 	}
 	return body, nil
+}
+
+// splitDirName 把树内路径拆成 (目录, 名字)。根目录返回 ""。
+func splitDirName(path string) (string, string) {
+	path = strings.Trim(path, "/")
+	if i := strings.LastIndex(path, "/"); i >= 0 {
+		return path[:i], path[i+1:]
+	}
+	return "", path
 }
 
 // findInTree 在树里按路径找 blob 的 SHA。
@@ -399,7 +543,7 @@ func (r *Repo) ReadMany(ref string, paths []string) (map[string][]byte, error) {
 	for _, p := range paths {
 		b, err := r.Read(ref, p)
 		if err != nil {
-			continue
+			return nil, err
 		}
 		out[p] = b
 	}
@@ -408,24 +552,100 @@ func (r *Repo) ReadMany(ref string, paths []string) (map[string][]byte, error) {
 
 // ── 写 ────────────────────────────────────────────────────────
 
-// Write 把内容写进仓库。
+type dirtyTask struct {
+	op   byte // 'W' 或 'D'
+	ref  string
+	path string
+	data []byte
+	mode Mode
+	size int64
+	done chan error
+}
+
+func (r *Repo) initDirtyWriter() {
+	r.writerOnce.Do(func() {
+		r.writerCh = make(chan dirtyTask, dirtyQueueCapacity)
+		r.writerDown = make(chan struct{})
+		go r.dirtyWorker()
+	})
+}
+
+func (r *Repo) dirtyWorker() {
+	defer close(r.writerDown)
+	for task := range r.writerCh {
+		if task.done != nil {
+			err := r.writerErr
+			r.writerErr = nil
+			task.done <- err
+			continue
+		}
+		var err error
+		if task.op == 'W' {
+			err = r.applyDirtyWrite(task.ref, task.path, task.data, task.mode)
+		} else if task.op == 'D' {
+			err = r.applyDirtyDelete(task.ref, task.path)
+		}
+		if err != nil && r.writerErr == nil {
+			r.writerErr = err
+		}
+		if task.size > 0 {
+			r.writerSize.Add(-task.size)
+		}
+	}
+}
+
+func (r *Repo) syncDirtyWriter() error {
+	r.writerMu.Lock()
+	if r.writerDead {
+		down := r.writerDown
+		r.writerMu.Unlock()
+		if down != nil {
+			<-down
+		}
+		// 已关闭的 worker 已经把队列排空了，磁盘脏层可直接读取；
+		// 关闭时的异步错误由 Close 返回，不重复污染只读操作。
+		return nil
+	}
+	r.initDirtyWriter()
+	ch := make(chan error, 1)
+	r.writerCh <- dirtyTask{done: ch}
+	r.writerMu.Unlock()
+	return <-ch
+}
+
+// Close 停止单线程写者：拒绝新投递、排空已接受的队列、等待落盘完成。
 //
-// 顺序是三步，任何一步失败都不会留下「看起来成功」的假象：
+// 为什么不复用 commit 的分支令牌：Close 是全仓库生命周期事件，
+// 与某条分支的提交排队无关；它要做的只是「队列关闸、存量刷完、
+// goroutine 退出」。幂等：重复调用与「从未写过」都安全。
+func (r *Repo) Close() error {
+	r.writerMu.Lock()
+	if r.writerDead {
+		down := r.writerDown
+		r.writerMu.Unlock()
+		if down != nil {
+			<-down
+		}
+		return nil
+	}
+	r.writerDead = true
+	if r.writerCh == nil {
+		r.writerMu.Unlock()
+		return nil
+	}
+	down := r.writerDown
+	close(r.writerCh)
+	r.writerMu.Unlock()
+	<-down
+	// worker 已退出，不会再改 writerErr；返回关闭前尚未被 barrier
+	// 观察到的最后一个异步写盘错误。
+	return r.writerErr
+}
+
+// Write 把内容投递进脏写入队列。
 //
-//	① 内容写到临时文件，fsync，再 rename 到 objects/xx/yyyy
-//	   rename 是原子的，所以磁盘上永远不会出现半个对象；
-//	   已存在同 SHA 则直接跳过（内容寻址，同一份内容就是同一个对象）
-//	② 往索引追加一行「哪个分支的哪个路径指向哪个 blob」
-//	   这一步失败时 blob 成为孤儿——内容在盘上，但没人指向它，
-//	   而调用方拿到错误，所以不会有人以为写成功了
-//	③ 最后才更新内存待提交区
-//	   内存是最后一步，保证它反映的一定是已经落盘的状态
-//
-// 于是 kill -9 在任何一点都会落进这两种情况之一：
-// 要么这一条根本没写成功（调用方拿到错误），要么它完整地在盘上。
-//
-// 注意：倒排索引不在这里。它是纯派生物，启动时从 blob 重建，
-// 不落盘也不上传——持久化的只有内容（blob）和指向它的记录（索引行）。
+// 语义：只承诺「已投递」。不等待落盘，不等待提交，返回即表示
+// 已进入单写者队列。若队列已满则报错拒绝（调用方知晓未被采纳）。
 func (r *Repo) Write(ref, path string, data []byte, mode Mode) error {
 	if err := validPath(path); err != nil {
 		return err
@@ -434,167 +654,356 @@ func (r *Repo) Write(ref, path string, data []byte, mode Mode) error {
 		mode = ModeContent
 	}
 
-	// ① blob 落盘（临时文件 → fsync → rename）
+	size := int64(len(data))
+	cp := make([]byte, len(data))
+	copy(cp, data)
+
+	r.writerMu.Lock()
+	if r.writerDead {
+		r.writerMu.Unlock()
+		return fmt.Errorf("仓库 %s 已关闭，拒绝新投递", filepath.Base(r.Path))
+	}
+	r.initDirtyWriter()
+	queuedSize := r.writerSize.Load()
+	if len(r.writerCh) >= dirtyQueueCapacity || queuedSize+size > dirtyQueueMaxBytes {
+		r.writerMu.Unlock()
+		return fmt.Errorf("脏写入队列已满（排队 %d 条 / %d 字节），拒绝新投递；请稍后重试", len(r.writerCh), queuedSize)
+	}
+	r.writerSize.Add(size)
+	select {
+	case r.writerCh <- dirtyTask{op: 'W', ref: ref, path: path, data: cp, mode: mode, size: size}:
+		r.writerMu.Unlock()
+		return nil
+	default:
+		r.writerSize.Add(-size)
+		r.writerMu.Unlock()
+		return fmt.Errorf("脏写入队列已满，拒绝新投递；请稍后重试")
+	}
+}
+
+func (r *Repo) applyDirtyWrite(ref, path string, data []byte, mode Mode) error {
+	normRef := normalizeRef(ref)
+	dir, name := splitDirName(path)
+
 	sha, err := r.writeObject("blob", data)
 	if err != nil {
 		return err
 	}
 
-	// ② 索引追加
-	if err := r.appendWAL(ref, path, mode, sha); err != nil {
+	r.dirtyMu.RLock()
+	defer r.dirtyMu.RUnlock()
+
+	unlock := r.lockDirtyFile(r.dirtyFilePath(normRef, dir))
+	defer unlock()
+
+	n, err := r.loadDirtyNode(normRef, dir)
+	if err != nil {
 		return err
 	}
+	if n == nil {
+		baseTree := ""
+		if c, cerr := r.commitOf(normRef); cerr == nil {
+			baseTree = c.Tree
+		}
+		items, cerr := r.cleanItemsAt(baseTree, dir)
+		if cerr != nil {
+			return cerr
+		}
+		n = startDirtyNode(items)
+	}
+	n.set[name] = dirtyEntry{Mode: mode, SHA: sha}
+	delete(n.del, name)
+	return r.saveDirtyNode(normRef, dir, n)
+}
 
-	// ③ 内存
+func (r *Repo) applyDirtyDelete(ref, path string) error {
 	normRef := normalizeRef(ref)
-	cp := make([]byte, len(data))
-	copy(cp, data)
-	r.mu.Lock()
-	if r.pending == nil {
-		r.pending = map[string]map[string][]byte{}
-		r.pmode = map[string]map[string]Mode{}
+	dir, name := splitDirName(path)
+
+	r.dirtyMu.RLock()
+	defer r.dirtyMu.RUnlock()
+
+	unlock := r.lockDirtyFile(r.dirtyFilePath(normRef, dir))
+	defer unlock()
+
+	n, err := r.loadDirtyNode(normRef, dir)
+	if err != nil {
+		return err
 	}
-	if r.pending[normRef] == nil {
-		r.pending[normRef] = map[string][]byte{}
-		r.pmode[normRef] = map[string]Mode{}
+	if n == nil {
+		baseTree := ""
+		if c, cerr := r.commitOf(normRef); cerr == nil {
+			baseTree = c.Tree
+		}
+		items, cerr := r.cleanItemsAt(baseTree, dir)
+		if cerr != nil {
+			return cerr
+		}
+		n = startDirtyNode(items)
 	}
-	r.pending[normRef][path] = cp
-	r.pmode[normRef][path] = mode
-	r.mu.Unlock()
-	return nil
+	delete(n.set, name)
+	n.del[name] = true
+	return r.saveDirtyNode(normRef, dir, n)
+}
+
+// Flush 等待当前排队的全部脏写入完成落盘。
+func (r *Repo) Flush() error {
+	return r.syncDirtyWriter()
 }
 
 // Pending 返回某分支（或全部分支）待提交的条数。
+//
+// 「条数」= 脏层里被改动过的名字总数（含墓碑）。它是判断
+// 「有没有东西等着被折叠」的唯一依据——不再有第二份内存账本。
 func (r *Repo) Pending(ref ...string) int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	_ = r.syncDirtyWriter()
+	r.dirtyMu.RLock()
+	defer r.dirtyMu.RUnlock()
+	return r.pendingOnDisk(ref...)
+}
+
+// pendingOnDisk 在已持 dirtyMu 的前提下统计脏层条目数。
+func (r *Repo) pendingOnDisk(ref ...string) int {
+
+	count := func(name string) int {
+		dirs, err := r.listDirtyDirs(name)
+		if err != nil {
+			return 0
+		}
+		total := 0
+		for _, d := range dirs {
+			n, err := r.loadDirtyNode(name, d)
+			if err != nil || n == nil {
+				continue
+			}
+			total += n.count()
+		}
+		return total
+	}
+
 	if len(ref) > 0 && ref[0] != "" {
-		norm := normalizeRef(ref[0])
-		return len(r.pending[norm])
+		return count(normalizeRef(ref[0]))
+	}
+	refs, err := r.dirtyRefs()
+	if err != nil {
+		return 0
 	}
 	total := 0
-	for _, m := range r.pending {
-		total += len(m)
+	for _, name := range refs {
+		total += count(name)
 	}
 	return total
 }
 
-// Commit 把待提交区写成对象并推进 ref。
+// Commit 把脏层折叠成 Git 对象并推进 ref。
+//
+// 全程持全局写锁：折叠必须看到一份不动的脏层，否则
+// 「读一半的脏节点 + 改了一半的脏节点」会写出一个从未存在过的树。
+//
+// 顺序（任一步崩溃都可重试，因为对象是内容寻址的）：
+//
+//	① 每个脏目录 → 一个 tree 对象
+//	② 自底向上把新 tree 挂进祖先目录
+//	③ 写 commit 对象
+//	④ 原子替换 ref          ← 唯一的提交点
+//	⑤ 删脏层
+//
+// ④ 之后 ⑤ 之前崩溃：ref 已前进但脏文件还在。下次 Commit 会发现
+// 脏层描述的内容已经在 ref 里（折叠是幂等的），于是直接清掉它。
 func (r *Repo) Commit(ref, message string) (string, error) {
 	normRef := normalizeRef(ref)
-	r.mu.Lock()
-	pending := r.pending[normRef]
-	pmode := r.pmode[normRef]
-	if len(pending) == 0 && len(r.pdeleted[normRef]) == 0 {
-		r.mu.Unlock()
-		return "", nil
-	}
-	deleted := r.pdeleted[normRef]
-	delete(r.pending, normRef)
-	delete(r.pmode, normRef)
-	delete(r.pdeleted, normRef)
-	r.mu.Unlock()
-
-	restore := func() {
-		r.mu.Lock()
-		if r.pending == nil {
-			r.pending = map[string]map[string][]byte{}
-			r.pmode = map[string]map[string]Mode{}
-		}
-		if r.pending[normRef] == nil {
-			r.pending[normRef] = map[string][]byte{}
-			r.pmode[normRef] = map[string]Mode{}
-		}
-		for p, d := range pending {
-			r.pending[normRef][p] = d
-			r.pmode[normRef][p] = pmode[p]
-		}
-		if len(deleted) > 0 {
-			if r.pdeleted == nil {
-				r.pdeleted = map[string]map[string]bool{}
-			}
-			r.pdeleted[normRef] = deleted
-		}
-		r.mu.Unlock()
-	}
-
-	// ① 每个文件写一个 blob（这一步就已经永久落盘）
-	node := newTreeNode()
-	oldCommit, err := r.Resolve(ref)
-	if err != nil {
-		restore()
+	if err := r.syncDirtyWriter(); err != nil {
 		return "", err
 	}
 
-	// 先把旧树整个载入，再叠加新条目——只写新条目会丢掉历史内容
-	if oldCommit != "" {
-		old, err := r.commitOf(ref)
-		if err != nil {
-			restore()
-			return "", err
-		}
-		if old.Tree != "" {
-			flat := map[string]Entry{}
-			if err := r.loadTree(old.Tree, "", flat); err != nil {
-				restore()
-				return "", err
-			}
-			gone := deleted
-			for p, e := range flat {
-				if _, replacing := pending[p]; replacing {
-					continue
-				}
-				if gone[p] {
-					continue
-				}
-				if err := node.insert(p, string(e.Mode), e.Hash); err != nil {
-					restore()
-					return "", err
-				}
-			}
-		}
-	}
-
-	// 再写入这一批
-	for p, data := range pending {
-		sha, err := r.writeObject("blob", data)
-		if err != nil {
-			restore()
-			return "", fmt.Errorf("写入 blob %s: %w", p, err)
-		}
-		if err := node.insert(p, string(pmode[p]), sha); err != nil {
-			restore()
-			return "", err
-		}
-	}
-
-	treeSHA, err := node.write(r)
+	release, err := r.acquireCommitToken(normRef)
 	if err != nil {
-		restore()
-		return "", fmt.Errorf("写树: %w", err)
+		return "", err
+	}
+	defer release()
+
+	r.dirtyMu.Lock()
+	defer r.dirtyMu.Unlock()
+
+	dirs, err := r.listDirtyDirs(normRef)
+	if err != nil {
+		return "", err
+	}
+	if len(dirs) == 0 {
+		return "", nil
 	}
 
+	oldCommit, err := r.Resolve(normRef)
+	if err != nil {
+		return "", err
+	}
+	baseTree := ""
+	if oldCommit != "" {
+		old, cerr := r.commitOf(normRef)
+		if cerr != nil {
+			return "", cerr
+		}
+		baseTree = old.Tree
+	}
+
+	// 折叠：脏目录 + 它们的全部祖先，按深度降序（先算最深的子目录，
+	// 再算它的父目录），逐层把新 tree SHA 挂上去。
+	//
+	// 为什么必须包含祖先：写 a/b/c.md 只会让 a/b 变脏，但 a 和根
+	// 的 tree 指针也得跟着换，否则新内容在历史上隐形。
+	needed := map[string]bool{}
+	for _, dir := range dirs {
+		needed[dir] = true
+		for d := dir; d != ""; {
+			parent, _ := splitDirName(d)
+			if parent == d {
+				break
+			}
+			needed[parent] = true
+			d = parent
+		}
+	}
+	toFold := make([]string, 0, len(needed))
+	for d := range needed {
+		toFold = append(toFold, d)
+	}
+	sortDirtyDirsDeepFirst(toFold)
+
+	patched := map[string]string{}
+	for _, dir := range toFold {
+		items, cerr := r.cleanItemsAt(baseTree, dir)
+		if cerr != nil {
+			return "", cerr
+		}
+		n, lerr := r.loadDirtyNode(normRef, dir)
+		if lerr != nil {
+			return "", lerr
+		}
+		items = applyDirty(items, n)
+		// 子目录已经算出新 SHA，最后叠上：新内容不能被子目录里的
+		// 旧指针盖回去。同名冲突（文件/目录重名）时保留已有项。
+		items = patchChildDirs(items, dir, patched)
+
+		sha, werr := r.writeTreeItems(items)
+		if werr != nil {
+			return "", werr
+		}
+		patched[dir] = sha
+	}
+	rootSHA, ok := patched[""]
+	if !ok {
+		rootSHA = baseTree
+	}
+
+	// ③ 写 commit
 	var parents []string
 	if oldCommit != "" {
 		parents = []string{oldCommit}
 	}
-	commitSHA, err := r.writeCommit(treeSHA, parents, message, time.Now())
+	commitSHA, err := r.writeCommit(rootSHA, parents, message, time.Now())
 	if err != nil {
-		restore()
-		return "", fmt.Errorf("写提交: %w", err)
+		return "", err
 	}
 
-	if err := r.updateRef("refs/heads/"+normalizeRef(ref), commitSHA); err != nil {
-		restore()
+	// ④ 唯一的提交点
+	if err := r.updateRef("refs/heads/"+normRef, commitSHA); err != nil {
 		return "", fmt.Errorf("更新 ref: %w", err)
 	}
-	// ref 已经指向新提交，WAL 里那批记录到此才算数完了。
-	_ = r.advanceCheckpoint(ref)
+
+	// ⑤ 清脏层。失败不算提交失败：内容已经在 ref 里了，
+	//    残留的脏文件会在下一次 Commit 时被识别为「已折叠」并清掉。
+	_ = r.clearDirtyRef(normRef)
 	return commitSHA, nil
 }
 
-func normalizeRef(ref string) string {
-	return strings.TrimPrefix(ref, "refs/heads/")
+// sortDirtyDirsDeepFirst 按深度降序排（深的在前）。
+func sortDirtyDirsDeepFirst(dirs []string) {
+	sort.Slice(dirs, func(i, j int) bool {
+		di, dj := strings.Count(dirs[i], "/"), strings.Count(dirs[j], "/")
+		if di != dj {
+			return di > dj
+		}
+		return dirs[i] > dirs[j]
+	})
+}
+
+// patchChildDirs 把已经被折叠过的直接子目录替换成新的 tree SHA；
+// 折叠过程中新建出来的子目录原本不在这一层里，补上。
+func patchChildDirs(items []treeItem, dir string, patched map[string]string) []treeItem {
+	byName := make(map[string]treeItem, len(items))
+	for _, it := range items {
+		byName[it.name] = it
+	}
+	prefix := ""
+	if dir != "" {
+		prefix = dir + "/"
+	}
+	for child, sha := range patched {
+		if !strings.HasPrefix(child, prefix) || child == dir {
+			continue
+		}
+		rest := strings.TrimPrefix(child, prefix)
+		if strings.Contains(rest, "/") {
+			continue
+		}
+		if old, ok := byName[rest]; ok && old.mode != "40000" {
+			continue
+		}
+		byName[rest] = treeItem{mode: "40000", name: rest, sha: sha}
+	}
+	out := make([]treeItem, 0, len(byName))
+	for _, it := range byName {
+		out = append(out, it)
+	}
+	return out
+}
+
+// writeTreeItems 把一组条目写成一个 tree 对象。
+func (r *Repo) writeTreeItems(items []treeItem) (string, error) {
+	if len(items) == 0 {
+		return r.writeObject("tree", nil)
+	}
+	return r.writeObject("tree", serializeTree(items))
+}
+
+// rebuildAncestors 从 patched 出发自底向上重建祖先目录，返回新的根 tree。
+//
+// 只处理「被脏节点触及的目录」的祖先链，深度通常 2~4 层，
+// 与树的规模无关。
+func (r *Repo) rebuildAncestors(baseTree string, patched map[string]string) (string, error) {
+	if sha, ok := patched[""]; ok {
+		return sha, nil
+	}
+	// 找出所有需要重建的祖先目录（patched 里每个目录的父目录链）。
+	pending := map[string]bool{}
+	for dir := range patched {
+		for dir != "" {
+			dir, _ = splitDirName(dir)
+			pending[dir] = true
+		}
+	}
+	dirs := make([]string, 0, len(pending))
+	for d := range pending {
+		dirs = append(dirs, d)
+	}
+	sortDirtyDirsDeepFirst(dirs)
+
+	for _, dir := range dirs {
+		items, err := r.cleanItemsAt(baseTree, dir)
+		if err != nil {
+			return "", err
+		}
+		items = patchChildDirs(items, dir, patched)
+		sha, err := r.writeTreeItems(items)
+		if err != nil {
+			return "", err
+		}
+		patched[dir] = sha
+	}
+	if sha, ok := patched[""]; ok {
+		return sha, nil
+	}
+	return baseTree, nil
 }
 
 // objectTime 取一个对象文件的修改时间（Unix 秒），取不到返回 0。
@@ -677,6 +1086,13 @@ func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
 
 // Fork 从 from 分支复制出 to 分支（零字节：只写一个 ref）。
 func (r *Repo) Fork(from, to string) error {
+	normTo := normalizeRef(to)
+	release, err := r.acquireCommitToken(normTo)
+	if err != nil {
+		return err
+	}
+	defer release()
+
 	sha, err := r.Resolve(from)
 	if err != nil {
 		return err
@@ -684,21 +1100,12 @@ func (r *Repo) Fork(from, to string) error {
 	if sha == "" {
 		return fmt.Errorf("分支 %s 不存在", from)
 	}
-	// 重置/分叉时把目标分支的待提交区清掉：重置就是放弃所有脏状态，
+	// 重置/分叉时把目标分支的脏层清掉：重置就是放弃所有未提交状态，
 	// 继承源分支的纯净快照。不清掉的话，之前没提交的写入会叠加在
 	// 新快照上，看起来像「没重置干净」。
-	normTo := normalizeRef(to)
-	r.mu.Lock()
-	if r.pending != nil {
-		delete(r.pending, normTo)
-	}
-	if r.pmode != nil {
-		delete(r.pmode, normTo)
-	}
-	if r.pdeleted != nil {
-		delete(r.pdeleted, normTo)
-	}
-	r.mu.Unlock()
+	r.dirtyMu.Lock()
+	_ = r.clearDirtyRef(normTo)
+	r.dirtyMu.Unlock()
 	return r.updateRef("refs/heads/"+normTo, sha)
 }
 
@@ -746,282 +1153,127 @@ func validPath(path string) error {
 	return nil
 }
 
-var _ = strconv.Itoa
-
-// ── 索引日志（WAL） ────────────────────────────────────────────
-//
-// 这一层记录「哪些 blob 还没进树」。没有它，进程被杀之后那些 blob
-// 就成了悬空对象——内容还在磁盘上，但谁也找不到它。
-//
-// 三个设计约束，都是为了「随时可能被杀」：
-//
-//   - 只追加，永不重写。重写意味着「写新文件 + rename」，而 rename
-//     之前的那一瞬间被杀会留下半成品，最坏情况让原日志消失。
-//     数据库的做法是 checkpoint：日志只涨，进度记在别处。
-//
-//   - 每行带 CRC32。断电会让最后一行只写了一半，而半行会和下一条
-//     记录拼在一起——没有校验的话，一条断电记录能毁掉两条正常记录。
-//
-//   - 重放遇到坏行就停。坏行之后的内容不可信（可能已经串行），
-//     继续往下读只会把垃圾当数据。
-
-// walPath 是索引日志的位置。
-func (r *Repo) walPath() string { return filepath.Join(r.Path, "zero-memcp.wal") }
-
-// ckptPath 记录「日志的哪些字节已经折叠进树了」。
-func (r *Repo) ckptPath() string { return filepath.Join(r.Path, "zero-memcp.checkpoint") }
-
-// walLine 拼一行日志：crc \t ref \t mode \t sha \t path
-func walLine(ref, path string, mode Mode, sha string) string {
-	body := strings.Join([]string{normalizeRef(ref), string(mode), sha, path}, "\t")
-	return fmt.Sprintf("%08x\t%s\n", crc32.ChecksumIEEE([]byte(body)), body)
+// normalizeRef 把 "refs/heads/x" 归一成 "x"。
+func normalizeRef(ref string) string {
+	return strings.TrimPrefix(ref, "refs/heads/")
 }
 
-// appendWAL 追加一条记录并 fsync。
-func (r *Repo) appendWAL(ref, path string, mode Mode, sha string) error {
-	f, err := os.OpenFile(r.walPath(), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+// ── 脏层恢复 ──────────────────────────────────────────────────
+//
+// 脏层本身就是持久层：每个被改过的目录一个文件，改了就原子替换。
+// 于是「恢复」不需要任何日志格式——扫一遍 dirty/<branch>/ 就够了，
+// 每个文件的内容就是那个目录的当前覆盖。
+//
+// 这与旧版 WAL 的差别值得记下来：WAL 记的是「发生过什么」（事件流），
+// 恢复要重放、要校验 CRC、要在坏行处截断。脏文件记的是「现在是什么」
+// （状态快照），恢复只是读，没有重放，也没有「半行毒化后续记录」
+// 这类问题——一个坏文件最多让那个目录退回干净层。
+
+// RecoveryResult 报告一次启动恢复的概况。
+type RecoveryResult struct {
+	// Refs 是仍有未提交内容的逻辑分支名。
+	Refs []string
+	// Dirs 是恢复出来的脏目录数。
+	Dirs int
+	// Entries 是脏层里被改动过的名字总数（含墓碑）。
+	Entries int
+}
+
+// Recover 扫描脏层，报告还有哪些分支有待折叠的改动。
+//
+// 它不改任何东西：脏文件已经是权威状态，重启后直接生效。
+// 唯一做的是清理「孤儿脏文件」——那些所属分支连 ref 都不存在的目录
+// （比如分支被 archive 掉了），留着只会让 Pending 永远不为零。
+func (r *Repo) Recover() (RecoveryResult, error) {
+	var res RecoveryResult
+
+	refs, err := r.dirtyRefs()
 	if err != nil {
-		return fmt.Errorf("打开索引日志: %w", err)
-	}
-	if _, err := f.WriteString(walLine(ref, path, mode, sha)); err != nil {
-		f.Close()
-		return fmt.Errorf("写索引日志: %w", err)
-	}
-	if err := f.Sync(); err != nil {
-		f.Close()
-		return fmt.Errorf("同步索引日志: %w", err)
-	}
-	return f.Close()
-}
-
-// readCheckpoint 读出「日志前 N 字节已折叠」。
-func (r *Repo) readCheckpoint() int64 {
-	b, err := os.ReadFile(r.ckptPath())
-	if err != nil {
-		return 0
-	}
-	n, err := strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
-	if err != nil || n < 0 {
-		return 0
-	}
-	return n
-}
-
-// writeCheckpoint 原子地推进进度。
-//
-// 先写临时文件再 rename：rename 之前被杀，旧的 checkpoint 还在，
-// 最多重放一遍已提交的记录——而重放是幂等的（只是重新指向同一个 blob）。
-func (r *Repo) writeCheckpoint(offset int64) error {
-	p := r.ckptPath()
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, []byte(strconv.FormatInt(offset, 10)+"\n"), 0o644); err != nil {
-		return err
-	}
-	if f, err := os.Open(tmp); err == nil {
-		_ = f.Sync()
-		_ = f.Close()
-	}
-	return os.Rename(tmp, p)
-}
-
-// walEntry 是重放出来的一条记录。
-type walEntry struct {
-	Ref  string
-	Mode Mode
-	SHA  string
-	Path string
-}
-
-// scanWAL 从 offset 开始读日志，返回合法记录与「下一段的起始偏移」。
-//
-// 遇到校验不过的行就停——后面不可信。返回的 end 是最后一条合法记录
-// 之后的字节位置，checkpoint 就写这个值。
-func (r *Repo) scanWAL(offset int64) (entries []walEntry, end int64, err error) {
-	f, err := os.Open(r.walPath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, offset, nil
-		}
-		return nil, offset, err
-	}
-	defer f.Close()
-
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return nil, offset, err
-	}
-	raw, err := io.ReadAll(f)
-	if err != nil {
-		return nil, offset, err
+		return res, err
 	}
 
-	pos := offset
-	for {
-		nl := bytes.IndexByte(raw, '\n')
-		if nl < 0 {
-			// 末尾没有换行 = 被截断的半行，丢弃。
-			// 不推进 pos，下次启动还会再读一遍（幂等）。
-			break
-		}
-		line := raw[:nl]
-		raw = raw[nl+1:]
-		lineStart := pos
-		pos += int64(nl + 1)
+	r.dirtyMu.Lock()
+	defer r.dirtyMu.Unlock()
 
-		crcStr, body, ok := bytes.Cut(line, []byte("\t"))
-		if !ok || len(crcStr) != 8 {
-			pos = lineStart
-			break
-		}
-		want, perr := strconv.ParseUint(string(crcStr), 16, 32)
-		if perr != nil {
-			pos = lineStart
-			break
-		}
-		if crc32.ChecksumIEEE(body) != uint32(want) {
-			// 校验失败：断电污染的记录，停在这里
-			pos = lineStart
-			break
-		}
-		fields := strings.Split(string(body), "\t")
-		if len(fields) != 4 {
-			pos = lineStart
-			break
-		}
-		entries = append(entries, walEntry{Ref: fields[0], Mode: Mode(fields[1]), SHA: fields[2], Path: fields[3]})
-	}
-	return entries, pos, nil
-}
-
-// ReplayWAL 把 checkpoint 之后的记录放回待提交区。
-//
-// 启动时调用一次。这样「写完立刻被杀」的记忆不会丢——内容在 blob 里，
-// 指向它的记录在日志里，重放就能把它们重新挂回树上。
-func (r *Repo) ReplayWAL() (int, error) {
-	entries, end, err := r.scanWAL(r.readCheckpoint())
-	if err != nil {
-		return 0, err
-	}
-
-	// 把日志截到最后一条合法记录之后。
-	//
-	// 必须做，不能只是「读的时候跳过」：末尾那半行没有换行符，
-	// 下一次追加会直接接在它后面，把半行和新记录拼成一行——
-	// 于是新记录也校验失败。一条断电记录会因此持续毒化后续所有写入，
-	// 而且是在重启之后才发作，排查时完全看不出因果。
-	if info, statErr := os.Stat(r.walPath()); statErr == nil && info.Size() > end {
-		if truncErr := os.Truncate(r.walPath(), end); truncErr != nil {
-			return 0, fmt.Errorf("修复索引日志尾部: %w", truncErr)
-		}
-	}
-	n := 0
-	for _, e := range entries {
-		if err := validPath(e.Path); err != nil {
+	for _, name := range refs {
+		dirs, derr := r.listDirtyDirs(name)
+		if derr != nil {
 			continue
 		}
-		typ, body, err := r.readObject(e.SHA)
-		if err != nil || typ != "blob" {
-			// blob 不在了（被回收或从没写成）——这条记录作废
+		if len(dirs) == 0 {
 			continue
 		}
-		norm := normalizeRef(e.Ref)
-		r.mu.Lock()
-		if r.pending == nil {
-			r.pending = map[string]map[string][]byte{}
-			r.pmode = map[string]map[string]Mode{}
+		// 分支已不存在时保留脏层：它可能是有意的「暂存分支」，
+		// 仅凭没有 ref 不足以判定数据是孤儿。archive/reset 会显式清理。
+		entries := 0
+		for _, d := range dirs {
+			n, lerr := r.loadDirtyNode(name, d)
+			if lerr != nil || n == nil {
+				continue
+			}
+			entries += n.count()
 		}
-		if r.pending[norm] == nil {
-			r.pending[norm] = map[string][]byte{}
-			r.pmode[norm] = map[string]Mode{}
-		}
-		r.pending[norm][e.Path] = body
-		r.pmode[norm][e.Path] = e.Mode
-		r.mu.Unlock()
-		n++
-	}
-	return n, nil
-}
-
-// advanceCheckpoint 在某个分支提交成功后推进日志进度。
-//
-// 只有当「日志里的记录全部属于这个分支」时才能推进——
-// 否则别的分支还没提交的记录会被一并跳过，那是真的丢数据。
-func (r *Repo) advanceCheckpoint(ref string) error {
-	norm := normalizeRef(ref)
-	entries, end, err := r.scanWAL(0)
-	if err != nil {
-		return err
-	}
-	for _, e := range entries {
-		if normalizeRef(e.Ref) == norm {
+		if entries == 0 {
+			_ = r.clearDirtyRef(name)
 			continue
 		}
-		// 还有别的分支未提交：不推进。本分支的记录会留在日志里，
-		// 下次重放时重新指向同一个 blob——幂等，不会出错。
-		return nil
+		res.Refs = append(res.Refs, name)
+		res.Dirs += len(dirs)
+		res.Entries += entries
 	}
-	return r.writeCheckpoint(end)
+	return res, nil
 }
 
-// CompactWAL 在日志远大于有效内容时收缩一次。
-//
-// 正常路径走不到这里：checkpoint 让日志只涨不读，一天几百条记录
-// 一年也就几 MB。真到了要收缩的时候，用临时文件 + rename。
-func (r *Repo) CompactWAL() error {
-	off := r.readCheckpoint()
-	b, err := os.ReadFile(r.walPath())
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	if off <= 0 || int64(len(b)) <= off*2 {
-		return nil
-	}
-	tmp := r.walPath() + ".tmp"
-	if err := os.WriteFile(tmp, b[off:], 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, r.walPath()); err != nil {
-		return err
-	}
-	return r.writeCheckpoint(0)
-}
-
-// Delete 删除一个路径。走待提交区，与写入一样的批处理语义。
-//
-// 删除是「打墓碑 + 记账」，不是立刻改树：这样它和写入共享同一个
-// commit 边界，二者不会互相覆盖。
+// Delete 把删除动作投递进脏写入队列。
 func (r *Repo) Delete(ref, path string) error {
 	if err := validPath(path); err != nil {
 		return err
 	}
-	normRef := normalizeRef(ref)
-	r.mu.Lock()
-	if r.pdeleted == nil {
-		r.pdeleted = map[string]map[string]bool{}
+	r.writerMu.Lock()
+	if r.writerDead {
+		r.writerMu.Unlock()
+		return fmt.Errorf("仓库 %s 已关闭，拒绝删除：%s", filepath.Base(r.Path), path)
 	}
-	if r.pdeleted[normRef] == nil {
-		r.pdeleted[normRef] = map[string]bool{}
+	r.initDirtyWriter()
+	if len(r.writerCh) >= dirtyQueueCapacity {
+		r.writerMu.Unlock()
+		return fmt.Errorf("脏写入队列已满，拒绝删除：%s", path)
 	}
-	r.pdeleted[normRef][path] = true
-	// 同一路径如果之前排着写入，取消它——删就是删。
-	// 注意：这只对「同一个分支」成立。跨分支移动时，目标分支的写入
-	// 在另一个 key 下，不受影响。
-	if r.pending[normRef] != nil {
-		delete(r.pending[normRef], path)
+	select {
+	case r.writerCh <- dirtyTask{op: 'D', ref: ref, path: path}:
+		r.writerMu.Unlock()
+		return nil
+	default:
+		r.writerMu.Unlock()
+		return fmt.Errorf("脏写入队列已满，拒绝删除：%s", path)
 	}
-	r.mu.Unlock()
-	return nil
 }
 
 // Deleted 返回某分支待提交的删除路径。
 func (r *Repo) Deleted(ref string) []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	if err := r.syncDirtyWriter(); err != nil {
+		return nil
+	}
+	r.dirtyMu.RLock()
+	defer r.dirtyMu.RUnlock()
+	normRef := normalizeRef(ref)
+	dirs, err := r.listDirtyDirs(normRef)
+	if err != nil {
+		return nil
+	}
 	var out []string
-	for p := range r.pdeleted[normalizeRef(ref)] {
-		out = append(out, p)
+	for _, dir := range dirs {
+		n, err := r.loadDirtyNode(normRef, dir)
+		if err != nil || n == nil {
+			continue
+		}
+		for name := range n.del {
+			path := name
+			if dir != "" {
+				path = dir + "/" + name
+			}
+			out = append(out, path)
+		}
 	}
 	sort.Strings(out)
 	return out
@@ -1257,36 +1509,29 @@ func (r *Repo) ArchiveRef(branch string) error {
 }
 
 // Branches 列出该仓库所有的分支名（refs/heads/ 下的短名）。
+// Branches 列出本地分支（短名）。
+//
+// 依赖 Refs 合并 packed-refs：git clone --bare 出来的仓库把分支全放在
+// packed-refs 里，refs/heads 是空目录。早先直接走目录，于是这样的仓库
+// 被判定为「没有分支」，索引为 0 块，而服务照常报 ok:true。
 func (r *Repo) Branches() []string {
-	var out []string
-	root := filepath.Join(r.Path, "refs", "heads")
-	_ = filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
-		if err != nil || d.IsDir() {
-			return nil
-		}
-		rel, rerr := filepath.Rel(root, p)
-		if rerr == nil && rel != "" {
-			out = append(out, rel)
-		}
+	refs, err := r.Refs("refs/heads/")
+	if err != nil {
 		return nil
-	})
+	}
+	out := make([]string, 0, len(refs))
+	for _, name := range refs {
+		out = append(out, strings.TrimPrefix(name, "refs/heads/"))
+	}
 	return out
 }
 
-// PendingRefs 列出当前待提交区里有变动的分支名。
+// PendingRefs 列出脏层里有待折叠改动的分支名。
+// 先等写入队列排空，确保看到最新状态。
 func (r *Repo) PendingRefs() []string {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	var out []string
-	for ref, m := range r.pending {
-		if len(m) > 0 {
-			out = append(out, ref)
-		}
-	}
-	for ref, m := range r.pdeleted {
-		if len(m) > 0 {
-			out = append(out, ref)
-		}
-	}
-	return out
+	_ = r.syncDirtyWriter()
+	r.dirtyMu.RLock()
+	defer r.dirtyMu.RUnlock()
+	refs, _ := r.dirtyRefs()
+	return refs
 }

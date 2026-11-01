@@ -52,6 +52,10 @@ mode = "rwxr-xr-x"
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	// 仓库的脏层写者是后台 goroutine：不关就会在 TempDir 清理时
+	// 继续往仓库目录写文件，撞上 RemoveAll。Close 幂等，测试里
+	// 显式再关一次也无害。
+	t.Cleanup(func() { _ = srv.Close() })
 	return srv, dataDir
 }
 
@@ -129,12 +133,12 @@ func TestWriteReadEndToEnd(t *testing.T) {
 	srv, dataDir := newTestServer(t, "")
 	tok := mintToken(t, dataDir, "zero")
 
-	res, err := callMCP(t, srv, tok, "note fact -- 第一条记忆")
+	res, err := callMCP(t, srv, tok, "put -- 第一条记忆")
 	if err != nil {
-		t.Fatalf("note: %v", err)
+		t.Fatalf("put: %v", err)
 	}
 	if !strings.HasPrefix(res, "ok daily/") {
-		t.Fatalf("note 返回异常: %s", res)
+		t.Fatalf("put 返回异常: %s", res)
 	}
 	addr := strings.TrimPrefix(res, "ok ")
 
@@ -336,37 +340,41 @@ mode  = "rwx------"
 
 	tok := mintToken(t, dataDir, "zero")
 
-	// 写 2 条：引擎不再自动提交，所以无论等多久都不该有 commit。
-	_, _ = callMCP(t, srv, tok, "note fact -- 1")
-	_, _ = callMCP(t, srv, tok, "note fact -- 2")
-	time.Sleep(300 * time.Millisecond)
-	if c, _ := repo.Resolve("zero"); c != "" {
-		t.Fatal("引擎不该自己提交：封箱时机由调用方决定")
+	// put 只进脏层，不自动推进分支。
+	_, _ = callMCP(t, srv, tok, "put -- 1")
+	_, _ = callMCP(t, srv, tok, "put -- 2")
+	if n := repo.Pending("zero"); n != 2 {
+		t.Fatalf("put 后 pending 应为 2，得到 %d", n)
 	}
 
-	// 再写第 3 条，仍然不该自动提交
-	_, _ = callMCP(t, srv, tok, "note fact -- 3")
-	time.Sleep(600 * time.Millisecond)
-	if c, _ := repo.Resolve("zero"); c != "" {
-		t.Fatal("写了 3 条也不该自动提交")
+	// 显式 commit 之后分支才真正前进。
+	sha, err := callMCP(t, srv, tok, "commit daily@zero")
+	if err != nil || !strings.Contains(sha, "已提交") {
+		t.Fatalf("commit 失败: %v (%s)", err, sha)
+	}
+	if c, _ := repo.Resolve("zero"); c == "" {
+		t.Fatal("commit 之后分支应已前进")
 	}
 
-	// 显式调用 commit 才封箱
-	if _, err := callMCP(t, srv, tok, "commit daily@zero"); err != nil {
-		t.Fatalf("显式 commit 失败: %v", err)
-	}
-	c, _ := repo.Resolve("zero")
-	if c == "" {
-		t.Fatal("显式 commit 后应该有提交")
-	}
-
-	// 三次写入应合并在同一个 commit 里
-	log, err := repo.Log("zero", 5)
+	// 再写一条并 commit
+	_, _ = callMCP(t, srv, tok, "put -- 3")
+	_, _ = callMCP(t, srv, tok, "commit daily@zero")
+	log, err := repo.Log("zero", 10)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(log) != 1 {
-		t.Fatalf("3 条写入应合并为 1 次提交，实际有 %d 次", len(log))
+	if len(log) != 2 {
+		t.Fatalf("2 次显式 commit 应产生 2 次提交，实际 %d 次", len(log))
+	}
+
+	// 显式 commit 在没有待提交内容时不该造出空提交。
+	before, _ := repo.Resolve("zero")
+	if _, err := callMCP(t, srv, tok, "commit daily@zero"); err != nil {
+		t.Fatalf("显式 commit 失败: %v", err)
+	}
+	after, _ := repo.Resolve("zero")
+	if before != after {
+		t.Fatal("没有待提交内容时不该产生新提交")
 	}
 }
 
@@ -426,18 +434,18 @@ mode  = "rwxrwxrwx"
 	bobTok := mintToken(t, dataDir, "bob")
 
 	// root：写受保护的 daily 应当成功
-	if _, err := callMCP(t, srv, rootTok, "note fact -- root 写的"); err != nil {
+	if _, err := callMCP(t, srv, rootTok, "put -- root 写的"); err != nil {
 		t.Fatalf("root 应能写入 daily: %v", err)
 	}
 
 	// 子用户显式指定 daily 写入：应当被拒绝，且不能悄悄改写到别的仓库
-	_, err = callMCP(t, srv, bobTok, "note fact daily -- bob 想写的")
+	_, err = callMCP(t, srv, bobTok, "put daily -- bob 想写的")
 	if err == nil || !strings.Contains(err.Error(), "缺少 w 权限") {
 		t.Fatalf("子用户写 daily 应被拒绝，实际: %v", err)
 	}
 
 	// 不指定目标时：自动挑一个他能写的，而不是报错
-	res, err := callMCP(t, srv, bobTok, "note fact -- bob 能写的")
+	res, err := callMCP(t, srv, bobTok, "put -- bob 能写的")
 	if err != nil {
 		t.Fatalf("应自动选到 shared: %v", err)
 	}

@@ -38,6 +38,9 @@ func (s *Server) execConfig(rest string, c Caller) (string, error) {
 
 	switch sub {
 	case "path":
+		if err := s.requireRootGlobal(c, 'r'); err != nil {
+			return "", err
+		}
 		if s.cfg.ConfigFile == "" {
 			return "（没有配置文件：本实例用命令行参数启动）", nil
 		}
@@ -45,6 +48,9 @@ func (s *Server) execConfig(rest string, c Caller) (string, error) {
 		return abs, nil
 
 	case "show":
+		if err := s.requireRootGlobal(c, 'r'); err != nil {
+			return "", err
+		}
 		if s.cfg.ConfigFile == "" {
 			return "（没有配置文件：本实例用命令行参数启动）", nil
 		}
@@ -55,6 +61,9 @@ func (s *Server) execConfig(rest string, c Caller) (string, error) {
 		return string(data), nil
 
 	case "put":
+		if err := s.requireRootGlobal(c, 'w'); err != nil {
+			return "", err
+		}
 		return s.putConfig(body)
 
 	default:

@@ -1,189 +1,177 @@
 # zero-memcp
 
-**长期记忆底座**：纯 Go、零外部依赖、以 Git 裸仓库为物理存储、WAL 断电保护、多分支隔离、支持只读 HTTP Git 与端口级安全策略。
+面向 AI 编码智能体的持久记忆体。
 
-实现 [termcp 协议](https://termcp.org)（[源码](https://github.com/open-mcp-ai/termcp)）：对外暴露单工具 `term({cmd})` 入口，声明面严格等于能力面，能力增长在命令空间，不在 `tools/list`。
+你写下的每一条记忆先进单线程脏层写者队列，立即返回确认；写者串行将内容落成 Git blob 并更新对应目录的脏覆盖。
+进程强杀或异常重启后，未封箱的脏层条目依然可读；已提交历史通过内容寻址与 Merkle 树保持不可变。
 
----
+## 核心设计
 
-## 为什么是 Git 裸仓库，而不是向量数据库
+1. **结构中立的记忆树**：没有额外的「主题」「频道」或「消息总线」概念。树上的路径（如 `team/chat`、`notes`）即为语义域。
+2. **多态原语 `put`**：
+   - `put -- $TEXT`：写入默认流水记忆树，按时间自动分片；
+   - `put <tree> -- $TEXT`：写入指定的子树；
+   - `put <tree> --ref <addr>`：在子树中追加已有记忆的引用，不重复复制正文。
+3. **指令与数据彻底分离**：严格遵循 Termcp 规范，`cmd` 只包含指令骨架，真实正文通过 `vars` 或 `args` 传入。未引用的变量直接报错，彻底避免正文拼接引发的命令注入与断句失真。
+4. **子树锚定与差分感知**：
+   - `remind [<tree>]`：将 Agent 的注意力锚定在特定子树上；
+   - 当该子树发生提交演进时，SSE 精准广播树更新事件；
+   - `since <tree> <commit>`：Agent 醒来后比对两次提交之间的子树差异，O(1) 忽略未修改的子树，只取回实际变动的切片。
+5. **写入只投递，封箱由策略决定**：
+   - `put` 返回只表示「已进入单线程脏层写者队列」，不等待落盘也不提交；
+   - 折叠成 Git 历史由显式 `commit` 或后台 `[commit]` 策略（条数/时间）触发；
+   - 内存脏层与不可变 Git 树分属两层，崩溃只会丢掉尚未落盘的脏文件，不会破坏已提交历史。
+6. **记忆同步**：
+   - `sync` / `fetch` / `push`：节点与远端之间的记忆比对、取回与推送，强制显式指定分支且禁止强推。
+   - `fetch` / `push` / `sync` / `gc` 全部由内置实现完成，**不依赖系统 Git**：SSH 走 Go SSH，HTTP(S) 走 smart-HTTP（自动协商协议 v2），本地裸仓库路径直接读写对象库；`gc` 用自研打包器生成 pack + `.idx` v2，`git fsck` 校验通过。
 
-主流记忆方案把内容存进向量数据库，换来的是「黑盒检索」与「无法追溯」。`zero-memcp` 走向相反的方向：
+## 快速上手
 
-- **内容不可变**：每一篇记忆是一个标准 Git blob，由 SHA-1 严格定址，不可篡改；
-- **历史即提交树**：提交（Commit）把状态钉在 Merkle 树上，支持 `diff`、`branch`、`tag`、`reset` 等外科手术；
-- **写与审分离**：工作 Agent 产生的脏流写在独立分支（如 `daily@chat`），由审计 Agent 提纯决议后合并入主干；
-- **断电零丢失**：每条写入走 Write-Ahead Log（带 CRC32 校验），即使 `kill -9` 也不丢未提交的记录；
-- **两类索引分离**：Git 树状态持久化，BM25 倒排索引纯内存派生、启动全量重建、永不落盘。
-
----
-
-## 安装与快速开始
-
-### 从源码编译
+### 1. 编译与启动
 
 ```bash
-git clone https://github.com/open-mcp-ai/zero-memcp.git
-cd zero-memcp
-go build -o /usr/local/bin/zero-memcp ./cmd/zero-memcp
+go build -o zero-memcp ./cmd/zero-memcp
+./zero-memcp -data ~/.zero-memcp -listen 127.0.0.1:1729
 ```
 
-### 极简启动（单端口，本机开发）
-
-```bash
-zero-memcp -data ~/.zero-memcp/data -listen 127.0.0.1:1729
-```
-
-服务会自动在 `~/.zero-memcp/data/repos/` 下建立默认仓库，并开始监听。
-
----
-
-## 配置文件（TOML）
-
-生产环境推荐使用配置文件。所有安全边界均可在配置中表达：
-
-```toml
-[server]
-data     = "/var/lib/zero-memcp/data"
-endpoint = "edge-box"
-
-# 定期 gc，保持松散对象整洁（可选）
-[gc]
-interval = "24h"
-
-# ── 端口级策略（内核级边界）──
-
-# 端口 1: 本机全能力（回环地址免签降级）
-[[listen]]
-addr  = "127.0.0.1:1729"
-allow = ["*"]
-
-# 端口 2: 只读 HTTP Git（给中心拉取记忆，需要 Token 鉴权）
-[[listen]]
-addr  = "0.0.0.0:1730"
-allow = ["git-upload-pack"]
-
-# 端口 3: 受限内网 MCP（只读白名单 + 强制 Token）
-[[listen]]
-addr    = "10.10.0.0:1731"
-allow   = ["read", "ls", "recall", "grep", "status"]
-require = "bearer"
-mount   = ["blackegg/daily=/daily:r@chat"]
-
-# ── 用户与项目权限 ──
-
-[[user]]
-name = "zero"
-root = true
-
-[[user]]
-name   = "chat"
-groups = ["agents"]
-
-[[project]]
-name  = "blackegg/me"
-owner = "zero"
-mode  = "rwx------"
-
-[[project]]
-name  = "blackegg/daily"
-owner = "zero"
-mode  = "rwx------"
-
-[[access]]
-user    = "chat"
-project = "blackegg/daily"
-perm    = "rw"
-```
-
----
-
-## 协议与使用
-
-### 单工具入口
-
-在 Claude Desktop、pi 或任意 MCP 宿主中配置本服务：
+### 2. 通过 Termcp 协议调用
 
 ```json
 {
-  "mcpServers": {
-    "zeromem": {
-      "command": "zero-memcp",
-      "args": ["-data", "/Users/yourname/.zero-memcp/data"]
+  "name": "term",
+  "arguments": {
+    "cmd": "put team/chat -- $TEXT",
+    "vars": {
+      "TEXT": "今天完成记忆体核心架构收敛：纯粹的 Merkle 树模型，取消独立总线。"
     }
   }
 }
 ```
 
-模型只看得见一个工具：
-
+```json
+{
+  "name": "term",
+  "arguments": {
+    "cmd": "recall $1",
+    "args": ["记忆体核心架构"]
+  }
+}
 ```
-term({ cmd: "recall 数据库选型" })
+
+### 3. 查看树增量
+
+```json
+{
+  "name": "term",
+  "arguments": {
+    "cmd": "since team/chat a1b2c3d4e5f6..."
+  }
+}
 ```
 
-### 动词全表（19 个动词）
+## DSL 原语一览
 
-| 动词 | 用法示例 | 语义说明 |
+| 动词 | 用法 | 说明 |
 |---|---|---|
-| **读** | | |
-| `recall` | `recall <text>` | BM25 语义检索（命中地址 + 摘要片段） |
-| `read` | `read <addr> [<addr>...]` | 读全文，支持多地址批量读取 |
-| `grep` | `grep <regex>` | 正则搜索全文（精确匹配符号、IP、代码名） |
-| `log` | `log [N]` | 按时间倒序看最近 N 篇切片 |
-| `ls` | `ls [date]` | 列出某天的全部切片 |
-| `status` | `status` | 报告文档数、词项数、分支状态 |
-| **写** | | |
-| `note` | `note <kind> -- <text>` | 追加一条切片（`fact`/`episode`/`preference`/`observation`） |
-| `commit` | `commit [<p>[@<br>]] [-m msg]` | 显式封箱（引擎绝不自动提交，由调用方显式提交） |
-| **树外科手术**（仅 Root） | | |
-| `diff` | `diff <p>@<br> [-> <p>@<br>]` | 分支比对 / 提取未审脏流 |
-| `cp` | `cp <src>@<br>/<path> -> <dst>@<br>/` | 跨分支复制切片 |
-| `mv` | `mv <src>@<br>/<path> -> <dst>@<br>/quarantine.md` | 跨分支剪切（支持异名搬运，如隔离区） |
-| `delete` | `delete <p>@<br>/<path>` | 墓碑标记删除（需 commit 生效） |
-| `batch` | `batch {"ops":[...]}` | 原子决议单（单批次执行 note/cp/mv/commit 等） |
-| **生命周期**（仅 Root） | | |
-| `branch` | `branch <p> <new> [from <src>]` | 分支列表 / 零拷贝分叉 |
-| `tag` | `tag <p> <name> [<ref>]` | 打标签 / 读取水印 |
-| `reset` | `reset <p>@<br> from <p>@<src>` | 重置分支（旧版自动归档为 `<br>-reset-*`） |
-| `archive` | `archive <p>@<br>` | 归档分支（ref 移到 `refs/archived/`，不物理删除） |
-| `kill` | `kill <p>@<br>` | 吊销该分支的关联凭证（子凭证随之级联失效） |
-| **身份与权限** | | |
-| `whoami` | `whoami` | 报告当前调用的用户、权限与有效挂载表 |
-| `users` | `users` | 列出系统中配置的用户清单 |
+| `put` | `put [<tree>] -- $TEXT` | 写入正文，投递至脏层并立即返回确认 |
+| `put` | `put <tree> --ref <addr>` | 追加已有记忆的稳定指针 |
+| `recall` | `recall <text> [--scope <tree>]` | 语义联想与回想，返回内容摘要与匹配度 |
+| `read` | `read <addr> [...]` | 细读一个或多个具体切片 |
+| `grep` | `grep <pattern> [--scope <tree>]` | 全文正则精确检索（符号、IP、代码名） |
+| `log` | `log [N]` | 时间线追溯 |
+| `ls` | `ls [date]` | 按日期列出切片条目 |
+| `trees` | `trees <project>[@<branch>]` | 查看子树目录结构 |
+| `remind` | `remind [<tree>]` | 查看或锚定注意力到特定子树 |
+| `since` | `since <tree> <commit>` | 取回自某次提交以来的子树差分 |
+| `sync` | `sync <project> [<remote>]` | 检查与远端的记忆领先/落后差异 |
+| `fetch` | `fetch <project> [<remote>]` | 取回远端历史（不改动本地活动分支） |
+| `push` | `push <project> [<remote>] <branch>` | 显式 SSH 推送一个获准分支（内置客户端） |
+| `remote-key` | `remote-key list/put/delete` | root 管理仅服务端可读的 SSH 私钥 |
+| `remote-secret` | `remote-secret list/put/delete` | root 管理仅服务端可读的 HTTP token |
+| `status`| `status` | 查看记忆索引与文档规模 |
+| `help` | `help [<verb>]` | 动词手册与用法指南 |
 
----
+### SSH 远端推送（当前最小闭环）
 
-## 原生 Git 互操作（只读 HTTP Git）
+私钥通过 root 凭证的 `vars` 安全地与命令分离后写入服务端 `system/sshkeys/`（目录 `0700`、文件 `0600`），私钥内容不会回显：
 
-无需任何特殊客户端，标准 Git 可以直接拉取整棵记忆树：
+```json
+{
+  "name": "term",
+  "arguments": {
+    "cmd": "remote-key put github-deploy -- $KEY",
+    "vars": { "KEY": "-----BEGIN OPENSSH PRIVATE KEY-----\n..." }
+  }
+}
+```
+
+远端声明绑定私钥名及预先核验的 SSH host fingerprint：
+
+```toml
+[[remote]]
+project  = "blackegg/daily"
+name     = "github"
+url      = "git@github.com:org/daily.git"
+ssh_key  = "github-deploy"
+host_key = "SHA256:<预先核验的指纹>"
+push     = ["zero"]
+```
+
+一次 `push` 只接受一个分支；未加密 OpenSSH PEM 私钥；拒绝非快进；SSH host key 必须匹配 pin。
+
+### HTTPS 远端推送
+
+token 同样由 root 写入服务端密钥库，配置只引用名字，token 本身不进 TOML、不进 URL：
+
+```json
+{
+  "name": "term",
+  "arguments": {
+    "cmd": "remote-secret put gh -- $TOKEN",
+    "vars": { "TOKEN": "ghp_..." }
+  }
+}
+```
+
+```toml
+[[remote]]
+project    = "blackegg/daily"
+name       = "github"
+url        = "https://github.com/org/daily.git"
+http_user  = "x-access-token"
+http_token = "gh"
+push       = ["zero"]
+```
+
+明文 `http://` 只对回环地址放行——token 不能被发到网络上。
+
+### 把外部历史推进来
+
+注入一份已经成形的历史（另一台机器的备份、一次批量导入）不该被拆成几千条 `put`。声明一个允许 `git-receive-pack` 的端口，就能用原生 `git push` 推进来：
+
+```toml
+[[listen]]
+addr  = "0.0.0.0:1731"
+allow = ["git-upload-pack", "git-receive-pack"]
+```
 
 ```bash
-# Basic Auth（密码处传 JWT Token）
-git clone http://zero:<jwt>@127.0.0.1:1729/repos/blackegg/me.git
-
-# 或带 Authorization Header
-git -c http.extraHeader="Authorization: Bearer <jwt>"     clone http://127.0.0.1:1729/repos/blackegg/me.git
-
-# 增量拉取（Fast-Forward）
-cd me && git pull
+git push http://zero:<token>@host:1731/repos/daily.git HEAD:refs/heads/import
 ```
 
----
+四条边界：
 
-## 架构保证
+- **只接受快进**。非快进会被拒绝并说明原因；覆盖已有历史要走 `reset`（root 显式动作），不走 push。
+- **只接受 `refs/heads/*`**，不接受删除分支（`delete-refs` 没有广告）。
+- **凭证必须有对应分支的写权限**，端口没声明 `git-receive-pack` 时直接 403。
+- **落地即重建索引**，并广播树脉冲——外部推进的 ref 不会变成静默写入。
 
-1. **零外部 Git 进程**：Loose Object、Packfile 读取器（含 OFS_DELTA / REF_DELTA）、Tree 生成、Commit 串行化全由 Go 标准库自研实现；产物天然符合 Git 规范，`git fsck --strict` 零报错；
-2. **Crash-Safe WAL**：每次写入先写 Loose Object 临时文件并 fsync，再追加 WAL（带 CRC32 校验），最后才更新内存状态；重启时自动重放并截断半行损坏；
-3. **chroot 挂载表**：Token 挂载表决定 Agent 的可见边界；挂载表外的项目完全不可见，绝对路径映射到虚拟根，输出严格虚拟化。
+推到一个新分支之后再决定要不要采纳：
 
----
+```
+reset daily@zero from daily@import
+```
 
-## 更多文档
+协议细节：取回优先用 v2（`ls-refs` + `fetch`），服务端不支持时退回 v0；协商时带本地分支尖作为 `have`，避免每次拉完整历史；v2 的 packfile 段按 side-band-64k 解复用（0x01 数据 / 0x02 进度 / 0x03 错误）。
 
-- [`docs/DESIGN.md`](docs/DESIGN.md) — 架构决策记录：每个「为什么不用那个更常见的做法」
-- [`zero-memcp.example.toml`](zero-memcp.example.toml) — 可直接复制的示例配置
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — 开发约定与提交规范
-
-## 许可证
-
-MIT License. 见 [LICENSE](LICENSE)。
+推送与取回都支持三种远端：`ssh://git@host/org/repo.git`（或 `git@host:org/repo.git`）、`https://host/org/repo.git`、以及本地裸仓库路径（备份盘、挂载卷）。本地路径写的是对方的对象库，不参与对方进程的锁，适合「目标是一份安静的备份」。

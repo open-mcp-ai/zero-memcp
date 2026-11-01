@@ -3,11 +3,11 @@ package server
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
 // repoState 是单个仓库的维护状态。
@@ -34,14 +34,19 @@ func (s *Server) maintain() {
 	defCommit := 30 * time.Second
 	defGC := 24 * time.Hour
 	defCount := 0
-	if s.cfgFile != nil {
-		if d := s.cfgFile.Commit.Interval; d > 0 {
+	// cfgFile 会被 Reload 在运行中替换，读它必须持锁。
+	// 这里是唯一「读一份完整快照」的地方，所以整段在锁内取完再放。
+	s.cfgMu.RLock()
+	cf := s.cfgFile
+	s.cfgMu.RUnlock()
+	if cf != nil {
+		if d := cf.Commit.Interval; d > 0 {
 			defCommit = d
 		}
-		if d := s.cfgFile.GC.Interval; d > 0 {
+		if d := cf.GC.Interval; d > 0 {
 			defGC = d
 		}
-		defCount = s.cfgFile.Commit.Count
+		defCount = cf.Commit.Count
 	}
 
 	// 检查周期取所有仓库里最短的那个，保证每个仓库都能按时被处理。
@@ -88,20 +93,29 @@ func (s *Server) maintain() {
 					gcEvery = rc.GCInterval
 				}
 
-				// 自动提交已彻底移除：
+				// 提交策略：脏层不会永远留着。
 				//
-				// 封箱时机属于语义判断，由 Agent（或外部显式调用 commit）控制。
-				// 引擎硬编码「攒够 50 条或等 30 秒」会在多分支和审计场景下打乱
-				// 边界——审计 Agent 刚要比对，后台定时器把分支往前推了，
-				// 造成未审和已审错位。
+				// 为什么需要它：put 只投递，如果没人折叠，脏文件会无限增长，
+				// 而外部 git clone 永远看不到新内容。让「另一个 root agent
+				// 来手动 commit」不现实——没人会为一个普通写入去担这个责任。
 				//
-				// WAL 保障断电不丢一条写入，所以不自动提交也是完全安全的。
-				_ = count
-				_ = interval
+				// 两条触发条件，任一满足就折叠：
+				//   ① 条数达到 count（攒批：历史整洁，对象少）
+				//   ② 距离上次提交超过 interval（时效：不让内容长期隐形）
+				if interval > 0 && count > 0 {
+					pending := repo.Pending()
+					if pending > 0 && (pending >= count || time.Since(st.lastCommit) >= interval) {
+						if n, cerr := s.commitRepo(repo, proj, pending); cerr != nil {
+							s.logf("%s 自动提交失败: %v", proj, cerr)
+						} else if n > 0 {
+							st.lastCommit = time.Now()
+						}
+					}
+				}
 
 				// gc
 				if gcEvery > 0 && time.Since(st.lastGC) >= gcEvery {
-					if err := runGitGC(repo.Path); err != nil {
+					if _, err := repo.Repack(); err != nil {
 						s.logf("%s gc 失败: %v", proj, err)
 					}
 					st.lastGC = time.Now()
@@ -118,7 +132,10 @@ func (s *Server) maintain() {
 // 太粗会让「一改就提交」变成「几秒后才提交」，太细会空转。
 func (s *Server) shortestTick(defCommit time.Duration) time.Duration {
 	t := defCommit
-	if s.cfgFile != nil {
+	s.cfgMu.RLock()
+	hasCfg := s.cfgFile != nil
+	s.cfgMu.RUnlock()
+	if hasCfg {
 		for _, p := range s.declaredProjects() {
 			if c := s.projects.MemcpConfig(p); c.CommitInterval > 0 && c.CommitInterval < t {
 				t = c.CommitInterval
@@ -134,22 +151,24 @@ func (s *Server) shortestTick(defCommit time.Duration) time.Duration {
 	return t
 }
 
-// commitRepo 提交单个仓库。
-func (s *Server) commitRepo(repo interface {
-	Pending(ref ...string) int
-	Commit(ref, message string) (string, error)
-}, proj string, n int) (int, error) {
-	if repo.Pending() == 0 {
-		return 0, nil
+// commitRepo 提交单个仓库的全部脏分支。
+func (s *Server) commitRepo(repo *gitstore.Repo, proj string, n int) (int, error) {
+	refs := repo.PendingRefs()
+	committed := 0
+	var firstErr error
+	for _, ref := range refs {
+		if _, err := repo.Commit(ref, fmt.Sprintf("mem: %s batch of %d", proj, n)); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		committed++
+		if sha, err := repo.Resolve(ref); err == nil && sha != "" {
+			s.lastCommits.Store(treeHeadKey(proj, ref), sha)
+		}
 	}
-	persona := s.persona
-	if persona == "" {
-		persona = "zero"
-	}
-	if _, err := repo.Commit(persona, fmt.Sprintf("mem: %s batch of %d", proj, n)); err != nil {
-		return 0, err
-	}
-	return 1, nil
+	return committed, firstErr
 }
 
 // flushPending 立刻提交所有攒着的写入。用于测试与关闭前。
@@ -189,29 +208,10 @@ func (s *Server) gcAll() {
 		if err != nil {
 			continue
 		}
-		if err := runGitGC(r.Path); err != nil {
+		if _, err := r.Repack(); err != nil {
 			s.logf("gc %s 失败: %v", p, err)
 		}
 	}
-}
-
-// runGitGC 在一个裸仓库里执行 git gc --prune=now。
-//
-// --prune=now 而不是默认的两周宽限：默认宽限是为了让误删的提交能被找回，
-// 但我们的悬空对象全是「写进磁盘但还没提交」的残留，它们永远不会有 ref
-// 指向，留着只是占地方。
-func runGitGC(repo string) error {
-	cmd := exec.Command("git", "-C", repo, "gc", "--prune=now", "--quiet")
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = err.Error()
-		}
-		return fmt.Errorf("%s", msg)
-	}
-	return nil
 }
 
 // checkExternalUpdates 检查裸仓库的 commit 是否被外部推进。
@@ -222,36 +222,28 @@ func (s *Server) checkExternalUpdates() {
 	if s.cfg.DataDir == "" {
 		return
 	}
-	persona := s.persona
-	if persona == "" {
-		persona = "zero"
-	}
-	projs, err := s.projects.Projects()
-	if err != nil {
-		return
-	}
+	// 检查所有分支，不只 persona：chat 在 daily@chat 写东西、
+	// 或外部 git push 推进了某条分支，都应该被感知并触发 Reload。
+	current := s.treeHeadsSnapshot()
 	changed := false
-	for _, p := range projs {
-		r, err := s.projects.Get(p)
-		if err != nil {
-			continue
-		}
-		commit, _ := r.Resolve(persona)
-		if commit == "" {
-			continue
-		}
-		// 基线在 Reload 时就记下了，这里只做比较。
-		//
-		// 曾经的 bug：基线在第一次 tick 才记录。如果外部提交发生在
-		// 启动到第一次 tick 之间，那次提交会被当成基线吸收掉，
-		// 永远不会被识别为「变化」——索引从此跟仓库不一致，且不报错。
-		key := p + "/" + persona
-		if val, ok := s.lastCommits.Load(key); ok && val.(string) != commit {
+	for key, head := range current {
+		val, ok := s.lastCommits.Load(key)
+		if !ok || val.(string) != head.Commit {
 			changed = true
+			break
 		}
+	}
+	if !changed {
+		s.lastCommits.Range(func(k, _ any) bool {
+			if _, exists := current[k.(string)]; !exists {
+				changed = true
+				return false
+			}
+			return true
+		})
 	}
 	if changed {
-		s.logf("检测到外部提交，自动重建索引")
+		s.logf("检测到分支头演进，自动重建索引并广播树差分")
 		_ = s.Reload()
 	}
 }

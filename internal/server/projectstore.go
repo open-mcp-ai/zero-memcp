@@ -37,6 +37,27 @@ func (ps *ProjectStore) RepoDir(project string) string {
 	return filepath.Join(ps.dataDir, "repos", project+".git")
 }
 
+// Close 停止所有已经打开的仓库写者。
+//
+// ProjectStore 关闭后不再拥有活动请求，逐个关闭 Repo 会等待已接收的
+// 脏写任务排空，避免进程退出时留下后台 goroutine 或正在进行的文件写入。
+func (ps *ProjectStore) Close() error {
+	ps.mu.Lock()
+	repos := make([]*gitstore.Repo, 0, len(ps.repos))
+	for _, repo := range ps.repos {
+		repos = append(repos, repo)
+	}
+	ps.mu.Unlock()
+
+	var firstErr error
+	for _, repo := range repos {
+		if err := repo.Close(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
 // Get 获取某个项目的仓库句柄，必要时打开它。
 //
 // 目录不存在时不自动创建——「项目存在」是一个需要明确声明的事，

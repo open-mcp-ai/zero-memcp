@@ -107,7 +107,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		var list []map[string]any
 		for _, tr := range s.trees {
-			if !caller.Mount.Visible(tr.Project, tr.Branch) {
+			if !s.allowed(caller, tr.Project, tr.Branch, configBitRead) {
 				continue
 			}
 			for _, b := range tr.Blocks {
@@ -139,7 +139,7 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 
 		var roots []map[string]any
 		for _, tr := range s.trees {
-			if !caller.Mount.Visible(tr.Project, tr.Branch) {
+			if !s.allowed(caller, tr.Project, tr.Branch, configBitRead) {
 				continue
 			}
 			name := caller.Mount.ToVirtual(tr.Project, tr.Branch, "")
@@ -152,7 +152,10 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 
 	case "read":
 		addr := r.URL.Query().Get("addr")
-		out, err := s.execTerm("read "+addr, Viewer{}, Caller{User: "root", Root: true})
+		// 曾经这里硬编码 Caller{Root:true}：任何能通过鉴权的调用者
+		// 都能从这个端点读到任意仓库的任意文件，把整个挂载表旁路掉。
+		// 读路径的判据只能有一个——就是调用者本来的身份。
+		out, err := s.execTerm("read "+addr, Viewer{}, caller)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return

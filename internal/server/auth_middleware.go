@@ -23,6 +23,10 @@ type Caller struct {
 	User string
 	Root bool
 
+	// Identity 是这个分身节点的名字（凭证名），例如 "laptop"、"pi-box"。
+	// 没给时回落到 Role 或 User。
+	Identity string
+
 	// Mount 是这张凭证的挂载表。nil 表示全命名空间。
 	Mount *Mount
 
@@ -89,7 +93,7 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 	//
 	// 为什么信箱不开例外：信箱里躺着的是跨端点投递的未确认消息，
 	// 谁都能读就等于破坏了端到端的隔离。
-	if (strings.HasPrefix(r.URL.Path, "/repos/") || r.URL.Path == "/mailbox") && token == "" {
+	if strings.HasPrefix(r.URL.Path, "/repos/") && token == "" {
 		return Caller{}, fmt.Errorf("该端点需要凭证：请带 Authorization: Bearer <jwt>")
 	}
 
@@ -168,13 +172,25 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 			mount = narrowByPort(mount, blk.Mount)
 		}
 
+		nodeName := claims.Name
+		if nodeName == "" {
+			nodeName = effectiveRole
+		}
+		if nodeName == "" {
+			nodeName = claims.Sub
+		}
+		if nodeName == "" {
+			nodeName = "anonymous"
+		}
+
 		return Caller{
-			User:  claims.Sub,
-			Root:  isRoot,
-			Mount: NewMount(mount, s.persona),
-			Cap:   capStr,
-			JTI:   claims.JTI,
-			Role:  effectiveRole,
+			User:     claims.Sub,
+			Identity: nodeName,
+			Root:     isRoot,
+			Mount:    NewMount(mount, s.persona),
+			Cap:      capStr,
+			JTI:      claims.JTI,
+			Role:     effectiveRole,
 		}, nil
 	}
 

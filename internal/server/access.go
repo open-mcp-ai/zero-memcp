@@ -18,6 +18,18 @@ import (
 // 凭证只能收窄，不能放宽——所以「改了配置不用重发 token」依然成立，
 // 而 root 又能为一次具体任务签一张更窄的凭证。
 func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
+	// 分支锁：锁住的分支只留「不受限的 root」。
+	//
+	// 对读写一视同仁：锁的目的是「停下来让 root 处理」，
+	// 一个还能继续读的分支不算停下来。
+	//
+	// 这里必须用 rootUnrestricted 而不是 c.Root：
+	// root 给分身签的派生凭证，Sub 仍然是 root（是 root 签的），
+	// Root 因此为真——只看 Root 就等于所有分身都能绕过锁，
+	// 而锁恰恰是为了拦住它们。判定标准是「这张凭证有没有被收窄」。
+	if !s.rootUnrestricted(c) && s.branchLocked(project, branch) {
+		return false
+	}
 	// 凭证层：项目必须在这张凭证的挂载表里
 	if !c.Mount.Visible(project, branch) {
 		return false
@@ -79,8 +91,87 @@ func (s *Server) roleNarrows(c Caller) bool {
 	return ok
 }
 
+// projectWritableFor 报告凭证是否至少能写该项目的一条已存在分支。
+func (s *Server) projectWritableFor(c Caller, project string) bool {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		branch := s.persona
+		if branch == "" {
+			branch = "zero"
+		}
+		return s.allowed(c, project, branch, configBitWrite)
+	}
+	refs, err := repo.Refs("refs/heads/")
+	if err != nil {
+		return false
+	}
+	if len(refs) == 0 {
+		branch := s.persona
+		if branch == "" {
+			branch = "zero"
+		}
+		return s.allowed(c, project, branch, configBitWrite)
+	}
+	for _, ref := range refs {
+		branch := strings.TrimPrefix(ref, "refs/heads/")
+		if s.allowed(c, project, branch, configBitWrite) {
+			return true
+		}
+	}
+	return false
+}
+
+// requireRootAccess 把「管理身份」与「本次凭证权限」分开检查。
+// root 是 root-only 管理动词的必要条件，但 token 的 cap/mount 仍是上限，
+// 不能因为主体是 root 就绕过它们。
+func (s *Server) requireRootAccess(c Caller, project, branch string, perm uint8) error {
+	if err := s.requireRoot(c); err != nil {
+		return err
+	}
+	if !s.allowed(c, project, branch, perm) {
+		return fmt.Errorf("%s", s.denyReason(c, project, branch, perm))
+	}
+	return nil
+}
+
+// requireRootCap 用于全局管理资源（如配置文件），它们没有项目挂载路径，
+// 但仍受签发时的凭证能力上限约束。
+func (s *Server) requireRootCap(c Caller, bit rune) error {
+	if err := s.requireRoot(c); err != nil {
+		return err
+	}
+	if !hasCap(c.Cap, bit) {
+		return fmt.Errorf("凭证能力受限（缺少 %c 权限）", bit)
+	}
+	return nil
+}
+
+// requireRootGlobal 用于没有项目路径的全局管理资源（配置、用户、密钥库、reload）。
+//
+// 与 requireRootCap 的差别就是多一条「这张凭证没被限制过」：
+// 一张只给 daily@zero 读的凭证，主体仍然是 root 用户，只查 Root+cap
+// 就会让它列密钥名、读全局配置——而它被签发时那条限制的本意，
+// 就是「这张纸只管那一摊」。项目内的管理动词走 requireRootAccess，
+// 那里挂载本来就是判定的一部分，不受这条影响。
+func (s *Server) requireRootGlobal(c Caller, bit rune) error {
+	if err := s.requireRootCap(c, bit); err != nil {
+		return err
+	}
+	if !c.Mount.Empty() {
+		return fmt.Errorf("这是一张受限凭证（挂载被限制在某处），全局管理动词需要不受限的凭证")
+	}
+	return nil
+}
+
 // denyReason 给出拒绝理由。
 func (s *Server) denyReason(c Caller, project, branch string, perm uint8) string {
+	// 锁的理由必须排在第一位。
+	//
+	// 否则调用者会看到「不在这张凭证的可见范围内」——而它明明挂载着
+	// 这个项目，于是去怀疑配置、怀疑 token，查很久才想到锁。
+	if !s.rootUnrestricted(c) && s.branchLocked(project, branch) {
+		return fmt.Sprintf("%s@%s 已被 root 锁定，非 root 凭证的读写都被暂停", project, branch)
+	}
 	if !c.Mount.Visible(project, branch) {
 		return fmt.Sprintf("项目 %q 不在这张凭证的可见范围内", project)
 	}
@@ -104,6 +195,30 @@ func (s *Server) denyReason(c Caller, project, branch string, perm uint8) string
 		return fmt.Sprintf("角色 %q：%s", c.Role, config.Explain(s.cfgIndex(), c.Role, project, perm))
 	}
 	return config.Explain(s.cfgIndex(), c.User, project, perm)
+}
+
+// rootUnrestricted 报告这是否是一张没有被收窄过的 root 凭证。
+//
+// 「root」是用户的属性，「这张纸有没有被限制」是凭证的属性。
+// 派生出去的凭证（给分身用的那些）主体仍是 root，但它被挂载表
+// 或角色收窄过——那它就不是全权凭证，管理动作与分支锁都不该让它过。
+func (s *Server) rootUnrestricted(c Caller) bool {
+	return c.Root && c.Mount.Empty() &&
+		hasCap(c.Cap, 'r') && hasCap(c.Cap, 'w') && hasCap(c.Cap, 'x')
+}
+
+// branchLocked 报告某条分支是否被 lock 锁住。
+//
+// 仓库打开失败时返回 false：锁是「额外的拒绝理由」，
+// 不是「拒绝的唯一理由」。仓库都打不开时，后面的判定自然会拒绝，
+// 这里再报一次错只会掩盖真正的原因。
+func (s *Server) branchLocked(project, branch string) bool {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return false
+	}
+	locked, _ := repo.BranchLocked(branch)
+	return locked
 }
 
 // readableBlock 判断调用者能否读某个块。
@@ -171,7 +286,11 @@ func (s *Server) rootCaller() Caller {
 			}
 		}
 	}
-	return Caller{User: name, Root: true, Cap: "rwx"}
+	node := name
+	if s.cfg.Endpoint != "" {
+		node = s.cfg.Endpoint
+	}
+	return Caller{User: name, Identity: node, Root: true, Cap: "rwx"}
 }
 
 // cfg 返回当前的配置索引，可能为 nil（无配置文件时）。

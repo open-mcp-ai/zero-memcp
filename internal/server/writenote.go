@@ -20,8 +20,10 @@ import (
 //   - Git 底层本身就是内容寻址（Merkle 树），每个 blob 的 SHA-1 就是它的真名；
 //   - 幂等去重直接通过比较已存在条目的 Blob SHA 实现，既精准又不污染文件名；
 //   - 时间戳本身就是切片的自然时间坐标，人类与机器一眼可读。
-func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, explicit string) (addr, project, branch string, err error) {
+func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, explicit, treePrefix string) (addr, project, branch string, err error) {
 	kind = strings.ToLower(strings.TrimSpace(kind))
+	// 空 kind 表示「由落点决定」：put 不再要求调用方先给自己分类。
+	implicitKind := kind == ""
 
 	// 这两类永远拒绝，无论 SKILL.md 怎么声明。
 	//
@@ -82,7 +84,14 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	if resolvedBranch != "" {
 		writeBranch = resolvedBranch
 	}
-	if !pol.AllowsKind(kind) {
+	if implicitKind {
+		// 落点决定类型：项目声明的第一个 kind 就是它的默认语义。
+		if len(pol.Kinds) > 0 {
+			kind = pol.Kinds[0]
+		} else {
+			kind = "fact"
+		}
+	} else if !pol.AllowsKind(kind) {
 		return "", "", "", fmt.Errorf("kind %q 不在本项目的写入策略里（允许 %s）",
 			kind, strings.Join(pol.Kinds, " / "))
 	}
@@ -105,8 +114,14 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	if session != "" {
 		sessionLine = fmt.Sprintf("session: %s\n", session)
 	}
-	content := fmt.Sprintf("---\nkind: %s\nsource: %s\nendpoint: %s\ncreated: %s\n%s---\n\n%s\n",
-		kind, source, endpoint, now.Format(time.RFC3339), sessionLine, text)
+	// 类型由落点决定：显式给了 kind 才写进 frontmatter。
+	// 写一条记忆还要先声明「我是哪种」，是多出来的一步自我分类。
+	kindLine := ""
+	if !implicitKind {
+		kindLine = fmt.Sprintf("kind: %s\n", kind)
+	}
+	content := fmt.Sprintf("---\n%ssource: %s\nendpoint: %s\ncreated: %s\n%s---\n\n%s\n",
+		kindLine, source, endpoint, now.Format(time.RFC3339), sessionLine, text)
 
 	// 幂等判重：按「语义内容」而不是整份文件。
 	//
@@ -117,7 +132,19 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	//
 	// 现在的指纹 = kind + session + 正文。这是「这条记忆是什么」，
 	// 而不是「它被写在哪份文件里」。
-	dedupKey := s.dedupKey(targetProject, writeBranch, kind, session, text)
+	// SKILL.md 可以为整个项目声明默认写入树。
+	if treePrefix == "" && pol.Tree != "" {
+		treePrefix = pol.Tree
+	}
+	// 树前缀进入判重键：同一段正文写进两棵不同的树，是两次独立写入。
+	// 判重键里的类型必须与「实际写进 frontmatter 的值」一致：
+	// 隐式类型不写 frontmatter，重启后重建指纹时读到的也是空。
+	// 两边不一致会让判重只在当次进程内有效，重启即失忆。
+	storedKind := kind
+	if implicitKind {
+		storedKind = ""
+	}
+	dedupKey := s.dedupKey(targetProject, writeBranch, treePrefix+"/"+storedKind, session, text)
 	if prev, ok := s.dedup.Load(dedupKey); ok {
 		if p, _ := prev.(string); p != "" {
 			return targetProject + "/" + p, targetProject, writeBranch, nil
@@ -125,12 +152,16 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	}
 
 	// 纯时间戳文件名，布局由策略决定。
-	// 不带 checksum：Git 内容寻址本身就是权威判据。
+	// 不带 checksum：内容寻址本身就是权威判据。
 	stamp := fmt.Sprintf("%s.%03d-%s.md",
 		now.Format("150405"), now.Nanosecond()/1e6, endpoint)
 	path := stamp
 	if pol.Layout == "date" {
 		path = now.Format("2006-01-02") + "/" + stamp
+	}
+	// 树前缀把切片放进指定子树：树路径即语义，不另设 kind 分类。
+	if treePrefix = strings.Trim(treePrefix, "/"); treePrefix != "" {
+		path = treePrefix + "/" + path
 	}
 
 	if err := repo.Write(writeBranch, path, []byte(content), gitstore.ModeContent); err != nil {
@@ -234,7 +265,7 @@ func (s *Server) writeTarget(c Caller, persona string) (project, branch string, 
 		// 多个流水项目 = 意图不明。此时沉默地选一个，等于让
 		// 「今天的记录写进哪个仓库」变成一次掷骰子。
 		return "", "", manifest.Policy{}, fmt.Errorf(
-			"有 %d 个可写项目声明了 stream: true（%s），无法判断流水该落哪里；请在 note 里显式指定目标",
+			"有 %d 个可写项目声明了 stream: true（%s），无法判断流水该落哪里；请在 put 里显式指定目标",
 			len(streams), strings.Join(streams, " "))
 	}
 
@@ -407,7 +438,7 @@ func (s *Server) seedDedup(trees []*memory.Tree) {
 			if text == "" {
 				continue
 			}
-			key := s.dedupKey(b.Project, b.Branch, kind, session, text)
+			key := s.dedupKey(b.Project, b.Branch, treePrefixOfPath(b.Path)+"/"+kind, session, text)
 			s.dedup.Store(key, b.Path)
 		}
 	}
@@ -417,7 +448,7 @@ func (s *Server) seedDedup(trees []*memory.Tree) {
 //
 // 只认我们自己的格式（frontmatter 后空行接正文）。不是这个格式的
 // 文件（README、SKILL.md、人写的叙事）一律返回空 text，不参与判重——
-// 它们本来就不会被 note 重复写入。
+// 它们本来就不会被 put 重复写入。
 func parseSliceMeta(content string) (kind, session, text string) {
 	if !strings.HasPrefix(content, "---\n") {
 		return "", "", ""
@@ -441,8 +472,40 @@ func parseSliceMeta(content string) (kind, session, text string) {
 		}
 	}
 	text = strings.TrimSpace(body)
-	if kind == "" || text == "" {
+	if text == "" {
 		return "", "", ""
 	}
 	return kind, session, text
+}
+
+// treePrefixOfPath 从切片路径反推它所在的子树。
+//
+// 切片路径形如 [<tree>/]YYYY-MM-DD/HHMMSS.mmm-endpoint.md（date 布局）
+// 或 [<tree>/]HHMMSS.mmm-endpoint.md（flat 布局）。判重键必须带子树，
+// 否则同一段正文写进两棵不同的树会被判成重复，只留下一条。
+func treePrefixOfPath(path string) string {
+	segs := strings.Split(strings.Trim(path, "/"), "/")
+	if len(segs) == 0 {
+		return ""
+	}
+	if len(segs) >= 2 && isDateDir(segs[len(segs)-2]) {
+		return strings.Join(segs[:len(segs)-2], "/")
+	}
+	return strings.Join(segs[:len(segs)-1], "/")
+}
+
+// isDateDir 判断一个路径段是不是 YYYY-MM-DD。
+func isDateDir(s string) bool {
+	if len(s) != 10 || s[4] != '-' || s[7] != '-' {
+		return false
+	}
+	for i, c := range s {
+		if i == 4 || i == 7 {
+			continue
+		}
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }

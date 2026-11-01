@@ -32,9 +32,9 @@ func TestMountOutputVirtualized(t *testing.T) {
 		out, _ := callMCP(t, srv, tok, "recall 形状")
 		t.Logf("recall = %s", out)
 	})
-	t.Run("note 输出", func(t *testing.T) {
-		out, _ := callMCP(t, srv, tok, "note fact -- 测试")
-		t.Logf("note = %s", out)
+	t.Run("put 输出", func(t *testing.T) {
+		out, _ := callMCP(t, srv, tok, "put -- 测试")
+		t.Logf("put = %s", out)
 	})
 }
 func TestMountGrepAndLog(t *testing.T) {

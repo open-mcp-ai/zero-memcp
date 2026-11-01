@@ -117,8 +117,14 @@ type Server struct {
 	// 读到的永远是某一份完整的表。
 	cfgLookup atomic.Pointer[config.Lookup]
 
-	// mailbox 是实例级待办收件箱。不分租户：分身就是调用者自己。
-	mailbox *Mailbox
+	// treeWatch 记录哪些身份关注了哪些树路径。
+	//
+	// 通知不另存一份消息日志：树的 SHA 变化本身就是事件。
+	// 关注关系是派生态，丢了最多重读一次，不写进不可变历史。
+	treeWatch *TreeWatchHub
+
+	// remotes 是 [[remote]] 的当前快照，随 reload 原子替换。
+	remotes atomic.Pointer[[]config.Remote]
 
 	// bcast 是 SSE 广播器：写记忆时扇出给监听者。
 	bcast *Broadcaster
@@ -135,8 +141,8 @@ type Server struct {
 	// 值带分支前缀，避免 chat 分支的同一条把 dev 分支的判掉。
 	dedup sync.Map // "project@branch:h8" -> path
 
-	// lastCommits 记录上次看到的各项目 HEAD，用来发现外部提交。
-	lastCommits sync.Map // "project/persona" -> commit hash
+	// lastCommits 记录上次看到的各分支 HEAD（键见 treeHeadKey），用来发现外部提交。
+	lastCommits sync.Map // treeHeadKey(project, branch) -> commit hash
 
 	// pending 是还没落成一次提交的写入条数。
 	pendingMu sync.Mutex
@@ -238,13 +244,17 @@ func New(cfg Config) (*Server, error) {
 		rev:      rev,
 		cfgFile:  cfgFile,
 
-		mailbox: newMailbox(),
-		listens: FromConfig(listenBlocks(cfgFile)),
-		bcast:   newBroadcaster(),
-		done:    make(chan struct{}),
+		listens:   FromConfig(listenBlocks(cfgFile)),
+		bcast:     newBroadcaster(),
+		treeWatch: newTreeWatchHub(),
+		done:      make(chan struct{}),
 	}
 	if lookup != nil {
 		s.cfgLookup.Store(lookup)
+	}
+	if cfgFile != nil {
+		rems := cfgFile.Remotes
+		s.remotes.Store(&rems)
 	}
 	if err := s.Reload(); err != nil {
 		return nil, fmt.Errorf("构建初始索引: %w", err)
@@ -288,6 +298,8 @@ func (s *Server) Reload() error {
 			s.cfgFile = newFile
 			s.cfgMu.Unlock()
 			s.cfgLookup.Store(newFile.Build())
+			rems := newFile.Remotes
+			s.remotes.Store(&rems)
 		}
 	}
 
@@ -327,19 +339,20 @@ func (s *Server) Reload() error {
 		}
 	}
 
-	// 记下基线，供后台探测外部提交使用。
-	for _, t := range trees {
-		if r, err := s.projects.Get(t.Project); err == nil {
-			if c, _ := r.Resolve(persona); c != "" {
-				s.lastCommits.Store(t.Project+"/"+persona, c)
-			}
-		}
-	}
+	// 比较上一观察水位与文件系统的当前 heads。分支变化的真相在 refs；
+	// 内存水位只是优化在线通知，丢了以后插件可以凭 last commit 调 since。
+	events := s.treeEventsSinceBaseline()
 
 	s.mu.Lock()
 	s.trees = trees
 	s.idx = idx
 	s.mu.Unlock()
+
+	// 先更新水位再广播：并发的下一次 Reload 不会重复发同一批事件。
+	s.rememberTreeHeads()
+	for _, ev := range events {
+		s.broadcastTreeEvent(ev)
+	}
 	return nil
 }
 
@@ -404,7 +417,6 @@ func (s *Server) muxFor(blk ListenBlock) http.Handler {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/api", s.handleAPI)
 	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/mailbox", s.handleMailboxAPI)
 	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/identity", s.handleIdentity)
 	mux.HandleFunc("/profiles", s.handleProfiles)
@@ -421,10 +433,22 @@ type portPolicy struct {
 }
 
 func (p *portPolicy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// 只读 HTTP Git 端点：只有 allow 里显式给了 git-upload-pack 才放行
+	// HTTP Git 端点：读与写分别要 allow 里显式声明。
+	// 推送入口默认关闭——多一个能写东西的入口就是多一处要守的边界。
 	if strings.HasPrefix(r.URL.Path, "/repos/") {
-		if !p.allows("git-upload-pack") {
+		readOK := p.allows("git-upload-pack")
+		pushOK := p.allows("git-receive-pack")
+		if !readOK && !pushOK {
 			http.Error(w, "这个端口没有开启 HTTP Git", http.StatusForbidden)
+			return
+		}
+		if strings.Contains(r.URL.Path, "git-receive-pack") || r.URL.Query().Get("service") == "git-receive-pack" {
+			if !pushOK {
+				http.Error(w, "这个端口没有开启 git-receive-pack（推送入口默认关闭）", http.StatusForbidden)
+				return
+			}
+		} else if !readOK {
+			http.Error(w, "这个端口没有开启拉取", http.StatusForbidden)
 			return
 		}
 		p.next.ServeHTTP(w, r)
@@ -453,6 +477,11 @@ func (s *Server) Close() error {
 	var lastErr error
 	for _, srv := range srvs {
 		if err := srv.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	if s.projects != nil {
+		if err := s.projects.Close(); err != nil && lastErr == nil {
 			lastErr = err
 		}
 	}
@@ -544,42 +573,44 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	var totalBlocks int
-	var injectBlocks int
-	for _, t := range s.trees {
-		totalBlocks += len(t.Blocks)
-		injectBlocks += len(t.Injectable())
-	}
-
 	resp := map[string]any{
-		"ok":            true,
-		"service":       "zero-memcp",
-		"version":       "0.1.0",
-		"listen":        s.Addr(),
-		"docs_indexed":  s.idx.Docs(),
-		"terms_indexed": s.idx.Terms(),
-		"total_blocks":  totalBlocks,
-		"inject_blocks": injectBlocks,
-
-		// clock 是通知计数器，不是文档数。
-		//
-		// 它的唯一用途：告诉客户端「你上次看过之后，有人写过东西」。
-		// 真相在文件里，它只是一个已落盘事实的回声。
-		// 重启归零没关系——客户端看到读数比基线小，自己重新对齐。
-		"clock": s.Clock(),
+		"ok":      true,
+		"service": "zero-memcp",
+		"version": "0.1.0",
+		"listen":  s.Addr(),
 	}
+
+	// 健康检查是未鉴权入口（探活要用它），所以它只说「我活着」。
+	// 索引规模是跨项目的信息，只有携带凭证时才给。
+	caller, authErr := s.authenticate(r)
+	if authErr == nil {
+		s.mu.RLock()
+		totalBlocks, injectBlocks, docs := 0, 0, 0
+		for _, t := range s.trees {
+			if !s.allowed(caller, t.Project, t.Branch, configBitRead) {
+				continue
+			}
+			totalBlocks += len(t.Blocks)
+			injectBlocks += len(t.Injectable())
+			docs += len(t.Indexable())
+		}
+		s.mu.RUnlock()
+		resp["docs_indexed"] = docs
+		// 词表规模是全局的：它不按项目切分，所以只给全命名空间的调用者。
+		if caller.Mount.Empty() {
+			resp["terms_indexed"] = s.idx.Terms()
+		}
+		resp["total_blocks"] = totalBlocks
+		resp["inject_blocks"] = injectBlocks
+	}
+
+	// clock 是通知计数器，不是文档数。
+	// 重启归零没关系——客户端看到读数比基线小，自己重新对齐。
+	resp["clock"] = s.Clock()
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// handleMailboxAPI 给插件热路径使用：GET 纯 JSON，毫秒级返回未读信件。
-//
-// 为什么不走 MCP 的 term "mailbox"：
-//   - term 是通用 DSL，有 JSON-RPC 包装，比纯 HTTP GET 慢一个数量级
-//   - 插件每轮都要看信箱有没有未读，必须在 2ms 内回来，不拖慢会话
 func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
 	caller, authErr := s.authenticate(r)
 	if authErr != nil {
@@ -598,7 +629,7 @@ func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
 	}
 	var list []projItem
 	for _, t := range s.trees {
-		if !caller.Mount.Visible(t.Project, t.Branch) {
+		if !s.allowed(caller, t.Project, t.Branch, configBitRead) {
 			continue
 		}
 		st := t.Stats()
@@ -663,7 +694,7 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 		//
 		// 索引键是 project@branch/path，分支就在地址里。早先一律拿
 		// s.persona（服务端人格分支）去判，后果是所有「不是人格分支」
-		// 的命中在权限层被静默丢弃：chat 角色 note 写进 daily@chat，
+		// 的命中在权限层被静默丢弃：chat 角色 put 写进 daily@chat，
 		// read 读得到、log 看得到，recall 却永远无命中——不报错，
 		// 只是搜不到，像一个不会说话的记忆库。
 		proj, br, _, _ := memory.SplitID(h.Addr)
@@ -763,7 +794,7 @@ func (s *Server) dispatchMCP(ctx context.Context, method string, params json.Raw
 		//
 		// 本服务实现 termcp 协议：单工具 term({cmd})，动词在命令空间里分发。
 		//
-		// termcp 协议的约定是「一个入口，一行命令」：recall / read / note
+		// termcp 协议的约定是「一个入口，一行命令」：recall / read / put
 		// 都是 term 的动词，不是独立的工具。逐个暴露等于给每个动词开一个
 		// 口子，工具表变长、每轮都出现在提示词里，而能力一点没多。
 		//
@@ -775,15 +806,19 @@ func (s *Server) dispatchMCP(ctx context.Context, method string, params json.Raw
 				{
 					"name": "term",
 					"description": "termcp 协议入口（本服务实现 termcp 协议）。收一行 DSL：\n" +
-						"  recall <text>            语义联想（返回地址 + 摘要片段）\n" +
+						"  recall <text> [--scope T] 语义联想（返回地址 + 摘要片段）\n" +
 						"  read <addr> [<addr>...]  读全文，可一次多篇\n" +
 						"  grep <regex>             正则扫全文，带前后一行上下文（找符号/数字/专名用它，比 recall 准）\n" +
 						"  log [N]                  按时间倒序看最近 N 篇（缺省 5）的日期和摘要\n" +
 						"  ls [date]                列出某天的切片\n" +
-						"  note <kind> -- <text>    追加一条（fact/episode/preference/observation）\n" +
+						"  put [<tree>] -- $TEXT    把正文写进记忆树（正文走 vars/args，不与 DSL 混写）\n" +
+						"  put <tree> --ref <addr>  在树里追加已有记忆的引用\n" +
+						"  trees <project>[@<branch>]  查看树目录\n" +
+						"  remind [<tree>]          锚定一棵树；它变动时收到通知\n" +
+						"  since <tree> <commit>    取回自上次提交以来的树差分\n" +
 						"  status                   索引规模\n" +
-						"  mailbox [ack <seq>]      待确认信箱（别人写过记忆时会投信）\n" +
 						"  help [<verb>]            这个动词怎么用；空命令也返回总览\n" +
+						"这是你的持久记忆体：put 成功即已落进本地持久记录，重启后仍可读。\n" +
 						"什么时候用哪个：问「关于X我之前怎么想的」→ recall；\n" +
 						"找精确串（IP、端口、QQ号、函数名）→ grep；\n" +
 						"问「最近做到哪了」→ log。\n" +
@@ -793,7 +828,17 @@ func (s *Server) dispatchMCP(ctx context.Context, method string, params json.Raw
 						"properties": map[string]any{
 							"cmd": map[string]any{
 								"type":        "string",
-								"description": "DSL 命令行，例如 'recall napcat' 或 'note fact -- 端口 1729'",
+								"description": "DSL 命令行，例如 'recall napcat' 或 'put -- $TEXT'。正文放进 vars/args，用 $NAME / $1 引用；引用必须独占一个词。",
+							},
+							"args": map[string]any{
+								"type":        "array",
+								"items":       map[string]any{"type": "string"},
+								"description": "位置参数，供 cmd 里的 $1、$2 引用。引用必须独占一个词，值不做任何转义或拼接——正文放这里，不要拼进 cmd。",
+							},
+							"vars": map[string]any{
+								"type":                 "object",
+								"additionalProperties": map[string]any{"type": "string"},
+								"description":          "命名参数，供 cmd 里的 $NAME 引用。与 args 同一条规则：引用独占一个词，传了就必须被引用。",
 							},
 							"content": map[string]any{
 								"type":        "boolean",
@@ -839,6 +884,13 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	var a struct {
 		Cmd string `json:"cmd"`
 
+		// Args / Vars 是参数表：DSL 只写引用，正文从这两张表进来。
+		//
+		// 为什么不在服务端做「智能转义」：一旦允许正文和语法拼在同一行，
+		// 切分器迟早会把数据当成命令。分开之后，值里有什么字符都不影响语法。
+		Args []string          `json:"args"`
+		Vars map[string]string `json:"vars"`
+
 		// For 是调用者的会话 UUID（分身身份）。
 		//
 		// 它刻意放在参数里而不是 cmd 里：身份是传输层的事实，
@@ -863,6 +915,25 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 		return nil, fmt.Errorf("解析 term 参数: %w", err)
 	}
 
+	// 参数替换发生在任何动词分发之前，且只做一次。
+	//
+	// 替换后的文本不再被当作模板重新展开：否则值里一个 $NAME 会变成
+	// 第二次替换的入口，等于把数据提升成指令。
+	cmd := a.Cmd
+	if len(a.Args) > 0 || len(a.Vars) > 0 {
+		expanded, err := expandArgs(a.Cmd, a.Vars, a.Args)
+		if err != nil {
+			return nil, err
+		}
+		cmd = expanded
+	} else if strings.Contains(a.Cmd, "$") {
+		// 没给参数表却写了引用：拒绝，而不是把它当字面量。
+		// 静默保留 $1 会让调用方以为参数生效了。
+		if _, err := expandArgs(a.Cmd, nil, nil); err != nil {
+			return nil, err
+		}
+	}
+
 	wantText := true
 	if a.Content != nil {
 		wantText = *a.Content
@@ -882,7 +953,7 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	// 检查放在 execTerm 之前而不是里面：execTerm 拿不到 request context，
 	// 而端口策略是跟着请求走的。放在这里也保证「拒绝」发生在任何
 	// 副作用之前——动词自己都还没开始跑。
-	verb := strings.TrimSpace(a.Cmd)
+	verb := strings.TrimSpace(cmd)
 	if i := strings.IndexAny(verb, " \t"); i > 0 {
 		verb = verb[:i]
 	}
@@ -893,7 +964,7 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	}
 
 	viewer := Viewer{Channel: "mcp"}
-	out, err := s.execTerm(a.Cmd, viewer, c)
+	out, err := s.execTerm(cmd, viewer, c)
 	if err != nil {
 		return nil, err
 	}
@@ -930,7 +1001,7 @@ func buildToolResult(r TermResult, wantText, wantStructured bool) map[string]any
 }
 
 func (s *Server) writeNote(kind, text, session, source string, c Caller, explicit string) (addr, project, branch string, err error) {
-	return s.writeNoteGit(kind, text, session, source, c, explicit)
+	return s.writeNoteGit(kind, text, session, source, c, explicit, "")
 }
 
 // TermResult 是一条命令的两种投影。
@@ -994,6 +1065,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 
 	case "recall":
 		// recall <text>
+		rest = restorePayload(rest)
 		//
 		// 返回地址 + 摘要片段，不是光秃秃的地址。
 		//
@@ -1018,7 +1090,16 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 			}
 			return s.allowed(c, proj, br, configBitRead)
 		}
-		hits := s.idx.SearchWeightedFiltered(rest, 3, 0, s.weightCount, allowedHit)
+		query, scope := splitScope(rest)
+		scopeMatch := func(addr string) bool {
+			if scope == "" {
+				return true
+			}
+			return addrUnderScope(addr, scope)
+		}
+		hits := s.idx.SearchWeightedFiltered(query, 3, 0, s.weightCount, func(addr string) bool {
+			return allowedHit(addr) && scopeMatch(addr)
+		})
 		permHits := make([]index.Hit, 0, len(hits))
 		for _, h := range hits {
 			// 命中项的地址形如 project@branch/path——
@@ -1057,7 +1138,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 				continue
 			}
 			sb.WriteString(fmt.Sprintf("%s (%.2f)\n", virt, h.Score))
-			snip := s.snippet(h.Addr, rest, 240)
+			snip := s.snippet(h.Addr, query, 240)
 			if snip != "" {
 				for _, line := range strings.Split(snip, "\n") {
 					sb.WriteString("    " + line + "\n")
@@ -1088,6 +1169,9 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		// 支持一次读多篇：模型经常需要同时看几篇才能回答一个问题，
 		// 一篇一次往返会让它转向 rg。
 		fields := strings.Fields(rest)
+		for i := range fields {
+			fields[i] = restorePayload(fields[i])
+		}
 		if len(fields) == 0 {
 			return TermResult{}, errors.New("read 语法: read <addr> [<addr> ...]")
 		}
@@ -1135,71 +1219,38 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		}
 		return TermResult{Text: out.String()}, nil
 
-	case "note":
-		// note <kind> [@session] -- <text>
-		//
-		// session 可选：插件会带上它，用来在面板里按会话分组。
-		// 没有它也能写，只是归到「未分组」。
-		k, body, ok := strings.Cut(rest, "--")
-		if !ok {
-			return TermResult{}, errors.New("note 语法: note <kind> [@session] -- <text>")
-		}
-		// 头部形如 "<kind> [项目] [@会话]"，逐段拆开。
-		head := strings.Fields(strings.TrimSpace(k))
-		kindPart := ""
-		explicit := ""
-		session := ""
-		for _, tok := range head {
-			switch {
-			case strings.HasPrefix(tok, "@"):
-				session = strings.TrimPrefix(tok, "@")
-			case kindPart == "":
-				kindPart = tok
-			default:
-				explicit = tok
-			}
-		}
-		// 目标选择与权限判定都在 writeNoteGit 里一次做完——
-		// 这里再做一遍会变成两处判定，迟早漂移。
-		source := c.Role
-		if source == "" {
-			source = "mcp"
-		}
-		path, wProj, wBranch, err := s.writeNote(kindPart, strings.TrimSpace(body), session, source, c, explicit)
-		if err != nil {
-			return TermResult{}, err
-		}
-		virtPath := c.Mount.ToVirtual(wProj, wBranch, strings.TrimPrefix(path, wProj+"/"))
-		return TermResult{
-			Text: "ok " + virtPath,
-			Structured: map[string]any{
-				"ok":    true,
-				"path":  virtPath,
-				"kind":  kindPart,
-				"clock": s.Clock(),
-			},
-		}, nil
+	case "put":
+		return s.execPut(rest, c)
 
-	case "mailbox":
-		return s.execMailbox(rest)
+	case "remind":
+		return s.execRemind(rest, c)
 
-	case "msg":
-		// msg <收件人> <正文>
-		//
-		// 点对点投一封信到实例收件箱。收件人只是信封上的字，
-		// 指令由收信那一方的 agent 自己解释。
-		if rest == "" {
-			return TermResult{}, errors.New("msg 需要 <收件人> <正文>")
+	case "trees":
+		return s.execTrees(rest, c)
+
+	case "since":
+		return s.execSince(rest, c)
+
+	case "remote-key":
+		return s.execRemoteKey(rest, c)
+
+	case "remote-secret":
+		return s.execRemoteSecret(rest, c)
+
+	case "remote":
+		return s.execRemote(rest, c)
+
+	case "fetch":
+		return s.execRemoteFetch(rest, c)
+
+	case "push":
+		if !c.canWrite() {
+			return TermResult{}, fmt.Errorf("推送需要 w 能力")
 		}
-		to, body, _ := strings.Cut(rest, " ")
-		m := s.mailbox.post("", "msg", s.cfg.Endpoint, strings.TrimSpace(body), to, c.User)
-		s.broadcastMail(m)
-		return TermResult{
-			Text: fmt.Sprintf("已投递 #%d → %s", m.Seq, to),
-			Structured: map[string]any{
-				"ok": true, "seq": m.Seq, "to": to,
-			},
-		}, nil
+		return s.execPush(rest, c)
+
+	case "sync":
+		return s.execSync(rest, c)
 
 	case "branch":
 		// branch [<project> [<new> [from <src>]]]
@@ -1221,14 +1272,24 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		out, err := s.execCrossBranch(rest, c, true)
 		return TermResult{Text: out}, err
 
+	case "chmod":
+		// chmod <project>[@<branch>]/<path> rule|content
+		out, err := s.execChmod(rest, c, persona)
+		return TermResult{Text: out}, err
+
 	case "delete":
 		// delete <project>@<branch>/<path> [...]
 		out, err := s.execDelete(rest, c, persona)
 		return TermResult{Text: out}, err
 
-	case "kill":
-		// kill <project>@<branch>
-		out, err := s.execKill(rest, c)
+	case "lock":
+		// lock <project>@<branch>
+		out, err := s.execLock(rest, c)
+		return TermResult{Text: out}, err
+
+	case "unlock":
+		// unlock <project>@<branch>
+		out, err := s.execUnlock(rest, c)
 		return TermResult{Text: out}, err
 
 	case "archive":
@@ -1267,6 +1328,9 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		return TermResult{Text: out}, err
 
 	case "reload":
+		if err := s.requireRootGlobal(c, 'w'); err != nil {
+			return TermResult{}, err
+		}
 		if err := s.Reload(); err != nil {
 			return TermResult{}, err
 		}
@@ -1276,11 +1340,23 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		return TermResult{Text: s.execWhoami(c)}, nil
 
 	case "users":
+		if err := s.requireRootGlobal(c, 'r'); err != nil {
+			return TermResult{}, err
+		}
 		return TermResult{Text: s.execUsers().Text}, nil
 
 	case "status":
+		// 全局索引量对不同凭证来说也是信息：受限身份只该看到
+		// 自己可见范围内的切片数，否则它能数出别人的记忆规模。
 		s.mu.RLock()
-		docs, terms := s.idx.Docs(), s.idx.Terms()
+		docs := 0
+		for _, t := range s.trees {
+			if !s.allowed(c, t.Project, t.Branch, configBitRead) {
+				continue
+			}
+			docs += len(t.Indexable())
+		}
+		terms := s.idx.Terms()
 		s.mu.RUnlock()
 		return TermResult{
 			Text: fmt.Sprintf("docs: %d, terms: %d", docs, terms),
@@ -1334,6 +1410,9 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		return TermResult{Text: lsText}, nil
 
 	default:
+		if suggestion := suggestVerb(verb); suggestion != "" {
+			return TermResult{}, fmt.Errorf("没有 %q 这个动词；你是不是想输入 %q？", verb, suggestion)
+		}
 		return TermResult{}, fmt.Errorf("没有 %q 这个动词（若对接了下游 MCP，此处应透传）\n\n%s", verb, helpOverview())
 	}
 }
@@ -1415,14 +1494,29 @@ func (s *Server) Report(w io.Writer, c Caller) {
 // 只读文件，不改任何状态——摘要预览不该被算作"读过"（那样 recall 会把权重也改了）。
 func (s *Server) snippet(addr, query string, limit int) string {
 	var block *memory.Block
-	for _, t := range s.trees {
-		if b, ok := t.Find(addr); ok {
-			bb := b
-			block = &bb
-			break
+	// 索引地址是 project@branch/path；Tree.Find 接受的是仓库内路径。
+	// 以前把整个 ID 直接交给 Find，分支前缀永远匹配不上，
+	// recall 有命中却永远不给摘要。先拆 ID，按项目+分支找树，再传 path。
+	if project, branch, path, ok := memory.SplitID(addr); ok {
+		for _, t := range s.trees {
+			if t.Project == project && t.Branch == branch {
+				if b, found := t.Find(path); found {
+					bb := b
+					block = &bb
+				}
+				break
+			}
+		}
+	} else {
+		for _, t := range s.trees {
+			if b, ok := t.Find(addr); ok {
+				bb := b
+				block = &bb
+				break
+			}
 		}
 	}
-	if block == nil || !true {
+	if block == nil {
 		return ""
 	}
 	data, err := s.readBlock(*block)
@@ -1497,7 +1591,9 @@ func (s *Server) execGrep(pattern string, c Caller) (string, error) {
 	var sb strings.Builder
 	totalHits := 0
 	for _, tr := range s.trees {
-		if !c.Mount.Visible(tr.Project, tr.Branch) {
+		// 只判挂载表会漏掉两层：凭证 cap 与 TOML 权限。
+		// grep 读的是正文，判据必须与 read 完全一致。
+		if !s.allowed(c, tr.Project, tr.Branch, configBitRead) {
 			continue
 		}
 		for _, b := range tr.Blocks {
@@ -1557,7 +1653,7 @@ func (s *Server) execLog(n int, c Caller) (string, error) {
 
 	var all []memory.Block
 	for _, tr := range s.trees {
-		if !c.Mount.Visible(tr.Project, tr.Branch) {
+		if !s.allowed(c, tr.Project, tr.Branch, configBitRead) {
 			continue
 		}
 		for _, b := range tr.Blocks {
@@ -1600,7 +1696,7 @@ func (s *Server) execLs(day string, c Caller) (string, error) {
 
 	var matches []memory.Block
 	for _, tr := range s.trees {
-		if !c.Mount.Visible(tr.Project, tr.Branch) {
+		if !s.allowed(c, tr.Project, tr.Branch, configBitRead) {
 			continue
 		}
 		for _, b := range tr.Blocks {
@@ -1625,7 +1721,11 @@ func (s *Server) execLs(day string, c Caller) (string, error) {
 
 	var sb strings.Builder
 	for _, b := range matches {
-		sb.WriteString(fmt.Sprintf("%-50s %6d 字节\n", b.Path, b.Size))
+		virt := c.Mount.ToVirtual(b.Project, b.Branch, b.Path)
+		if virt == "" {
+			virt = b.Path
+		}
+		sb.WriteString(fmt.Sprintf("%-50s %6d 字节\n", virt, b.Size))
 	}
 	return strings.TrimRight(sb.String(), "\n"), nil
 }

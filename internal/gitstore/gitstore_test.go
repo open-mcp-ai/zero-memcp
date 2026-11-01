@@ -3,6 +3,8 @@ package gitstore
 import (
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"testing"
 )
 
@@ -295,5 +297,50 @@ func TestLog(t *testing.T) {
 	}
 	if len(log) != 3 {
 		t.Fatalf("应有 3 条提交，得到 %d", len(log))
+	}
+}
+
+// 分支在 packed-refs 里时，Branches 必须照样列出来。
+//
+// 踩过的坑：Branches 只走 filepath.WalkDir(refs/heads)，而 git clone --bare
+// 和 git pack-refs 都把分支搬进 packed-refs，目录当场变空。症状是仓库明明
+// 有提交、服务却报 0 个块，ok:true，一句告警都没有——迁移一台机器上原本
+// 跑得好好的记忆库，换过去就全空了。
+func TestBranchesReadsPackedRefs(t *testing.T) {
+	dir := t.TempDir()
+	r, err := Init(dir)
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	sha := strings.Repeat("a", 40)
+	if err := r.updateRef("refs/heads/main", sha); err != nil {
+		t.Fatalf("updateRef: %v", err)
+	}
+	if err := r.updateRef("refs/heads/chat", sha); err != nil {
+		t.Fatalf("updateRef: %v", err)
+	}
+
+	// 模拟 git pack-refs：写 packed-refs，删掉松散 ref
+	packed := "# pack-refs with: peeled fully-peeled sorted\n" +
+		sha + " refs/heads/main\n" +
+		sha + " refs/heads/chat\n"
+	if err := os.WriteFile(filepath.Join(dir, "packed-refs"), []byte(packed), 0o644); err != nil {
+		t.Fatalf("写 packed-refs: %v", err)
+	}
+	if err := os.RemoveAll(filepath.Join(dir, "refs", "heads")); err != nil {
+		t.Fatalf("删 refs/heads: %v", err)
+	}
+
+	got := r.Branches()
+	sort.Strings(got)
+	want := []string{"chat", "main"}
+	if len(got) != len(want) {
+		t.Fatalf("Branches() = %v，期望 %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("Branches() = %v，期望 %v", got, want)
+		}
 	}
 }

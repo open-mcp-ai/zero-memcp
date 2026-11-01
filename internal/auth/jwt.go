@@ -26,6 +26,15 @@ type Claims struct {
 	Iss string `json:"iss"`
 	Iat int64  `json:"iat"`
 
+	// Name 是这张凭证的名字，也就是「分身标识」。
+	//
+	// 为什么 Sub 不够：一个 user 可以有多张凭证（laptop / pi-box / vps），
+	// 它们是不同的节点，要能被分别看见、分别投信、分别显示在线状态。
+	// 用 Sub 当节点名的话，三台机器在花名册里会挤成同一行。
+	//
+	// 空值回落到 Sub，保持对旧凭证的兼容。
+	Name string `json:"name,omitempty"`
+
 	// Exp 是过期时间戳，0 表示永不过期。
 	Exp int64 `json:"exp"`
 

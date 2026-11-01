@@ -23,12 +23,18 @@ interval = "24h"
 addr  = "127.0.0.1:1729"
 allow = ["*"]
 
-# 端口 2：只读 HTTP Git 端点（可选）
+# 端口 2：HTTP Git 端点（可选）
 #   供中心节点或其他设备用原生 git clone / git pull 拉取记忆
 #   即使在回环地址也强制要求 Token（可走 Basic Auth 或 Bearer）
 # [[listen]]
 # addr  = "0.0.0.0:1730"
 # allow = ["git-upload-pack"]
+
+# 要让别的机器把历史推上来（注入一份备份、批量导入），再加 push 能力。
+# 推送入口默认关闭；开放后仍然只接受快进，非快进一律拒绝。
+# [[listen]]
+# addr  = "0.0.0.0:1731"
+# allow = ["git-upload-pack", "git-receive-pack"]
 
 # 端口 3：受限只读 MCP 端口（可选，给非受信网络）
 #   只允许查询类动词，拒绝所有写入；强制验签
@@ -73,3 +79,38 @@ mode  = "rwx------"
 user    = "chat"
 project = "blackegg/daily"
 perm    = "r"
+
+# [[remote]] 声明记忆仓库的远端，用于备份与多节点同步。
+#
+# 四条纪律：
+#   • 不自动 push —— 写入只落本地，推送必须显式调用
+#   • 不隐式 commit —— 有未提交内容时 push 拒绝并说明条数
+#   • 不强推 —— 记忆历史只追加
+#   • 冲突不静默 —— 分叉时保留两边并报错
+#
+# url 里不能内嵌密码：那会让它出现在 TOML、日志和错误信息三处。
+# 凭证来自 git credential helper、SSH agent 或环境变量。
+#
+# push 是分支白名单，留空表示这个远端不可推。
+# fetch_only = true
+# ssh_key    = "github-deploy"   # SSH push 的服务端私钥名（root 用 remote-key put 添加）
+# host_key   = "SHA256:..."       # SSH host key fingerprint 必须 pin
+# http_user  = "x-access-token"  # HTTP push 的用户名（GitHub 约定）
+# http_token = "gh"              # remote-secret put 保存的 token 名，不是 token 本身 表示只读镜像。
+#
+# [[remote]]
+# project    = "blackegg/daily"
+# name       = "github"
+# url        = "git@github.com:private/daily.git"
+# push       = ["main", "chat"]
+# fetch_only = false
+#
+# [[remote]]
+# project    = "blackegg/me"
+# name       = "blackbox"
+# url        = "http://10.0.0.238:1729/repos/blackegg/me.git"
+# fetch_only = true
+# ssh_key    = "github-deploy"   # SSH push 的服务端私钥名（root 用 remote-key put 添加）
+# host_key   = "SHA256:..."       # SSH host key fingerprint 必须 pin
+# http_user  = "x-access-token"  # HTTP push 的用户名（GitHub 约定）
+# http_token = "gh"              # remote-secret put 保存的 token 名，不是 token 本身

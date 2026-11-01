@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 	"sort"
 	"strings"
@@ -60,8 +59,11 @@ func (s *Server) execBranch(rest string, c Caller, persona string) (string, erro
 		src = args[3]
 	}
 
-	if !c.Mount.Visible(project, src) || !c.Mount.Visible(project, newBranch) {
-		return "", fmt.Errorf("项目 %q 或分支不在挂载表内", project)
+	if !s.allowed(c, project, src, configBitRead) {
+		return "", fmt.Errorf("%s", s.denyReason(c, project, src, configBitRead))
+	}
+	if !s.allowed(c, project, newBranch, configBitWrite) {
+		return "", fmt.Errorf("%s", s.denyReason(c, project, newBranch, configBitWrite))
 	}
 	repo, err := s.projects.Get(project)
 	if err != nil {
@@ -85,6 +87,10 @@ func (s *Server) execBranch(rest string, c Caller, persona string) (string, erro
 }
 
 // listBranches 列出分支。
+//
+// 只写「至少有一条分支可见」的项目：项目标题本身就是信息，
+// 先把名字打出来再发现下面一行都没有，等于告诉调用方
+// 「这个仓库存在，只是你看不见内容」。
 func (s *Server) listBranches(project string, c Caller) string {
 	projects := s.declaredProjects()
 	if project != "" {
@@ -111,10 +117,14 @@ func (s *Server) listBranches(project string, c Caller) string {
 		if len(refs) == 0 {
 			continue
 		}
-		sb.WriteString(p + "\n")
+		locked := map[string]bool{}
+		for _, name := range repo.LockedBranches() {
+			locked[name] = true
+		}
+		var body strings.Builder
 		for _, ref := range refs {
 			name := strings.TrimPrefix(ref, "refs/heads/")
-			if !c.Mount.Visible(p, name) {
+			if !s.allowed(c, p, name, configBitRead) {
 				continue
 			}
 			sha, _ := repo.Resolve(name)
@@ -127,8 +137,17 @@ func (s *Server) listBranches(project string, c Caller) string {
 			if name == s.persona {
 				marked = "*"
 			}
-			sb.WriteString(fmt.Sprintf("  %s %-16s %5d 篇  %s  %s\n", marked, name, len(n), when, shortSHA(sha)))
+			lockMark := ""
+			if locked[name] {
+				lockMark = "  [已锁定]"
+			}
+			body.WriteString(fmt.Sprintf("  %s %-16s %5d 篇  %s  %s%s\n", marked, name, len(n), when, shortSHA(sha), lockMark))
 		}
+		if body.Len() == 0 {
+			continue
+		}
+		sb.WriteString(p + "\n")
+		sb.WriteString(body.String())
 	}
 	if sb.Len() == 0 {
 		return "没有任何分支"
@@ -157,12 +176,15 @@ func (s *Server) execTag(rest string, c Caller, persona string) (string, error) 
 	args := strings.Fields(rest)
 
 	if len(args) == 0 {
-		return s.listTags(""), nil
+		return s.listTags("", c), nil
 	}
 
 	if args[0] == "-d" || args[0] == "--delete" {
 		if len(args) < 3 {
 			return "", fmt.Errorf("用法：tag -d <project> <name>")
+		}
+		if !s.projectWritableFor(c, args[1]) {
+			return "", fmt.Errorf("项目 %q 不在这张凭证的可写范围内", args[1])
 		}
 		repo, err := s.projects.Get(args[1])
 		if err != nil {
@@ -176,13 +198,16 @@ func (s *Server) execTag(rest string, c Caller, persona string) (string, error) 
 
 	project := args[0]
 	if len(args) == 1 {
-		return s.listTags(project), nil
+		return s.listTags(project, c), nil
 	}
 
 	name := args[1]
 	ref := persona
 	if len(args) >= 3 {
 		ref = args[2]
+	}
+	if !s.allowed(c, project, ref, configBitWrite) {
+		return "", fmt.Errorf("%s", s.denyReason(c, project, ref, configBitWrite))
 	}
 	repo, err := s.projects.Get(project)
 	if err != nil {
@@ -195,13 +220,16 @@ func (s *Server) execTag(rest string, c Caller, persona string) (string, error) 
 	return fmt.Sprintf("已打 tag %s → %s@%s（%s）", name, project, ref, shortSHA(sha)), nil
 }
 
-func (s *Server) listTags(project string) string {
+func (s *Server) listTags(project string, c Caller) string {
 	projects := s.declaredProjects()
 	if project != "" {
 		projects = []string{project}
 	}
 	var sb strings.Builder
 	for _, p := range projects {
+		if !s.projectVisibleFor(c, p) {
+			continue
+		}
 		repo, err := s.projects.Get(p)
 		if err != nil {
 			continue
@@ -271,10 +299,10 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 		if perr != nil {
 			return "", fmt.Errorf("源地址 %q: %w", raw, perr)
 		}
-		if !c.Mount.Visible(srcProj, srcBranch) {
-			return "", fmt.Errorf("源 %s@%s 不在挂载表内", srcProj, srcBranch)
+		if !s.allowed(c, srcProj, srcBranch, configBitRead) {
+			return "", fmt.Errorf("%s", s.denyReason(c, srcProj, srcBranch, configBitRead))
 		}
-		// 剪切要求两端都可写；复制只要求目标可写
+		// 剪切要求源可写；复制只读源，但目标都必须可写。
 		if isMove && !s.allowed(c, srcProj, srcBranch, configBitWrite) {
 			return "", fmt.Errorf("%s", s.denyReason(c, srcProj, srcBranch, configBitWrite))
 		}
@@ -304,13 +332,21 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 		}
 
 		// 立刻提交两端，让这次手术当场生效
-		if _, cerr := repo.Commit(srcBranch, fmt.Sprintf("mem: %s 取出 %s", verbName(isMove), srcPath)); cerr != nil {
-			return "", fmt.Errorf("提交源分支: %w", cerr)
+		if isMove {
+			if _, cerr := repo.Commit(srcBranch, fmt.Sprintf("mem: %s 取出 %s", verbName(isMove), srcPath)); cerr != nil {
+				return "", fmt.Errorf("提交源分支: %w", cerr)
+			}
 		}
 		if srcBranch != dstBranch {
 			if _, cerr := repo.Commit(dstBranch, fmt.Sprintf("mem: %s 收入 %s", verbName(isMove), target)); cerr != nil {
 				return "", fmt.Errorf("提交目标分支: %w", cerr)
 			}
+		}
+
+		// 两端都推进了分支头：各自通知一次，锚定任一侧的人都要知道。
+		s.notifyTreeChange(srcProj, srcBranch, "")
+		if srcBranch != dstBranch || srcProj != dstProj {
+			s.notifyTreeChange(dstProj, dstBranch, "")
 		}
 
 		moved = append(moved, fmt.Sprintf("  %s@%s/%s → %s@%s/%s", srcProj, srcBranch, srcPath, dstProj, dstBranch, target))
@@ -420,6 +456,12 @@ func (s *Server) execCommit(rest string, c Caller, persona string) (string, erro
 
 	// 1. 无参：全部提交
 	if rest == "" {
+		if !c.Mount.Empty() {
+			return "", fmt.Errorf("受限挂载凭证必须指定 commit <project>@<branch>")
+		}
+		if err := s.requireRoot(c); err != nil {
+			return "", err
+		}
 		n, err := s.projects.CommitAll(persona, "mem: manual commit")
 		if err != nil {
 			return "", err
@@ -438,8 +480,8 @@ func (s *Server) execCommit(rest string, c Caller, persona string) (string, erro
 	if branch == "" {
 		branch = persona
 	}
-	if !c.Mount.Visible(proj, branch) {
-		return "", fmt.Errorf("项目 %s@%s 不在挂载表内", proj, branch)
+	if !s.allowed(c, proj, branch, configBitWrite) {
+		return "", fmt.Errorf("%s", s.denyReason(c, proj, branch, configBitWrite))
 	}
 
 	repo, err := s.projects.Get(proj)
@@ -459,6 +501,10 @@ func (s *Server) execCommit(rest string, c Caller, persona string) (string, erro
 	if err != nil {
 		return "", fmt.Errorf("提交失败: %w", err)
 	}
+	// 显式提交同样推进了分支头：锚定者必须收到脉冲，
+	// 否则「手动封箱」会变成一次无人知晓的静默变更。
+	s.lastCommits.Store(treeHeadKey(proj, branch), sha)
+	s.notifyTreeChange(proj, branch, "")
 	if err := s.Reload(); err != nil {
 		return "", err
 	}
@@ -499,11 +545,11 @@ func (s *Server) execDiff(rest string, c Caller, persona string) (string, error)
 	if fromAddr != "" && fromProj != toProj {
 		return "", fmt.Errorf("暂不支持跨项目比对（%s vs %s）", fromProj, toProj)
 	}
-	if !c.Mount.Visible(toProj, toBranch) {
-		return "", fmt.Errorf("%s@%s 不在这张凭证的可见范围内", toProj, toBranch)
+	if !s.allowed(c, toProj, toBranch, configBitRead) {
+		return "", fmt.Errorf("%s", s.denyReason(c, toProj, toBranch, configBitRead))
 	}
-	if fromAddr != "" && !c.Mount.Visible(fromProj, fromBranch) {
-		return "", fmt.Errorf("%s@%s 不在这张凭证的可见范围内", fromProj, fromBranch)
+	if fromAddr != "" && !s.allowed(c, fromProj, fromBranch, configBitRead) {
+		return "", fmt.Errorf("%s", s.denyReason(c, fromProj, fromBranch, configBitRead))
 	}
 
 	repo, err := s.projects.Get(toProj)
@@ -623,6 +669,14 @@ func (s *Server) execDelete(rest string, c Caller, persona string) (string, erro
 			}
 			continue
 		}
+		// 先确认它真的存在。
+		//
+		// repo.Delete 只是标记「这个路径待删」，路径拼错也照样成功——
+		// 于是一次手误得到「已标记删除 1 个文件」，而文件还在原地。
+		// 删除是少数几个不能沉默的操作。
+		if _, rerr := repo.Read(branch, p); rerr != nil {
+			return "", fmt.Errorf("%s 不存在（%s@%s）", p, proj, branch)
+		}
 		if err := repo.Delete(branch, p); err != nil {
 			return "", err
 		}
@@ -641,66 +695,6 @@ func (s *Server) execDelete(rest string, c Caller, persona string) (string, erro
 }
 
 // ── 分支生命周期 ───────────────────────────────────────────────
-
-// agentTokenPrefix 是「分支关联凭证」的命名约定。
-//
-// 约定优于配置：一张凭证如果叫 agent-<branch>，它就是这个分支的身份。
-// 不做复杂登记表的原因：登记表需要一致性问题（删分支忘删登记、
-// 改名字忘改表），而命名约定天然同步——它不占额外状态，也就不腐坏。
-const agentTokenPrefix = "agent-"
-
-// execKill 实现 kill 动词：吊销某分支的全部关联凭证。
-//
-//	kill <project>@<branch>
-//
-// 它只做一件事：让那张凭证立刻失效（走 JTI 级联吊销，子凭证一并失效）。
-// 不杀进程——进程是 termcp 的事，而记忆引擎不该有远程执行能力。
-// 「先吊销再杀进程」的顺序是对的：反过来的话，进程还活着的窗口里
-// 凭证仍然有效。
-func (s *Server) execKill(rest string, c Caller) (string, error) {
-	if err := s.requireRoot(c); err != nil {
-		return "", err
-	}
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return "", fmt.Errorf("用法：kill <project>@<branch>")
-	}
-	proj, branch, _, err := s.parseBranchAddr(rest)
-	if err != nil {
-		return "", err
-	}
-	if branch == "" {
-		return "", fmt.Errorf("必须指定分支：kill %s@<branch>", proj)
-	}
-
-	recs, _ := auth.LoadTokenRecords(s.dataDir)
-	want := agentTokenPrefix + branch
-	var killed, already []string
-	for _, r := range recs {
-		if r.Name != want {
-			continue
-		}
-		if s.rev != nil {
-			if s.rev.Revoked(r.JTI) {
-				already = append(already, r.Name)
-				continue
-			}
-			if err := s.rev.Revoke(r.JTI); err != nil {
-				return "", fmt.Errorf("吊销 %s: %w", r.Name, err)
-			}
-		}
-		killed = append(killed, r.Name)
-	}
-
-	if len(killed) == 0 && len(already) == 0 {
-		return fmt.Sprintf("%s@%s 没有关联凭证（凭证名应为 %s%s）", proj, branch, agentTokenPrefix, branch), nil
-	}
-	if len(killed) == 0 {
-		return fmt.Sprintf("%s@%s 的凭证已经处于吊销状态", proj, branch), nil
-	}
-	// 子凭证一并失效（RecordParent 建立的父链）
-	return fmt.Sprintf("已吊销 %s@%s 的凭证 %s（子凭证随之失效）", proj, branch, strings.Join(killed, ", ")), nil
-}
 
 // execArchive 实现 archive 动词：把一个分支的整棵树并入归档分支，然后删除它的 ref。
 //
@@ -741,6 +735,14 @@ func (s *Server) execArchive(rest string, c Caller) (string, error) {
 	}
 	if dstBranch == branch {
 		return "", fmt.Errorf("归档目标和源分支不能同名")
+	}
+	if err := s.requireRootAccess(c, proj, branch, configBitWrite); err != nil {
+		return "", err
+	}
+	if dstAddr != "" {
+		if err := s.requireRootAccess(c, proj, dstBranch, configBitWrite); err != nil {
+			return "", err
+		}
 	}
 
 	repo, err := s.projects.Get(proj)
@@ -803,6 +805,12 @@ func (s *Server) execReset(rest string, c Caller) (string, error) {
 	if dstBranch == srcBranch {
 		return "", fmt.Errorf("源和目标是同一个分支")
 	}
+	if err := s.requireRootAccess(c, srcProj, srcBranch, configBitRead); err != nil {
+		return "", err
+	}
+	if err := s.requireRootAccess(c, dstProj, dstBranch, configBitWrite); err != nil {
+		return "", err
+	}
 
 	repo, err := s.projects.Get(dstProj)
 	if err != nil {
@@ -832,4 +840,60 @@ func (s *Server) execReset(rest string, c Caller) (string, error) {
 		msg += fmt.Sprintf("；旧版本已归档为 %s-reset-*", dstBranch)
 	}
 	return msg, nil
+}
+
+// execChmod 改一个块的模式位：rule（注入系统提示）或 content（普通内容）。
+//
+// 为什么需要它：`write` 与 `put` 只能写内容块——规则位写不进去。
+// 于是「把一条笔记提升为法则」这件事只能靠外部 git 改 100755，
+// 而那要求人先 clone、再 chmod、再 push。规则位决定「什么进系统提示」，
+// 它不该是命令行之外能力。
+func (s *Server) execChmod(rest string, c Caller, persona string) (string, error) {
+	if err := s.requireRoot(c); err != nil {
+		return "", err
+	}
+	fields := strings.Fields(rest)
+	if len(fields) != 2 {
+		return "", fmt.Errorf("用法：chmod <project>[@<branch>]/<path> rule|content")
+	}
+	addr, want := fields[0], fields[1]
+	var mode gitstore.Mode
+	switch want {
+	case "rule", "x", "755", "100755":
+		mode = gitstore.ModeRule
+	case "content", "c", "644", "100644":
+		mode = gitstore.ModeContent
+	default:
+		return "", fmt.Errorf("模式只能是 rule 或 content，收到 %q", want)
+	}
+
+	proj, branch, path, err := s.resolveAddr(addr, c)
+	if err != nil {
+		return "", err
+	}
+	if path == "" {
+		return "", fmt.Errorf("%q 只给出了项目，没有文件路径", addr)
+	}
+	if !s.allowed(c, proj, branch, configBitWrite) {
+		return "", fmt.Errorf("无权修改 %s@%s", proj, branch)
+	}
+	repo, err := s.projects.Get(proj)
+	if err != nil {
+		return "", err
+	}
+	body, err := repo.Read(branch, path)
+	if err != nil {
+		return "", fmt.Errorf("%s 不存在（%s@%s）", path, proj, branch)
+	}
+	if err := repo.Write(branch, path, body, mode); err != nil {
+		return "", err
+	}
+	if err := s.Reload(); err != nil {
+		return "", fmt.Errorf("已改模式，但重建索引失败：%w", err)
+	}
+	label := "规则（每轮注入）"
+	if mode == gitstore.ModeContent {
+		label = "普通内容（不注入）"
+	}
+	return fmt.Sprintf("%s@%s/%s → %s，需 commit 才生效", proj, branch, path, label), nil
 }

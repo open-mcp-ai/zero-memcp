@@ -20,6 +20,7 @@ type File struct {
 	Listens  []ListenBlock
 	Projects []Project
 	Access   []AccessRule
+	Remotes  []Remote
 
 	// Path 是它被读出来的位置，仅用于错误信息与日志。
 	Path string
@@ -104,6 +105,31 @@ type Project struct {
 	Perm auth.Perm
 }
 
+// Remote 是一个项目记忆仓库的远端。
+//
+// 它只声明「能去哪」和「能推什么」，不含任何凭证：
+// url 里内嵌密码会让它出现在 TOML、日志和错误信息里三处。
+type Remote struct {
+	// Project 是本地项目名，例如 blackegg/me。
+	Project string
+	// Name 是远端别名，例如 origin / github / blackbox。
+	Name string
+	// URL 是远端地址，禁止内嵌凭证。
+	URL string
+	// FetchOnly 为真时禁止推送。
+	FetchOnly bool
+	// Push 是允许推送的分支白名单；空表示不推任何分支。
+	Push []string
+	// SSHKey 是服务端 system/sshkeys 下的私钥名；不包含私钥内容。
+	SSHKey string
+	// HostKey 是 SSH server 的 SHA256 host-key fingerprint，必须显式 pin。
+	HostKey string
+	// HTTPUser 是 HTTP Basic 的用户名（GitHub 用 x-access-token）。
+	HTTPUser string
+	// HTTPToken 是服务端密钥库里的 token 名，不是 token 本身。
+	HTTPToken string
+}
+
 // AccessRule 是绕过项目 mode 的一条例外授权。
 //
 // 它的用处是「给某个用户单独开某个项目的口子」，而不必为此改项目归属
@@ -148,6 +174,7 @@ var knownKeys = map[string]map[string]bool{
 	"project": {"name": true, "owner": true, "group": true, "mode": true},
 	"access":  {"user": true, "project": true, "perm": true},
 	"listen":  {"addr": true, "allow": true, "require": true, "mount": true},
+	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true},
 }
 
 // checkKeys 拒绝未知分节与未知键。
@@ -220,6 +247,66 @@ func ParseFile(raw []byte) (*File, error) {
 		} else if v != 0 {
 			f.Commit.Count = int(v)
 		}
+	}
+
+	for _, sec := range doc.Arrays["remote"] {
+		var rm Remote
+		var err error
+		if rm.Project, err = str(sec, "[[remote]]", "project"); err != nil {
+			return nil, err
+		}
+		if rm.Name, err = str(sec, "[[remote]]", "name"); err != nil {
+			return nil, err
+		}
+		if rm.URL, err = str(sec, "[[remote]]", "url"); err != nil {
+			return nil, err
+		}
+		if rm.FetchOnly, err = boolean(sec, "[[remote]]", "fetch_only"); err != nil {
+			return nil, err
+		}
+		if rm.Push, err = list(sec, "[[remote]]", "push"); err != nil {
+			return nil, err
+		}
+		if rm.SSHKey, err = str(sec, "[[remote]]", "ssh_key"); err != nil {
+			return nil, err
+		}
+		if rm.HostKey, err = str(sec, "[[remote]]", "host_key"); err != nil {
+			return nil, err
+		}
+		if rm.SSHKey != "" {
+			if err := ValidateSSHKeyName(rm.SSHKey); err != nil {
+				return nil, fmt.Errorf("[[remote]] ssh_key: %w", err)
+			}
+		}
+		if rm.HostKey != "" && !strings.HasPrefix(rm.HostKey, "SHA256:") {
+			return nil, fmt.Errorf("[[remote]] host_key 必须是 SHA256:... fingerprint")
+		}
+		if rm.HTTPUser, err = str(sec, "[[remote]]", "http_user"); err != nil {
+			return nil, err
+		}
+		if rm.HTTPToken, err = str(sec, "[[remote]]", "http_token"); err != nil {
+			return nil, err
+		}
+		if rm.HTTPToken != "" {
+			if err := ValidateSSHKeyName(rm.HTTPToken); err != nil {
+				return nil, fmt.Errorf("[[remote]] http_token: %w", err)
+			}
+		}
+		// 凭证名与传输方式必须对得上：ssh_key 配 https、http_token 配 ssh://
+		// 都是「配了却没生效」的典型来源，只有启动期报错才治得住。
+		if rm.SSHKey != "" && (strings.HasPrefix(rm.URL, "http://") || strings.HasPrefix(rm.URL, "https://")) {
+			return nil, fmt.Errorf("[[remote]] %s/%s: ssh_key 不能用于 HTTP 远端，改用 http_token", rm.Project, rm.Name)
+		}
+		if rm.HTTPToken != "" && !strings.HasPrefix(rm.URL, "http://") && !strings.HasPrefix(rm.URL, "https://") {
+			return nil, fmt.Errorf("[[remote]] %s/%s: http_token 只能用于 http(s) 远端", rm.Project, rm.Name)
+		}
+		if rm.Project == "" || rm.Name == "" || rm.URL == "" {
+			return nil, fmt.Errorf("[[remote]] 需要 project、name、url")
+		}
+		if err := validateRemoteURL(rm.URL); err != nil {
+			return nil, fmt.Errorf("[[remote]] %s/%s: %w", rm.Project, rm.Name, err)
+		}
+		f.Remotes = append(f.Remotes, rm)
 	}
 
 	if sec, ok := doc.Sections["gc"]; ok {
@@ -634,4 +721,52 @@ func (f *File) EffectiveListens() []ListenBlock {
 func (l *Lookup) Declared(name string) bool {
 	_, ok := l.Project(name)
 	return ok
+}
+
+// validateRemoteURL 拒绝内嵌凭证的远端地址。
+//
+// 与 gitremote.ValidateURL 同一条规则，但这里在配置解析期就执行：
+// 一个带着密码的配置项如果能保存到磁盘，它就已经泄漏了。
+func validateRemoteURL(url string) error {
+	if strings.Contains(url, "@") {
+		// git@host:path 是 SSH 用户名，不是密码；只有 scheme://user:pass@ 才是。
+		if i := strings.Index(url, "://"); i >= 0 {
+			rest := url[i+3:]
+			if at := strings.Index(rest, "@"); at > 0 {
+				userinfo := rest[:at]
+				if strings.Contains(userinfo, ":") {
+					return fmt.Errorf("远端地址不能内嵌密码（用 credential helper 或 SSH agent）")
+				}
+			}
+		}
+	}
+	if strings.HasPrefix(url, "-") {
+		return fmt.Errorf("远端地址不能以 - 开头")
+	}
+	return nil
+}
+
+// RemotesOf 返回某个项目声明的远端。
+func (f *File) RemotesOf(project string) []Remote {
+	var out []Remote
+	for _, r := range f.Remotes {
+		if r.Project == project {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// ValidateSSHKeyName accepts a short, path-safe identifier, never key material.
+func ValidateSSHKeyName(name string) error {
+	if len(name) == 0 || len(name) > 64 {
+		return fmt.Errorf("SSH key 名称长度须为 1..64 字符")
+	}
+	for i, r := range name {
+		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || i > 0 && (r == '-' || r == '_' || r == '.')
+		if !ok {
+			return fmt.Errorf("SSH key 名称只允许字母、数字及 ._-：%q", name)
+		}
+	}
+	return nil
 }

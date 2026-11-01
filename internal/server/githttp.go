@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-// 只读 HTTP Git：让任何机器用原生 git 就能拉走整棵记忆树。
+// HTTP Git 端点：支持 clone/pull（git-upload-pack）与 push（git-receive-pack）。
 //
 // 端点形态与标准 git smart HTTP 一致，所以 `git clone http://host:port/repos/<project>.git`
 // 可以直接用，不需要装任何客户端插件。
@@ -16,10 +16,11 @@ import (
 //	GET  /repos/<project>.git/info/refs?service=git-upload-pack
 //	POST /repos/<project>.git/git-upload-pack
 //
-// 为什么只做只读：边缘节点的职责是「被中心 pull」，它不该有接收推送的
-// 入口。中心节点的写入走 MCP 动词，那条路有权限、有审计、有原子提交。
-// 把 receive-pack 也开出来，等于在 MCP 之外多出一个绕过所有校验的
-// 写入口——而两个入口的权限语义迟早会漂移。
+// push 的安全防线：
+//  1. 必须在 [[listen]] 的 allow 里显式声明 "git-receive-pack"（缺省不给）；
+//  2. 凭证必须有对应分支的写权限（allowed bit: w）；
+//  3. 只接受快进，非快进一律拒绝；
+//  4. 落地后触发 Reload 与树脉冲通知，不会变成静默写入。
 
 // handleGitHTTP 是 /repos/ 前缀的统一入口。
 func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
@@ -68,27 +69,51 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		svc := r.URL.Query().Get("service")
-		if svc != "git-upload-pack" {
-			// receive-pack 一律拒绝：那是写入口，本服务不提供
-			http.Error(w, "只支持 git-upload-pack（只读）", http.StatusForbidden)
-			return
+		switch svc {
+		case "git-upload-pack":
+			body, err := repo.AdvertiseRefsFiltered(s.persona, func(ref string) bool {
+				branch := strings.TrimPrefix(ref, "refs/heads/")
+				if branch == ref {
+					return true
+				}
+				return s.allowed(caller, project, branch, configBitRead)
+			})
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+
+		case "git-receive-pack":
+			if !s.gitPushAllowed(caller, project) {
+				http.Error(w, "当前端口未开启 git-receive-pack，或凭证没有写权限", http.StatusForbidden)
+				return
+			}
+			body, err := repo.AdvertiseReceivePack(s.persona, func(ref string) bool {
+				branch := strings.TrimPrefix(ref, "refs/heads/")
+				return s.allowed(caller, project, branch, configBitWrite)
+			})
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/x-git-receive-pack-advertisement")
+			w.Header().Set("Cache-Control", "no-cache")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+
+		default:
+			http.Error(w, "不支持的 git 服务："+svc, http.StatusBadRequest)
 		}
-		body, err := repo.AdvertiseRefs(s.persona)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
 
 	case "git-upload-pack":
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		// git 客户端会发 gzip 压缩的请求体
 		in := r.Body
 		if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
 			gz, err := newGzipReader(r.Body)
@@ -99,7 +124,24 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 			defer gz.Close()
 			in = gz
 		}
-		body, err := repo.UploadPackResponse(in)
+		allowedTips := map[string]bool{}
+		refs, _ := repo.Refs("refs/heads/")
+		for _, ref := range refs {
+			branch := strings.TrimPrefix(ref, "refs/heads/")
+			if !s.allowed(caller, project, branch, configBitRead) {
+				continue
+			}
+			sha, _ := repo.Resolve(branch)
+			if sha != "" {
+				allowedTips[sha] = true
+			}
+		}
+		if tags, err := repo.Tags(); err == nil {
+			for _, sha := range tags {
+				allowedTips[sha] = true
+			}
+		}
+		body, err := repo.UploadPackResponseFiltered(in, func(sha string) bool { return allowedTips[sha] })
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -109,6 +151,42 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(body)
 
+	case "git-receive-pack":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if !s.gitPushAllowed(caller, project) {
+			http.Error(w, "当前端口未开启 git-receive-pack，或凭证没有写权限", http.StatusForbidden)
+			return
+		}
+		in := r.Body
+		if strings.EqualFold(r.Header.Get("Content-Encoding"), "gzip") {
+			gz, err := newGzipReader(r.Body)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			defer gz.Close()
+			in = gz
+		}
+		body, err := repo.ReceivePack(in, func(ref string) bool {
+			branch := strings.TrimPrefix(ref, "refs/heads/")
+			return s.allowed(caller, project, branch, configBitWrite)
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		// 写入成功后触发重载与脉冲广播：外部推进的 ref 也是真写入，
+		// 内存索引与 SSE 锚定者必须立刻知道。
+		_ = s.Reload()
+		s.checkExternalUpdates()
+
+		w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
 	default:
 		http.Error(w, "unsupported git service", http.StatusNotFound)
 	}
@@ -140,25 +218,30 @@ func parseGitPath(p string) (project, action string, err error) {
 
 // projectVisible 报告该凭证能否看到这个项目（任意分支可见即可）。
 func (s *Server) projectVisible(c Caller, project string) bool {
-	if c.Mount.Empty() {
-		return true
+	// Smart Git advertises and serves the repository as a whole; it cannot enforce
+	// per-branch ACLs. Fail closed unless the caller may read every active branch.
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return false
 	}
-	for _, p := range s.declaredProjects() {
-		if p != project {
-			continue
+	refs, err := repo.Refs("refs/heads/")
+	if err != nil {
+		return false
+	}
+	if len(refs) == 0 {
+		branch := s.persona
+		if branch == "" {
+			branch = "zero"
 		}
-		repo, err := s.projects.Get(p)
-		if err != nil {
+		return s.allowed(c, project, branch, configBitRead)
+	}
+	for _, ref := range refs {
+		branch := strings.TrimPrefix(ref, "refs/heads/")
+		if !s.allowed(c, project, branch, configBitRead) {
 			return false
 		}
-		refs, _ := repo.Refs("refs/heads/")
-		for _, ref := range refs {
-			if c.Mount.Visible(p, strings.TrimPrefix(ref, "refs/heads/")) {
-				return true
-			}
-		}
 	}
-	return false
+	return true
 }
 
 func newGzipReader(r io.Reader) (io.ReadCloser, error) { return gzip.NewReader(r) }
@@ -226,4 +309,24 @@ func parseGitPathFull(p string) (project, action string, err error) {
 		p = head + tail
 	}
 	return parseGitPath(p)
+}
+
+// gitPushAllowed 检查凭证侧：该项目下至少有一条它能写的分支。
+// 端口侧的门槛在 portPolicy 里，两处都要过。
+func (s *Server) gitPushAllowed(c Caller, project string) bool {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return false
+	}
+	refs, _ := repo.Refs("refs/heads/")
+	if len(refs) == 0 {
+		return s.allowed(c, project, "zero", configBitWrite)
+	}
+	for _, ref := range refs {
+		branch := strings.TrimPrefix(ref, "refs/heads/")
+		if s.allowed(c, project, branch, configBitWrite) {
+			return true
+		}
+	}
+	return false
 }

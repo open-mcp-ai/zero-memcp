@@ -136,7 +136,9 @@ func (s *Server) parsePutSpec(target string, c Caller) putSpec {
 func (s *Server) putBody(target, body, session string, c Caller) (TermResult, error) {
 	spec := s.parsePutSpec(target, c)
 
-	source := c.Role
+	// source 是审计标签：这条记忆从哪个设备/实例写进来。
+	// 它只是数据，不参与任何权限判定。
+	source := c.Identity
 	if source == "" {
 		source = "mcp"
 	}
@@ -207,7 +209,7 @@ func (s *Server) putRef(target, refAddr, session string, c Caller) (TermResult, 
 
 	body := fmt.Sprintf("ref: %s@%s/%s\n", srcProj, srcBranch, srcPath)
 	spec := s.parsePutSpec(target, c)
-	path, proj, branch, err := s.writeNoteGit("", body, session, c.Role, c, spec.Explicit, spec.TreePath)
+	path, proj, branch, err := s.writeNoteGit("", body, session, c.Identity, c, spec.Explicit, spec.TreePath)
 	if err != nil {
 		return TermResult{}, err
 	}
@@ -439,21 +441,15 @@ func (s *Server) parseTreeAddress(addr string, c Caller) (project, branch, treeP
 	}
 	for _, p := range s.declaredProjects() {
 		if addr == p {
-			br := s.persona
-			if br == "" {
-				br = "zero"
-			}
+			br := s.defaultBranch
 			return p, br, "", nil
 		}
 		if strings.HasPrefix(addr, p+"/") {
-			br := s.persona
-			if br == "" {
-				br = "zero"
-			}
+			br := s.defaultBranch
 			return p, br, strings.TrimPrefix(addr, p+"/"), nil
 		}
 	}
-	p, br, _, e := s.writeTarget(c, s.persona)
+	p, br, _, e := s.writeTarget(c, s.defaultBranch)
 	if e != nil {
 		return "", "", "", e
 	}

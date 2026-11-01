@@ -59,7 +59,7 @@ func TestBranchForkIsolation(t *testing.T) {
 	}
 }
 
-// 默认分叉源是 persona 分支（不写 from 时）。
+// 默认分叉源是 defaultBranch 分支（不写 from 时）。
 func TestBranchForkDefaultsToPersona(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "boss", Cap: "rwx"})
@@ -79,7 +79,7 @@ func TestBranchForkDefaultsToPersona(t *testing.T) {
 		t.Fatalf("默认分叉失败: %v", err)
 	}
 	if got, _ := repo.Resolve("implicit"); got != head {
-		t.Fatalf("默认应从 persona 分支分叉: %s vs %s", got, head)
+		t.Fatalf("默认应从 defaultBranch 分支分叉: %s vs %s", got, head)
 	}
 }
 

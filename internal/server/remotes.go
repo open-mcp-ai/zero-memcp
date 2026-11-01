@@ -269,7 +269,7 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 	if len(branches) != 1 {
 		return TermResult{}, errors.New("SSH 最小闭环一次只推一个分支；多分支逐个确认，避免部分成功被误认为整体成功")
 	}
-	// 逐分支判写权限：能推 main 不等于能推 me@chat。
+	// 逐分支判写权限：能推主干不等于能推别的分支。
 	// 推送是「让远端历史前进」，它必须和本地写入走同一把尺子。
 	for _, br := range branches {
 		branch := strings.TrimPrefix(br, "refs/heads/")
@@ -528,10 +528,7 @@ func (s *Server) pendingCount(project string) int {
 func (s *Server) projectVisibleFor(c Caller, project string) bool {
 	repo, err := s.projects.Get(project)
 	if err != nil {
-		branch := s.persona
-		if branch == "" {
-			branch = "zero"
-		}
+		branch := s.defaultBranch
 		return s.allowed(c, project, branch, configBitRead)
 	}
 	refs, err := repo.Refs("refs/heads/")
@@ -539,10 +536,7 @@ func (s *Server) projectVisibleFor(c Caller, project string) bool {
 		return false
 	}
 	if len(refs) == 0 {
-		branch := s.persona
-		if branch == "" {
-			branch = "zero"
-		}
+		branch := s.defaultBranch
 		return s.allowed(c, project, branch, configBitRead)
 	}
 	for _, ref := range refs {

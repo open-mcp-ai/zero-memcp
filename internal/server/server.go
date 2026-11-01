@@ -24,6 +24,7 @@ import (
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 	"github.com/open-mcp-ai/zero-memcp/internal/index"
 	"github.com/open-mcp-ai/zero-memcp/internal/manifest"
 	"github.com/open-mcp-ai/zero-memcp/internal/memory"
@@ -51,8 +52,11 @@ type Config struct {
 	// WeightsPath 阅读频次状态文件。
 	WeightsPath string
 
-	// DefaultProfile 是没指定 profile 时的默认人格名。
-	DefaultProfile string
+	// DefaultBranch 是默认分支名。
+	//
+	// 分支是「这份记忆的版本线」，不是「谁在用」——
+	// 所以它是存储参数，不是身份参数。
+	DefaultBranch string
 
 	// EnforceAuth 即使在 127.0.0.1 也强制要求带 JWT Token。
 	EnforceAuth bool
@@ -82,12 +86,12 @@ type Server struct {
 	// 「记忆库更新过」是实例级事实，不需要按身份分裂。
 	clock atomic.Int64
 
-	// persona 是当前写入的分支名。所有仓库共用它。
+	// defaultBranch 是默认版本线。所有仓库共用它。
 	//
-	// 为什么是单一 persona 而不是每用户一份：现在「多用户」只表示
-	// 「哪些人能用哪些仓库」，不是「每个人有自己的记忆分支」。
-	// 一台机器上跑的记忆就是一份，分支名是它的版本线。
-	persona string
+	// 为什么是单一默认值而不是每用户一份：多用户只表示「哪些人能用
+	// 哪些仓库」，不表示「每个人有自己的分支」。一台机器上跑的记忆
+	// 就是一份，分支名是它的版本线，不是它的身份。
+	defaultBranch string
 
 	// weights 记录哪些块真的被读过。只统计 read，不统计 recall——
 	// recall 只是列出候选，瞄一眼没读说明它没帮上忙。
@@ -136,7 +140,7 @@ type Server struct {
 	// 早先拿整份带时间戳的文件内容算 Git blob hash 做判重，同一段文字
 	// 每次写出来的 created 都不同，哈希永远不相等，去重从未生效。
 	//
-	// 值带分支前缀，避免 chat 分支的同一条把 dev 分支的判掉。
+	// 值带分支前缀，避免不同分支上的同一条互相判掉。
 	dedup sync.Map // "project@branch:h8" -> path
 
 	// lastCommits 记录上次看到的各分支 HEAD（键见 treeHeadKey），用来发现外部提交。
@@ -229,14 +233,28 @@ func New(cfg Config) (*Server, error) {
 		tokens = auth.NewTokenStore(nil)
 	}
 
+	// 默认分支在启动时定一次，而且必须在 Reload 之前：
+	//
+	// Reload 需要它去决定读哪些分支的树。早先把赋值放在 Reload 之后，
+	// 结果首次加载拿到的是空分支，只能靠各处写死的字面量兜底——
+	// 那些兜底分支永远不会被走到，却让人以为默认分支是代码里的常量。
+	branch := cfg.DefaultBranch
+	if branch == "" && cfgFile != nil {
+		branch = cfgFile.Server.DefaultBranch
+	}
+	if branch == "" {
+		branch = gitstore.DefaultBranch
+	}
+
 	s := &Server{
-		cfg:      cfg,
-		dataDir:  cfg.DataDir,
-		weights:  w,
-		projects: NewProjectStore(cfg.DataDir),
-		tokens:   tokens,
-		rev:      rev,
-		cfgFile:  cfgFile,
+		cfg:           cfg,
+		dataDir:       cfg.DataDir,
+		weights:       w,
+		projects:      NewProjectStore(cfg.DataDir),
+		tokens:        tokens,
+		rev:           rev,
+		cfgFile:       cfgFile,
+		defaultBranch: branch,
 
 		listens:   FromConfig(listenBlocks(cfgFile)),
 		bcast:     newBroadcaster(),
@@ -254,18 +272,6 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("构建初始索引: %w", err)
 	}
 
-	// persona 在启动时定一次。
-	//
-	// 只认配置里的 default_persona，别的一概不管：
-	// 分支名是「这份记忆的版本线」，不是「谁在用」。
-	s.mu.Lock()
-	if cfg.DefaultProfile != "" {
-		s.persona = cfg.DefaultProfile
-	} else {
-		s.persona = "zero"
-	}
-	s.mu.Unlock()
-
 	return s, nil
 }
 
@@ -273,7 +279,7 @@ func New(cfg Config) (*Server, error) {
 //
 // 存储层完全是 Git 裸仓库：
 //   - 项目 = <data>/repos/<name>.git，配一个就有，想加几个加几个
-//   - 树来自每个项目的当前分支 refs/heads/<persona>
+//   - 树来自每个项目的当前分支 refs/heads/<defaultBranch>
 //   - 规则与内容的分野写在 tree entry 的 mode 里（100755 = 规则，100644 = 内容）
 //
 // 这里没有「身份」这个概念：分支名只是这份记忆的版本线。
@@ -297,12 +303,9 @@ func (s *Server) Reload() error {
 		}
 	}
 
-	persona := s.persona
-	if persona == "" {
-		persona = "zero"
-	}
+	defaultBranch := s.defaultBranch
 
-	trees, err := s.loadGitTrees(persona)
+	trees, err := s.loadGitTrees(defaultBranch)
 	if err != nil {
 		return err
 	}
@@ -350,16 +353,16 @@ func (s *Server) Reload() error {
 	return nil
 }
 
-// DescribeProfiles 返回一句话的项目概览，供启动日志用。
+// DescribeProjects 返回一句话的项目概览，供启动日志用。
 //
 // 用配置声明的集合，不用磁盘扫描：启动瞬间仓库可能一个都还没建，
 // 但配置里已经声明了项目——打印「无项目」会让人以为配置没生效。
-func (s *Server) DescribeProfiles() string {
+func (s *Server) DescribeProjects() string {
 	projs := s.declaredProjects()
 	if len(projs) == 0 {
 		return "（无项目）"
 	}
-	return fmt.Sprintf("项目 %s（%s）", strings.Join(projs, " "), s.persona)
+	return fmt.Sprintf("项目 %s（%s）", strings.Join(projs, " "), s.defaultBranch)
 }
 
 // Start 按配置里的每个 [[listen]] 块分别起一个监听器。
@@ -413,7 +416,7 @@ func (s *Server) muxFor(blk ListenBlock) http.Handler {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/identity", s.handleIdentity)
-	mux.HandleFunc("/profiles", s.handleProfiles)
+	mux.HandleFunc("/projects", s.handleProjects)
 	mux.HandleFunc("/recall", s.handleRecall)
 	mux.HandleFunc("/mcp", s.handleMCP)
 	mux.HandleFunc("/repos/", s.handleGitHTTP)
@@ -511,15 +514,11 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// 这里曾经有一个 ?profile= 参数，用来「选一份身份档案」。
+	// 注入哪些块完全由这张凭证决定：能力位 x 决定给不给规则，
+	// 挂载表决定看得见哪些项目与分支。没有任何 query 参数能改变它。
 	//
-	// 它是假的：算出来的 persona 只赋给一个再也没被读过的变量，
-	// 过滤条件的真相是挂载表（X-Zero-Role 决定），不是这个 query。
-	// 于是 serve -profile 与 /identity?profile=xxx 都能接受，
-	// 都什么也不做——承诺在那儿，实现不在。
-	//
-	// 现在删掉它。要换身份视角，换角色，不换参数：
-	// 身份由凭证的挂载表表达，不由请求里的一个字符串表达。
+	// 这里曾经有过 ?profile=，它算出一个值再也没被用过——承诺在那儿，
+	// 实现不在。身份是签发时的事，不是请求里的一件事。
 	type block struct {
 		Addr string `json:"addr"`
 		Text string `json:"text"`
@@ -605,7 +604,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(resp)
 }
 
-func (s *Server) handleProfiles(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 	caller, authErr := s.authenticate(r)
 	if authErr != nil {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="zero-memcp"`)
@@ -684,17 +683,17 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 		if len(view) >= req.Limit {
 			break
 		}
-		// 用命中那条自己的分支判权限，不能用 s.persona。
+		// 用命中那条自己的分支判权限，不能用 s.defaultBranch。
 		//
 		// 索引键是 project@branch/path，分支就在地址里。早先一律拿
-		// s.persona（服务端人格分支）去判，后果是所有「不是人格分支」
-		// 的命中在权限层被静默丢弃：chat 角色 put 写进 daily@chat，
+		// s.defaultBranch（服务端默认分支）去判，后果是所有「不是默认分支」
+		// 的命中在权限层被静默丢弃：受限身份把内容写进自己的分支，
 		// read 读得到、log 看得到，recall 却永远无命中——不报错，
 		// 只是搜不到，像一个不会说话的记忆库。
 		proj, br, _, _ := memory.SplitID(h.Addr)
 		if proj == "" {
 			proj = s.projectOfAddr(h.Addr)
-			br = s.persona
+			br = s.defaultBranch
 		}
 		if !s.allowed(caller, proj, br, configBitRead) {
 			continue
@@ -1026,15 +1025,12 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 	verb := parts[0]
 	rest := strings.TrimSpace(strings.TrimPrefix(line, verb))
 
-	// persona 是写入与 branch/tag 类动词的目标分支线。
+	// defaultBranch 是写入与 branch/tag 类动词的目标分支线。
 	//
-	// 唯一来源是服务端的 s.persona（serve -profile 或配置的默认值）。
-	// 曾经还可以从 ?profile= 逐请求覆盖，那条路已经删了：
+	// 唯一来源是服务端的 s.defaultBranch（启动参数或配置里的默认值）。
+	// 没有逐请求覆盖身份的路：
 	// 它让「这条记忆属于谁」看起来是请求属性，而真相是分支。
-	persona := s.persona
-	if persona == "" {
-		persona = "zero"
-	}
+	defaultBranch := s.defaultBranch
 
 	switch verb {
 	case "help":
@@ -1077,7 +1073,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 			proj, br, _, ok := memory.SplitID(addr)
 			if !ok {
 				proj = s.projectOfAddr(addr)
-				br = s.persona
+				br = s.defaultBranch
 			}
 			if !c.Mount.Visible(proj, br) {
 				return false
@@ -1097,16 +1093,16 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		permHits := make([]index.Hit, 0, len(hits))
 		for _, h := range hits {
 			// 命中项的地址形如 project@branch/path——
-			// 必须用它自己的分支判权限，不能用 s.persona。
+			// 必须用它自己的分支判权限，不能用 s.defaultBranch。
 			//
-			// 踩过的坑：早先一律按 s.persona（服务端人格分支）判定，
-			// 于是 chat 角色写进 daily@chat 的内容虽然进了索引，
-			// 却因为「chat 挂载表里没有 zero 分支」被全部过滤掉——
+			// 踩过的坑：早先一律按 s.defaultBranch（服务端默认分支）判定，
+			// 于是受限身份写进自己分支的内容虽然进了索引，
+			// 却因为「它的挂载表里没有那条分支」被全部过滤掉——
 			// 症状是 recall 永远「无命中」，而内容明明写成功了。
 			proj, br, _, ok := memory.SplitID(h.Addr)
 			if !ok {
 				proj = s.projectOfAddr(h.Addr)
-				br = s.persona
+				br = s.defaultBranch
 			}
 			if s.allowed(c, proj, br, configBitRead) {
 				permHits = append(permHits, h)
@@ -1125,7 +1121,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		for _, h := range hits {
 			_, hbr, _, okBr := memory.SplitID(h.Addr)
 			if !okBr {
-				hbr = s.persona
+				hbr = s.defaultBranch
 			}
 			virt := s.addrToVirtual(h.Addr, hbr, c)
 			if virt == "" {
@@ -1248,12 +1244,12 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 
 	case "branch":
 		// branch [<project> [<new> [from <src>]]]
-		out, err := s.execBranch(rest, c, persona)
+		out, err := s.execBranch(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "tag":
 		// tag [-d] <project> [<name> [<ref>]]
-		out, err := s.execTag(rest, c, persona)
+		out, err := s.execTag(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "cp":
@@ -1268,12 +1264,12 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 
 	case "chmod":
 		// chmod <project>[@<branch>]/<path> rule|content
-		out, err := s.execChmod(rest, c, persona)
+		out, err := s.execChmod(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "delete":
 		// delete <project>@<branch>/<path> [...]
-		out, err := s.execDelete(rest, c, persona)
+		out, err := s.execDelete(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "lock":
@@ -1298,22 +1294,22 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 
 	case "batch":
 		// batch {"ops":[{...}]}
-		out, err := s.execBatch(rest, c, persona)
+		out, err := s.execBatch(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "diff":
 		// diff <project>@<branch>  或  diff a@br -> b@br
-		out, err := s.execDiff(rest, c, persona)
+		out, err := s.execDiff(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "commit":
 		// commit [<project>[@<branch>]] [-m <msg>]
-		out, err := s.execCommit(rest, c, persona)
+		out, err := s.execCommit(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "write":
 		// write <project>[@<branch>]/<path> -- <内容>
-		out, err := s.execWrite(rest, c, persona)
+		out, err := s.execWrite(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "config":
@@ -1704,18 +1700,6 @@ func (s *Server) execLs(day string, c Caller) (string, error) {
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
 
-// handleProfileSub 处理 /profiles/<name>/ensure。
-
-// EnsureProfile 确保某份身份存在。
-//
-// 如果已存在：幂等返回。
-// 如果不存在且有 MemoriesRoot：从模板或内建骨架创建，然后重扫。
-// 没有 MemoriesRoot 时报错——单身份模式不支持运行时加身份。
-
-// provisionTemplate 填充一个新身份目录的骨架。
-
-// copyDir 递归复制目录
-
 // ── 逻辑时钟（进程内 atomic）──────────────────────────────────
 //
 // 唯一职责：告诉客户端「你上次看过之后，有人写过东西」。
@@ -1732,7 +1716,7 @@ func (s *Server) bumpClock() int64 {
 
 // ExecLine 执行一行记忆 DSL，返回文本结果。
 //
-// 这是给内嵌调用者使用的快捷入口：它用 root 权限、默认人格、
+// 这是给内嵌调用者使用的快捷入口：它用 root 权限、默认分支、
 // 无端口策略约束直接跑一条动词。宿主如果自己已经做了鉴权，就不需要
 // 再走一遍 HTTP 中间件；如果它需要收窄，可以通过带上下文的变种调。
 func (s *Server) ExecLine(ctx context.Context, line string) (string, error) {

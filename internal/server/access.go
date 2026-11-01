@@ -38,7 +38,7 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 	//
 	// 两处来源取交集：凭证级 cap（整张凭证的天花板）与
 	// 该挂载点的 cap（这一个仓库的天花板）。这样一张凭证就能表达
-	// 「写自己的仓库、只读 daily」，不必为此发两张。
+	// 「写自己的仓库、别处只读」，不必为此发两张。
 	effective := c.Cap
 	if pc := c.Mount.CapOf(project, branch); pc != "" {
 		effective = intersectCap(c.Cap, pc)
@@ -61,44 +61,14 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 	if !config.Check(s.cfgIndex(), c.User, project, perm) {
 		return false
 	}
-	// 配置层：角色也要过一遍。
-	//
-	// 为什么必须有这一步：凭证的 sub 是「这张 token 是谁签的」，
-	// 角色是「这次请求以谁的名义做」。两者不是一回事——sub 是 root，
-	// 而 X-Zero-Role: chat 要的是一份受限视角。只看 sub 的话，
-	// TOML 里 [[access]] user="chat" perm="r" 这行永远不会被查到，
-	// chat 于是拿着 root 的配置层权限写进了只该读的仓库。
-	//
-	// 取交集而不是替换：凭证只能收窄、不能放宽，这条不变。
-	// 角色名在配置里没声明为 [[user]] 时跳过——那是纯凭证层的角色，
-	// 权限已经由挂载表和 cap 定死，不为它凭空造一个用户。
-	if s.roleNarrows(c) && !config.Check(s.cfgIndex(), c.Role, project, perm) {
-		return false
-	}
 	return true
-}
-
-// roleNarrows 报告本次请求要不要额外拿角色名去配置层判一遍。
-//
-// 三个条件缺一不可：请求选了角色、角色名与凭证主体不同（否则判的是
-// 同一个人，白跑一次）、而且这个名字在 TOML 里真的被声明成了 [[user]]
-// （没声明的角色只是凭证里的能力包，配置层没有它的档案，不能凭空造）。
-func (s *Server) roleNarrows(c Caller) bool {
-	if c.Role == "" || c.Role == c.User {
-		return false
-	}
-	_, ok := s.cfgIndex().User(c.Role)
-	return ok
 }
 
 // projectWritableFor 报告凭证是否至少能写该项目的一条已存在分支。
 func (s *Server) projectWritableFor(c Caller, project string) bool {
 	repo, err := s.projects.Get(project)
 	if err != nil {
-		branch := s.persona
-		if branch == "" {
-			branch = "zero"
-		}
+		branch := s.defaultBranch
 		return s.allowed(c, project, branch, configBitWrite)
 	}
 	refs, err := repo.Refs("refs/heads/")
@@ -106,10 +76,7 @@ func (s *Server) projectWritableFor(c Caller, project string) bool {
 		return false
 	}
 	if len(refs) == 0 {
-		branch := s.persona
-		if branch == "" {
-			branch = "zero"
-		}
+		branch := s.defaultBranch
 		return s.allowed(c, project, branch, configBitWrite)
 	}
 	for _, ref := range refs {
@@ -149,7 +116,7 @@ func (s *Server) requireRootCap(c Caller, bit rune) error {
 // requireRootGlobal 用于没有项目路径的全局管理资源（配置、用户、密钥库、reload）。
 //
 // 与 requireRootCap 的差别就是多一条「这张凭证没被限制过」：
-// 一张只给 daily@zero 读的凭证，主体仍然是 root 用户，只查 Root+cap
+// 一张只读某个项目某分支的凭证，主体仍然是 root 用户，只查 Root+cap
 // 就会让它列密钥名、读全局配置——而它被签发时那条限制的本意，
 // 就是「这张纸只管那一摊」。项目内的管理动词走 requireRootAccess，
 // 那里挂载本来就是判定的一部分，不受这条影响。
@@ -191,9 +158,6 @@ func (s *Server) denyReason(c Caller, project, branch string, perm uint8) string
 	}
 	// 被角色挡住时要说清是角色挡的，否则排查时只会看到
 	// 「root 为什么被拒」这种没法解释的结论。
-	if s.roleNarrows(c) && !config.Check(s.cfgIndex(), c.Role, project, perm) {
-		return fmt.Sprintf("角色 %q：%s", c.Role, config.Explain(s.cfgIndex(), c.Role, project, perm))
-	}
 	return config.Explain(s.cfgIndex(), c.User, project, perm)
 }
 

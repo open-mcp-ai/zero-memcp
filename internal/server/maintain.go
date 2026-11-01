@@ -96,7 +96,7 @@ func (s *Server) maintain() {
 				// 提交策略：脏层不会永远留着。
 				//
 				// 为什么需要它：put 只投递，如果没人折叠，脏文件会无限增长，
-				// 而外部 git clone 永远看不到新内容。让「另一个 root agent
+				// 而外部 git clone 永远看不到新内容。让「另一个管理员
 				// 来手动 commit」不现实——没人会为一个普通写入去担这个责任。
 				//
 				// 两条触发条件，任一满足就折叠：
@@ -179,7 +179,7 @@ func (s *Server) checkExternalUpdates() {
 	if s.cfg.DataDir == "" {
 		return
 	}
-	// 检查所有分支，不只 persona：chat 在 daily@chat 写东西、
+	// 检查所有分支，不只 defaultBranch：受限角色在自己分支上写东西、
 	// 或外部 git push 推进了某条分支，都应该被感知并触发 Reload。
 	current := s.treeHeadsSnapshot()
 	changed := false

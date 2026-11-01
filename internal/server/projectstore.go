@@ -16,7 +16,7 @@ import (
 // 对应关系：
 //   - 配置文件里的 [[project]] 声明了每个项目的名字、属主和 mode
 //   - 磁盘上对应的目录是 <data>/repos/<name>.git
-//   - 每个人格对应仓库里的一个分支（refs/heads/<persona>）
+//   - 每条版本线对应仓库里的一个分支（refs/heads/<name>）
 type ProjectStore struct {
 	dataDir string
 

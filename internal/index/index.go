@@ -103,7 +103,7 @@ func (ix *Index) SearchWeighted(query string, limit int, idfFloor float64, wf We
 // SearchWeightedFiltered 按照 filter 预筛选候选集合，再做 BM25 打分与排序。
 //
 // 为什么必须在打分前过滤，而不是打完分之后再抛弃：
-// 当索引包含多个分支（zero/chat/dev）时，如果不加过滤，全局 top-N
+// 当索引包含多个分支时，如果不加过滤，全局 top-N
 // 很容易全被其他分支的同名词占满——随后的权限过滤把它们全部拦下，
 // 最终返回「无命中」。
 //

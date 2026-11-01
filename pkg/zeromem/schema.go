@@ -21,7 +21,7 @@ const memToolDescription = `我的持久记忆体。写入即入队，立即可�
 正文用 vars / args 传，引用必须独占一个词：
   {"cmd": "put team/chat -- $TEXT", "vars": {"TEXT": "正文"}}
 
-多分支是多人格/多端点协作的物理基础：
+多分支是多端点协作的物理基础：
   commit / branch / diff / cp / mv / tag / delete / archive / reset / lock / unlock / batch
 
 什么时候用哪个：问「关于 X 我之前怎么想的」→ recall；

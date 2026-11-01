@@ -10,7 +10,7 @@ import (
 )
 
 // loadGitTrees 按分支扫描所有项目，构建内存树。
-func (s *Server) loadGitTrees(persona string) ([]*memory.Tree, error) {
+func (s *Server) loadGitTrees(defaultBranch string) ([]*memory.Tree, error) {
 	projects, err := s.projects.Projects()
 	if err != nil {
 		return nil, err
@@ -23,26 +23,25 @@ func (s *Server) loadGitTrees(persona string) ([]*memory.Tree, error) {
 			return nil, fmt.Errorf("打开项目 %s: %w", proj, err)
 		}
 
-		// 索引所有分支，不只 persona。
+		// 索引所有分支，不只 defaultBranch。
 		//
-		// 为什么必须这样：角色是按分支划分的（chat 写 daily@chat、
-		// dev 写 daily@dev）。只索引 persona 的话，chat 角色写进
-		// chat 分支的内容永远搜不到——写成功、read 读得到、
+		// 为什么必须这样：权限是按分支划分的。只索引 defaultBranch 的话，
+		// 受限身份写进其他分支的内容永远搜不到——写成功、read 读得到、
 		// recall 无命中，一个不报错的静默失效。
 		//
 		// 索引是纯内存派生物，多扫几个分支的代价只是启动时多几百毫秒。
 		branches := repo.Branches()
 		if len(branches) == 0 {
-			branches = []string{persona}
+			branches = []string{defaultBranch}
 		}
-		// 把 persona 和 pending 里的分支也带上（可能是还没提交的新分支）
+		// 把 defaultBranch 和 pending 里的分支也带上（可能是还没提交的新分支）
 		seen := map[string]bool{}
 		for _, b := range branches {
 			seen[b] = true
 		}
-		if !seen[persona] {
-			branches = append(branches, persona)
-			seen[persona] = true
+		if !seen[defaultBranch] {
+			branches = append(branches, defaultBranch)
+			seen[defaultBranch] = true
 		}
 		for _, b := range repo.PendingRefs() {
 			if !seen[b] {
@@ -67,23 +66,23 @@ func (s *Server) loadGitTrees(persona string) ([]*memory.Tree, error) {
 }
 
 // scanGitProject 把一个仓库的一个分支读成内存树。
-func (s *Server) scanGitProject(repo *gitstore.Repo, project, persona string) (*memory.Tree, error) {
-	entries, err := repo.List(persona)
+func (s *Server) scanGitProject(repo *gitstore.Repo, project, defaultBranch string) (*memory.Tree, error) {
+	entries, err := repo.List(defaultBranch)
 	if err != nil {
 		return nil, err
 	}
 
-	t := &memory.Tree{Project: project, Branch: persona}
+	t := &memory.Tree{Project: project, Branch: defaultBranch}
 	for _, e := range entries {
 		path := e.Path
 		r := repo
 		read := func() ([]byte, error) {
-			return r.Read(persona, path)
+			return r.Read(defaultBranch, path)
 		}
 
 		block := memory.Block{
 			Project: project,
-			Branch:  persona,
+			Branch:  defaultBranch,
 			Path:    path,
 			Size:    e.Size,
 			Time:    e.Time,
@@ -140,7 +139,7 @@ func (s *Server) scanGitProject(repo *gitstore.Repo, project, persona string) (*
 	//
 	// 判据来自 SKILL.md 自己写的那句「按文件名顺序读就是全文」——
 	// 也就是说 01-rebuilt.md、02-shape.md … 和 SKILL.md 合起来才是
-	// 一份完整的人格。只注入目录索引而不注入正文，等于给了目录
+	// 一份完整的规则集。只注入目录索引而不注入正文，等于给了目录
 	// 却不给内容：模型知道"有 6 个文件"，但一个字都看不到。
 	ruleDirs := map[string]bool{}
 	for _, b := range t.Blocks {

@@ -38,22 +38,18 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 		return "", "", "", errors.New("文本不能为空")
 	}
 
-	persona := s.persona
-	if persona == "" {
-		persona = "zero"
-	}
-	// 写入分支：显式挂载点优先，否则用默认人格分支。
-	writeBranch := persona
+	defaultBranch := s.defaultBranch
+	// 写入分支：显式挂载点优先，否则用默认分支。
+	writeBranch := defaultBranch
 	if !c.Mount.Empty() {
 		writeBranch = c.Mount.DefaultBranch()
 	}
 
 	// 显式目标里写了 @<branch> 时，分支也跟着它走。
 	//
-	// 这是审计 Agent 的关键路径：它读完脏流，要把提纯后的内容写进
-	// main / dev / chat / private 中的某一条，而它自己的人格分支
-	// 跟这些都不是一回事。没有 @branch，它只能往自己分支上写，
-	// 然后再多一步 mv——两跳之间被杀就留下半吊子状态。
+	// 这是跨分支搬运的关键路径：调用方要把内容写进另一条版本线，
+	// 而它的默认分支跟那条不是一回事。没有 @branch，它只能往自己
+	// 分支上写，再多一步 mv——两跳之间被杀就留下半吊子状态。
 	if explicit != "" {
 		if at := strings.Index(explicit, "@"); at >= 0 {
 			proj := explicit[:at]
@@ -74,13 +70,13 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 
 	// 写入目标必须同时满足三件事：挂载表可见、有写权限、配置里声明过。
 	// 取「全局第一个项目」是错的——那张凭证可能根本看不见它。
-	targetProject, resolvedBranch, pol, err := s.resolveWriteTarget(c, persona, explicit)
+	targetProject, resolvedBranch, pol, err := s.resolveWriteTarget(c, defaultBranch, explicit)
 	if err != nil {
 		return "", "", "", err
 	}
-	// 挂载表解析出的分支优先：chat 角色的 /daily 指向 daily@chat，
-	// 而不是它的人格分支 zero。忽略它会让「用 chat 身份写」
-	// 全都落进 zero 分支，权限看着对、内容却混在一起。
+	// 挂载表解析出的分支优先：一张挂在某条分支上的凭证，它的虚拟路径
+	// 指向的就是那条分支，而不是服务端默认分支。忽略它会让写入全都落进
+	// 默认分支——权限看着对，内容却和别人的混在一起。
 	if resolvedBranch != "" {
 		writeBranch = resolvedBranch
 	}
@@ -175,7 +171,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	//
 	// 键必须带分支（project@branch/path），与启动时索引重建（b.ID()）保持同构。
 	// 早先传不带分支的 targetProject + "/" + path，导致刚写进去的切片在
-	// recall 里拆不出分支，被当作默认分支走权限判定——如果是 chat 角色，
+	// recall 里拆不出分支，被当作默认分支走权限判定——如果是 受限角色，
 	// 立刻被误杀成「无权查看该分支」，直到重启重建索引才恢复。
 	blockID := targetProject + "@" + writeBranch + "/" + path
 	s.mu.Lock()
@@ -197,19 +193,19 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 //
 // 三者缺一不可。早先的实现取「s.trees 里第一个项目」，于是受限凭证
 // 会被告知「项目 X 不在你的可见范围内」——而它其实有别的可写仓库。
-func (s *Server) writeTarget(c Caller, persona string) (project, branch string, pol manifest.Policy, err error) {
+func (s *Server) writeTarget(c Caller, defaultBranch string) (project, branch string, pol manifest.Policy, err error) {
 	// 候选是「(项目, 分支)」而不是光秃秃的项目名。
 	//
 	// 踩过的坑：早先只按 c.Mount.DefaultBranch()（恒为 zero）判可写，
-	// 而 chat 角色的挂载表里只有 chat/main/*，没有 zero 分支——
-	// 于是它明明能写 daily@chat，却被告知「没有任何可写的仓库」。
+	// 而它的挂载表里只有自己那几条分支——于是它明明能写，
+	// 却被告知「没有任何可写的仓库」。
 	//
 	// 分支不是可以默认的东西：写哪个分支，取决于挂载表怎么说。
 	var cands []string
 	var pairs []writeCand
 
 	if c.Mount.Empty() {
-		branch := persona
+		branch := defaultBranch
 		for _, p := range s.declaredProjects() {
 			if s.allowed(c, p, branch, configBitWrite) {
 				cands = append(cands, p)
@@ -258,7 +254,7 @@ func (s *Server) writeTarget(c Caller, persona string) (project, branch string, 
 	}
 	if len(streams) == 1 {
 		pol, _ := s.policyOf(streams[0])
-		return streams[0], branchOf(pairs, streams[0], persona), pol, nil
+		return streams[0], branchOf(pairs, streams[0], defaultBranch), pol, nil
 	}
 	if len(streams) > 1 {
 		// 多个流水项目 = 意图不明。此时沉默地选一个，等于让
@@ -274,7 +270,7 @@ func (s *Server) writeTarget(c Caller, persona string) (project, branch string, 
 			pol := v.(manifest.Policy)
 			// SKILL.md 可以指向别的仓库，但目标必须同样可见且可写，
 			// 否则回落到它自己——规则不能把写入引到凭证看不见的地方。
-			br := branchOf(pairs, p, persona)
+			br := branchOf(pairs, p, defaultBranch)
 			if pol.Target != p && pol.Target != "" {
 				if c.Mount.Visible(pol.Target, br) && s.allowed(c, pol.Target, br, configBitWrite) {
 					return pol.Target, branchOf(pairs, pol.Target, br), pol, nil
@@ -284,7 +280,7 @@ func (s *Server) writeTarget(c Caller, persona string) (project, branch string, 
 			return p, br, pol, nil
 		}
 	}
-	return cands[0], branchOf(pairs, cands[0], persona), manifest.Default(cands[0]), nil
+	return cands[0], branchOf(pairs, cands[0], defaultBranch), manifest.Default(cands[0]), nil
 }
 
 // writeCand 是一个可写的 (项目, 分支) 组合。
@@ -295,9 +291,9 @@ type writeCand struct {
 
 // branchOf 找出某个项目在这张凭证下真正可写的分支。
 //
-// 不返回 Mount.DefaultBranch()：那是「人格分支」，与「这张凭证
-// 被授权写哪个分支」是两件事。chat 角色的人格分支是 zero，
-// 但它能写的只有 daily@chat。
+// 不返回 Mount.DefaultBranch()：那是「默认分支」，与「这张凭证
+// 被授权写哪个分支」是两件事。受限角色的默认分支是 zero，
+// 但它能写的只有挂载表里那条。
 func branchOf(pairs []writeCand, project, fallback string) string {
 	for _, p := range pairs {
 		if p.project == project {
@@ -320,20 +316,20 @@ func (s *Server) policyOf(project string) (manifest.Policy, bool) {
 // explicit 非空时必须命中它：指定了目标却写到别处，等于悄悄改主意。
 // 没有权限就拒绝，绝不回落到另一个仓库——那会让「我明明写这个仓库，
 // 结果写进了那个」变成一次无从察觉的事故。
-func (s *Server) resolveWriteTarget(c Caller, persona, explicit string) (string, string, manifest.Policy, error) {
+func (s *Server) resolveWriteTarget(c Caller, defaultBranch, explicit string) (string, string, manifest.Policy, error) {
 	if explicit == "" {
-		p, br, pol, err := s.writeTarget(c, persona)
+		p, br, pol, err := s.writeTarget(c, defaultBranch)
 		if err != nil {
 			return "", "", manifest.Policy{}, err
 		}
 		return p, br, pol, nil
 	}
 
-	// 挂载表优先：调用方传的是虚拟路径（例如 /daily、/me），
+	// 挂载表优先：调用方传的是虚拟路径，
 	// 挂载表把它翻译成真实项目和分支。
 	//
 	// 必须优先走它：否则挂载表定义的虚拟根没有任何意义——
-	// 模型看见的是 /daily，写的时候却被逼着知道全名 blackegg/daily。
+	// 调用方看见的是虚拟路径，写的时候却被逼着知道真实项目全名。
 	var mountBranch string
 	if !c.Mount.Empty() {
 		if realProj, realBranch, _, err := c.Mount.ToReal(explicit); err == nil && realProj != "" {
@@ -355,7 +351,7 @@ func (s *Server) resolveWriteTarget(c Caller, persona, explicit string) (string,
 	if !ok || project == "" {
 		return "", "", manifest.Policy{}, fmt.Errorf("目标 %q 不是已声明的项目", explicit)
 	}
-	branch := persona
+	branch := defaultBranch
 	if mountBranch != "" {
 		branch = mountBranch
 	} else if !c.Mount.Empty() {
@@ -390,16 +386,6 @@ func capOf(c Caller) string {
 		return "（空）"
 	}
 	return string(out)
-}
-
-// policyFor 返回写入策略（兼容旧调用点，默认对全局视角）。
-func (s *Server) policyFor(persona string) manifest.Policy {
-	p, _, pol, err := s.writeTarget(Caller{User: "root", Root: true, Cap: "rwx"}, persona)
-	if err != nil {
-		return manifest.Default("daily")
-	}
-	_ = p
-	return pol
 }
 
 // dedupKey 计算一条记忆的语义指纹。

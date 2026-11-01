@@ -84,8 +84,8 @@ func (s *Server) declaredProjects() []string {
 func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path string, err error) {
 	// 地址里显式写了 @<branch> 时直接用它，绕过挂载表的默认分支。
 	//
-	// 为什么这条通道必须存在：审计 Agent 要读「别人分支上的脏流」，
-	// 清理者要读「冻结批次」，这些都不是它自己的人格分支。没有它，
+	// 为什么这条通道必须存在：要读「别人分支上的脏流」，
+	// 清理者要读「冻结批次」，这些都不是它自己的默认分支。没有它，
 	// 跨分支协作就只能靠发一堆 token，而 token 是有过期的。
 	// 权限不收窄——下面仍然逐条走 allowed()。
 	if strings.Contains(addr, "@") {
@@ -105,10 +105,7 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 	if derr != nil {
 		return "", "", "", derr
 	}
-	br := s.persona
-	if br == "" {
-		br = "zero"
-	}
+	br := s.defaultBranch
 	return proj, br, p, nil
 }
 
@@ -136,10 +133,7 @@ func (s *Server) splitAddrPwd(addr, pwd string) (project, path string, err error
 		for _, p := range projects {
 			if strings.HasPrefix(p, org+"/") {
 				if r, rerr := s.projects.Get(p); rerr == nil {
-					br := s.persona
-					if br == "" {
-						br = "zero"
-					}
+					br := s.defaultBranch
 					if _, ferr := r.Read(br, subPath); ferr == nil {
 						subMatch = p
 						subMatchCount++
@@ -178,10 +172,7 @@ func (s *Server) splitAddrPwd(addr, pwd string) (project, path string, err error
 	matchCount := 0
 	for _, p := range projects {
 		if r, rerr := s.projects.Get(p); rerr == nil {
-			br := s.persona
-			if br == "" {
-				br = "zero"
-			}
+			br := s.defaultBranch
 			if _, ferr := r.Read(br, clean); ferr == nil {
 				matchProj = p
 				matchCount++

@@ -39,10 +39,10 @@ func TestReadReinforcesRecall(t *testing.T) {
 	}
 
 	srv, err := New(Config{
-		DataDir:        dataDir,
-		DefaultProfile: "zero",
-		Listen:         "127.0.0.1:0",
-		WeightsPath:    stateFile,
+		DataDir:       dataDir,
+		DefaultBranch: "zero",
+		Listen:        "127.0.0.1:0",
+		WeightsPath:   stateFile,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

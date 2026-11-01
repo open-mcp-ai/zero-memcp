@@ -11,111 +11,82 @@ import (
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
-// 调一次工具，带上角色 header。
-func callWithRole(t *testing.T, srv *Server, token, role, cmd string) (string, error) {
-	t.Helper()
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":"` + cmd + `"}}}`
-	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
-	req.RemoteAddr = "127.0.0.1:12345"
-	req.Header.Set("Authorization", "Bearer "+token)
-	if role != "" {
-		req.Header.Set("X-Zero-Role", role)
-	}
-	rec := httptest.NewRecorder()
-	srv.handleMCP(rec, req)
+// 身份由凭证在签发时定死，不由请求头切换。
+//
+// 这条测试盯的是「身份不是鉴权机制」这个边界：一张凭证的 cap 与挂载表
+// 就是它全部的世界，任何请求头都不该让这个世界变大。想换视角就换凭证。
 
-	if rec.Code == http.StatusUnauthorized {
-		return "", errString(strings.TrimSpace(rec.Body.String()))
-	}
-	return mcpText(t, rec.Body.Bytes())
-}
-
-type errString string
-
-func (e errString) Error() string { return string(e) }
-
-// 一张凭证带多个角色，按 header 切换；每个角色看到的世界不同。
-func TestRolesSwitchByHeader(t *testing.T) {
+// 一张凭证一个视角：挂载表决定看得见什么。
+func TestCredentialDefinesSingleView(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 
-	tok := mintRestricted(t, dataDir, auth.Claims{
-		Sub:     "zero",
-		Default: "chat",
-		Roles: map[string]auth.Role{
-			"chat": {
-				Cap:   "rw",
-				Mount: []auth.MountPoint{{Project: "blackegg/daily", At: "/"}},
-			},
-			"dev": {
-				Cap: "rw",
-				Mount: []auth.MountPoint{
-					{Project: "blackegg/me", At: "/"},
-					{Project: "blackegg/daily", At: "/daily", Cap: "r"},
-				},
-			},
-		},
+	// 只挂 daily 的凭证。
+	dailyOnly := mintRestricted(t, dataDir, auth.Claims{
+		Sub:   "zero",
+		Cap:   "rw",
+		Mount: []auth.MountPoint{{Project: "blackegg/daily", At: "/"}},
 	})
 
-	// chat 角色：只有 daily
-	out, err := callWithRole(t, srv, tok, "chat", "read today.md")
+	out, err := callMCP(t, srv, dailyOnly, "read today.md")
 	if err != nil || !strings.Contains(out, "今天") {
-		t.Fatalf("chat 角色应能读 daily: %v, out=%s", err, out)
+		t.Fatalf("应能读挂载内的 daily: %v, out=%s", err, out)
 	}
-	// chat 角色看不到 me
-	out, _ = callWithRole(t, srv, tok, "chat", "read 01-shape.md")
+	// 挂载外的东西完全不可见。
+	out, _ = callMCP(t, srv, dailyOnly, "read 01-shape.md")
 	if strings.Contains(out, "形状") {
-		t.Fatalf("chat 角色不该看到 blackegg/me: %s", out)
+		t.Fatalf("不该看到挂载外的 blackegg/me: %s", out)
 	}
 
-	// dev 角色：能看到 me，也能读 daily
-	out, err = callWithRole(t, srv, tok, "dev", "read 01-shape.md")
-	if err != nil || !strings.Contains(out, "形状") {
-		t.Fatalf("dev 角色应能读 blackegg/me: %v, out=%s", err, out)
-	}
-	out, err = callWithRole(t, srv, tok, "dev", "read daily/today.md")
-	if err != nil || !strings.Contains(out, "今天") {
-		t.Fatalf("dev 角色应能读 daily: %v, out=%s", err, out)
-	}
-
-	// 没指定角色 → 用 Default(chat)
-	out, err = callWithRole(t, srv, tok, "", "read today.md")
-	if err != nil || !strings.Contains(out, "今天") {
-		t.Fatalf("默认角色应生效: %v, out=%s", err, out)
-	}
-}
-
-// 未知角色必须拒绝，不能回落到默认。
-func TestUnknownRoleRejected(t *testing.T) {
-	srv, dataDir := setupMountServer(t)
-	tok := mintRestricted(t, dataDir, auth.Claims{
-		Sub:     "zero",
-		Default: "chat",
-		Roles: map[string]auth.Role{
-			"chat": {Cap: "r", Mount: []auth.MountPoint{{Project: "blackegg/me", At: "/"}}},
-		},
-	})
-	_, err := callWithRole(t, srv, tok, "admin", "read 01-shape.md")
-	if err == nil || !strings.Contains(err.Error(), "未知角色") {
-		t.Fatalf("未知角色应被拒绝，实际: %v", err)
-	}
-}
-
-// 定义了角色但没默认、请求也不给 → 拒绝，不猜。
-func TestRolesWithoutDefaultRejected(t *testing.T) {
-	srv, dataDir := setupMountServer(t)
-	tok := mintRestricted(t, dataDir, auth.Claims{
+	// 想要另一个视角，就再签一张——而不是给同一张加 header。
+	meAndDaily := mintRestricted(t, dataDir, auth.Claims{
 		Sub: "zero",
-		Roles: map[string]auth.Role{
-			"chat": {Cap: "r", Mount: []auth.MountPoint{{Project: "blackegg/me", At: "/"}}},
+		Cap: "rw",
+		Mount: []auth.MountPoint{
+			{Project: "blackegg/me", At: "/"},
+			{Project: "blackegg/daily", At: "/daily", Cap: "r"},
 		},
 	})
-	_, err := callWithRole(t, srv, tok, "", "read 01-shape.md")
-	if err == nil || !strings.Contains(err.Error(), "没指定") {
-		t.Fatalf("无默认角色时应拒绝，实际: %v", err)
+	out, err = callMCP(t, srv, meAndDaily, "read 01-shape.md")
+	if err != nil || !strings.Contains(out, "形状") {
+		t.Fatalf("第二张凭证应能读 blackegg/me: %v, out=%s", err, out)
+	}
+	out, err = callMCP(t, srv, meAndDaily, "read daily/today.md")
+	if err != nil || !strings.Contains(out, "今天") {
+		t.Fatalf("第二张凭证应能读 daily: %v, out=%s", err, out)
 	}
 }
 
-// 同一张凭证内，挂载点 cap 生效：写自己的仓库可以，写 daily 不行。
+// 请求头不能改变身份：带什么 header 都还是同一张凭证的世界。
+func TestRoleHeaderHasNoEffect(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+
+	tok := mintRestricted(t, dataDir, auth.Claims{
+		Sub:   "zero",
+		Cap:   "r",
+		Mount: []auth.MountPoint{{Project: "blackegg/daily", At: "/"}},
+	})
+
+	// 带任意角色 header，都仍然使用同一张凭证的身份与挂载范围。
+	for _, role := range []string{"admin", "root", "zero", "dev", "owner"} {
+		req := httptest.NewRequest(http.MethodGet, "/identity", nil)
+		req.RemoteAddr = "127.0.0.1:12345"
+		req.Header.Set("Authorization", "Bearer "+tok)
+		req.Header.Set("X-Zero-Role", role)
+		c, err := srv.authenticate(req)
+		if err != nil {
+			t.Fatalf("header %q 不该导致鉴权失败: %v", role, err)
+		}
+		// 世界没变：仍然只有 daily。
+		if !c.Mount.Visible("blackegg/daily", "zero") {
+			t.Errorf("header %q 改变了可见范围", role)
+		}
+		if c.Mount.Visible("blackegg/me", "zero") {
+			t.Errorf("header %q 越权看到了挂载外项目", role)
+		}
+	}
+}
+
+// 同一张凭证内，挂载点 cap 生效：写自己的仓库可以，写别处不行。
 func TestPerMountCap(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 	tok := mintRestricted(t, dataDir, auth.Claims{
@@ -153,9 +124,9 @@ func TestIntersectCap(t *testing.T) {
 	}
 }
 
-// TOML 里配了 [[access]] user="chat" perm="r"，
-// 即使凭证来自 sub="zero"(root)，切到 chat 角色写 daily 也必须被拦下。
-func TestRoleNarrowsByTomlAccess(t *testing.T) {
+// 凭证只能收窄，不能放宽：TOML 里给某个用户配了只读，
+// 即使它的凭证 cap=rwx，写入也必须被配置层拦下。
+func TestConfigLayerNarrowsCredential(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
@@ -166,7 +137,7 @@ name = "zero"
 root = true
 
 [[user]]
-name = "chat"
+name = "reader"
 
 [[project]]
 name  = "blackegg/daily"
@@ -174,7 +145,7 @@ owner = "zero"
 mode  = "rwx------"
 
 [[access]]
-user    = "chat"
+user    = "reader"
 project = "blackegg/daily"
 perm    = "r"
 `
@@ -201,70 +172,53 @@ perm    = "r"
 	}
 	defer srv.Close()
 
+	// reader 的凭证自身给了 rwx，但配置层只给 r。
 	tok := mintRestricted(t, dataDir, auth.Claims{
-		Sub:     "zero",
-		Default: "chat",
-		Roles: map[string]auth.Role{
-			"chat": {
-				Cap:   "rwx",
-				Mount: []auth.MountPoint{{Project: "blackegg/daily", At: "/"}},
-			},
-		},
+		Sub:   "reader",
+		Cap:   "rwx",
+		Mount: []auth.MountPoint{{Project: "blackegg/daily", At: "/"}},
 	})
 
-	// chat 读：允许
-	out, err := callWithRole(t, srv, tok, "chat", "read today.md")
+	out, err := callMCP(t, srv, tok, "read today.md")
 	if err != nil || !strings.Contains(out, "今天") {
-		t.Fatalf("chat 角色应能读 daily: %v, out=%s", err, out)
+		t.Fatalf("reader 应能读 daily: %v, out=%s", err, out)
 	}
 
-	// chat 写：TOML 明确只给 r，即使 sub=zero 也必须被拦下
-	_, err = callWithRole(t, srv, tok, "chat", "put -- 试写")
-	if err == nil {
-		t.Fatal("chat 角色只有 r 权限，写 daily 必须被拒绝")
+	if _, err := callMCP(t, srv, tok, "put -- 试写"); err == nil {
+		t.Fatal("配置层只给 r，写入必须被拒绝（凭证不能放宽配置）")
 	}
-	if !strings.Contains(err.Error(), "没有任何可写的仓库") {
-		t.Fatalf("应拒绝写入并提示无可写仓库，实际: %v", err)
-	}
-
-	// 显式指定 blackegg/daily 也必须被拒绝，并说清缺少 w
-	_, err = callWithRole(t, srv, tok, "chat", "put blackegg/daily -- 试写")
-	if err == nil {
-		t.Fatal("显式指定目标也必须被拒绝")
-	}
-	if !strings.Contains(err.Error(), "chat") || !strings.Contains(err.Error(), "缺少 w") {
-		t.Fatalf("显式指定拒绝理由应指明角色缺少 w，实际: %v", err)
+	if _, err := callMCP(t, srv, tok, "put blackegg/daily -- 试写"); err == nil {
+		t.Fatal("显式指定目标也必须被配置层拒绝")
 	}
 }
 
 // recall 必须按命中自己所在的分支判权限。
 //
-// 踩过的坑：handleRecall 一律拿 s.persona 去判，于是「不在人格分支上」
-// 的命中被权限层静默过滤。症状是 chat 角色 put 写进去、read 读得到、
+// 踩过的坑：handleRecall 一律拿 s.defaultBranch 去判，于是「不在默认分支上」
+// 的命中被权限层静默过滤。症状是受限身份 put 写进去、read 读得到、
 // log 看得到，recall 却永远无命中——不报错，只是搜不到。
 func TestRecallUsesHitBranch(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 
+	// 这张凭证挂的是 daily 的 chat 分支，不是默认分支。
 	tok := mintRestricted(t, dataDir, auth.Claims{
 		Sub: "zero",
-		Roles: map[string]auth.Role{
-			"chat": {Cap: "rwx", Mount: []auth.MountPoint{
-				{Project: "blackegg/daily", At: "/", Branch: "chat", Cap: "rw"},
-			}},
+		Cap: "rwx",
+		Mount: []auth.MountPoint{
+			{Project: "blackegg/daily", At: "/", Branch: "chat", Cap: "rw"},
 		},
 	})
 
-	// chat 角色写一条自己的记录
-	if _, err := callWithRole(t, srv, tok, "chat", "put -- 群友张三喜欢 Rust"); err != nil {
-		t.Fatalf("chat 写入失败: %v", err)
+	if _, err := callMCP(t, srv, tok, "put -- 群友张三喜欢 Rust"); err != nil {
+		t.Fatalf("写入失败: %v", err)
 	}
 
-	out, err := callWithRole(t, srv, tok, "chat", "recall 张三 Rust")
+	out, err := callMCP(t, srv, tok, "recall 张三 Rust")
 	if err != nil {
 		t.Fatalf("recall 失败: %v", err)
 	}
 	// 挂载点是 /，虚拟地址里不带项目名，只看有没有命中内容。
 	if strings.Contains(out, "无命中") || !strings.Contains(out, ".md") {
-		t.Fatalf("chat 应该能 recall 到自己写的记录，实际: %q", out)
+		t.Fatalf("应该能 recall 到自己写的记录，实际: %q", out)
 	}
 }

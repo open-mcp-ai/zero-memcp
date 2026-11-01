@@ -16,7 +16,7 @@ import (
 func TestLockBlocksNonRootOnly(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 	rootTok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "boss", Cap: "rwx"})
-	// 一张挂在 chat 分支上的普通凭证
+	// 一张挂在 另一条分支上的普通凭证
 	agentTok := mintRestricted(t, dataDir, auth.Claims{
 		Sub:   "zero",
 		Name:  "agent-chat",

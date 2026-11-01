@@ -71,7 +71,7 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 		svc := r.URL.Query().Get("service")
 		switch svc {
 		case "git-upload-pack":
-			body, err := repo.AdvertiseRefsFiltered(s.persona, func(ref string) bool {
+			body, err := repo.AdvertiseRefsFiltered(s.defaultBranch, func(ref string) bool {
 				branch := strings.TrimPrefix(ref, "refs/heads/")
 				if branch == ref {
 					return true
@@ -92,7 +92,7 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "当前端口未开启 git-receive-pack，或凭证没有写权限", http.StatusForbidden)
 				return
 			}
-			body, err := repo.AdvertiseReceivePack(s.persona, func(ref string) bool {
+			body, err := repo.AdvertiseReceivePack(s.defaultBranch, func(ref string) bool {
 				branch := strings.TrimPrefix(ref, "refs/heads/")
 				return s.allowed(caller, project, branch, configBitWrite)
 			})
@@ -229,10 +229,7 @@ func (s *Server) projectVisible(c Caller, project string) bool {
 		return false
 	}
 	if len(refs) == 0 {
-		branch := s.persona
-		if branch == "" {
-			branch = "zero"
-		}
+		branch := s.defaultBranch
 		return s.allowed(c, project, branch, configBitRead)
 	}
 	for _, ref := range refs {
@@ -320,7 +317,7 @@ func (s *Server) gitPushAllowed(c Caller, project string) bool {
 	}
 	refs, _ := repo.Refs("refs/heads/")
 	if len(refs) == 0 {
-		return s.allowed(c, project, "zero", configBitWrite)
+		return s.allowed(c, project, s.defaultBranch, configBitWrite)
 	}
 	for _, ref := range refs {
 		branch := strings.TrimPrefix(ref, "refs/heads/")

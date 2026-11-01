@@ -3,7 +3,6 @@ package server
 import (
 	"fmt"
 	"net/http"
-	"sort"
 	"strings"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
@@ -13,12 +12,6 @@ import (
 //
 // 极其简单：就是「谁在调用」以及「他是不是 root」。
 // 权限细节不带在身上——由 access.go 查配置决定。
-// rootRoleName 是唯一能绕过挂载表的角色名。
-//
-// 它不是一个特权开关，而是「这个角色的挂载表本来就覆盖全部项目」
-// 的显式标记——用名字表达意图，比用能力位推断更难出错。
-const rootRoleName = "zero"
-
 type Caller struct {
 	User string
 	Root bool
@@ -35,9 +28,6 @@ type Caller struct {
 
 	// JTI 是这张凭证的编号，写审计用。
 	JTI string
-
-	// Role 是本次请求选中的角色名（可能为空）。
-	Role string
 }
 
 // canRead / canWrite / canInject 是 cap 这一层的判定。
@@ -119,63 +109,34 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 			}
 		}
 
-		// ── 角色选择 ──
+		// 一张凭证就是一个身份：能力与挂载表在签发时定死，
+		// 只能被端口进一步收窄，不能由请求头当场改。
 		//
-		// 有 Roles 时，能力与挂载表都来自「本次选中的角色」。
-		// 角色名只从 header 取：那是客户端/用户的地盘（pi 的 /mem:role 命令），
-		// 模型碰不到。把它做成工具参数等于把提权写进协议。
+		// 早先这里支持 Roles + X-Zero-Role 逐请求切换身份。删掉的理由：
+		// 身份是数据，不是鉴权机制。一个数据库连接不会中途换成另一个用户，
+		// 想要另一份权限就签另一张凭证。逐请求切换把「我是谁」交给了
+		// 传输层，也就把提权入口留给了任何能发 header 的东西。
 		capStr := claims.Cap
 		mount := claims.Mount
-
-		if len(claims.Roles) > 0 {
-			roleName := r.Header.Get("X-Zero-Role")
-			if roleName == "" {
-				roleName = claims.Default
-			}
-			if roleName == "" {
-				return Caller{}, fmt.Errorf("这张凭证定义了角色，但请求没指定（X-Zero-Role），也没有默认角色")
-			}
-			role, ok := claims.Roles[roleName]
-			if !ok {
-				return Caller{}, fmt.Errorf("未知角色 %q（可用：%s）", roleName, strings.Join(roleNames(claims.Roles), " "))
-			}
-			capStr = role.Cap
-			mount = role.Mount
-			// 角色存在时，只有名为 "zero" 的角色保留 root。
-			//
-			// 不能靠能力位推断（曾经试过 hasFullCap）：chat 角色
-			// 为了拿到 x（规则注入）也会声明 cap=rwx，于是被误判成
-			// 全能力角色、继续保留 root，挂载表又一次被短路——
-			// 权限隔离看着做了，实际没生效。
-			//
-			// 名字是显式意图，能力位是本事。判断「谁能绕过挂载表」
-			// 必须用意图，不能用本事。
-			isRoot = isRoot && roleName == rootRoleName
-		}
 
 		// 没给 token 级挂载表时，退回配置里该用户的 pwd。
 		// 非 root 用户配了 pwd 就被自动关进那个仓库——
 		// 这是「受限账户只有自己那一摊」的默认形态。
-		if len(mount) == 0 && pwd != "" && !isRoot && len(claims.Roles) == 0 {
+		if len(mount) == 0 && pwd != "" && !isRoot {
 			mount = []auth.MountPoint{{Project: pwd, At: "/"}}
 		}
 
-		effectiveRole := r.Header.Get("X-Zero-Role")
-		if effectiveRole == "" && len(claims.Roles) > 0 {
-			effectiveRole = claims.Default
-		}
 		// 端口级挂载：与凭证自身挂载取交集，只能进一步收窄。
 		//
-		// 典型用法是「这个端口只暴露 chat 分支」——那么即使拿的是
-		// 一张全量凭证，从这个端口进来也只能看到 chat。
+		// 典型用法是「这个端口只暴露某一条分支」——那么即使拿的是
+		// 一张全量凭证，从这个端口进来也只能看到那一条。
 		if hasBlk && len(blk.Mount) > 0 {
 			mount = narrowByPort(mount, blk.Mount)
 		}
 
+		// 节点名：这张凭证是哪个设备/实例在用。它只是审计标签，
+		// 不参与任何权限判定。
 		nodeName := claims.Name
-		if nodeName == "" {
-			nodeName = effectiveRole
-		}
 		if nodeName == "" {
 			nodeName = claims.Sub
 		}
@@ -187,10 +148,9 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 			User:     claims.Sub,
 			Identity: nodeName,
 			Root:     isRoot,
-			Mount:    NewMount(mount, s.persona),
+			Mount:    NewMount(mount, s.defaultBranch),
 			Cap:      capStr,
 			JTI:      claims.JTI,
-			Role:     effectiveRole,
 		}, nil
 	}
 
@@ -221,9 +181,6 @@ func (s *Server) isLocal(r *http.Request) bool {
 func (s *Server) execWhoami(c Caller) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("User: %s\n", c.User))
-	if c.Role != "" {
-		sb.WriteString(fmt.Sprintf("Role: %s\n", c.Role))
-	}
 	if c.Root {
 		sb.WriteString("Privilege: root (拥有全局直通权限)\n")
 	} else if s.cfgIndex() != nil {
@@ -267,14 +224,4 @@ func (s *Server) execUsers() TermResult {
 			p.Name, owner, group, p.Perm.String()))
 	}
 	return TermResult{Text: strings.TrimRight(sb.String(), "\n")}
-}
-
-// roleNames 列出全部角色名，按字典序，供错误信息用。
-func roleNames(roles map[string]auth.Role) []string {
-	out := make([]string, 0, len(roles))
-	for k := range roles {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
 }

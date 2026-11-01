@@ -70,7 +70,7 @@ func TestMountSameRepoTwoBranches(t *testing.T) {
 		{Project: "daily", At: "/main", Branch: "zero", Cap: "r"},
 	}, "zero")
 
-	// 根挂 chat 分支
+	// 根挂 另一条分支
 	p, br, path, err := m.ToReal("2026-10-30/a.md")
 	if err != nil || p != "daily" || br != "chat" || path != "2026-10-30/a.md" {
 		t.Fatalf("根应映射到 daily@chat，得到 (%q,%q,%q,%v)", p, br, path, err)
@@ -82,14 +82,14 @@ func TestMountSameRepoTwoBranches(t *testing.T) {
 	}
 	// 两个分支的能力不同
 	if got := m.CapOf("daily", "chat"); got != "rw" {
-		t.Errorf("chat 分支 cap 应为 rw，得到 %q", got)
+		t.Errorf("另一条分支 cap 应为 rw，得到 %q", got)
 	}
 	if got := m.CapOf("daily", "zero"); got != "r" {
 		t.Errorf("zero 分支 cap 应为 r，得到 %q", got)
 	}
 	// 输出侧：两个分支翻成不同虚拟路径
 	if got := m.ToVirtual("daily", "chat", "x.md"); got != "x.md" {
-		t.Errorf("chat 分支应翻成 x.md，得到 %q", got)
+		t.Errorf("另一条分支应翻成 x.md，得到 %q", got)
 	}
 	if got := m.ToVirtual("daily", "zero", "x.md"); got != "main/x.md" {
 		t.Errorf("zero 分支应翻成 main/x.md，得到 %q", got)

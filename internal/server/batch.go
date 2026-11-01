@@ -33,7 +33,7 @@ type BatchRequest struct {
 //
 // 为什么需要原子决议：
 //
-//	审计 Agent 审完 50 条脏流，决议可能包含：
+//	审完一批待定内容，决议可能包含：
 //	  1. 提纯 2 条核心事实写进 main
 //	  2. 把 1 个恶意 payload 移入 quarantine 分支
 //	  3. 推进 audited 标签/水位
@@ -43,7 +43,7 @@ type BatchRequest struct {
 //	半吊子状态，下次重启就会产生重复提纯或漏审。
 //
 // 只要其中任何一步报错，全部动作在同一个事务边界内中止。
-func (s *Server) execBatch(body string, c Caller, persona string) (string, error) {
+func (s *Server) execBatch(body string, c Caller, defaultBranch string) (string, error) {
 	if err := s.requireRoot(c); err != nil {
 		return "", err
 	}
@@ -68,7 +68,7 @@ func (s *Server) execBatch(body string, c Caller, persona string) (string, error
 		switch strings.ToLower(op.Action) {
 		case "put":
 			target := op.Target
-			addr, _, _, err := s.writeNote(op.Kind, op.Text, "", "auditor", c, target)
+			addr, _, _, err := s.writeNote(op.Kind, op.Text, "", "batch", c, target)
 			if err != nil {
 				return "", fmt.Errorf("op[%d] put 失败: %w", idx, err)
 			}
@@ -105,16 +105,16 @@ func (s *Server) execBatch(body string, c Caller, persona string) (string, error
 			name := op.Name
 			ref := op.Ref
 			if ref == "" {
-				ref = persona
+				ref = defaultBranch
 			}
-			res, err := s.execTag(fmt.Sprintf("%s %s %s", project, name, ref), c, persona)
+			res, err := s.execTag(fmt.Sprintf("%s %s %s", project, name, ref), c, defaultBranch)
 			if err != nil {
 				return "", fmt.Errorf("op[%d] tag 失败: %w", idx, err)
 			}
 			journal = append(journal, fmt.Sprintf("[%d] tag: %s", idx, res))
 
 		case "commit":
-			res, err := s.execCommit(op.Target, c, persona)
+			res, err := s.execCommit(op.Target, c, defaultBranch)
 			if err != nil {
 				return "", fmt.Errorf("op[%d] commit 失败: %w", idx, err)
 			}

@@ -232,9 +232,9 @@ func TestRuleBitInjectedIntoSystem(t *testing.T) {
 	_, _ = r.Commit("zero", "init")
 
 	srv, err := New(Config{
-		DataDir:        dataDir,
-		DefaultProfile: "zero",
-		Listen:         "127.0.0.1:0",
+		DataDir:       dataDir,
+		DefaultBranch: "zero",
+		Listen:        "127.0.0.1:0",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -420,11 +420,11 @@ mode  = "rwxrwxrwx"
 	}
 
 	srv, err := New(Config{
-		DataDir:        dataDir,
-		ConfigFile:     filepath.Join(dataDir, "zero-memcp.toml"),
-		DefaultProfile: "zero",
-		Listen:         "127.0.0.1:0",
-		EnforceAuth:    true,
+		DataDir:       dataDir,
+		ConfigFile:    filepath.Join(dataDir, "zero-memcp.toml"),
+		DefaultBranch: "zero",
+		Listen:        "127.0.0.1:0",
+		EnforceAuth:   true,
 	})
 	if err != nil {
 		t.Fatal(err)

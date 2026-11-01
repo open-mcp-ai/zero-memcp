@@ -152,6 +152,12 @@ func OpenWith(path string, storage FS, locker Locker) (*Repo, error) {
 }
 
 // Init 初始化一个裸仓库。全部用标准库，不调 git。
+// DefaultBranch 是仓库的默认分支名。
+//
+// 它只在「调用方没有指定」时兜底：新仓库的 HEAD、挂载点补全、
+// git 协议广告里的 symref。它不是身份，也不该被当成权限判据。
+const DefaultBranch = "zero"
+
 func Init(path string) (*Repo, error) {
 	return InitWith(path, nil, nil)
 }
@@ -181,7 +187,7 @@ func InitWith(path string, storage FS, locker Locker) (*Repo, error) {
 	// HEAD 指向默认分支
 	head := filepath.Join(abs, "HEAD")
 	if _, err := storage.Stat(head); err != nil {
-		if err := storage.WriteFile(head, []byte("ref: refs/heads/zero\n"), 0o644); err != nil {
+		if err := storage.WriteFile(head, []byte("ref: refs/heads/"+DefaultBranch+"\n"), 0o644); err != nil {
 			return nil, err
 		}
 	}
@@ -1433,7 +1439,7 @@ type Change struct {
 // 纯哈希比较：同一个 SHA 必然同内容，不需要读任何 blob。
 //
 // from 为空串表示「和空树比」，即列出 to 的全部文件——
-// 审计 Agent 第一次扫某个脏流分支时就是这个用法。
+// 第一次扫某个脏流分支时就是这个用法。
 func (r *Repo) Diff(from, to string) ([]Change, error) {
 	oldEntries := map[string]Entry{}
 	if from != "" {

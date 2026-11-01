@@ -11,7 +11,7 @@ import (
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 )
 
-// 补齐未测试的 HTTP 端点：/identity /profiles /recall /api
+// 补齐未测试的 HTTP 端点：/identity /projects /recall /api
 func TestHTTPEndpoints(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "boss", Cap: "rwx"})
@@ -31,7 +31,7 @@ func TestHTTPEndpoints(t *testing.T) {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/identity", srv.handleIdentity)
-	mux.HandleFunc("/profiles", srv.handleProfiles)
+	mux.HandleFunc("/projects", srv.handleProjects)
 	mux.HandleFunc("/recall", srv.handleRecall)
 	mux.HandleFunc("/health", srv.handleHealth)
 	mux.HandleFunc("/api", srv.handleAPI)
@@ -51,12 +51,12 @@ func TestHTTPEndpoints(t *testing.T) {
 		t.Fatalf("/identity 未包含提升后的规则内容: %s", string(body))
 	}
 
-	// 2. /profiles: 列出可见画像/分支
-	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/profiles", nil)
+	// 2. /projects: 列出可见项目与分支
+	req, _ = http.NewRequest(http.MethodGet, ts.URL+"/projects", nil)
 	req.Header.Set("Authorization", "Bearer "+tok)
 	resp, err = http.DefaultClient.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
-		t.Fatalf("/profiles 失败: %v %v", err, resp.Status)
+		t.Fatalf("/projects 失败: %v %v", err, resp.Status)
 	}
 	var profs struct {
 		Projects []map[string]any `json:"projects"`
@@ -64,7 +64,7 @@ func TestHTTPEndpoints(t *testing.T) {
 	_ = json.NewDecoder(resp.Body).Decode(&profs)
 	resp.Body.Close()
 	if len(profs.Projects) == 0 {
-		t.Fatal("/profiles 结果为空")
+		t.Fatal("/projects 结果为空")
 	}
 	// 规则数应当反映出刚才 chmod rule 的那一条
 	rules := 0
@@ -74,7 +74,7 @@ func TestHTTPEndpoints(t *testing.T) {
 		}
 	}
 	if rules == 0 {
-		t.Fatalf("/profiles 未统计到规则块: %+v", profs.Projects)
+		t.Fatalf("/projects 未统计到规则块: %+v", profs.Projects)
 	}
 
 	// 3. /recall: POST JSON 的检索端点

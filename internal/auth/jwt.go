@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Claims 是签发给 agent 的凭证载荷。
+// Claims 是签发给客户端的凭证载荷。
 //
 // 它只回答一个问题：**你是谁**。
 //
@@ -61,25 +61,11 @@ type Claims struct {
 	// 空串表示不额外限制（等同 rwx），仍然受 TOML 约束。
 	Cap string `json:"cap,omitempty"`
 
-	// Mount 是挂载表。数组形式，因为**同一个仓库可以挂多次**：
-	// 一次挂 chat 分支当根（可写），一次挂 zero 分支当只读参考。
-	//
-	//	[{"project":"daily","at":"/","branch":"chat","cap":"rw"},
-	//	 {"project":"daily","at":"/main","branch":"zero","cap":"r"}]
+	// Mount 是挂载表。数组形式，因为同一个仓库可以挂多次：
+	// 可以在不同虚拟路径下挂载不同分支，并为各挂载点配置独立能力。
 	//
 	// 不在表里的项目对这张凭证完全不可见。空表表示全命名空间（root）。
 	Mount []MountPoint `json:"mount,omitempty"`
-
-	// Roles 是命名预设：一个名字对应一组 (能力位, 挂载表)。
-	//
-	// 有 Roles 时，Cap/Mount 不再生效，改由「本次请求选中的角色」决定。
-	// 选哪个角色由客户端在传输层给出（pi 的 /mem:role 命令写进 header），
-	// **绝不能由 MCP 工具参数决定**——否则一次提示注入就是一次提权。
-	Roles map[string]Role `json:"roles,omitempty"`
-
-	// Default 是未指定角色时用哪个。空且 Roles 非空时一律拒绝：
-	// 猜一个默认角色等于给注入留了一条不必提权也能越界的路。
-	Default string `json:"default,omitempty"`
 
 	// Ticket 为真表示这是一张兑换券，不是正式凭证。
 	//
@@ -137,12 +123,6 @@ func parseMountShorthand(s string) MountPoint {
 		pt.Cap = strings.TrimSpace(capStr)
 	}
 	return pt
-}
-
-// Role 是一个命名预设：一组能力位 + 一张挂载表。
-type Role struct {
-	Cap   string       `json:"cap,omitempty"`
-	Mount []MountPoint `json:"mount,omitempty"`
 }
 
 // TokenStore 持有签名密钥与验签能力。

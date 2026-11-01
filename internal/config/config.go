@@ -31,6 +31,11 @@ type Server struct {
 	Data     string
 	Listen   string
 	Endpoint string
+	// DefaultBranch 是默认分支名。空表示用内置缺省（zero）。
+	//
+	// 分支是「这份记忆的版本线」，不是「谁在用」——
+	// 所以它是一个存储参数，而不是身份参数。
+	DefaultBranch string
 }
 
 // ListenBlock 是一个独立的监听端口及其安全策略。
@@ -166,7 +171,7 @@ func Load(path string) (*File, error) {
 // 每个分节允许的键。写错一个键名不能被静默忽略——
 // 那会变成「配置里写了但没生效」，而症状是权限不对、不是报错。
 var knownKeys = map[string]map[string]bool{
-	"server":  {"data": true, "listen": true, "endpoint": true},
+	"server":  {"data": true, "listen": true, "endpoint": true, "default_branch": true},
 	"commit":  {"interval": true, "count": true},
 	"gc":      {"interval": true},
 	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
@@ -233,6 +238,11 @@ func ParseFile(raw []byte) (*File, error) {
 			return nil, err
 		} else if v != "" {
 			f.Server.Endpoint = v
+		}
+		if v, err := str(sec, "server", "default_branch"); err != nil {
+			return nil, err
+		} else if v != "" {
+			f.Server.DefaultBranch = v
 		}
 	}
 
@@ -427,7 +437,7 @@ func ParseFile(raw []byte) (*File, error) {
 // Validate 校验内部一致性。
 //
 // 全部在启动前做完：配置错误在运行中才暴露出来时，表现往往是
-// 「某个 agent 忽然什么都没有权限」，而不是一条清晰的错误。
+// 「某个身份忽然什么都没有权限」，而不是一条清晰的错误。
 func (f *File) Validate() error {
 	if len(f.Users) == 0 {
 		return fmt.Errorf("至少要有一个 [[user]]（否则没人能拿凭证）")

@@ -413,56 +413,69 @@ perm    = "w"
 	}
 }
 
-// 角色切换决定 root：只有名为 zero 的角色保留 root。
-// 这条规则不能用「能力位是否齐全」代替——chat 为了拿 x 也会声明 rwx。
-func TestRoleNameDecidesRootNotCapability(t *testing.T) {
+// 管理员权限只来自配置里的 [[user]] root = true。
+//
+// 它不来自凭证名、不来自能力位、也不来自请求头：cap=rwx 只说明这张纸
+// 能读写，不说明它是管理员；一张被挂载表收窄的凭证即使主体是 root
+// 也不是「不受限 root」。
+func TestRootComesFromConfigNotNameOrCap(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 
-	// 同一张凭证里：zero 是全量角色，chat 是受限角色。
-	tokWithZero := mintRestricted(t, dataDir, auth.Claims{
-		Sub:     "zero",
-		Name:    "switch",
-		Default: "zero",
-		Roles: map[string]auth.Role{
-			"zero": {Cap: "rwx", Mount: []auth.MountPoint{{Project: "blackegg/me", At: "/", Branch: "*"}}},
-			"chat": {Cap: "rwx", Mount: []auth.MountPoint{{Project: "other/secret", At: "/", Branch: "*"}}},
-		},
+	// 配置里 zero 是 root，reader 不是。
+	rootTok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Cap: "rwx"})
+	cRoot, err := srv.authenticate(roleReq(rootTok, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !cRoot.Root {
+		t.Fatal("配置里 root=true 的用户应获得管理员身份")
+	}
+
+	// 名字叫 admin、cap=rwx，但配置里没声明为 root：不是管理员。
+	namedAdmin := mintRestricted(t, dataDir, auth.Claims{Sub: "reader", Name: "admin", Cap: "rwx"})
+	cNamed, err := srv.authenticate(roleReq(namedAdmin, "admin"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cNamed.Root {
+		t.Fatal("凭证名或请求头不该产生管理员身份")
+	}
+}
+
+// 被挂载表收窄的 root 凭证不是「不受限 root」：它不能通过全局管理动词。
+func TestNarrowedRootIsNotUnrestricted(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+
+	tok := mintRestricted(t, dataDir, auth.Claims{
+		Sub:   "zero",
+		Cap:   "rwx",
+		Mount: []auth.MountPoint{{Project: "blackegg/me", At: "/", Branch: "*"}},
 	})
-
-	otherReq := func(tok, role string) *http.Request {
-		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(
-			`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":"ls"}}}`))
-		req.RemoteAddr = "127.0.0.1:12345"
-		req.Header.Set("Authorization", "Bearer "+tok)
-		if role != "" {
-			req.Header.Set("X-Zero-Role", role)
-		}
-		return req
-	}
-
-	// zero 角色：Root 成立，管理动词可用。
-	cZero, err := srv.authenticate(otherReq(tokWithZero, "zero"))
+	c, err := srv.authenticate(roleReq(tok, ""))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !cZero.Root {
-		t.Fatal("zero 角色应保留 root")
+	if !c.Root {
+		t.Fatal("主体仍是 root 用户，Root 标志应为真")
 	}
-	if _, err := srv.execTerm("branch blackegg/me", Viewer{}, cZero); err != nil {
-		t.Fatalf("zero 角色应能管理自己挂载的仓库: %v", err)
+	if srv.rootUnrestricted(c) {
+		t.Fatal("被挂载表收窄的 root 不该算不受限凭证")
 	}
+	if _, err := srv.execTerm("users", Viewer{}, c); err == nil {
+		t.Fatal("受限 root 不该通过全局管理动词")
+	}
+}
 
-	// chat 角色：即使 cap=rwx，也不得继承 root。
-	cChat, err := srv.authenticate(otherReq(tokWithZero, "chat"))
-	if err != nil {
-		t.Fatal(err)
+// roleReq 造一个带凭证（和可选角色 header）的请求。
+func roleReq(tok, role string) *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":"ls"}}}`))
+	req.RemoteAddr = "127.0.0.1:12345"
+	req.Header.Set("Authorization", "Bearer "+tok)
+	if role != "" {
+		req.Header.Set("X-Zero-Role", role)
 	}
-	if cChat.Root {
-		t.Fatal("chat 角色不该保留 root（能力位齐全不等于管理身份）")
-	}
-	if _, err := srv.execTerm("branch other/secret", Viewer{}, cChat); err == nil {
-		t.Fatal("非 root 角色不该通过管理动词")
-	}
+	return req
 }
 
 // 远端同步是「记忆离开本机」的动作：只读凭证不该能取回，

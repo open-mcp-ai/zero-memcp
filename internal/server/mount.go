@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
 // Mount 是一张凭证的挂载表。
@@ -39,7 +40,7 @@ func NewMount(points []auth.MountPoint, defaultBranch string) *Mount {
 		return nil
 	}
 	if defaultBranch == "" {
-		defaultBranch = "zero"
+		defaultBranch = gitstore.DefaultBranch
 	}
 	m := &Mount{defaultBranch: defaultBranch}
 	for _, p := range points {
@@ -83,7 +84,7 @@ func (m *Mount) Empty() bool { return m == nil || len(m.entries) == 0 }
 // DefaultBranch 返回补全用的默认分支。
 func (m *Mount) DefaultBranch() string {
 	if m == nil || m.defaultBranch == "" {
-		return "zero"
+		return gitstore.DefaultBranch
 	}
 	return m.defaultBranch
 }

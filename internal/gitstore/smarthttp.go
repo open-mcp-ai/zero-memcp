@@ -78,7 +78,7 @@ func (r *Repo) advertise(defaultBranch string, keep func(ref string) bool, servi
 	buf.Write(PktFlush())
 
 	if defaultBranch == "" {
-		defaultBranch = "zero"
+		defaultBranch = DefaultBranch
 	}
 	caps := capsFormat
 	if strings.Contains(capsFormat, "%s") {

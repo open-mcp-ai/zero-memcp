@@ -41,10 +41,10 @@ func newCore(t *testing.T, mutate func(*Options)) *Core {
 		t.Fatalf("写配置: %v", err)
 	}
 	opts := Options{
-		DataDir:        dataDir,
-		ConfigFile:     cfgPath,
-		Endpoint:       "test",
-		DefaultProfile: "zero",
+		DataDir:       dataDir,
+		ConfigFile:    cfgPath,
+		Endpoint:      "test",
+		DefaultBranch: "zero",
 	}
 	if mutate != nil {
 		mutate(&opts)

@@ -15,7 +15,7 @@ type Block struct {
 	// Project 是它所属的项目名（裸仓库目录名去掉 .git）。
 	Project string
 	// Branch 是它来自哪个分支。同一个仓库的不同分支是两份记忆，
-	// 必须能同时存在——chat 的分身和 dev 的分身写的是同一仓库的不同版本线。
+	// 必须能同时存在——同一仓库的不同版本线各自独立。
 	Branch string
 	// Path 是树内路径，例如 "2026-10-29/225550-local.md"。
 	Path string
@@ -50,7 +50,7 @@ func (b Block) Injectable() bool { return b.Rule }
 
 // Indexable 报告它是否进倒排索引。
 //
-// 规则块也进：它们是系统提示的一部分，但 agent 同样需要能用 recall
+// 规则块也进：它们是系统提示的一部分，但同样需要能用 recall
 // 找到它们，否则「我知道有这条规则，但找不到它在哪」就成了常态。
 func (b Block) Indexable() bool { return !b.Hidden }
 

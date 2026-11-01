@@ -15,7 +15,7 @@ import (
 // 这一组是「树外科手术」：分叉、打标、跨分支剪切与合并。
 //
 // 为什么要有它：记忆不是一坨平铺的数据，它天然分层——
-// 共识该留在 main，开发细节该在 dev，群聊该在 chat，
+// 共识该留在主干，开发细节该在临时分支，讨论该在另一条，
 // 私密的该切到 private。没有这组动作时，所有东西只能挤在一个
 // 分支里，靠路径前缀假装分层，而路径前缀没有权限边界、
 // 没有独立历史、也没法整体分叉。
@@ -39,7 +39,7 @@ func (s *Server) requireRoot(c Caller) error {
 //	branch                              列出全部项目 × 分支
 //	branch <project>                    列出某项目的分支
 //	branch <project> <new> [from <src>] 新建分支（缺省从默认分支分叉）
-func (s *Server) execBranch(rest string, c Caller, persona string) (string, error) {
+func (s *Server) execBranch(rest string, c Caller, defaultBranch string) (string, error) {
 	if err := s.requireRoot(c); err != nil {
 		return "", err
 	}
@@ -54,7 +54,7 @@ func (s *Server) execBranch(rest string, c Caller, persona string) (string, erro
 	}
 
 	newBranch := args[1]
-	src := persona
+	src := defaultBranch
 	if len(args) >= 4 && strings.EqualFold(args[2], "from") {
 		src = args[3]
 	}
@@ -134,7 +134,7 @@ func (s *Server) listBranches(project string, c Caller) string {
 				when = logs[0].When.Format("2006-01-02 15:04")
 			}
 			marked := " "
-			if name == s.persona {
+			if name == s.defaultBranch {
 				marked = "*"
 			}
 			lockMark := ""
@@ -152,7 +152,7 @@ func (s *Server) listBranches(project string, c Caller) string {
 	if sb.Len() == 0 {
 		return "没有任何分支"
 	}
-	sb.WriteString("\n* 表示当前默认人格分支")
+	sb.WriteString("\n* 表示当前默认分支")
 	return sb.String()
 }
 
@@ -169,7 +169,7 @@ func shortSHA(s string) string {
 //	tag <project>                列出某项目的 tag
 //	tag <project> <name> [<ref>] 打 tag（缺省打在默认分支上）
 //	tag -d <project> <name>      删 tag（挪到 refs/tags-removed/，不真删）
-func (s *Server) execTag(rest string, c Caller, persona string) (string, error) {
+func (s *Server) execTag(rest string, c Caller, defaultBranch string) (string, error) {
 	if err := s.requireRoot(c); err != nil {
 		return "", err
 	}
@@ -202,7 +202,7 @@ func (s *Server) execTag(rest string, c Caller, persona string) (string, error) 
 	}
 
 	name := args[1]
-	ref := persona
+	ref := defaultBranch
 	if len(args) >= 3 {
 		ref = args[2]
 	}
@@ -393,7 +393,7 @@ func modeOf(repo *gitstore.Repo, branch, path string) gitstore.Mode {
 // parseBranchAddr 解析地址。
 //
 //	<project>@<branch>/<path>   显式指定分支
-//	<project>/<path>            用默认人格分支
+//	<project>/<path>            用默认分支
 //
 // 项目名可以含斜杠（blackegg/daily），所以 @ 是唯一可靠的分隔符：
 // 项目名里不会有 @，路径里也几乎不会有。在第一个 @ 处切。
@@ -403,10 +403,7 @@ func (s *Server) parseBranchAddr(addr string) (project, branch, path string, err
 		return "", "", "", fmt.Errorf("地址不能为空")
 	}
 
-	def := s.persona
-	if def == "" {
-		def = "zero"
-	}
+	def := s.defaultBranch
 
 	if at := strings.Index(addr, "@"); at >= 0 {
 		project = addr[:at]
@@ -442,7 +439,7 @@ func (s *Server) parseBranchAddr(addr string) (project, branch, path string, err
 //	commit <project>               提交某项目的默认分支
 //	commit <project>@<branch>      提交某项目的指定分支
 //	commit <project> -m "消息"     带自定义提交信息
-func (s *Server) execCommit(rest string, c Caller, persona string) (string, error) {
+func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string, error) {
 	if err := s.requireRoot(c); err != nil {
 		return "", err
 	}
@@ -462,7 +459,7 @@ func (s *Server) execCommit(rest string, c Caller, persona string) (string, erro
 		if err := s.requireRoot(c); err != nil {
 			return "", err
 		}
-		n, err := s.projects.CommitAll(persona, "mem: manual commit")
+		n, err := s.projects.CommitAll(defaultBranch, "mem: manual commit")
 		if err != nil {
 			return "", err
 		}
@@ -478,7 +475,7 @@ func (s *Server) execCommit(rest string, c Caller, persona string) (string, erro
 		return "", perr
 	}
 	if branch == "" {
-		branch = persona
+		branch = defaultBranch
 	}
 	if !s.allowed(c, proj, branch, configBitWrite) {
 		return "", fmt.Errorf("%s", s.denyReason(c, proj, branch, configBitWrite))
@@ -516,11 +513,11 @@ func (s *Server) execCommit(rest string, c Caller, persona string) (string, erro
 //	diff <project>@<branch>                  列出该分支的全部文件（= 和空树比）
 //	diff <project>@<from> -> <project>@<to>  列出 to 相对 from 的变化
 //
-// 审计 Agent 的用法：
+// 多分支搬运的用法：
 //
 //	inbox@raw 是脏流，inbox@audited 是上次审完的水位。
 //	diff inbox@raw -> inbox@audited 的反向就是「还有哪些没审」。
-func (s *Server) execDiff(rest string, c Caller, persona string) (string, error) {
+func (s *Server) execDiff(rest string, c Caller, defaultBranch string) (string, error) {
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
 		return "", fmt.Errorf("用法：diff <project>@<branch> 或 diff <project>@<from> -> <project>@<to>")
@@ -613,7 +610,7 @@ func (s *Server) execDiff(rest string, c Caller, persona string) (string, error)
 // 删除走墓碑（gitstore.Delete），与写入共享同一个 commit 边界：
 // 它不会立刻改树，而是要等 commit 才生效。这样「删一条」和
 // 「写一条」不会各自触发一次提交，把一次整理拆成两次。
-func (s *Server) execDelete(rest string, c Caller, persona string) (string, error) {
+func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string, error) {
 	if err := s.requireRoot(c); err != nil {
 		return "", err
 	}
@@ -848,7 +845,7 @@ func (s *Server) execReset(rest string, c Caller) (string, error) {
 // 于是「把一条笔记提升为法则」这件事只能靠外部 git 改 100755，
 // 而那要求人先 clone、再 chmod、再 push。规则位决定「什么进系统提示」，
 // 它不该是命令行之外能力。
-func (s *Server) execChmod(rest string, c Caller, persona string) (string, error) {
+func (s *Server) execChmod(rest string, c Caller, defaultBranch string) (string, error) {
 	if err := s.requireRoot(c); err != nil {
 		return "", err
 	}

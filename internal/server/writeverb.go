@@ -18,7 +18,7 @@ import (
 //
 // 仅 root：一个能改 SKILL.md 的人可以改「谁看见什么」，
 // 那比改内容本身危险。
-func (s *Server) execWrite(rest string, c Caller, persona string) (string, error) {
+func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string, error) {
 	if err := s.requireRoot(c); err != nil {
 		return "", err
 	}

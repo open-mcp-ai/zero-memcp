@@ -29,8 +29,9 @@ type Options struct {
 	// Endpoint 是本端点标识（local / blackbox / …），写进每条记忆的 frontmatter。
 	Endpoint string
 
-	// DefaultProfile 是没指定人格时的默认分支名，缺省 zero。
-	DefaultProfile string
+	// DefaultBranch 是默认分支名。空表示用配置里的 [server] default_branch，
+	// 再空则用内置缺省（main）。
+	DefaultBranch string
 
 	// EnforceAuth 为真时连回环地址也要求 token。
 	EnforceAuth bool
@@ -52,16 +53,12 @@ func New(opts Options) (*Core, error) {
 	if opts.DataDir == "" {
 		return nil, fmt.Errorf("zeromem: 必须给 DataDir")
 	}
-	profile := opts.DefaultProfile
-	if profile == "" {
-		profile = "zero"
-	}
 	srv, err := server.New(server.Config{
-		DataDir:        opts.DataDir,
-		ConfigFile:     opts.ConfigFile,
-		Endpoint:       opts.Endpoint,
-		DefaultProfile: profile,
-		EnforceAuth:    opts.EnforceAuth,
+		DataDir:       opts.DataDir,
+		ConfigFile:    opts.ConfigFile,
+		Endpoint:      opts.Endpoint,
+		DefaultBranch: opts.DefaultBranch,
+		EnforceAuth:   opts.EnforceAuth,
 	})
 	if err != nil {
 		return nil, err

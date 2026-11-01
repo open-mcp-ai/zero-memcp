@@ -233,7 +233,7 @@ func TestDirtyTwoBranchesSamePath(t *testing.T) {
 
 	// 各自读到自己那份
 	if got, err := r.Read("chat", "same.md"); err != nil || string(got) != "chat 内容\n" {
-		t.Fatalf("chat 分支读错: %q", got)
+		t.Fatalf("另一条分支读错: %q", got)
 	}
 	if got, err := r.Read("dev", "same.md"); err != nil || string(got) != "dev 内容\n" {
 		t.Fatalf("dev 分支读错: %q", got)

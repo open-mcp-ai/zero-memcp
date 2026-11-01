@@ -32,7 +32,7 @@ remote-secret list | put | delete    root 配置 HTTP token（外部 push 用）
 
 push 必须显式指定分支，不会替你提交，也不会强推。
 
-只有维护记忆结构时才需要的操作（普通 agent 不需要）：
+只有维护记忆结构时才需要的操作（日常读写不需要）：
 commit [<p>[@<br>]] [-m msg]   显式折叠脏层进历史
 diff <p>@<br> [-> <p>@<br>]    比对分支差异（审计用）
 branch [<p> [<new> [from s]]]  列出或分叉分支
@@ -69,12 +69,12 @@ put <tree> --ref <addr>
 指定树路径时，正文作为新节点写入该子树。
 
 文本必须通过 Termcp 的 vars / args 与 cmd 分开：
-  cmd:  put team/chat -- $TEXT
+  cmd:  put notes/todo -- $TEXT
   vars: {"TEXT":"正文，可以含空格、换行和 --"}
 
 引用模式不复制正文：
-  cmd: put team/chat --ref $1
-  args: ["daily/2026-08-03/123456-local.md"]
+  cmd: put notes/todo --ref $1
+  args: ["memories/2026-08-03/123456-local.md"]
 
 put 返回的地址是稳定文件引用。写入会进入单线程脏层并可立即检索，由策略或 commit 折叠进历史。
 `), true
@@ -88,7 +88,7 @@ since <project>@<branch>[/<tree>] <commit|empty>
 这是断线续传的入口：保存你上次读到的 commit，重连后用它换回差量，
 不必整棵树重读。SHA 相同则返回空——没动过的子树代价是零。
 
-例：since blackegg/daily@chat/ctx/team 3f2a1b9
+例：since proj/memories@main/ctx/team 3f2a1b9
 `), true
 
 	case "remind":
@@ -101,7 +101,7 @@ remind [<project>[@<branch>[/<path>]]]
 remind 只登记关注目标，不搬运正文、不分配任务。
 
 例：
-  remind blackegg/daily@chat/ctx/team
+  remind proj/memories@main/ctx/team
   remind
 `), true
 
@@ -125,11 +125,11 @@ unlock <project>@<branch>
 重启后仍然有效。branch 列表里被锁的分支会标 [已锁定]。
 
 回收一条分支的典型顺序：
-  lock   blackegg/me@chat              # agent 下一个请求就 403
-  ls     blackegg/me@chat              # 分拣：看清楚有什么
-  cp     blackegg/me@chat/x.md -> blackegg/me@zero/lessons/
-  archive blackegg/me@chat             # 收尾：内容全留，引用移入归档命名空间
-  # 或者决定继续用：unlock blackegg/me@chat
+  lock   proj/notes@work             # 非 root 的下一个请求就 403
+  ls     proj/notes@work             # 分拣：看清楚有什么
+  cp     proj/notes@work/x.md -> proj/notes@main/lessons/
+  archive proj/notes@work            # 收尾：内容全留，引用移入归档命名空间
+  # 或者决定继续用：unlock proj/notes@work
 `), true
 
 	case "chmod":
@@ -143,7 +143,7 @@ unlock <project>@<branch>
 write 与 put 都只能写 content。要把一条已有内容提升为规则，用 chmod；
 它保留正文，只改模式位。改完要 commit 才生效。
 
-例：chmod blackegg/me@zero/rules/01.md rule
+例：chmod proj/notes@main/rules/01.md rule
 `), true
 
 	case "remote-secret":
@@ -180,10 +180,10 @@ remote-key list | put | delete       root 配置 SSH 私钥
 配置在 TOML 里：
 
   [[remote]]
-  project    = "blackegg/daily"
+  project    = "proj/memories"
   name       = "github"
-  url        = "git@github.com:private/daily.git"
-  push       = ["main", "chat"]     # 空 = 不可推
+  url        = "git@github.com:org/memories.git"
+  push       = ["main"]             # 空 = 不可推
   fetch_only = false                # true = 只读远端
   ssh_key    = "github-deploy"     # SSH push 的 root 私钥名
   host_key   = "SHA256:..."         # 必须 pin，不信任未知 SSH host key
@@ -191,10 +191,10 @@ remote-key list | put | delete       root 配置 SSH 私钥
 HTTP 远端（HTTPS）用 token：
 
   [[remote]]
-  project    = "blackegg/daily"
+  project    = "proj/memories"
   name       = "github"
-  url        = "https://github.com/org/daily.git"
-  push       = ["zero"]
+  url        = "https://github.com/org/memories.git"
+  push       = ["main"]
   http_user  = "x-access-token"     # GitHub 的约定
   http_token = "gh"                 # remote-secret 保存的名字，不是 token 本身
 
@@ -212,9 +212,9 @@ fetch 优先用协议 v2（ls-refs + fetch），不支持时退回 v0，并且�
 gc 用内置打包器写出 pack + .idx v2，同样不需要系统 git。
 
 例：
-  sync blackegg/daily github
-  push blackegg/daily github main chat
-  fetch blackegg/daily github
+  sync proj/memories github
+  push proj/memories github main
+  fetch proj/memories github
 `), true
 
 	case "recall":
@@ -258,8 +258,8 @@ BM25 不擅长纯符号和专有名词（QQ 号、IP、函数名、变量名）�
 记忆树大了之后，不分范围的全量扫会把命中堆到与本次无关的项目上。
 
 例：grep 1729
-    grep 1729 --scope daily
-    grep func.*Server --scope blackegg/me@zero/rules
+    grep 1729 --scope proj/memories
+    grep func.*Server --scope proj/notes@main/rules
 `), true
 
 	case "log":
@@ -318,8 +318,8 @@ put 只负责投递：它把内容写进目录级脏层就返回，不代表历�
 不带参数时提交所有项目；指定项目/分支时只提交那一支。
 
 例：commit
-    commit blackegg/daily@chat
-    commit blackegg/daily@chat -m "整理端口笔记"
+    commit proj/memories@main
+    commit proj/memories@main -m "整理端口笔记"
 `), true
 
 	case "diff":
@@ -331,10 +331,10 @@ diff <project>@<branch> -> <project>@<branch>
 
 单分支形式列出该分支相对其父提交的变更；箭头形式对比两条分支。
 
-审计 Agent 的入口：diff audited -> raw 提取未审内容。
+分支比对的入口：diff audited -> raw 提取未审内容。
 
-例：diff blackegg/daily@chat
-    diff blackegg/daily@audited -> blackegg/daily@raw
+例：diff proj/memories@main
+    diff proj/memories@reviewed -> proj/memories@raw
 `), true
 
 	case "branch":
@@ -350,8 +350,8 @@ branch <project> <new> [from <src>]
 分叉是零字节操作：只写一个 ref，不复制任何对象。
 
 例：branch
-    branch blackegg/daily
-    branch blackegg/daily review from chat
+    branch proj/memories
+    branch proj/memories review from main
 `), true
 
 	case "tag":
@@ -364,9 +364,9 @@ tag -d <project> <name>
 不带 name 时列出该项目的全部标签。
 -d 删除标签，但不删内容——内容在分支里，标签只是一个指针。
 
-例：tag blackegg/daily
-    tag blackegg/daily v1 chat
-    tag -d blackegg/daily v1
+例：tag proj/memories
+    tag proj/memories v1 main
+    tag -d proj/memories v1
 `), true
 
 	case "cp", "mv":
@@ -376,13 +376,13 @@ mv <src>@<br>/<path> ... -> <dst>@<br>/[<path>]
 
 跨分支复制（cp）或移动（mv）切片。
 
-这是审计与提纯的搬运工具：把 chat 分支上审过的内容搬进 main，
+这是审计与提纯的搬运工具：把 另一条分支上审过的内容搬进 main，
 不必先把内容读出来再写一遍（那样会丢掉原来的文件时间与模式位）。
 
 mv = cp + delete，两步在同一个提交边界内完成。
 
-例：cp blackegg/daily@chat/x.md -> blackegg/daily@main/lessons/
-    mv blackegg/me@chat/x.md -> blackegg/me@zero/lessons/
+例：cp proj/memories@work/x.md -> proj/memories@main/lessons/
+    mv proj/notes@work/x.md -> proj/notes@main/lessons/
 `), true
 
 	case "delete":
@@ -393,7 +393,7 @@ delete <project>@<branch>/<path> [<path> ...]
 
 删除同样进脏层，要 commit 才真正从历史里消失（在下一个提交里不再出现）。
 
-例：delete blackegg/daily@chat/2026-10-28/old.md
+例：delete proj/memories@main/2026-10-28/old.md
 `), true
 
 	case "archive":
@@ -405,10 +405,10 @@ archive <project>@<branch> [-> <project>@<as>]
 归档不是删除：对象还在、历史还在，只是从分支列表里移走，
 不再出现在 clone/push 的默认引用里。
 
-典型用途：一个 agent 的任务结束了，它的分支不该继续被当作活跃版本线。
+典型用途：一条任务分支结束了，它的分支不该继续被当作活跃版本线。
 
-例：archive blackegg/me@chat
-    archive blackegg/me@chat -> blackegg/me@chat-2026-10
+例：archive proj/notes@work
+    archive proj/notes@work -> proj/notes@work-2026-10
 `), true
 
 	case "reset":
@@ -420,7 +420,7 @@ reset <project>@<branch> from <project>@<src>
 这是覆盖历史，只能由 root 显式执行——push 永远不做这件事。
 重置会清掉目标分支的脏层：重置就是放弃所有未提交状态。
 
-例：reset blackegg/daily@zero from blackegg/daily@import
+例：reset proj/memories@main from proj/memories@import
 `), true
 
 	case "write":
@@ -436,10 +436,10 @@ SKILL.md 的 frontmatter 决定注入与索引，那不可能靠 put 的自动�
 仅 root：能改 SKILL.md 的人可以改「谁看见什么」，比改内容本身危险。
 
 正文同样走 vars/args：
-  cmd:  write blackegg/me@zero/SKILL.md -- $BODY
+  cmd:  write proj/notes@main/SKILL.md -- $BODY
   vars: {"BODY": "---\nname: me\n---\n"}
 
-例：write blackegg/me@zero/rules/01.md -- $TEXT
+例：write proj/notes@main/rules/01.md -- $TEXT
 `), true
 
 	case "batch":
@@ -448,13 +448,13 @@ batch {"ops":[{...}, ...]}
 
 把多个写操作打包成一次提交。
 
-为什么需要它：审计 Agent 常常要一次性搬运一批切片，
+为什么需要它：一次要搬运一次性搬运一批切片，
 逐个执行会产生几十个中间提交，历史被切碎，而且中途失败会留下半吊子状态。
 batch 要么全部成功，要么一个都不落。
 
 支持的操作：put / cp / mv / delete / tag / commit。
 
-例：batch {"ops":[{"op":"delete","addr":"daily@chat/x.md"},{"op":"commit"}]}
+例：batch {"ops":[{"op":"delete","addr":"proj/memories@main/x.md"},{"op":"commit"}]}
 `), true
 
 	case "config":

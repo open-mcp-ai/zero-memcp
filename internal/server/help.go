@@ -25,7 +25,7 @@ status                      索引规模
 记忆同步（远端在配置里声明）：
 remote [<project>]                    查看已配置的记忆副本
 fetch <project> [<remote>]            从远端取回历史，不自动覆盖本地分支
-push <project> [<remote>] <branch...> 显式推送指定分支（外部 git push 进来见 README）
+push <project> [<remote>] <branch>   显式推送一个分支（一次一个，外部 git push 见 README）
 sync <project> [<remote>]             查看本地与远端的差异
 remote-key list | put | delete       root 配置 SSH 私钥（外部 push 用）
 remote-secret list | put | delete    root 配置 HTTP token（外部 push 用）
@@ -33,8 +33,18 @@ remote-secret list | put | delete    root 配置 HTTP token（外部 push 用）
 push 必须显式指定分支，不会替你提交，也不会强推。
 
 只有维护记忆结构时才需要的操作（普通 agent 不需要）：
-commit [<p>[@<br>]] [-m msg]   显式封箱待提交内容
-branch / tag / cp / mv / delete / chmod / archive / reset / lock / unlock
+commit [<p>[@<br>]] [-m msg]   显式折叠脏层进历史
+diff <p>@<br> [-> <p>@<br>]    比对分支差异（审计用）
+branch [<p> [<new> [from s]]]  列出或分叉分支
+tag [-d] <p> [<name> [<ref>]]  轻量标签
+cp / mv <src> -> <dst>         跨分支搬运切片
+delete <p>@<br>/<path>...      删除切片
+archive <p>@<br>               归档分支
+reset <p>@<br> from <src>      重置分支到另一条分支
+lock / unlock <p>@<br>         锁定/解锁分支（暂停非 root 访问）
+chmod <p>@<br>/<path> mode     修改规则/内容属性
+write <p>@<br>/<path> -- text  精确写文件（规则专用，须 root）
+batch {"ops":[...]}            原子批处理（打包多步为一次提交）
 
 怎么用：
   • 想起一件事             → recall
@@ -102,11 +112,11 @@ trees <project>[@<branch>]
 查看当前树目录，用路径选择 put / remind / recall 的范围。
 `), true
 
-	case "lock":
+	case "lock", "unlock":
 		return strings.TrimSpace(`lock   <project>@<branch>
 unlock <project>@<branch>
 
-锁住一条分支：非 root 凭证对它的一切读写都被拒绝，root 不受影响。
+锁住或解锁一条分支：非 root 凭证对它的一切读写都被拒绝，root 不受影响。
 
 锁的用途是「停下来让 root 处理」——分拣、搬运、归档、重置。
 所以 root 必须仍然能进去：一道连 root 都挡住的闸门等于把分支堵死。
@@ -163,7 +173,7 @@ remote-key delete <name>
 		return strings.TrimSpace(`
 remote [<project>]                    列出项目声明的远端
 fetch <project> [<remote>]        取回远端历史到 refs/remotes/<remote>/*
-push <project> [<remote>] <branch...> 推送指定分支（SSH 内置实现）
+push <project> [<remote>] <branch>   推送一个分支（SSH 内置实现，不批量）
 sync <project> [<remote>]             报告领先/落后/分叉
 remote-key list | put | delete       root 配置 SSH 私钥
 
@@ -236,7 +246,7 @@ recall: off 的目录读不出来——声明写着"不许被翻到"，read 就�
 
 	case "grep":
 		return strings.TrimSpace(`
-grep <pattern>
+grep <pattern> [--scope <tree>]
 
 正则扫全文，带前后行上下文。
 
@@ -244,8 +254,12 @@ BM25 不擅长纯符号和专有名词（QQ 号、IP、函数名、变量名）�
 这类东西用 grep 比 recall 准得多。这也是模型换 bash 去 rg 的头号原因——
 给它原生的 grep，它就不用换工具了。
 
+--scope 收窄范围，可写 project、project@branch 或 project@branch/subtree：
+记忆树大了之后，不分范围的全量扫会把命中堆到与本次无关的项目上。
+
 例：grep 1729
-    grep func.*Server
+    grep 1729 --scope daily
+    grep func.*Server --scope blackegg/me@zero/rules
 `), true
 
 	case "log":
@@ -291,6 +305,198 @@ help [<verb>] [--all]
     help put
     help --all
 `), true
+
+	case "commit":
+		return strings.TrimSpace(`
+commit [<project>[@<branch>]] [-m <msg>]
+
+把脏层折叠成 Git 提交，推进分支 ref。
+
+put 只负责投递：它把内容写进目录级脏层就返回，不代表历史已经前进。
+折叠要么由显式 commit 触发，要么由后台 [commit] 策略（条数/时间）自动完成。
+
+不带参数时提交所有项目；指定项目/分支时只提交那一支。
+
+例：commit
+    commit blackegg/daily@chat
+    commit blackegg/daily@chat -m "整理端口笔记"
+`), true
+
+	case "diff":
+		return strings.TrimSpace(`
+diff <project>@<branch>
+diff <project>@<branch> -> <project>@<branch>
+
+分支比对：列出两边路径的差异。
+
+单分支形式列出该分支相对其父提交的变更；箭头形式对比两条分支。
+
+审计 Agent 的入口：diff audited -> raw 提取未审内容。
+
+例：diff blackegg/daily@chat
+    diff blackegg/daily@audited -> blackegg/daily@raw
+`), true
+
+	case "branch":
+		return strings.TrimSpace(`
+branch
+branch <project>
+branch <project> <new> [from <src>]
+
+不带参数：列出所有项目的分支
+带项目：列出该项目的分支
+带新分支名：从 src（缺省当前分支）分叉出一条新分支
+
+分叉是零字节操作：只写一个 ref，不复制任何对象。
+
+例：branch
+    branch blackegg/daily
+    branch blackegg/daily review from chat
+`), true
+
+	case "tag":
+		return strings.TrimSpace(`
+tag <project> [<name> [<ref>]]
+tag -d <project> <name>
+
+轻量标签：给某个提交起一个稳定的名字。
+
+不带 name 时列出该项目的全部标签。
+-d 删除标签，但不删内容——内容在分支里，标签只是一个指针。
+
+例：tag blackegg/daily
+    tag blackegg/daily v1 chat
+    tag -d blackegg/daily v1
+`), true
+
+	case "cp", "mv":
+		return strings.TrimSpace(`
+cp <src>@<br>/<path> ... -> <dst>@<br>/[<path>]
+mv <src>@<br>/<path> ... -> <dst>@<br>/[<path>]
+
+跨分支复制（cp）或移动（mv）切片。
+
+这是审计与提纯的搬运工具：把 chat 分支上审过的内容搬进 main，
+不必先把内容读出来再写一遍（那样会丢掉原来的文件时间与模式位）。
+
+mv = cp + delete，两步在同一个提交边界内完成。
+
+例：cp blackegg/daily@chat/x.md -> blackegg/daily@main/lessons/
+    mv blackegg/me@chat/x.md -> blackegg/me@zero/lessons/
+`), true
+
+	case "delete":
+		return strings.TrimSpace(`
+delete <project>@<branch>/<path> [<path> ...]
+
+从指定分支删除切片。可一次删多个。
+
+删除同样进脏层，要 commit 才真正从历史里消失（在下一个提交里不再出现）。
+
+例：delete blackegg/daily@chat/2026-10-28/old.md
+`), true
+
+	case "archive":
+		return strings.TrimSpace(`
+archive <project>@<branch> [-> <project>@<as>]
+
+归档一条分支：把它的 ref 移入 refs/archived/，内容全部保留。
+
+归档不是删除：对象还在、历史还在，只是从分支列表里移走，
+不再出现在 clone/push 的默认引用里。
+
+典型用途：一个 agent 的任务结束了，它的分支不该继续被当作活跃版本线。
+
+例：archive blackegg/me@chat
+    archive blackegg/me@chat -> blackegg/me@chat-2026-10
+`), true
+
+	case "reset":
+		return strings.TrimSpace(`
+reset <project>@<branch> from <project>@<src>
+
+把一条分支重置到另一条分支的当前位置。
+
+这是覆盖历史，只能由 root 显式执行——push 永远不做这件事。
+重置会清掉目标分支的脏层：重置就是放弃所有未提交状态。
+
+例：reset blackegg/daily@zero from blackegg/daily@import
+`), true
+
+	case "write":
+		return strings.TrimSpace(`
+write <project>[@<branch>]/<path> -- <content>
+
+把内容写到指定路径，文件名与位置完全由你决定。
+
+与 put 的区别：put 写的是「切片」（自动时间戳文件名 + frontmatter），
+write 写的是「这个路径上就该是这段内容」。它存在的理由是规则文件：
+SKILL.md 的 frontmatter 决定注入与索引，那不可能靠 put 的自动命名表达。
+
+仅 root：能改 SKILL.md 的人可以改「谁看见什么」，比改内容本身危险。
+
+正文同样走 vars/args：
+  cmd:  write blackegg/me@zero/SKILL.md -- $BODY
+  vars: {"BODY": "---\nname: me\n---\n"}
+
+例：write blackegg/me@zero/rules/01.md -- $TEXT
+`), true
+
+	case "batch":
+		return strings.TrimSpace(`
+batch {"ops":[{...}, ...]}
+
+把多个写操作打包成一次提交。
+
+为什么需要它：审计 Agent 常常要一次性搬运一批切片，
+逐个执行会产生几十个中间提交，历史被切碎，而且中途失败会留下半吊子状态。
+batch 要么全部成功，要么一个都不落。
+
+支持的操作：put / cp / mv / delete / tag / commit。
+
+例：batch {"ops":[{"op":"delete","addr":"daily@chat/x.md"},{"op":"commit"}]}
+`), true
+
+	case "config":
+		return strings.TrimSpace(`
+config show
+config path
+config put <TOML>
+
+查看或更新服务配置文件（仅 root）。
+
+config show 显示当前加载的有效配置。
+config put 原子覆写配置文件并触发重载（支持通过 vars 传大段 TOML）。
+
+例：config show
+`), true
+
+	case "reload":
+		return strings.TrimSpace(`
+reload
+
+重新扫描所有项目并重建倒排索引（仅 root）。
+
+外部直接改动裸仓库（如人手敲 git commit、或外部工具推送进来）后，
+可以用此动词强制刷新内存状态，无需重启进程。
+`), true
+
+	case "whoami":
+		return strings.TrimSpace(`
+whoami
+
+回显当前调用方的凭证主体、有效角色、能力位与挂载范围。
+
+用于自省与调试：排查「为什么我写不进去」时先看这张卡片。
+`), true
+
+	case "users":
+		return strings.TrimSpace(`
+users
+
+列出配置中声明的用户与访问控制摘要（仅 root）。
+`), true
+
 	}
 	return "", false
 }
@@ -300,7 +506,7 @@ func helpAll() string {
 	var b strings.Builder
 	b.WriteString(helpOverview())
 	b.WriteString("\n\n")
-	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "help"} {
+	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "batch", "config", "reload", "whoami", "users", "help"} {
 		if d, ok := helpVerb(v); ok {
 			b.WriteString("\n── " + v + " ")
 			b.WriteString(strings.Repeat("─", max(0, 60-len(v))))

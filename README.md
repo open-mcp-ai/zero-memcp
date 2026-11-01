@@ -23,7 +23,9 @@
    - 内存脏层与不可变 Git 树分属两层，崩溃只会丢掉尚未落盘的脏文件，不会破坏已提交历史。
 6. **记忆同步**：
    - `sync` / `fetch` / `push`：节点与远端之间的记忆比对、取回与推送，强制显式指定分支且禁止强推。
-   - `fetch` / `push` / `sync` / `gc` 全部由内置实现完成，**不依赖系统 Git**：SSH 走 Go SSH，HTTP(S) 走 smart-HTTP（自动协商协议 v2），本地裸仓库路径直接读写对象库；`gc` 用自研打包器生成 pack + `.idx` v2，`git fsck` 校验通过。
+   - `fetch` / `push` / `sync` 全部由内置实现完成，**不依赖系统 Git**：SSH 走 Go SSH，HTTP(S) 走 smart-HTTP（自动协商协议 v2），本地裸仓库路径直接读写对象库。
+   - 松散对象打包（gc）同样是内置打包器（`zero-memcp gc` 子命令 + 后台按周期自动执行），生成 pack + `.idx` v2，`git fsck` 校验通过。
+     **gc 不是 DSL 动词**：合包对上层读写完全透明，不该让 Agent 承担磁盘运维的心智。
 
 ## 快速上手
 
@@ -85,7 +87,7 @@ go build -o zero-memcp ./cmd/zero-memcp
 | `since` | `since <tree> <commit>` | 取回自某次提交以来的子树差分 |
 | `sync` | `sync <project> [<remote>]` | 检查与远端的记忆领先/落后差异 |
 | `fetch` | `fetch <project> [<remote>]` | 取回远端历史（不改动本地活动分支） |
-| `push` | `push <project> [<remote>] <branch>` | 显式 SSH 推送一个获准分支（内置客户端） |
+| `push` | `push <project> [<remote>] <branch>` | 显式推送一个获准分支（内置客户端；一次一个，不批量） |
 | `remote-key` | `remote-key list/put/delete` | root 管理仅服务端可读的 SSH 私钥 |
 | `remote-secret` | `remote-secret list/put/delete` | root 管理仅服务端可读的 HTTP token |
 | `status`| `status` | 查看记忆索引与文档规模 |
@@ -154,6 +156,12 @@ push       = ["zero"]
 addr  = "0.0.0.0:1731"
 allow = ["git-upload-pack", "git-receive-pack"]
 ```
+
+> **两套地址策略要分清楚。**
+> `-listen` / `[server] listen` 是**主端口**（MCP 全能力入口），只接受回环地址——`0.0.0.0:1729` 会在启动时报错退出。
+> `[[listen]]` 块是**额外端口**，可以绑任意地址，靠 `allow` 白名单收窄能力。
+> 暴露到公网前先想清楚：这些端口是明文 HTTP，凭证一旦被网络嗅到就是权限泄露，
+> 所以生产环境应该放在反代（Nginx / Tailscale / WireGuard）后面。
 
 ```bash
 git push http://zero:<token>@host:1731/repos/daily.git HEAD:refs/heads/import

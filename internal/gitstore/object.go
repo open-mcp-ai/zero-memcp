@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -76,7 +75,7 @@ func (r *Repo) readObject(sha string) (string, []byte, error) {
 	}
 	f, err := r.FS().Open(r.objectPath(sha))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if isNotExist(err) {
 			// 松散对象库没有：退回查 packfile。
 			// 任何跑过 gc 或刚 clone 的仓库，对象都在 pack 里。
 			return r.readPacked(sha)

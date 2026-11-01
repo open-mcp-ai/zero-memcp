@@ -1758,7 +1758,7 @@ func (s *Server) bumpClock() int64 {
 
 // ExecLine 执行一行记忆 DSL，返回文本结果。
 //
-// 这是给嵌入式宿主（zero-agi）调用的快捷入口：它用 root 权限、默认人格、
+// 这是给内嵌调用者使用的快捷入口：它用 root 权限、默认人格、
 // 无端口策略约束直接跑一条动词。宿主如果自己已经做了鉴权，就不需要
 // 再走一遍 HTTP 中间件；如果它需要收窄，可以通过带上下文的变种调。
 func (s *Server) ExecLine(ctx context.Context, line string) (string, error) {

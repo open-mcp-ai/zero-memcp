@@ -193,7 +193,7 @@ func decodeDirtyNode(data []byte) *dirtyNode {
 func (r *Repo) loadDirtyNode(ref, dir string) (*dirtyNode, error) {
 	data, err := r.FS().ReadFile(r.dirtyFilePath(ref, dir))
 	if err != nil {
-		if os.IsNotExist(err) {
+		if isNotExist(err) {
 			return nil, nil
 		}
 		return nil, err
@@ -224,7 +224,7 @@ func (r *Repo) saveDirtyNode(ref, dir string, n *dirtyNode) error {
 
 // deleteDirtyNode 删一个目录的脏覆盖。不存在不算错。
 func (r *Repo) deleteDirtyNode(ref, dir string) error {
-	if err := r.FS().Remove(r.dirtyFilePath(ref, dir)); err != nil && !os.IsNotExist(err) {
+	if err := r.FS().Remove(r.dirtyFilePath(ref, dir)); err != nil && !isNotExist(err) {
 		return err
 	}
 	return nil
@@ -239,7 +239,7 @@ func (r *Repo) listDirtyDirs(ref string) ([]string, error) {
 	var out []string
 	err := r.FS().WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
-			if os.IsNotExist(err) {
+			if isNotExist(err) {
 				return nil
 			}
 			return err
@@ -293,7 +293,7 @@ func (r *Repo) dirtyRefs() ([]string, error) {
 	root := filepath.Join(r.Path, dirtyDirName)
 	entries, err := r.FS().ReadDir(root)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if isNotExist(err) {
 			return nil, nil
 		}
 		return nil, err

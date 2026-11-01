@@ -50,12 +50,12 @@ func (r *Repo) UnlockBranch(branch string) (bool, error) {
 	name := normalizeRef(branch)
 	path := r.lockPath(name)
 	if _, err := r.FS().Stat(path); err != nil {
-		if os.IsNotExist(err) {
+		if isNotExist(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	if err := r.FS().Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := r.FS().Remove(path); err != nil && !isNotExist(err) {
 		return false, err
 	}
 	return true, nil

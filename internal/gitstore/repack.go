@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"hash/crc32"
-	"os"
 	"path/filepath"
 	"sort"
 )
@@ -115,7 +114,7 @@ func (r *Repo) Repack() (RepackResult, error) {
 	for _, sha := range shas {
 		path := r.objectPath(sha)
 		if err := r.FS().Remove(path); err != nil {
-			if os.IsNotExist(err) {
+			if isNotExist(err) {
 				continue
 			}
 			return RepackResult{Objects: len(shas), PackName: packName, Removed: removed}, err
@@ -137,7 +136,7 @@ func (r *Repo) allObjectSHAs() ([]string, error) {
 
 	objDir := filepath.Join(r.Path, "objects")
 	fans, err := r.FS().ReadDir(objDir)
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !isNotExist(err) {
 		return nil, err
 	}
 	for _, fan := range fans {

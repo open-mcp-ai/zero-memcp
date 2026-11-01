@@ -1,6 +1,7 @@
 package gitstore
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -107,5 +108,20 @@ func TestRepoInjectLocker(t *testing.T) {
 	}
 	if spy.commitTokens.Load() == 0 {
 		t.Fatalf("提交令牌未路由至自定义 Locker: %d", spy.commitTokens.Load())
+	}
+}
+
+// 验证 isNotExist 能解包 fmt.Errorf("%w")，对自定义 FS 友好。
+func TestIsNotExistUnwrapsWrappedError(t *testing.T) {
+	wrapped := fmt.Errorf("storage layer error: %w", os.ErrNotExist)
+	if !isNotExist(wrapped) {
+		t.Fatalf("应该识别包装过的 os.ErrNotExist")
+	}
+	doubleWrapped := fmt.Errorf("remote: %w", fmt.Errorf("inner: %w", os.ErrNotExist))
+	if !isNotExist(doubleWrapped) {
+		t.Fatalf("应该识别多层包装的 os.ErrNotExist")
+	}
+	if isNotExist(fmt.Errorf("some other error")) {
+		t.Fatalf("不相关错误不应判为 NotExist")
 	}
 }

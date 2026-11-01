@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"os"
 	"path/filepath"
 	"sort"
 	"sync"
@@ -49,7 +48,7 @@ func (r *Repo) loadPacks() ([]*packIdx, error) {
 	packDir := filepath.Join(r.Path, "objects", "pack")
 	entries, err := r.FS().ReadDir(packDir)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if isNotExist(err) {
 			packCache[r.Path] = nil
 			return nil, nil
 		}

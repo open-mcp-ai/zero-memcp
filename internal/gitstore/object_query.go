@@ -2,7 +2,6 @@ package gitstore
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 )
@@ -67,7 +66,7 @@ func (r *Repo) RemoteRef(remote, branch string) string {
 // DeleteRemoteRef 删除一个远端跟踪引用（远端已不存在该分支时）。
 func (r *Repo) DeleteRemoteRef(remote, branch string) error {
 	err := r.FS().Remove(r.refPath("refs/remotes/" + remote + "/" + branch))
-	if err != nil && !os.IsNotExist(err) {
+	if err != nil && !isNotExist(err) {
 		return err
 	}
 	return nil

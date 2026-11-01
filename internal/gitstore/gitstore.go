@@ -217,7 +217,7 @@ func (r *Repo) Refs(prefix string) ([]string, error) {
 	root := filepath.Join(r.Path, "refs")
 	err := r.FS().WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
-			if os.IsNotExist(err) {
+			if isNotExist(err) {
 				return nil
 			}
 			return err
@@ -1282,7 +1282,7 @@ func (r *Repo) Tags() (map[string]string, error) {
 	root := filepath.Join(r.Path, "refs", "tags")
 	err := r.FS().WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
-			if os.IsNotExist(err) {
+			if isNotExist(err) {
 				return nil
 			}
 			return err

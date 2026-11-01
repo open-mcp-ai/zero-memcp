@@ -2,6 +2,7 @@ package gitstore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -142,6 +143,19 @@ func writeAtomicNative(path string, perm os.FileMode, syncFile, syncDirectory bo
 		return syncDir(dir)
 	}
 	return nil
+}
+
+// isNotExist 判定错误是否表示文件/目录不存在。
+//
+// 为什么不直接调 os.IsNotExist：自定义 FS（内存、对象存储适配层）
+// 会用 fmt.Errorf("%w", fs.ErrNotExist) 包装错误，而 os.IsNotExist
+// 在某些 Go 版本或复杂包装链下可能判假。统一走 errors.Is 解包，
+// 同时兜底 os.IsNotExist。
+func isNotExist(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, fs.ErrNotExist) || os.IsNotExist(err)
 }
 
 // syncDir 在 Unix 上 fsync 目录；Windows 上目录不能 fsync，退化为空操作。

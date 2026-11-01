@@ -289,7 +289,6 @@ internal/
   index/        BM25 倒排索引（纯内存，启动重建）
   memory/       切片模型、路径规则、隐藏判定
   manifest/     SKILL.md frontmatter 解析（inject / index 声明）
-  importer/     会话 JSONL 导入器（幂等，按 stopReason 判据）
   weights/      阅读频次（影响排序，不影响授权）
   server/       MCP 动词实现、HTTP 路由、端口策略、树外科手术
 cmd/zero-memcp/ 主程序与子命令（serve / token / keygen / gc）

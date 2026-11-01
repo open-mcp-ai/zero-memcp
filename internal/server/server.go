@@ -13,7 +13,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -25,7 +24,6 @@ import (
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
-	"github.com/open-mcp-ai/zero-memcp/internal/importer"
 	"github.com/open-mcp-ai/zero-memcp/internal/index"
 	"github.com/open-mcp-ai/zero-memcp/internal/manifest"
 	"github.com/open-mcp-ai/zero-memcp/internal/memory"
@@ -1428,42 +1426,6 @@ func textResult(s string) map[string]any {
 // Report 打印扫描结果，用于验证目录结构与声明是否符合预期。
 //
 // 这一屏输出比读文档快：它直接告诉你哪些块会被注入、哪些进索引、哪些被跳过。
-// ImportSessions 把 pi 的会话记录补进记忆库。
-//
-// 这是迁移用的，不是日常路径：日常靠插件在每轮结束时落盘。
-// 判重依赖已有正文——写盘时的时间戳每次都不同，文件名也就不同，
-// 只比文件名会重复导入。
-func (s *Server) ImportSessions(sessionsDir string, cutoff time.Time, dryRun bool) (importer.Result, error) {
-	// Block 只带元数据，正文得回磁盘读。
-	s.mu.RLock()
-	var paths []string
-	for _, t := range s.trees {
-		for _, blk := range t.Blocks {
-			paths = append(paths, blk.Path)
-		}
-	}
-	s.mu.RUnlock()
-
-	var b strings.Builder
-	for _, p := range paths {
-		if d, err := os.ReadFile(p); err == nil {
-			b.Write(d)
-			b.WriteString("\n")
-		}
-	}
-
-	return importer.Import(importer.Options{
-		SessionsDir: sessionsDir,
-		Cutoff:      cutoff,
-		Existing:    b.String(),
-		DryRun:      dryRun,
-		Write: func(kind, text, session string) (string, error) {
-			addr, _, _, err := s.writeNote(kind, text, session, "importer", s.rootCaller(), "")
-			return addr, err
-		},
-	})
-}
-
 func (s *Server) Report(w io.Writer, c Caller) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

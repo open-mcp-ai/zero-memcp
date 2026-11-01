@@ -9,6 +9,6 @@
 # macOS
 # Tests & coverage
 bin/
-zero-memcp
-zmcp
+/zero-memcp
+/zmcp
 .ext-align/

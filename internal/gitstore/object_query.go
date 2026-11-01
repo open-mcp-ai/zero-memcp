@@ -12,7 +12,7 @@ func (r *Repo) HasObject(sha string) bool {
 	if err := validSHA(sha); err != nil {
 		return false
 	}
-	if _, err := os.Stat(r.objectPath(sha)); err == nil {
+	if _, err := r.FS().Stat(r.objectPath(sha)); err == nil {
 		return true
 	}
 	packs, err := r.loadPacks()
@@ -49,27 +49,10 @@ func (r *Repo) SetRemoteRef(remote, branch, sha string) error {
 	}
 	ref := "refs/remotes/" + remote + "/" + branch
 	path := r.refPath(ref)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := r.FS().MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".ref-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.WriteString(sha + "\n"); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return r.FS().WriteAtomicSync(path, []byte(sha+"\n"), 0o644)
 }
 
 // RemoteRef 读出 refs/remotes/<remote>/<branch> 的 sha，没有则返回空串。
@@ -83,7 +66,7 @@ func (r *Repo) RemoteRef(remote, branch string) string {
 
 // DeleteRemoteRef 删除一个远端跟踪引用（远端已不存在该分支时）。
 func (r *Repo) DeleteRemoteRef(remote, branch string) error {
-	err := os.Remove(r.refPath("refs/remotes/" + remote + "/" + branch))
+	err := r.FS().Remove(r.refPath("refs/remotes/" + remote + "/" + branch))
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -103,25 +86,8 @@ func (r *Repo) SetRef(ref, sha string) error {
 		return fmt.Errorf("非法的 ref：%q", ref)
 	}
 	path := r.refPath(ref)
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := r.FS().MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".ref-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.WriteString(sha + "\n"); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	return r.FS().WriteAtomicSync(path, []byte(sha+"\n"), 0o644)
 }

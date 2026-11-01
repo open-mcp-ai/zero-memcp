@@ -36,10 +36,10 @@ func (r *Repo) LockBranch(branch string) (string, error) {
 		return "", fmt.Errorf("分支 %q 不存在或没有提交", branch)
 	}
 	path := r.lockPath(name)
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	if err := r.FS().MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", err
 	}
-	if err := writeFileAtomic(path, []byte(sha+"\n"), 0o600); err != nil {
+	if err := r.FS().WriteAtomic(path, []byte(sha+"\n"), 0o600); err != nil {
 		return "", err
 	}
 	return sha, nil
@@ -49,13 +49,13 @@ func (r *Repo) LockBranch(branch string) (string, error) {
 func (r *Repo) UnlockBranch(branch string) (bool, error) {
 	name := normalizeRef(branch)
 	path := r.lockPath(name)
-	if _, err := os.Stat(path); err != nil {
+	if _, err := r.FS().Stat(path); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
 		}
 		return false, err
 	}
-	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+	if err := r.FS().Remove(path); err != nil && !os.IsNotExist(err) {
 		return false, err
 	}
 	return true, nil
@@ -63,7 +63,7 @@ func (r *Repo) UnlockBranch(branch string) (bool, error) {
 
 // BranchLocked 报告分支是否被锁，以及加锁时它指向的提交。
 func (r *Repo) BranchLocked(branch string) (bool, string) {
-	b, err := os.ReadFile(r.lockPath(normalizeRef(branch)))
+	b, err := r.FS().ReadFile(r.lockPath(normalizeRef(branch)))
 	if err != nil {
 		return false, ""
 	}
@@ -78,7 +78,7 @@ func (r *Repo) BranchLocked(branch string) (bool, string) {
 func (r *Repo) LockedBranches() []string {
 	root := filepath.Join(r.Path, lockDirName)
 	var out []string
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+	_ = r.FS().WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}

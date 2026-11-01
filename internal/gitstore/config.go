@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -35,7 +34,7 @@ func (r *Repo) Config(key string) string {
 	if !ok {
 		return ""
 	}
-	f, err := os.Open(r.configPath())
+	f, err := r.FS().Open(r.configPath())
 	if err != nil {
 		return ""
 	}
@@ -69,7 +68,7 @@ func (r *Repo) SetConfig(key, value string) error {
 		return fmt.Errorf("键应为 section.key，得到 %q", key)
 	}
 	p := r.configPath()
-	raw, _ := os.ReadFile(p)
+	raw, _ := r.FS().ReadFile(p)
 
 	lines := strings.Split(string(raw), "\n")
 	curSec := ""
@@ -120,7 +119,7 @@ func (r *Repo) SetConfig(key, value string) error {
 			buf.WriteByte('\n')
 		}
 	}
-	return os.WriteFile(p, buf.Bytes(), 0o644)
+	return r.FS().WriteAtomic(p, buf.Bytes(), 0o644)
 }
 
 // MemcpConfig 读出当前裸仓库的 [memcp] 自定义配置。

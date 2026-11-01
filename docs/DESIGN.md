@@ -78,6 +78,47 @@ Agent 的长期记忆需要满足三个相互冲突的要求：
 
 ---
 
+## 二之补：为什么把文件系统与锁抽成接口
+
+### 问题
+
+脏层、对象库、ref 更新、pack 读写各自直接调 `os.*`，并发控制直接调 `sync.RWMutex`。
+后果是两层硬绑定：存储层只能在本地磁盘上跑；锁只能在单进程内生效。
+
+### 决策
+
+抽出两个接口，`Repo` 持有其默认实现，可由调用方注入替换：
+
+```go
+repo, err := gitstore.OpenWith(path, fsImpl, lockerImpl)
+// 初始化新仓库时使用 gitstore.InitWith(path, fsImpl, lockerImpl)
+```
+
+**为什么不把所有写压成一个 `Write`**：三种写的承诺不同，不能合并。
+
+| 方法 | 承诺 | 用在 |
+|---|---|---|
+| `WriteFile` | 无。读者可能看见半截 | 一次性建档（HEAD / config）|
+| `WriteAtomic` | 读者只会看到完整旧版或完整新版；掉电退回上一版 | ref、脏文件 |
+| `WriteDurable` | 再加上 fsync 文件与目录 | pack / idx（丢了得重新拉）|
+
+压成一个方法只有两种结局：要么在写入热路径上白付 fsync 的钱，
+要么在最需要耐久性的 pack 上悄悄丢数据。
+
+**为什么锁要分成三层而不是一把大锁**：
+
+- `LockNode(ref, dir)`：同目录串行重写，不同目录并发；
+- `LockDirty()` / `RLockDirty()`：提交全局独占，改脏共享；
+- `AcquireCommitToken(ref, timeout)`：同分支提交排队，带超时而不是死等。
+
+锁序恒为「先全局后目录」，任何路径不得反过来。
+
+**代价**：多一层间接，每处 I/O 都要问自己「需要哪一档承诺」。
+**收益**：记忆底座可以从本地磁盘迁到共享块设备或对象存储适配层，
+而 Git 对象语义、脏层折叠、提交事务不需要重写。
+
+---
+
 ## 三、封箱时机：语义提交与策略兜底
 
 ### 问题
@@ -240,6 +281,7 @@ Git 里没有中心/边缘 —— 每个仓库对等，能 push 还是只能 fet
 ```
 internal/
   gitstore/     Git 对象读写、脏层覆盖、pack 读取与打包器、分支手术原语
+                （fs.go 的 FS / Locker 是存储与锁的可替换边界）
   gittransport/ 内置 smart-HTTP / SSH 传输协议客户端与推送计划
   gitremote/    SSH 私钥与 Host key pin 管理
   auth/         JWT、吊销名单、挂载表、权限位

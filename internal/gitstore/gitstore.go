@@ -17,7 +17,6 @@
 package gitstore
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -65,21 +64,13 @@ type Repo struct {
 	// Path 是仓库目录（通常以 .git 结尾）。
 	Path string
 
-	// mu 保护下面那些非脏层的共享状态（commitTok 等）。
+	// fs 与 locker 抽象底层存储与并发锁。
+	// 默认使用本地磁盘与进程内锁，但可由外部注入替换。
+	fs     FS
+	locker Locker
+
+	// mu 保护仓库实例自身的字段。
 	mu sync.Mutex
-
-	// dirtyMu 是脏层的两把锁之一：
-	//
-	//	改脏    RLock + 该目录的脏文件锁
-	//	提交    Lock（全局独占）
-	//	读      RLock
-	//
-	// 锁序恒为「先 dirtyMu 后脏文件锁」，任何路径不得反过来，
-	// 否则提交与写入会互相等成死锁。
-	dirtyMu sync.RWMutex
-
-	// commitTok 串行化同一 ref 的提交请求。
-	commitTok sync.Map
 
 	// writer 是单线程脏层写者。Write/Delete 只把任务投递进队列就返回；
 	// Read/List/Commit 会排一个 barrier，保证此前已接受的任务先处理完。
@@ -90,12 +81,32 @@ type Repo struct {
 	writerErr  error         // worker 累积的异步错误，下一次 barrier 返回并清空
 	writerDown chan struct{} // worker 退出后关闭，Close 等它
 	writerDead bool          // 队列已关，不再接受新投递
+}
 
-	// nodeLocks 是每个脏目录一把互斥锁。
-	//
-	// 放在实例而不是包级：包级的 map 会随仓库数量永久增长，
-	// 而一个进程里打开过又关掉的仓库不该留下任何东西。
-	nodeLocks sync.Map // 脏文件路径 -> *sync.Mutex
+// FS 返回当前仓库使用的存储抽象。
+func (r *Repo) FS() FS {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fs == nil {
+		r.fs = DefaultFS()
+	}
+	return r.fs
+}
+
+// Locker 返回当前仓库使用的锁管理器。
+func (r *Repo) Locker() Locker {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.locker == nil {
+		r.locker = newLocalLocker()
+	}
+	return r.locker
+}
+
+func (r *Repo) rlockDirty() func() { return r.Locker().RLockDirty() }
+func (r *Repo) lockDirty() func()  { return r.Locker().LockDirty() }
+func (r *Repo) lockNode(ref, dir string) func() {
+	return r.Locker().LockNode(ref, dir)
 }
 
 const (
@@ -106,19 +117,33 @@ const (
 // Open 打开一个裸仓库。目录不存在时报错，不自动创建——
 // 「项目存在」是一个需要人明确决定的事，不该由一次读操作顺手造就。
 func Open(path string) (*Repo, error) {
+	return OpenWith(path, nil, nil)
+}
+
+// OpenWith 打开仓库并注入存储与锁实现。传 nil 使用本机默认实现。
+//
+// 注入必须发生在仓库开始对外服务之前：所有读写与加锁路径都从 Repo
+// 上取同一对实现，中途替换会让两个写者各自持不同的锁。
+func OpenWith(path string, storage FS, locker Locker) (*Repo, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := os.Stat(abs); err != nil {
+	if storage == nil {
+		storage = DefaultFS()
+	}
+	if locker == nil {
+		locker = newLocalLocker()
+	}
+	if _, err := storage.Stat(abs); err != nil {
 		return nil, fmt.Errorf("仓库 %s: %w", abs, err)
 	}
 	for _, want := range []string{"HEAD", "objects"} {
-		if _, err := os.Stat(filepath.Join(abs, want)); err != nil {
+		if _, err := storage.Stat(filepath.Join(abs, want)); err != nil {
 			return nil, fmt.Errorf("%s 不是裸仓库（缺 %s）", abs, want)
 		}
 	}
-	r := &Repo{Path: abs}
+	r := &Repo{Path: abs, fs: storage, locker: locker}
 	// 脏层本身就是持久层，重启后直接生效；这里只清掉孤儿脏层
 	// （所属分支已不存在）并统计还有多少改动等着折叠。
 	// 失败不影响打开：脏层文件读不出来最多让那个目录退回干净层。
@@ -128,41 +153,50 @@ func Open(path string) (*Repo, error) {
 
 // Init 初始化一个裸仓库。全部用标准库，不调 git。
 func Init(path string) (*Repo, error) {
+	return InitWith(path, nil, nil)
+}
+
+// InitWith 初始化裸仓库并注入存储与锁实现。传 nil 使用本机默认实现。
+func InitWith(path string, storage FS, locker Locker) (*Repo, error) {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(filepath.Join(abs, "objects", "info"), 0o750); err != nil {
-		return nil, err
+	if storage == nil {
+		storage = DefaultFS()
 	}
-	if err := os.MkdirAll(filepath.Join(abs, "objects", "pack"), 0o750); err != nil {
-		return nil, err
+	if locker == nil {
+		locker = newLocalLocker()
 	}
-	if err := os.MkdirAll(filepath.Join(abs, "refs", "heads"), 0o750); err != nil {
-		return nil, err
-	}
-	if err := os.MkdirAll(filepath.Join(abs, "refs", "tags"), 0o750); err != nil {
-		return nil, err
+	for _, d := range []string{
+		filepath.Join(abs, "objects", "info"),
+		filepath.Join(abs, "objects", "pack"),
+		filepath.Join(abs, "refs", "heads"),
+		filepath.Join(abs, "refs", "tags"),
+	} {
+		if err := storage.MkdirAll(d, 0o750); err != nil {
+			return nil, err
+		}
 	}
 	// HEAD 指向默认分支
 	head := filepath.Join(abs, "HEAD")
-	if _, err := os.Stat(head); err != nil {
-		if err := os.WriteFile(head, []byte("ref: refs/heads/zero\n"), 0o644); err != nil {
+	if _, err := storage.Stat(head); err != nil {
+		if err := storage.WriteFile(head, []byte("ref: refs/heads/zero\n"), 0o644); err != nil {
 			return nil, err
 		}
 	}
 	cfg := filepath.Join(abs, "config")
-	if _, err := os.Stat(cfg); err != nil {
+	if _, err := storage.Stat(cfg); err != nil {
 		body := "[core]\n\trepositoryformatversion = 0\n\tfilemode = true\n\tbare = true\n"
-		if err := os.WriteFile(cfg, []byte(body), 0o644); err != nil {
+		if err := storage.WriteFile(cfg, []byte(body), 0o644); err != nil {
 			return nil, err
 		}
 	}
 	desc := filepath.Join(abs, "description")
-	if _, err := os.Stat(desc); err != nil {
-		_ = os.WriteFile(desc, []byte("zero-memcp memory store\n"), 0o644)
+	if _, err := storage.Stat(desc); err != nil {
+		_ = storage.WriteFile(desc, []byte("zero-memcp memory store\n"), 0o644)
 	}
-	return Open(abs)
+	return OpenWith(abs, storage, locker)
 }
 
 // ── refs ──────────────────────────────────────────────────────
@@ -181,7 +215,7 @@ func (r *Repo) Refs(prefix string) ([]string, error) {
 	out := map[string]bool{}
 
 	root := filepath.Join(r.Path, "refs")
-	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	err := r.FS().WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -221,7 +255,7 @@ func (r *Repo) Refs(prefix string) ([]string, error) {
 
 // packedRefs 读出 packed-refs 里的 ref 名（不含 peeled 行）。
 func (r *Repo) packedRefs() []string {
-	b, err := os.ReadFile(filepath.Join(r.Path, "packed-refs"))
+	b, err := r.FS().ReadFile(filepath.Join(r.Path, "packed-refs"))
 	if err != nil {
 		return nil
 	}
@@ -246,7 +280,7 @@ func (r *Repo) Resolve(ref string) (string, error) {
 		cands = append([]string{"refs/heads/" + ref}, cands...)
 	}
 	for _, c := range cands {
-		b, err := os.ReadFile(r.refPath(c))
+		b, err := r.FS().ReadFile(r.refPath(c))
 		if err != nil {
 			continue
 		}
@@ -259,7 +293,7 @@ func (r *Repo) Resolve(ref string) (string, error) {
 		}
 	}
 	// 打包过的 ref 在 packed-refs 里
-	if b, err := os.ReadFile(filepath.Join(r.Path, "packed-refs")); err == nil {
+	if b, err := r.FS().ReadFile(filepath.Join(r.Path, "packed-refs")); err == nil {
 		want := ref
 		if !strings.HasPrefix(want, "refs/") {
 			want = "refs/heads/" + want
@@ -285,61 +319,22 @@ func (r *Repo) Resolve(ref string) (string, error) {
 const commitTokenTimeout = 30 * time.Second
 
 // acquireCommitToken 获取某分支的提交令牌（带超时）。
-//
-// 令牌是一槽 channel：没人在提时立刻拿到；有人在提时排队等；
-// 超时后报错，调用者退回错误而不是死等。
 func (r *Repo) acquireCommitToken(normRef string) (func(), error) {
 	return r.acquireCommitTokenFor(normRef, commitTokenTimeout)
 }
 
 func (r *Repo) acquireCommitTokenFor(normRef string, timeout time.Duration) (func(), error) {
-	v, _ := r.commitTok.LoadOrStore(normRef, make(chan struct{}, 1))
-	ch := v.(chan struct{})
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	// 一槽 channel 本来是空的：投递成功就是拿到令牌，
-	// 持有期间 channel 满，其他提交无法再投递；释放时从同一 channel 取出。
-	select {
-	case ch <- struct{}{}:
-		var releaseOnce sync.Once
-		return func() {
-			releaseOnce.Do(func() { <-ch })
-		}, nil
-	case <-ctx.Done():
-		return nil, fmt.Errorf("分支 %s 提交排队超时（上一个提交占用超过 %v）", normRef, timeout)
-	}
+	return r.Locker().AcquireCommitToken(normRef, timeout)
 }
 
 // updateRef 原子地更新一个 ref。
 func (r *Repo) updateRef(ref, sha string) error {
 	p := r.refPath(ref)
 	dir := filepath.Dir(p)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	if err := r.FS().MkdirAll(dir, 0o750); err != nil {
 		return err
 	}
-	// 临时文件必须用唯一名：固定名 .lock 在两条更新碰在一起时
-	// 会先被 A rename 走，然后 B rename 时报 no such file or directory。
-	tmp, err := os.CreateTemp(dir, ".ref-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-
-	if _, err := tmp.WriteString(sha + "\n"); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, p)
+	return r.FS().WriteAtomicSync(p, []byte(sha+"\n"), 0o644)
 }
 
 // ── 读 ────────────────────────────────────────────────────────
@@ -383,10 +378,10 @@ func (r *Repo) List(ref string) ([]Entry, error) {
 	//
 	// 只在目录粒度做覆盖，不展开成路径 map：脏文件里存的是
 	// 「这个目录下的哪些名字被换成了什么」，与干净层一一对应。
-	r.dirtyMu.RLock()
+	unlockDirty := r.rlockDirty()
 	dirs, err := r.listDirtyDirs(ref)
 	if err != nil {
-		r.dirtyMu.RUnlock()
+		unlockDirty()
 		return nil, err
 	}
 	for _, dir := range dirs {
@@ -415,7 +410,7 @@ func (r *Repo) List(ref string) ([]Entry, error) {
 			delete(out, prefix+name)
 		}
 	}
-	r.dirtyMu.RUnlock()
+	unlockDirty()
 
 	list := make([]Entry, 0, len(out))
 	for _, e := range out {
@@ -446,19 +441,19 @@ func (r *Repo) Read(ref, path string) ([]byte, error) {
 
 	// ① 脏层优先：刚投递的内容也必须读得到。
 	//    记忆服务最常见的动作就是「写一条，马上读回来确认」。
-	r.dirtyMu.RLock()
+	unlockDirty := r.rlockDirty()
 	n, err := r.loadDirtyNode(normRef, dir)
 	if err != nil {
-		r.dirtyMu.RUnlock()
+		unlockDirty()
 		return nil, err
 	}
 	if n != nil {
 		if gone := n.del[name]; gone {
-			r.dirtyMu.RUnlock()
+			unlockDirty()
 			return nil, fmt.Errorf("%s 不存在（已删除，尚未提交）", path)
 		}
 		if e, ok := n.set[name]; ok && e.Mode != "40000" {
-			r.dirtyMu.RUnlock()
+			unlockDirty()
 			typ, body, err := r.readObject(e.SHA)
 			if err != nil {
 				return nil, err
@@ -469,7 +464,7 @@ func (r *Repo) Read(ref, path string) ([]byte, error) {
 			return body, nil
 		}
 	}
-	r.dirtyMu.RUnlock()
+	unlockDirty()
 
 	// ② 干净层
 	c, err := r.commitOf(ref)
@@ -690,10 +685,10 @@ func (r *Repo) applyDirtyWrite(ref, path string, data []byte, mode Mode) error {
 		return err
 	}
 
-	r.dirtyMu.RLock()
-	defer r.dirtyMu.RUnlock()
+	unlockDirty := r.rlockDirty()
+	defer unlockDirty()
 
-	unlock := r.lockDirtyFile(r.dirtyFilePath(normRef, dir))
+	unlock := r.lockDirtyFile(normRef, dir)
 	defer unlock()
 
 	n, err := r.loadDirtyNode(normRef, dir)
@@ -720,10 +715,10 @@ func (r *Repo) applyDirtyDelete(ref, path string) error {
 	normRef := normalizeRef(ref)
 	dir, name := splitDirName(path)
 
-	r.dirtyMu.RLock()
-	defer r.dirtyMu.RUnlock()
+	unlockDirty := r.rlockDirty()
+	defer unlockDirty()
 
-	unlock := r.lockDirtyFile(r.dirtyFilePath(normRef, dir))
+	unlock := r.lockDirtyFile(normRef, dir)
 	defer unlock()
 
 	n, err := r.loadDirtyNode(normRef, dir)
@@ -757,8 +752,8 @@ func (r *Repo) Flush() error {
 // 「有没有东西等着被折叠」的唯一依据——不再有第二份内存账本。
 func (r *Repo) Pending(ref ...string) int {
 	_ = r.syncDirtyWriter()
-	r.dirtyMu.RLock()
-	defer r.dirtyMu.RUnlock()
+	unlockDirty := r.rlockDirty()
+	defer unlockDirty()
 	return r.pendingOnDisk(ref...)
 }
 
@@ -822,8 +817,8 @@ func (r *Repo) Commit(ref, message string) (string, error) {
 	}
 	defer release()
 
-	r.dirtyMu.Lock()
-	defer r.dirtyMu.Unlock()
+	unlockDirty := r.lockDirty()
+	defer unlockDirty()
 
 	dirs, err := r.listDirtyDirs(normRef)
 	if err != nil {
@@ -1011,7 +1006,7 @@ func (r *Repo) objectTime(sha string) int64 {
 	if err := validSHA(sha); err != nil {
 		return 0
 	}
-	info, err := os.Stat(r.objectPath(sha))
+	info, err := r.FS().Stat(r.objectPath(sha))
 	if err != nil {
 		return 0
 	}
@@ -1103,9 +1098,9 @@ func (r *Repo) Fork(from, to string) error {
 	// 重置/分叉时把目标分支的脏层清掉：重置就是放弃所有未提交状态，
 	// 继承源分支的纯净快照。不清掉的话，之前没提交的写入会叠加在
 	// 新快照上，看起来像「没重置干净」。
-	r.dirtyMu.Lock()
+	unlockDirty := r.lockDirty()
 	_ = r.clearDirtyRef(normTo)
-	r.dirtyMu.Unlock()
+	unlockDirty()
 	return r.updateRef("refs/heads/"+normTo, sha)
 }
 
@@ -1192,8 +1187,8 @@ func (r *Repo) Recover() (RecoveryResult, error) {
 		return res, err
 	}
 
-	r.dirtyMu.Lock()
-	defer r.dirtyMu.Unlock()
+	unlockDirty := r.lockDirty()
+	defer unlockDirty()
 
 	for _, name := range refs {
 		dirs, derr := r.listDirtyDirs(name)
@@ -1254,8 +1249,8 @@ func (r *Repo) Deleted(ref string) []string {
 	if err := r.syncDirtyWriter(); err != nil {
 		return nil
 	}
-	r.dirtyMu.RLock()
-	defer r.dirtyMu.RUnlock()
+	unlockDirty := r.rlockDirty()
+	defer unlockDirty()
 	normRef := normalizeRef(ref)
 	dirs, err := r.listDirtyDirs(normRef)
 	if err != nil {
@@ -1285,7 +1280,7 @@ func (r *Repo) Deleted(ref string) []string {
 func (r *Repo) Tags() (map[string]string, error) {
 	out := map[string]string{}
 	root := filepath.Join(r.Path, "refs", "tags")
-	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	err := r.FS().WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -1299,7 +1294,7 @@ func (r *Repo) Tags() (map[string]string, error) {
 		if rerr != nil {
 			return nil
 		}
-		b, rerr := os.ReadFile(p)
+		b, rerr := r.FS().ReadFile(p)
 		if rerr != nil {
 			return nil
 		}
@@ -1316,7 +1311,7 @@ func (r *Repo) Tags() (map[string]string, error) {
 		return nil, err
 	}
 	// packed-refs 里的 tag
-	if b, rerr := os.ReadFile(filepath.Join(r.Path, "packed-refs")); rerr == nil {
+	if b, rerr := r.FS().ReadFile(filepath.Join(r.Path, "packed-refs")); rerr == nil {
 		for _, line := range strings.Split(string(b), "\n") {
 			line = strings.TrimSpace(line)
 			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "^") {
@@ -1361,20 +1356,20 @@ func (r *Repo) Tag(name, ref string) error {
 // 扔掉唯一的入口，而这个操作最容易在事后才被发现是错的。
 func (r *Repo) Untag(name string) error {
 	src := filepath.Join(r.Path, "refs", "tags", filepath.FromSlash(name))
-	b, err := os.ReadFile(src)
+	b, err := r.FS().ReadFile(src)
 	if err != nil {
 		return fmt.Errorf("tag %q 不存在", name)
 	}
 	dstDir := filepath.Join(r.Path, "refs", "tags-removed")
-	if err := os.MkdirAll(dstDir, 0o750); err != nil {
+	if err := r.FS().MkdirAll(dstDir, 0o750); err != nil {
 		return err
 	}
 	stamp := time.Now().Format("20060102-150405")
 	dst := filepath.Join(dstDir, strings.ReplaceAll(name, "/", "_")+"."+stamp)
-	if err := os.WriteFile(dst, b, 0o644); err != nil {
+	if err := r.FS().WriteFile(dst, b, 0o644); err != nil {
 		return err
 	}
-	return os.Remove(src)
+	return r.FS().Remove(src)
 }
 
 // ── 跨分支操作 ─────────────────────────────────────────────────
@@ -1499,13 +1494,13 @@ func (r *Repo) ArchiveRef(branch string) error {
 		return fmt.Errorf("分支 %q 不存在", branch)
 	}
 	dstDir := filepath.Join(r.Path, "refs", "archived")
-	if err := os.MkdirAll(dstDir, 0o750); err != nil {
+	if err := r.FS().MkdirAll(dstDir, 0o750); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(dstDir, name), []byte(sha+"\n"), 0o644); err != nil {
+	if err := r.FS().WriteFile(filepath.Join(dstDir, name), []byte(sha+"\n"), 0o644); err != nil {
 		return err
 	}
-	return os.Remove(filepath.Join(r.Path, "refs", "heads", name))
+	return r.FS().Remove(filepath.Join(r.Path, "refs", "heads", name))
 }
 
 // Branches 列出该仓库所有的分支名（refs/heads/ 下的短名）。
@@ -1530,8 +1525,8 @@ func (r *Repo) Branches() []string {
 // 先等写入队列排空，确保看到最新状态。
 func (r *Repo) PendingRefs() []string {
 	_ = r.syncDirtyWriter()
-	r.dirtyMu.RLock()
-	defer r.dirtyMu.RUnlock()
+	unlockDirty := r.rlockDirty()
+	defer unlockDirty()
 	refs, _ := r.dirtyRefs()
 	return refs
 }

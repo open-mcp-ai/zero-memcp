@@ -82,28 +82,28 @@ func (r *Repo) Repack() (RepackResult, error) {
 	packName := "pack-" + hex.EncodeToString(packSum[:])
 
 	packDir := filepath.Join(r.Path, "objects", "pack")
-	if err := os.MkdirAll(packDir, 0o755); err != nil {
+	if err := r.FS().MkdirAll(packDir, 0o755); err != nil {
 		return RepackResult{}, err
 	}
 	packPath := filepath.Join(packDir, packName+".pack")
-	if err := writeFileAtomic(packPath, full, 0o444); err != nil {
+	if err := r.FS().WriteDurable(packPath, full, 0o444); err != nil {
 		return RepackResult{}, err
 	}
 
 	idx, err := buildIdxV2(entries, packSum)
 	if err != nil {
-		_ = os.Remove(packPath)
+		_ = r.FS().Remove(packPath)
 		return RepackResult{}, err
 	}
-	if err := writeFileAtomic(filepath.Join(packDir, packName+".idx"), idx, 0o444); err != nil {
-		_ = os.Remove(packPath)
+	if err := r.FS().WriteDurable(filepath.Join(packDir, packName+".idx"), idx, 0o444); err != nil {
+		_ = r.FS().Remove(packPath)
 		return RepackResult{}, err
 	}
 	r.InvalidatePackCache()
 
 	// 校验：索引能被解析，且对象确实读得到。宁可留下重复的松散副本，
 	// 也不要在索引写坏的情况下删掉唯一能读的那份。
-	idxInfo, err := parseIdx(filepath.Join(packDir, packName+".idx"))
+	idxInfo, err := r.parseIdx(filepath.Join(packDir, packName+".idx"))
 	if err != nil {
 		return RepackResult{}, fmt.Errorf("新索引无法解析: %w", err)
 	}
@@ -114,7 +114,7 @@ func (r *Repo) Repack() (RepackResult, error) {
 	removed := 0
 	for _, sha := range shas {
 		path := r.objectPath(sha)
-		if err := os.Remove(path); err != nil {
+		if err := r.FS().Remove(path); err != nil {
 			if os.IsNotExist(err) {
 				continue
 			}
@@ -136,7 +136,7 @@ func (r *Repo) allObjectSHAs() ([]string, error) {
 	seen := map[string]bool{}
 
 	objDir := filepath.Join(r.Path, "objects")
-	fans, err := os.ReadDir(objDir)
+	fans, err := r.FS().ReadDir(objDir)
 	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
@@ -144,7 +144,7 @@ func (r *Repo) allObjectSHAs() ([]string, error) {
 		if !fan.IsDir() || len(fan.Name()) != 2 || fan.Name() == "pack" || fan.Name() == "info" {
 			continue
 		}
-		files, err := os.ReadDir(filepath.Join(objDir, fan.Name()))
+		files, err := r.FS().ReadDir(filepath.Join(objDir, fan.Name()))
 		if err != nil {
 			continue
 		}
@@ -266,45 +266,4 @@ func buildIdxV2(entries []packEntry, packSum [20]byte) ([]byte, error) {
 	sum := sha1.Sum(buf.Bytes())
 	buf.Write(sum[:])
 	return buf.Bytes(), nil
-}
-
-// writeFileAtomic 写文件：临时文件 + fsync + rename。
-// 目录也要 fsync，否则 rename 本身可能还在页缓存里。
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return err
-	}
-	name := tmp.Name()
-	defer os.Remove(name)
-	if err := tmp.Chmod(perm); err != nil {
-		tmp.Close()
-		return err
-	}
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(name, path); err != nil {
-		return err
-	}
-	return syncDir(dir)
-}
-
-// syncDir 在 Unix 上 fsync 目录；Windows 上目录不能 fsync，退化为空操作。
-func syncDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
 }

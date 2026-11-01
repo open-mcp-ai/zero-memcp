@@ -47,7 +47,7 @@ func (r *Repo) loadPacks() ([]*packIdx, error) {
 	}
 
 	packDir := filepath.Join(r.Path, "objects", "pack")
-	entries, err := os.ReadDir(packDir)
+	entries, err := r.FS().ReadDir(packDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			packCache[r.Path] = nil
@@ -61,7 +61,7 @@ func (r *Repo) loadPacks() ([]*packIdx, error) {
 		if filepath.Ext(e.Name()) != ".idx" {
 			continue
 		}
-		idx, err := parseIdx(filepath.Join(packDir, e.Name()))
+		idx, err := r.parseIdx(filepath.Join(packDir, e.Name()))
 		if err != nil {
 			// 一个坏索引不该让整个仓库读不了：跳过它，剩下的照读。
 			continue
@@ -72,12 +72,15 @@ func (r *Repo) loadPacks() ([]*packIdx, error) {
 	return idxs, nil
 }
 
-// parseIdx 解析 v2 格式的 .idx。
-func parseIdx(path string) (*packIdx, error) {
-	b, err := os.ReadFile(path)
+func (r *Repo) parseIdx(path string) (*packIdx, error) {
+	b, err := r.FS().ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
+	return parseIdxBytes(path, b)
+}
+
+func parseIdxBytes(path string, b []byte) (*packIdx, error) {
 	if len(b) < 8+256*4+40 {
 		return nil, fmt.Errorf("%s 太短，不像 idx", path)
 	}
@@ -164,7 +167,7 @@ func (r *Repo) readAt(idx *packIdx, off int64, depth int) (string, []byte, error
 	if depth > 64 {
 		return "", nil, fmt.Errorf("delta 链过深（可能成环）")
 	}
-	f, err := os.Open(idx.packPath)
+	f, err := r.FS().Open(idx.packPath)
 	if err != nil {
 		return "", nil, err
 	}
@@ -238,7 +241,7 @@ func (r *Repo) readAt(idx *packIdx, off int64, depth int) (string, []byte, error
 
 // readAtType 只求类型，用于让 OFS_DELTA 的结果继承基对象类型。
 func (r *Repo) readAtType(idx *packIdx, off int64) (string, int64, error) {
-	f, err := os.Open(idx.packPath)
+	f, err := r.FS().Open(idx.packPath)
 	if err != nil {
 		return "", 0, err
 	}

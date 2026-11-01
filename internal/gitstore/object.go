@@ -44,45 +44,26 @@ func (r *Repo) writeObject(typ string, content []byte) (string, error) {
 	sum := sha1.Sum(full)
 	sha := hex.EncodeToString(sum[:])
 	dst := r.objectPath(sha)
-	if _, err := os.Stat(dst); err == nil {
+	if _, err := r.FS().Stat(dst); err == nil {
 		return sha, nil
 	}
 
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	if err := r.FS().MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", fmt.Errorf("建对象目录: %w", err)
 	}
 
-	// 压缩到临时文件再 rename：rename 在同一文件系统上是原子的，
-	// 所以磁盘上永远不会出现「写了一半的对象」。
-	// 直接往目标路径写的话，断电会留下一个 SHA 合法但内容截断的文件，
-	// 而它会被后续读取当成真对象用。
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".tmp-*")
+	// 压缩到临时文件再 rename：通过 FS.WriteAtomicWithSync 原子同步
+	err := r.FS().WriteAtomicWithSync(dst, 0o444, func(w io.Writer) error {
+		zw := zlib.NewWriter(w)
+		if _, err := zw.Write(full); err != nil {
+			return fmt.Errorf("压缩对象: %w", err)
+		}
+		if err := zw.Close(); err != nil {
+			return fmt.Errorf("关闭压缩流: %w", err)
+		}
+		return nil
+	})
 	if err != nil {
-		return "", fmt.Errorf("建临时对象: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-
-	zw := zlib.NewWriter(tmp)
-	if _, err := zw.Write(full); err != nil {
-		tmp.Close()
-		return "", fmt.Errorf("压缩对象: %w", err)
-	}
-	if err := zw.Close(); err != nil {
-		tmp.Close()
-		return "", fmt.Errorf("关闭压缩流: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return "", fmt.Errorf("同步对象: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return "", fmt.Errorf("关闭对象: %w", err)
-	}
-	if err := os.Chmod(tmpName, 0o444); err != nil {
-		return "", err
-	}
-	if err := os.Rename(tmpName, dst); err != nil {
 		return "", fmt.Errorf("落盘对象: %w", err)
 	}
 	return sha, nil
@@ -93,7 +74,7 @@ func (r *Repo) readObject(sha string) (string, []byte, error) {
 	if err := validSHA(sha); err != nil {
 		return "", nil, err
 	}
-	f, err := os.Open(r.objectPath(sha))
+	f, err := r.FS().Open(r.objectPath(sha))
 	if err != nil {
 		if os.IsNotExist(err) {
 			// 松散对象库没有：退回查 packfile。

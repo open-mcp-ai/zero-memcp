@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
 )
 
 // 脏层（dirty overlay）：干净 Git tree 之上，按目录做的一层覆盖。
@@ -192,7 +191,7 @@ func decodeDirtyNode(data []byte) *dirtyNode {
 
 // loadDirtyNode 读一个目录的脏覆盖。文件不存在返回 nil（不是错误）。
 func (r *Repo) loadDirtyNode(ref, dir string) (*dirtyNode, error) {
-	data, err := os.ReadFile(r.dirtyFilePath(ref, dir))
+	data, err := r.FS().ReadFile(r.dirtyFilePath(ref, dir))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -216,28 +215,16 @@ func (r *Repo) saveDirtyNode(ref, dir string, n *dirtyNode) error {
 		return err
 	}
 	path := r.dirtyFilePath(ref, dir)
-	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
+	if err := r.FS().MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(path), ".tmp-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err := tmp.Write(data); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return os.Rename(tmpName, path)
+	// 0600：脏文件只有本服务自己读，不像 refs 那样需要给外部 git 工具看。
+	return r.FS().WriteAtomic(path, data, 0o600)
 }
 
 // deleteDirtyNode 删一个目录的脏覆盖。不存在不算错。
 func (r *Repo) deleteDirtyNode(ref, dir string) error {
-	if err := os.Remove(r.dirtyFilePath(ref, dir)); err != nil && !os.IsNotExist(err) {
+	if err := r.FS().Remove(r.dirtyFilePath(ref, dir)); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
@@ -250,7 +237,7 @@ func (r *Repo) deleteDirtyNode(ref, dir string) error {
 func (r *Repo) listDirtyDirs(ref string) ([]string, error) {
 	root := r.dirtyDirPath(ref)
 	var out []string
-	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+	err := r.FS().WalkDir(root, func(p string, d os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -295,7 +282,7 @@ func sortDirtyDirs(dirs []string) {
 
 // clearDirtyRef 删掉某分支的整个脏层。
 func (r *Repo) clearDirtyRef(ref string) error {
-	if err := os.RemoveAll(r.dirtyDirPath(ref)); err != nil {
+	if err := r.FS().RemoveAll(r.dirtyDirPath(ref)); err != nil {
 		return fmt.Errorf("清理脏层: %w", err)
 	}
 	return nil
@@ -304,7 +291,7 @@ func (r *Repo) clearDirtyRef(ref string) error {
 // dirtyRefs 列出脏层里有待折叠改动的分支名。
 func (r *Repo) dirtyRefs() ([]string, error) {
 	root := filepath.Join(r.Path, dirtyDirName)
-	entries, err := os.ReadDir(root)
+	entries, err := r.FS().ReadDir(root)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -327,14 +314,8 @@ func (r *Repo) dirtyRefs() ([]string, error) {
 }
 
 // lockDirtyFile 取得某个脏目录的文件锁。
-//
-// 提交拿全局写锁，改脏拿「全局读锁 + 该目录文件锁」：不同目录的写入互不相干，
-// 同一个目录必须串行——脏文件是整个重写一遍的，两个写入交错会丢一份。
-func (r *Repo) lockDirtyFile(path string) func() {
-	v, _ := r.nodeLocks.LoadOrStore(path, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+func (r *Repo) lockDirtyFile(ref, dir string) func() {
+	return r.Locker().LockNode(ref, dir)
 }
 
 // startDirtyNode 新建一个目录的覆盖，并把干净层的原值记成基线。

@@ -144,10 +144,6 @@ type Server struct {
 	// lastCommits 记录上次看到的各分支 HEAD（键见 treeHeadKey），用来发现外部提交。
 	lastCommits sync.Map // treeHeadKey(project, branch) -> commit hash
 
-	// pending 是还没落成一次提交的写入条数。
-	pendingMu sync.Mutex
-	pending   int
-
 	// done 通知后台维护循环退出。
 	done     chan struct{}
 	doneOnce sync.Once
@@ -1368,15 +1364,19 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		}, nil
 
 	case "grep":
-		// grep <pattern>
+		// grep <pattern> [--scope <tree>]
 		//
 		// 正则匹配全文，带上下文。
 		// 模型换 bash 的头号原因就是想搜精确串（比如 "254203716" 或 "BlackEgg"）
 		// 而 BM25 不擅长这类纯符号/专有名词。给它原生的 grep，它就不用换工具。
-		if rest == "" {
-			return TermResult{}, errors.New("grep 语法: grep <pattern>")
+		//
+		// --scope 收窄搜索范围：记忆树大了之后，不分范围的全量扫
+		// 会把命中堆到与本次无关的项目上。
+		pattern, scope := splitScope(rest)
+		if pattern == "" {
+			return TermResult{}, errors.New("grep 语法: grep <pattern> [--scope <tree>]")
 		}
-		grepText, grepErr := s.execGrep(rest, c)
+		grepText, grepErr := s.execGrep(pattern, scope, c)
 		if grepErr != nil {
 			return TermResult{}, grepErr
 		}
@@ -1579,7 +1579,14 @@ func (s *Server) weightCount(addr string) int {
 }
 
 // execGrep 在所有可 recall 的块里正则搜索，返回命中行及其上下文。
-func (s *Server) execGrep(pattern string, c Caller) (string, error) {
+//
+// scope 非空时只搜该范围下的条目。范围可以写成 project、
+// project@branch 或 project@branch/subtree，与 recall 的 --scope 同一套语义。
+//
+// 为什么要先剥参数再编译正则：早先整个 rest 直接当正则用，
+// 于是 `grep 1729 --scope daily` 会把 "--scope daily" 也编进模式里，
+// 结果是必然零命中——而报错文本是「无命中」，看上去像内容不存在。
+func (s *Server) execGrep(pattern, scope string, c Caller) (string, error) {
 	re, err := regexp.Compile("(?i)" + pattern)
 	if err != nil {
 		return "", fmt.Errorf("非法正则: %w", err)
@@ -1598,6 +1605,11 @@ func (s *Server) execGrep(pattern string, c Caller) (string, error) {
 		}
 		for _, b := range tr.Blocks {
 			if b.Hidden {
+				continue
+			}
+			// 范围收窄：把块拼回索引地址形状，复用与 recall 同一套判定，
+			// 避免两处各写一份前缀匹配而慢慢走偏。
+			if scope != "" && !addrUnderScope(b.Project+"@"+b.Branch+"/"+b.Path, scope) {
 				continue
 			}
 			data, err := s.readBlock(b)

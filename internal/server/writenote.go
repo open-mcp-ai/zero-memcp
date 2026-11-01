@@ -183,7 +183,6 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	s.addBlockLocked(targetProject, repo, writeBranch, path, int64(len(content)), now.Unix())
 	s.mu.Unlock()
 
-	s.notePending()
 	s.bumpClock()
 
 	return addr, targetProject, writeBranch, nil

@@ -171,49 +171,6 @@ func (s *Server) commitRepo(repo *gitstore.Repo, proj string, n int) (int, error
 	return committed, firstErr
 }
 
-// flushPending 立刻提交所有攒着的写入。用于测试与关闭前。
-func (s *Server) flushPending() {
-	persona := s.persona
-	if persona == "" {
-		persona = "zero"
-	}
-	n, err := s.projects.CommitAll(persona, "mem: flush")
-	if err != nil {
-		s.logf("提交失败: %v", err)
-		return
-	}
-	if n > 0 {
-		s.logf("已提交 %d 个项目", n)
-	}
-}
-
-// notePending 记录一次待提交的写入。
-//
-// 这里只负责让写入「被记住」，真正什么时候提交由 maintain 按
-// 每个仓库自己的周期和条数决定。
-func (s *Server) notePending() {
-	s.pendingMu.Lock()
-	s.pending++
-	s.pendingMu.Unlock()
-}
-
-// gcAll 对所有裸仓库执行 git gc。递归发现多层项目目录。
-func (s *Server) gcAll() {
-	projects, err := s.projects.Projects()
-	if err != nil {
-		return
-	}
-	for _, p := range projects {
-		r, err := s.projects.Get(p)
-		if err != nil {
-			continue
-		}
-		if _, err := r.Repack(); err != nil {
-			s.logf("gc %s 失败: %v", p, err)
-		}
-	}
-}
-
 // checkExternalUpdates 检查裸仓库的 commit 是否被外部推进。
 //
 // 只要有一处变了就触发 Reload —— 另一台设备 push 上来、

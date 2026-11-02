@@ -37,6 +37,12 @@ func (r *Repo) HasObject(sha string) bool {
 // 只写远端跟踪引用，不动本地分支：fetch 的职责是「知道远端有什么」。
 // ref 是本地状态的指针，可以有旧值，因此用 tmp + rename 原子替换。
 func (r *Repo) SetRemoteRef(remote, branch, sha string) error {
+	if err := ValidateBranch(remote); err != nil {
+		return fmt.Errorf("远端名非法: %w", err)
+	}
+	if err := ValidateBranch(branch); err != nil {
+		return fmt.Errorf("分支名非法: %w", err)
+	}
 	if err := validSHA(sha); err != nil {
 		return err
 	}
@@ -65,6 +71,12 @@ func (r *Repo) RemoteRef(remote, branch string) string {
 
 // DeleteRemoteRef 删除一个远端跟踪引用（远端已不存在该分支时）。
 func (r *Repo) DeleteRemoteRef(remote, branch string) error {
+	if err := ValidateBranch(remote); err != nil {
+		return err
+	}
+	if err := ValidateBranch(branch); err != nil {
+		return err
+	}
 	err := r.FS().Remove(r.refPath("refs/remotes/" + remote + "/" + branch))
 	if err != nil && !isNotExist(err) {
 		return err
@@ -77,6 +89,9 @@ func (r *Repo) DeleteRemoteRef(remote, branch string) error {
 // 与 SetRemoteRef 的区别只是名字：远端跟踪引用和本地分支的语义不同，
 // 但落盘方式必须一样——tmp + rename，避免读到写了一半的指针。
 func (r *Repo) SetRef(ref, sha string) error {
+	if err := validFullRef(ref); err != nil {
+		return err
+	}
 	if err := validSHA(sha); err != nil {
 		return err
 	}

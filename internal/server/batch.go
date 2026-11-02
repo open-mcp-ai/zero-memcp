@@ -7,21 +7,22 @@ import (
 )
 
 // BatchOp 是决议单里的一个动作。
+// 字段名是 DSL 协议的一部分，JSON 示例与实现必须使用同一组字段；
+// delete 使用 Target（完整地址），没有单独的 Path 字段。
 type BatchOp struct {
 	// Action: "put" | "cp" | "mv" | "delete" | "tag" | "commit"
 	Action string `json:"action"`
 
 	// 各动作的参数
-	Target  string `json:"target,omitempty"`  // put / commit 的目标（如 t@zero）
-	Kind    string `json:"kind,omitempty"`    // 旧结构兼容字段（put 忽略）
+	Target  string `json:"target,omitempty"`  // put / commit / delete 的目标（如 t@zero 或 t@zero/x.md）
+	Kind    string `json:"kind,omitempty"`    // put 的 kind（如 fact / decision）
 	Text    string `json:"text,omitempty"`    // put 的正文
 	From    string `json:"from,omitempty"`    // cp / mv 的源
 	To      string `json:"to,omitempty"`      // cp / mv 的目标
-	Path    string `json:"path,omitempty"`    // delete 的路径
 	Project string `json:"project,omitempty"` // tag 的项目
 	Name    string `json:"name,omitempty"`    // tag 的名称
 	Ref     string `json:"ref,omitempty"`     // tag 指向的分支
-	Message string `json:"message,omitempty"` // commit 提交说明
+	Message string `json:"message,omitempty"` // 预留字段（当前 commit 动作不读取）
 }
 
 // BatchRequest 是批量请求体。
@@ -29,20 +30,20 @@ type BatchRequest struct {
 	Ops []BatchOp `json:"ops"`
 }
 
-// execBatch 执行一张原子决议单。
+// execBatch 执行一张决议单。
 //
-// 为什么需要原子决议：
+// 为什么需要它：一次要搬运一批切片时，逐个执行会产生几十个中间提交，
+// 历史被切碎，而且调用方要自己记「做到第几条了」。
 //
-//	审完一批待定内容，决议可能包含：
-//	  1. 提纯 2 条核心事实写进 main
-//	  2. 把 1 个恶意 payload 移入 quarantine 分支
-//	  3. 推进 audited 标签/水位
-//	  4. 提交涉及的所有分支
+// 它**不是**事务，也不假装是。遇到第一个错误就停，
+// 已经执行的动作不回滚（脏层里已经落的写入不会撤回）。
+// 早先这里的注释声称「要么全部成功，要么一个都不落」，
+// 但代码里没有任何补偿逻辑——那是比没有保证更坏的东西，
+// 因为调用方会按那句承诺去设计重试。
 //
-//	如果一条一条跑，中间被杀就会留下一半已提纯、一半没推进水位的
-//	半吊子状态，下次重启就会产生重复提纯或漏审。
-//
-// 只要其中任何一步报错，全部动作在同一个事务边界内中止。
+// 真正的用法是：把一批无依赖的写入打包（省中间提交），
+// 失败时看错误里的 op 序号，从断点继续。需要真正的原子性，
+// 就在单个分支上做一次 put + commit。
 func (s *Server) execBatch(body string, c Caller, defaultBranch string) (string, error) {
 	if err := s.requireRoot(c); err != nil {
 		return "", err
@@ -114,7 +115,13 @@ func (s *Server) execBatch(body string, c Caller, defaultBranch string) (string,
 			journal = append(journal, fmt.Sprintf("[%d] tag: %s", idx, res))
 
 		case "commit":
-			res, err := s.execCommit(op.Target, c, defaultBranch)
+			// 提交说明走 execCommit 自己的 " -m " 语法，
+			// 不要给 BatchOp 留一个不生效的字段。
+			target := op.Target
+			if msg := strings.TrimSpace(op.Message); msg != "" {
+				target = strings.TrimSpace(target + " -m " + msg)
+			}
+			res, err := s.execCommit(target, c, defaultBranch)
 			if err != nil {
 				return "", fmt.Errorf("op[%d] commit 失败: %w", idx, err)
 			}

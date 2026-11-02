@@ -29,7 +29,8 @@ type repoState struct {
 //
 // 为什么必须支持仓库级：宪法仓库希望「一改就提交」（留痕细），
 // 流水记忆仓库希望「攒一批再提交」（历史整洁）。同一套周期伺候不了两者。
-func (s *Server) maintain() {
+func (s *Server) maintain(done chan struct{}) {
+	defer close(done)
 	// 全局缺省
 	defCommit := 30 * time.Second
 	defGC := 24 * time.Hour
@@ -179,7 +180,7 @@ func (s *Server) checkExternalUpdates() {
 	if s.cfg.DataDir == "" {
 		return
 	}
-	// 检查所有分支，不只 defaultBranch：受限角色在自己分支上写东西、
+	// 检查所有分支，不只 defaultBranch：受限凭证在自己分支上写东西、
 	// 或外部 git push 推进了某条分支，都应该被感知并触发 Reload。
 	current := s.treeHeadsSnapshot()
 	changed := false

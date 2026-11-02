@@ -107,19 +107,30 @@ func TestPerMountCap(t *testing.T) {
 	}
 }
 
-// intersectCap 只能收窄。
+// intersectCap 只能收窄，且空集不能退化成「不限制」。
+//
+// 为什么单独测 r∩w：空串在 hasCap 里的语义是「全允许」，
+// 所以不相交的两个能力集如果返回空串，等于提权（已实测：
+// 只读凭证 + 只写挂载点 = 能写）。空集必须用 capNothing 表达。
 func TestIntersectCap(t *testing.T) {
 	cases := []struct{ a, b, want string }{
 		{"", "r", "r"},
 		{"rw", "", "rw"},
 		{"rwx", "rw", "rw"},
 		{"r", "rwx", "r"},
-		{"r", "w", ""},
+		{"r", "w", capNothing},
+		{"r", "wx", capNothing},
 		{"rwx", "rwx", "rwx"},
 	}
 	for _, c := range cases {
 		if got := intersectCap(c.a, c.b); got != c.want {
 			t.Errorf("intersectCap(%q,%q) = %q，要 %q", c.a, c.b, got, c.want)
+		}
+	}
+	// 空集对每一位都必须判假，且不能被当成「不限制」
+	for _, bit := range []rune{'r', 'w', 'x'} {
+		if hasCap(capNothing, bit) {
+			t.Errorf("capNothing 不应含有能力位 %c", bit)
 		}
 	}
 }

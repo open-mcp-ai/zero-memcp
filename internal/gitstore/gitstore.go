@@ -280,6 +280,11 @@ func (r *Repo) packedRefs() []string {
 
 // Resolve 把一个 ref 名解析成 commit SHA。解析不到返回空串与 nil。
 func (r *Repo) Resolve(ref string) (string, error) {
+	// 越界名字不能悄悄变成「不存在」（那会把一次穿越尝试伪装成
+	// 「这个分支还没建」），但合法名字的「不存在」是正常返回值。
+	if err := ValidateBranch(strings.TrimPrefix(ref, "refs/")); err != nil {
+		return "", err
+	}
 	// 允许简写：zero → refs/heads/zero
 	cands := []string{ref}
 	if !strings.HasPrefix(ref, "refs/") {
@@ -334,7 +339,16 @@ func (r *Repo) acquireCommitTokenFor(normRef string, timeout time.Duration) (fun
 }
 
 // updateRef 原子地更新一个 ref。
+//
+// 这里是所有「推进分支指针」的唯一出口，所以 ref 名校验也必须在这里：
+// ref 名会直接变成 refs/ 下的文件路径，放任 "../../.." 进来
+// 就能把文件写到仓库外面去（已验证：Fork 可以把 ref 写到 data 目录旁边）。
+// 调用方（Commit / Fork / Tag）传的是拼好的完整 ref，逐个校验
+// 会漏掉一个——入口统一校验才没有漏网的。
 func (r *Repo) updateRef(ref, sha string) error {
+	if err := validFullRef(ref); err != nil {
+		return err
+	}
 	p := r.refPath(ref)
 	dir := filepath.Dir(p)
 	if err := r.FS().MkdirAll(dir, 0o750); err != nil {
@@ -648,6 +662,11 @@ func (r *Repo) Close() error {
 // 语义：只承诺「已投递」。不等待落盘，不等待提交，返回即表示
 // 已进入单写者队列。若队列已满则报错拒绝（调用方知晓未被采纳）。
 func (r *Repo) Write(ref, path string, data []byte, mode Mode) error {
+	// 分支名在这里就要拦：脏层目录同样按它拼路径（dirty/<branch>/），
+	// 越界写入不经过 ref 文件，updateRef 的校验管不到。
+	if err := ValidateBranch(normalizeRef(ref)); err != nil {
+		return err
+	}
 	if err := validPath(path); err != nil {
 		return err
 	}
@@ -813,6 +832,10 @@ func (r *Repo) pendingOnDisk(ref ...string) int {
 // 脏层描述的内容已经在 ref 里（折叠是幂等的），于是直接清掉它。
 func (r *Repo) Commit(ref, message string) (string, error) {
 	normRef := normalizeRef(ref)
+	// 折叠要读 dirty/<branch>/ 并推进 refs/heads/<branch>，两处都拼路径。
+	if err := ValidateBranch(normRef); err != nil {
+		return "", err
+	}
 	if err := r.syncDirtyWriter(); err != nil {
 		return "", err
 	}
@@ -896,6 +919,17 @@ func (r *Repo) Commit(ref, message string) (string, error) {
 		rootSHA = baseTree
 	}
 
+	// 折叠结果与当前树一模一样时，不要写空提交。
+	//
+	// 这个分支不是理论情况：④ 之后、⑤ 之前崩溃（或清理脏层失败）
+	// 会留下「ref 已前进、脏文件还在」的形态。注释一直声称下次
+	// Commit 会认出「已经折叠过」并直接清掉——但代码里没有这个判定，
+	// 于是每次重试都多一个内容相同的 commit，脏层却永远清不掉。
+	if rootSHA == baseTree && oldCommit != "" {
+		_ = r.clearDirtyRef(normRef)
+		return oldCommit, nil
+	}
+
 	// ③ 写 commit
 	var parents []string
 	if oldCommit != "" {
@@ -912,7 +946,8 @@ func (r *Repo) Commit(ref, message string) (string, error) {
 	}
 
 	// ⑤ 清脏层。失败不算提交失败：内容已经在 ref 里了，
-	//    残留的脏文件会在下一次 Commit 时被识别为「已折叠」并清掉。
+	//    残留的脏文件会在下一次 Commit 时被上面的「折叠结果与当前树
+	//    相同」判定识别为已折叠并清掉。
 	_ = r.clearDirtyRef(normRef)
 	return commitSHA, nil
 }
@@ -1087,6 +1122,13 @@ func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
 
 // Fork 从 from 分支复制出 to 分支（零字节：只写一个 ref）。
 func (r *Repo) Fork(from, to string) error {
+	// from 要读、to 要写，两个名字都会变成 refs/heads/ 下的文件路径。
+	if err := ValidateBranch(normalizeRef(to)); err != nil {
+		return fmt.Errorf("目标分支名非法: %w", err)
+	}
+	if err := ValidateBranch(normalizeRef(from)); err != nil {
+		return fmt.Errorf("源分支名非法: %w", err)
+	}
 	normTo := normalizeRef(to)
 	release, err := r.acquireCommitToken(normTo)
 	if err != nil {
@@ -1118,40 +1160,98 @@ func (r *Repo) BlobHash(data []byte) (string, error) {
 
 // ── 校验 ──────────────────────────────────────────────────────
 
-func validRef(ref string) error {
-	if ref == "" {
-		return fmt.Errorf("ref 不能为空")
+// validateSegments 是「名字变路径」的唯一判据。
+//
+// 分支名、tag 名、远端名、项目名、树内路径，最终都是仓库目录下的
+// 路径片段。它们的规则本来是同一套，却被抄成了四份
+// （validRef、validFullRef、validPath、auth 里的两个 Validate*），
+// 于是每加一条限制都要记得改四处——而漏改一处的结果是
+// 「某个入口能写、另一个入口不能写」，这种不一致比规则本身更危险。
+//
+// 只在一处实现之后，「什么名字是合法的」只有一种答案。
+func validateSegments(kind, name string, allowSlash bool) error {
+	if name == "" {
+		return fmt.Errorf("%s不能为空", kind)
 	}
-	if strings.Contains(ref, "..") || strings.ContainsAny(ref, " ~^:?*[\\") {
-		return fmt.Errorf("非法 ref %q", ref)
+	if strings.ContainsRune(name, 0) {
+		return fmt.Errorf("%s不能含 NUL：%q", kind, name)
+	}
+	// ~ ^ 是 Git 的 revision 语法字符，放进去会让 ref 名与命令行解析冲突。
+	// 空格与 : ? * [ \ 同时被 Git 与 Windows 拒绝。
+	if strings.ContainsAny(name, " ~^:?*[\\") {
+		return fmt.Errorf("%s不能含空格 ~ ^ : ? * [ \\ 等字符：%q", kind, name)
+	}
+	// Windows 保留字符：同一份记忆要在三个平台上路径一致，一律拒绝。
+	if strings.ContainsAny(name, `"<>|`) {
+		return fmt.Errorf("%s不能含 \" < > | 等字符：%q", kind, name)
+	}
+	if strings.ContainsAny(name, "\n\r\t") {
+		return fmt.Errorf("%s不能含控制字符：%q", kind, name)
+	}
+	if strings.Contains(name, "..") {
+		return fmt.Errorf("%s不能含 ..：%q", kind, name)
+	}
+	if strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") {
+		return fmt.Errorf("%s不能以 / 开头或结尾：%q", kind, name)
+	}
+	if !allowSlash && strings.Contains(name, "/") {
+		return fmt.Errorf("%s不能含路径分隔符：%q", kind, name)
+	}
+	for _, seg := range strings.Split(name, "/") {
+		if seg == "" {
+			return fmt.Errorf("%s不能有空段：%q", kind, name)
+		}
+		if seg == "." || seg == ".." {
+			return fmt.Errorf("%s不能含 . 或 .. 段：%q", kind, name)
+		}
+		// 以 . 开头：Git 自己就禁止；而且 "....//...." 这类绕法的每一段
+		// 都是「. 加尾巴」，不是字面 ".."，路径解析后却仍回到上级。
+		if strings.HasPrefix(seg, ".") {
+			return fmt.Errorf("%s的每一段都不能以 . 开头：%q", kind, name)
+		}
+		if strings.HasSuffix(seg, ".") {
+			return fmt.Errorf("%s的每一段都不能以 . 结尾：%q", kind, name)
+		}
 	}
 	return nil
 }
 
+// ValidateName 校验一个会变成文件名的名字。allowSlash 区分两类：
+// 分支/tag/远端/项目名允许层级（feat/x、blackegg/me）；
+// 用户名与凭证名不进目录树，一个斜杠就是越界。
+func ValidateName(kind, name string, allowSlash bool) error {
+	return validateSegments(kind, name, allowSlash)
+}
+
+// ValidateBranch 校验逻辑分支名（归一化后的短名，如 "zero"、"feat/x"）。
+func ValidateBranch(ref string) error { return validateSegments("ref", ref, true) }
+
+// ValidateRepoName 校验项目（裸仓库）名，允许多层如 "blackegg/me"。
+func ValidateRepoName(name string) error { return validateSegments("项目名", name, true) }
+
+// ValidateCredName 校验用户名/凭证名：它们不进目录树，不允许斜杠。
+func ValidateCredName(name string) error { return validateSegments("名字", name, false) }
+
+// validPath 校验树内路径。与 ValidateBranch 同源，只是错误措辞不同
+// （路径与分支名对使用者是两件事）。
 func validPath(path string) error {
-	if path == "" {
-		return fmt.Errorf("路径不能为空")
+	return validateSegments("路径", path, true)
+}
+
+// validFullRef 校验一个完整 ref，并限制到本仓库使用的命名空间。
+func validFullRef(ref string) error {
+	if !strings.HasPrefix(ref, "refs/") {
+		return fmt.Errorf("ref 必须以 refs/ 开头：%q", ref)
 	}
-	if strings.HasPrefix(path, "/") || strings.HasSuffix(path, "/") {
-		return fmt.Errorf("路径不能以 / 开头或结尾：%q", path)
+	if err := ValidateBranch(strings.TrimPrefix(ref, "refs/")); err != nil {
+		return err
 	}
-	// Windows 上 : * ? " < > | 会被当成非法字符，而我们希望同一份记忆
-	// 在三个平台上路径一致——所以一律拒绝。
-	if strings.ContainsRune(path, 0) {
-		return fmt.Errorf("路径不能含 NUL")
-	}
-	if strings.ContainsAny(path, `:*?"<>|\\`) {
-		return fmt.Errorf("路径不能含 : * ? \" < > | \\ 等字符：%q", path)
-	}
-	for _, seg := range strings.Split(path, "/") {
-		if seg == "" {
-			return fmt.Errorf("路径不能含空段：%q", path)
-		}
-		if seg == "." || seg == ".." {
-			return fmt.Errorf("路径不能含 . 或 .. 段：%q", path)
+	for _, ns := range []string{"refs/heads/", "refs/tags/", "refs/remotes/", "refs/archived/"} {
+		if strings.HasPrefix(ref, ns) {
+			return nil
 		}
 	}
-	return nil
+	return fmt.Errorf("拒绝写入 ref %q：只允许 refs/heads、refs/tags、refs/remotes、refs/archived", ref)
 }
 
 // normalizeRef 把 "refs/heads/x" 归一成 "x"。
@@ -1227,6 +1327,10 @@ func (r *Repo) Recover() (RecoveryResult, error) {
 
 // Delete 把删除动作投递进脏写入队列。
 func (r *Repo) Delete(ref, path string) error {
+	// 与 Write 同理：墓碑写在 dirty/<branch>/ 里。
+	if err := ValidateBranch(normalizeRef(ref)); err != nil {
+		return err
+	}
 	if err := validPath(path); err != nil {
 		return err
 	}
@@ -1340,11 +1444,10 @@ func (r *Repo) Tags() (map[string]string, error) {
 // 记忆库不需要 annotated tag 的那套元数据——要记「为什么打这个标」
 // 就写在切片里，那才是这套系统的正文。
 func (r *Repo) Tag(name, ref string) error {
-	if name == "" {
-		return fmt.Errorf("tag 名不能为空")
-	}
-	if strings.ContainsAny(name, " ~^:?*[\\") || strings.Contains(name, "..") {
-		return fmt.Errorf("非法 tag 名 %q", name)
+	// updateRef 会校验拼好的 ref，但那里报的是「ref 非法」。
+	// 这里先校验一次是为了让错误信息说清是「tag 名」。
+	if err := ValidateBranch(name); err != nil {
+		return fmt.Errorf("tag 名非法: %w", err)
 	}
 	sha, err := r.Resolve(ref)
 	if err != nil {
@@ -1361,6 +1464,9 @@ func (r *Repo) Tag(name, ref string) error {
 // 为什么要留档：tag 往往标记「重构前的那个状态」。删掉它就等于
 // 扔掉唯一的入口，而这个操作最容易在事后才被发现是错的。
 func (r *Repo) Untag(name string) error {
+	if err := ValidateBranch(name); err != nil {
+		return fmt.Errorf("tag 名非法: %w", err)
+	}
 	src := filepath.Join(r.Path, "refs", "tags", filepath.FromSlash(name))
 	b, err := r.FS().ReadFile(src)
 	if err != nil {
@@ -1495,6 +1601,9 @@ func (r *Repo) Exists(ref, path string) bool {
 // 但内容完好地留在 refs/archived/，随时可以移回来。
 func (r *Repo) ArchiveRef(branch string) error {
 	name := normalizeRef(branch)
+	if err := ValidateBranch(name); err != nil {
+		return fmt.Errorf("分支名非法: %w", err)
+	}
 	sha, err := r.Resolve(name)
 	if err != nil || sha == "" {
 		return fmt.Errorf("分支 %q 不存在", branch)

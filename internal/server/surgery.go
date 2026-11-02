@@ -114,9 +114,26 @@ func (s *Server) listBranches(project string, c Caller) string {
 			continue
 		}
 		refs, _ := repo.Refs("refs/heads/")
+		// 把「已有待提交写入、但还没 commit」的分支也列出来。
+		//
+		// 脏层是权威状态，refs 只是已折叠的那部分。只看 refs 的后果：
+		// put proj@feat 返回 ok，紧接着 branch proj 却说「没有任何分支」——
+		// 内容明明写成功了，列目录却说没有，而它其实就在脏层里等着。
+		// 这种「刚做的事看不见」会直接导致重复写入。
+		nameSet := map[string]bool{}
+		for _, ref := range refs {
+			nameSet[strings.TrimPrefix(ref, "refs/heads/")] = true
+		}
+		for _, name := range repo.PendingRefs() {
+			if !nameSet[name] {
+				nameSet[name] = true
+				refs = append(refs, "refs/heads/"+name)
+			}
+		}
 		if len(refs) == 0 {
 			continue
 		}
+		sort.Strings(refs)
 		locked := map[string]bool{}
 		for _, name := range repo.LockedBranches() {
 			locked[name] = true
@@ -141,7 +158,13 @@ func (s *Server) listBranches(project string, c Caller) string {
 			if locked[name] {
 				lockMark = "  [已锁定]"
 			}
-			body.WriteString(fmt.Sprintf("  %s %-16s %5d 篇  %s  %s%s\n", marked, name, len(n), when, shortSHA(sha), lockMark))
+			// 还没 commit 的分支标出来：否则「0 篇 + 空 sha」
+			// 看起来像一条坏掉的记录。
+			pendingMark := ""
+			if sha == "" && repo.Pending(name) > 0 {
+				pendingMark = "  [待提交]"
+			}
+			body.WriteString(fmt.Sprintf("  %s %-16s %5d 篇  %s  %s%s%s\n", marked, name, len(n), when, shortSHA(sha), pendingMark, lockMark))
 		}
 		if body.Len() == 0 {
 			continue

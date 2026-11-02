@@ -149,6 +149,15 @@ type Server struct {
 	// done 通知后台维护循环退出。
 	done     chan struct{}
 	doneOnce sync.Once
+	// maintainDone 在维护 goroutine 真正退出后关闭。
+	//
+	// 为什么必须等它：Close 会关掉各仓库的写者（writerDead），
+	// 而 maintain 可能正在 repo.Commit——那条路径不经过写入队列，
+	// 会直接写 ref。不等待就关库，等于让提交和关库赛跑。
+	maintainDone chan struct{}
+	// startMu 保护下面两个字段：Start 写、Close 读。
+	startMu         sync.Mutex
+	maintainStarted bool
 
 	// netMu 保护下面两个字段：Start 在 goroutine 里写，Addr/Close 在别处读。
 	netMu       sync.Mutex
@@ -260,6 +269,13 @@ func New(cfg Config) (*Server, error) {
 		bcast:     newBroadcaster(),
 		treeWatch: newTreeWatchHub(),
 		done:      make(chan struct{}),
+		// 默认视为「没有维护循环」：New 之后没 Start 就 Close 的路径
+		// （测试里很常见）不该在这里永久阻塞。
+		maintainDone: func() chan struct{} {
+			ch := make(chan struct{})
+			close(ch)
+			return ch
+		}(),
 	}
 	if lookup != nil {
 		s.cfgLookup.Store(lookup)
@@ -371,7 +387,15 @@ func (s *Server) DescribeProjects() string {
 // 权限边界落在端口上而不是代码里的 if：
 // 一个端口没配写动词，它的路由里就没有写代码可走。
 func (s *Server) Start() error {
-	go s.maintain()
+	// Start 只在真正启动维护循环时重建这个通道。
+	// 用 mutex 保护：Start 可能在 goroutine 里跑，Close 同时在等它。
+	s.startMu.Lock()
+	if !s.maintainStarted {
+		s.maintainStarted = true
+		s.maintainDone = make(chan struct{})
+		go s.maintain(s.maintainDone)
+	}
+	s.startMu.Unlock()
 
 	blocks := s.listens
 	if len(blocks) == 0 {
@@ -448,7 +472,7 @@ func (p *portPolicy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "这个端口没有开启拉取", http.StatusForbidden)
 			return
 		}
-		p.next.ServeHTTP(w, r)
+		p.next.ServeHTTP(w, r.WithContext(withPortPolicy(r.Context(), p.blk)))
 		return
 	}
 	// 其余路径（含 MCP）：把端口策略挂进 context，供动词层读取
@@ -476,6 +500,17 @@ func (s *Server) Close() error {
 		if err := srv.Close(); err != nil {
 			lastErr = err
 		}
+	}
+	// 先等维护循环退出，再关仓库。
+	//
+	// 反过来的顺序（先关仓库）会让正在跑的 repo.Commit 撞上
+	// 已关闭的写者：提交本身写的是 ref 和对象，不经过写队列，
+	// 于是它会在一个逻辑上已关闭的仓库上继续写。
+	s.startMu.Lock()
+	done := s.maintainDone
+	s.startMu.Unlock()
+	if done != nil {
+		<-done
 	}
 	if s.projects != nil {
 		if err := s.projects.Close(); err != nil && lastErr == nil {
@@ -1066,9 +1101,9 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		// 先按「这张凭证看得见什么」收窄候选集合，再打分排序。
 		//
 		// 顺序不能反：索引是所有分支的合集，先取全局 top-N 再按权限
-		// 抛弃，等于让其他角色的内容占掉名额——最终结果可能是
+		// 抛弃，等于让其他凭证的内容占掉名额——最终结果可能是
 		// 「明明有 360 篇相关记录，recall 返回无命中」。
-		// 在角色的世界里算出 top-N，才是它该看到的最佳答案。
+		// 在这张凭证的可见范围内算出 top-N，才是它该看到的最佳答案。
 		allowedHit := func(addr string) bool {
 			proj, br, _, ok := memory.SplitID(addr)
 			if !ok {
@@ -1109,6 +1144,13 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 			}
 		}
 		hits = permHits
+		// 摘要必须在锁内取完：snippet 读的是 s.trees，而 Reload 会在
+		// s.mu.Lock() 里把它整体换掉。在锁外调用等于读一份随时会
+		// 被替换的切片——-race 能稳定复现（TestRecallConcurrentWithReload）。
+		snips := make([]string, len(hits))
+		for i, h := range hits {
+			snips[i] = s.snippet(h.Addr, query, 240)
+		}
 		s.mu.RUnlock()
 		if len(hits) == 0 {
 			return TermResult{
@@ -1118,7 +1160,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		}
 		var sb strings.Builder
 		structHits := make([]any, 0, len(hits))
-		for _, h := range hits {
+		for i, h := range hits {
 			_, hbr, _, okBr := memory.SplitID(h.Addr)
 			if !okBr {
 				hbr = s.defaultBranch
@@ -1128,7 +1170,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 				continue
 			}
 			sb.WriteString(fmt.Sprintf("%s (%.2f)\n", virt, h.Score))
-			snip := s.snippet(h.Addr, query, 240)
+			snip := snips[i]
 			if snip != "" {
 				for _, line := range strings.Split(snip, "\n") {
 					sb.WriteString("    " + line + "\n")
@@ -1338,6 +1380,10 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 	case "status":
 		// 全局索引量对不同凭证来说也是信息：受限身份只该看到
 		// 自己可见范围内的切片数，否则它能数出别人的记忆规模。
+		//
+		// 词表规模是**全局**事实（它不按项目切分），所以与 /health
+		// 同一口径：只给全命名空间的调用者。早先这里无条件返回，
+		// 于是 health 刻意隐藏的东西在 status 里一读就到。
 		s.mu.RLock()
 		docs := 0
 		for _, t := range s.trees {
@@ -1346,10 +1392,19 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 			}
 			docs += len(t.Indexable())
 		}
-		terms := s.idx.Terms()
+		// Terms 必须在锁内读：Reload 会在 s.mu.Lock() 里整体替换 s.idx，
+		// 锁外调用就是和写方赛跑（-race 可复现）。
+		terms := 0
+		if c.Mount.Empty() {
+			terms = s.idx.Terms()
+		}
 		s.mu.RUnlock()
+		text := fmt.Sprintf("docs: %d", docs)
+		if c.Mount.Empty() {
+			text = fmt.Sprintf("docs: %d, terms: %d", docs, terms)
+		}
 		return TermResult{
-			Text: fmt.Sprintf("docs: %d, terms: %d", docs, terms),
+			Text: text,
 			Structured: map[string]any{
 				"docs":  docs,
 				"terms": terms,

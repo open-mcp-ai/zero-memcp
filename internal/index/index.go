@@ -107,7 +107,7 @@ func (ix *Index) SearchWeighted(query string, limit int, idfFloor float64, wf We
 // 很容易全被其他分支的同名词占满——随后的权限过滤把它们全部拦下，
 // 最终返回「无命中」。
 //
-// 过滤是安全边界，也是检索相关性的边界：在这个角色的世界里算出来的
+// 过滤是安全边界，也是检索相关性的边界：在这张凭证的可见范围里算出来的
 // top-N，才是它该看见的最佳答案。
 func (ix *Index) SearchWeightedFiltered(query string, limit int, idfFloor float64, wf WeightFunc, filter FilterFunc) []Hit {
 	qtokens := Tokenize(query)

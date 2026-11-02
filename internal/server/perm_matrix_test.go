@@ -192,6 +192,16 @@ func TestStatusCountsAreScoped(t *testing.T) {
 	if fullRes.Text == scopedRes.Text {
 		t.Fatalf("受限身份的切片计数应与全局不同: %q", scopedRes.Text)
 	}
+	if strings.Contains(scopedRes.Text, "terms:") {
+		t.Fatalf("受限身份不该看到全局词表规模: %q", scopedRes.Text)
+	}
+	structured, ok := scopedRes.Structured.(map[string]any)
+	if !ok {
+		t.Fatalf("status structured projection 类型错误: %T", scopedRes.Structured)
+	}
+	if terms, ok := structured["terms"].(int); !ok || terms != 0 {
+		t.Fatalf("受限身份的 terms 应为 0，得到 %#v", structured["terms"])
+	}
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)

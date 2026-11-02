@@ -8,6 +8,7 @@ import (
 	"io"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -33,23 +34,66 @@ type packIdx struct {
 
 var (
 	packCacheMu sync.Mutex
-	packCache   = map[string][]*packIdx{} // 仓库路径 -> 索引列表
+	// packCache 的键是仓库路径，值是缓存条目。
+	//
+	// 光用路径做键是不够的：仓库目录会被外部进程改写。
+	// `git gc` / `git repack` 会换掉 objects/pack 下的文件，
+	// 而缓存里还是旧索引——于是 gc 之后所有对象「凭空消失」，
+	// 报错是「不在松散库也不在任何 pack 里」，看不出是缓存问题。
+	// 所以缓存条目带一个指纹（pack 目录的文件名 + 大小 + mtime），
+	// 每轮先比指纹，不一致就重新读。
+	packCache = map[string]packCacheEntry{} // 仓库路径 -> 缓存条目
 )
+
+type packCacheEntry struct {
+	idxs []*packIdx
+	// fingerprint 是 pack 目录里全部 .idx/.pack 的名字与元数据摘要。
+	fingerprint string
+}
+
+// packFingerprint 汇总 pack 目录里全部索引与包文件的名字、大小与修改时间。
+//
+// 只比文件名不够：内部 Repack 写出的包名带内容哈希，外部 gc 的包名
+// 形态不同，但两者都可能在同名文件上重写。带上大小与 mtime
+// 才能在不动文件名的重写（如 git repack 覆盖同名包）时也发现变化。
+func (r *Repo) packFingerprint(packDir string) string {
+	entries, err := r.FS().ReadDir(packDir)
+	if err != nil {
+		return ""
+	}
+	var b strings.Builder
+	for _, e := range entries {
+		ext := filepath.Ext(e.Name())
+		if ext != ".idx" && ext != ".pack" {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		fmt.Fprintf(&b, "%s|%d|%d\n", e.Name(), info.Size(), info.ModTime().UnixNano())
+	}
+	return b.String()
+}
 
 // loadPacks 读出并缓存一个仓库的全部 pack 索引。
 func (r *Repo) loadPacks() ([]*packIdx, error) {
+	packDir := filepath.Join(r.Path, "objects", "pack")
+
+	// 指纹在锁外算：ReadDir 可能不便宜，而包目录通常不变。
+	fingerprint := r.packFingerprint(packDir)
+
 	packCacheMu.Lock()
 	defer packCacheMu.Unlock()
 
-	if idxs, ok := packCache[r.Path]; ok {
-		return idxs, nil
+	if e, ok := packCache[r.Path]; ok && e.fingerprint == fingerprint {
+		return e.idxs, nil
 	}
 
-	packDir := filepath.Join(r.Path, "objects", "pack")
 	entries, err := r.FS().ReadDir(packDir)
 	if err != nil {
 		if isNotExist(err) {
-			packCache[r.Path] = nil
+			packCache[r.Path] = packCacheEntry{fingerprint: fingerprint}
 			return nil, nil
 		}
 		return nil, err
@@ -67,7 +111,7 @@ func (r *Repo) loadPacks() ([]*packIdx, error) {
 		}
 		idxs = append(idxs, idx)
 	}
-	packCache[r.Path] = idxs
+	packCache[r.Path] = packCacheEntry{idxs: idxs, fingerprint: fingerprint}
 	return idxs, nil
 }
 

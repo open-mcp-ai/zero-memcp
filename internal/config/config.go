@@ -525,6 +525,49 @@ func (f *File) Validate() error {
 		}
 	}
 
+	// 端口级挂载项同样要校验。
+	//
+	// 这一层以前完全不查：写错的项目名、写错的 cap 字母、写错的
+	// 虚拟路径都会静默变成一个「永远不匹配」的挂载项，而症状是
+	// 「这个端口什么都看不到」——一个需要读完 portpolicy.go 才能
+	// 解释的现象。端口策略是安全边界，它的配置就该在启动时校验。
+	seenAddr := map[string]bool{}
+	for i, lb := range f.Listens {
+		if lb.Addr == "" {
+			continue
+		}
+		if seenAddr[lb.Addr] {
+			return fmt.Errorf("[[listen]] 重复监听 %q", lb.Addr)
+		}
+		seenAddr[lb.Addr] = true
+		for j, m := range lb.Mount {
+			if err := auth.ValidateRepoName(m.Project); err != nil {
+				return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 项目名: %w", i+1, j+1, err)
+			}
+			if strings.ContainsRune(m.At, 0) || strings.ContainsAny(m.At, `\\:*?\"<>|`) {
+				return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 虚拟路径非法: %q", i+1, j+1, m.At)
+			}
+			trimmedAt := strings.Trim(m.At, "/") // root "/" is valid
+			if trimmedAt != "" {
+				for _, seg := range strings.Split(trimmedAt, "/") {
+					if seg == "" || seg == "." || seg == ".." {
+						return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 虚拟路径不能含空、. 或 .. 段: %q", i+1, j+1, m.At)
+					}
+				}
+			}
+			for _, c := range m.Cap {
+				if !strings.ContainsRune("rwx", c) {
+					return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 的 cap %q 只能由 rwx 组成", i+1, j+1, m.Cap)
+				}
+			}
+			if m.Branch != "" && m.Branch != "*" {
+				if err := auth.ValidateBranchName(m.Branch); err != nil {
+					return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 的分支名: %w", i+1, j+1, err)
+				}
+			}
+		}
+	}
+
 	return nil
 }
 

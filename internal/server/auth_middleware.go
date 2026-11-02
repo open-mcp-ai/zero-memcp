@@ -17,7 +17,7 @@ type Caller struct {
 	Root bool
 
 	// Identity 是这个分身节点的名字（凭证名），例如 "laptop"、"pi-box"。
-	// 没给时回落到 Role 或 User。
+	// 没给时回落到 User。
 	Identity string
 
 	// Mount 是这张凭证的挂载表。nil 表示全命名空间。
@@ -130,8 +130,17 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 		//
 		// 典型用法是「这个端口只暴露某一条分支」——那么即使拿的是
 		// 一张全量凭证，从这个端口进来也只能看到那一条。
+		//
+		// 交集为空必须 fail closed。早先这里直接交给 NewMount，
+		// 而空输入被当成 nil（= 全命名空间），于是两个都不包含对方
+		// 的挂载表反而把挂载限制整个取消掉——实测凭证只挂 daily、
+		// 端口只挂 me 时，能读到第三个项目 other/secret。
 		if hasBlk && len(blk.Mount) > 0 {
-			mount = narrowByPort(mount, blk.Mount)
+			narrowed := narrowByPort(mount, blk.Mount)
+			if len(narrowed) == 0 {
+				return Caller{}, fmt.Errorf("这张凭证的挂载范围与本端口的挂载范围没有交集，拒绝访问（端口 %s）", blk.Addr)
+			}
+			mount = narrowed
 		}
 
 		// 节点名：这张凭证是哪个设备/实例在用。它只是审计标签，

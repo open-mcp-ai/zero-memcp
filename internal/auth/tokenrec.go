@@ -8,6 +8,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
 // TokenRecord 是一张凭证的签发记录。
@@ -104,43 +106,16 @@ func DeleteTokenRecord(dataDir, name string) error {
 }
 
 // ValidateName 校验名字。它同时是文件名，所以不许路径分隔符。
-func ValidateName(name string) error {
-	if name == "" {
-		return fmt.Errorf("名字不能为空")
-	}
-	if strings.ContainsAny(name, `/\:*?"<>|`) || strings.Contains(name, "..") {
-		return fmt.Errorf("名字不能含路径分隔符或 : * ? \" < > |：%q", name)
-	}
-	if strings.HasPrefix(name, ".") {
-		return fmt.Errorf("名字不能以 . 开头：%q", name)
-	}
-	return nil
-}
-
-// ValidateRepoName 校验项目（裸仓库）名。
 //
-// 与用户名不同，项目名允许斜杠——"blackegg/me" 是合法的。
-// 但不允许空段、绝对路径、点段：那些会让它逃出 repos/ 目录。
-func ValidateRepoName(name string) error {
-	if name == "" {
-		return fmt.Errorf("项目名不能为空")
-	}
-	if strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") {
-		return fmt.Errorf("项目名不能以 / 开头或结尾：%q", name)
-	}
-	if strings.ContainsAny(name, `\:*?"<>|`) {
-		return fmt.Errorf("项目名不能含 \\ : * ? \" < > |：%q", name)
-	}
-	for _, seg := range strings.Split(name, "/") {
-		if seg == "" {
-			return fmt.Errorf("项目名不能有空的层级：%q", name)
-		}
-		if seg == "." || seg == ".." {
-			return fmt.Errorf("项目名不能含 . 或 .. 段：%q", name)
-		}
-		if strings.HasPrefix(seg, ".") {
-			return fmt.Errorf("项目名的每一层都不能以 . 开头：%q", name)
-		}
-	}
-	return nil
-}
+// 具体规则只有一份实现（gitstore.ValidateName）——名字最终都会变成
+// refs/ 或 repos/ 下的路径片段，判据必须同源。这里只做语义化包装，
+// 让错误信息说清是「名字」而不是「ref」。
+func ValidateName(name string) error { return gitstore.ValidateCredName(name) }
+
+// ValidateRepoName 校验项目（裸仓库）名。与用户名不同，项目名允许斜杠
+// ——"blackegg/me" 是合法的。
+func ValidateRepoName(name string) error { return gitstore.ValidateRepoName(name) }
+
+// ValidateBranchName 校验分支名。"*" 是挂载表里的通配声明，不是分支名，
+// 调用方需要自己排除。
+func ValidateBranchName(name string) error { return gitstore.ValidateBranch(name) }

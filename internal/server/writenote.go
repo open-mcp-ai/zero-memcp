@@ -40,9 +40,16 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 
 	defaultBranch := s.defaultBranch
 	// 写入分支：显式挂载点优先，否则用默认分支。
+	//
+	// "*" 是「这个项目的所有分支」的通配声明，不是一个真实分支名。
+	// 把它直接当落点会写出名为 "*" 的分支（已实测），或者在
+	// 底层 ref 校验开启后直接被拒——两种都是错的：隐式写入应落到
+	// 挂载点所代表的具体分支，通配时落到默认分支。
 	writeBranch := defaultBranch
 	if !c.Mount.Empty() {
-		writeBranch = c.Mount.DefaultBranch()
+		if b := c.Mount.DefaultBranch(); b != "" && b != "*" {
+			writeBranch = b
+		}
 	}
 
 	// 显式目标里写了 @<branch> 时，分支也跟着它走。
@@ -50,12 +57,18 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// 这是跨分支搬运的关键路径：调用方要把内容写进另一条版本线，
 	// 而它的默认分支跟那条不是一回事。没有 @branch，它只能往自己
 	// 分支上写，再多一步 mv——两跳之间被杀就留下半吊子状态。
+	// explicitBranch 记住调用方在目标里写明的分支。
+	// 它必须单独拿出来：否则后面 resolveWriteTarget 按挂载表默认分支
+	// 解析时会把「写到哪条分支」这个明确意图覆盖掉（实测：
+	// put proj@chat 写进了挂载表的分支，chat 根本没建）。
+	explicitBranch := ""
 	if explicit != "" {
 		if at := strings.Index(explicit, "@"); at >= 0 {
 			proj := explicit[:at]
 			rest := explicit[at+1:]
 			br, _, _ := strings.Cut(rest, "/")
 			if br != "" {
+				explicitBranch = br
 				if !c.Mount.Visible(proj, br) {
 					return "", "", "", fmt.Errorf("项目 %s@%s 不在这张凭证的可见范围内", proj, br)
 				}
@@ -74,10 +87,14 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	if err != nil {
 		return "", "", "", err
 	}
-	// 挂载表解析出的分支优先：一张挂在某条分支上的凭证，它的虚拟路径
-	// 指向的就是那条分支，而不是服务端默认分支。忽略它会让写入全都落进
-	// 默认分支——权限看着对，内容却和别人的混在一起。
-	if resolvedBranch != "" {
+	// 写入分支的优先级：显式 @branch > 挂载表解析出的分支 > 默认分支。
+	//
+	// 显式分支在入口就校验过可见性与可写性，它是最强的意图，
+	// 不能被挂载表默认分支覆盖——否则「跨分支搬运」写进了错误的版本线，
+	// 而返回的 ok 地址看起来还是成功的。
+	if explicitBranch != "" {
+		writeBranch = explicitBranch
+	} else if resolvedBranch != "" {
 		writeBranch = resolvedBranch
 	}
 	if implicitKind {
@@ -171,11 +188,16 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	//
 	// 键必须带分支（project@branch/path），与启动时索引重建（b.ID()）保持同构。
 	// 早先传不带分支的 targetProject + "/" + path，导致刚写进去的切片在
-	// recall 里拆不出分支，被当作默认分支走权限判定——如果是 受限角色，
+	// recall 里拆不出分支，被当作默认分支走权限判定——如果是受限凭证，
 	// 立刻被误杀成「无权查看该分支」，直到重启重建索引才恢复。
+	//
+	// 正文也必须与重建时一致：重建走的是 readBlock + 整份文件（含
+	// frontmatter），这里早先只索引 text，于是 source/endpoint/session
+	// 这些词在重启前搜不到、重启后才出现——同一份记忆的可检索性
+	// 随进程生命周期变化，docLen 也跟着变，BM25 分数跟着漂。
 	blockID := targetProject + "@" + writeBranch + "/" + path
 	s.mu.Lock()
-	s.idx.AddWithTime(blockID, text, now.Unix())
+	s.idx.AddWithTime(blockID, content, now.Unix())
 	s.addBlockLocked(targetProject, repo, writeBranch, path, int64(len(content)), now.Unix())
 	s.mu.Unlock()
 
@@ -224,6 +246,11 @@ func (s *Server) writeTarget(c Caller, defaultBranch string) (project, branch st
 				}
 				if len(cands) == 0 || cands[len(cands)-1] != p {
 					cands = append(cands, p)
+				}
+				if br == "*" {
+					// 通配挂载的隐式落点是默认分支，不是字面的 "*"。
+					// 显式 put proj@branch 在更前面已经处理过，不经过这里。
+					br = defaultBranch
 				}
 				pairs = append(pairs, writeCand{p, br})
 			}
@@ -292,7 +319,7 @@ type writeCand struct {
 // branchOf 找出某个项目在这张凭证下真正可写的分支。
 //
 // 不返回 Mount.DefaultBranch()：那是「默认分支」，与「这张凭证
-// 被授权写哪个分支」是两件事。受限角色的默认分支是 zero，
+// 被授权写哪个分支」是两件事。受限凭证的默认分支是 zero，
 // 但它能写的只有挂载表里那条。
 func branchOf(pairs []writeCand, project, fallback string) string {
 	for _, p := range pairs {

@@ -153,11 +153,9 @@ func (s *Server) denyReason(c Caller, project, branch string, perm uint8) string
 	if s.cfgIndex() == nil {
 		return "无权访问"
 	}
-	if !config.Check(s.cfgIndex(), c.User, project, perm) {
-		return config.Explain(s.cfgIndex(), c.User, project, perm)
-	}
-	// 被角色挡住时要说清是角色挡的，否则排查时只会看到
-	// 「root 为什么被拒」这种没法解释的结论。
+	// 这一层只剩配置（TOML 的 mode/owner/group）。
+	// 早先这里还有一段「被角色挡住」的判定，逐请求切换身份的
+	// 机制删掉之后它就永远不可达了——留着只会让人以为还有角色。
 	return config.Explain(s.cfgIndex(), c.User, project, perm)
 }
 
@@ -165,7 +163,7 @@ func (s *Server) denyReason(c Caller, project, branch string, perm uint8) string
 //
 // 「root」是用户的属性，「这张纸有没有被限制」是凭证的属性。
 // 派生出去的凭证（给分身用的那些）主体仍是 root，但它被挂载表
-// 或角色收窄过——那它就不是全权凭证，管理动作与分支锁都不该让它过。
+// 或被挂载表收窄过——那它就不是全权凭证，管理动作与分支锁都不该让它过。
 func (s *Server) rootUnrestricted(c Caller) bool {
 	return c.Root && c.Mount.Empty() &&
 		hasCap(c.Cap, 'r') && hasCap(c.Cap, 'w') && hasCap(c.Cap, 'x')
@@ -219,10 +217,21 @@ func capBit(perm uint8) rune {
 	return 0
 }
 
+// capNothing 是「空集」的哨兵：两个非空能力集取交集可能为空，
+// 而空串在整套代码里表示「不额外限制」。同一个值承担两种含义，
+// 结果就是「不相交的交集」反而得到最宽的结果——
+// 只读凭证配上只写挂载点，反而拿到写权限（已实测复现）。
+//
+// 哨兵不含任何 rwx 字符，所以 hasCap 对每一位都判假，
+// 而它非空，又不会退化成「不限制」。
+const capNothing = "-"
+
 // intersectCap 取两个能力串的交集。
 //
 // 空串表示「不额外限制」，等价于 rwx。所以 intersect("", "r") = "r"，
 // 而 intersect("rw", "r") = "r"——凭证只能收窄，这个函数是它的实现。
+//
+// 两个非空集完全不相交时返回 capNothing，不是空串。
 func intersectCap(a, b string) string {
 	if a == "" {
 		return b
@@ -235,6 +244,9 @@ func intersectCap(a, b string) string {
 		if strings.ContainsRune(a, ch) && strings.ContainsRune(b, ch) {
 			out = append(out, ch)
 		}
+	}
+	if len(out) == 0 {
+		return capNothing
 	}
 	return string(out)
 }

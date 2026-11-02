@@ -35,6 +35,21 @@ func TestEveryDispatchedVerbHasHelp(t *testing.T) {
 }
 
 // help --all 必须把每个有词条的动词都带上，而不是漏掉几个。
+func TestHelpBatchExampleUsesRealJSONFields(t *testing.T) {
+	detail, ok := helpVerb("batch")
+	if !ok {
+		t.Fatal("batch help entry missing")
+	}
+	for _, key := range []string{`"action"`, `"target"`} {
+		if !strings.Contains(detail, key) {
+			t.Errorf("batch help example must include %s", key)
+		}
+	}
+	if strings.Contains(detail, `"op"`) || strings.Contains(detail, `"addr"`) {
+		t.Fatal("batch help example uses obsolete fields op/addr")
+	}
+}
+
 func TestHelpAllCoversEveryVerb(t *testing.T) {
 	all := helpAll()
 	for _, v := range []string{"commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "batch", "write", "grep"} {

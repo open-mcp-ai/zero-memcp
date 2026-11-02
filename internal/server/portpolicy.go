@@ -95,13 +95,38 @@ func narrowByPort(cred, port []auth.MountPoint) []auth.MountPoint {
 			if c.Project != p.Project {
 				continue
 			}
-			// 分支：以端口为准；凭证指定了就取交集
-			branch := p.Branch
-			if branch == "" {
+			// 分支取交集："*" 是通配，不是一个真实分支名。
+			branch := ""
+			switch {
+			case p.Branch == "" || p.Branch == "*":
 				branch = c.Branch
-			} else if c.Branch != "" && c.Branch != p.Branch {
+			case c.Branch == "" || c.Branch == "*":
+				branch = p.Branch
+			case c.Branch == p.Branch:
+				branch = p.Branch
+			default:
 				continue
 			}
+
+			// 虚拟路径也是挂载权限的一部分。必须取两个挂载根的较窄者；
+			// 不相交的虚拟子树没有交集，不能把其中一边的根拷贝过来。
+			credAt, portAt := normalizeVirtual(c.At), normalizeVirtual(p.At)
+			at := ""
+			switch {
+			case credAt == "/":
+				at = p.At
+			case portAt == "/":
+				at = c.At
+			case credAt == portAt:
+				at = c.At
+			case strings.HasPrefix(credAt, portAt+"/"):
+				at = c.At
+			case strings.HasPrefix(portAt, credAt+"/"):
+				at = p.At
+			default:
+				continue
+			}
+
 			capStr := p.Cap
 			if capStr == "" {
 				capStr = c.Cap
@@ -109,7 +134,7 @@ func narrowByPort(cred, port []auth.MountPoint) []auth.MountPoint {
 				capStr = intersectCap(c.Cap, p.Cap)
 			}
 			out = append(out, auth.MountPoint{
-				Project: p.Project, At: p.At, Branch: branch, Cap: capStr,
+				Project: p.Project, At: at, Branch: branch, Cap: capStr,
 			})
 		}
 	}

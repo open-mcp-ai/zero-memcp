@@ -15,6 +15,37 @@ import (
 func systemDir(data string) string { return filepath.Join(data, "system") }
 func keyPath(data string) string   { return filepath.Join(systemDir(data), "jwt.key") }
 
+// validateMountCap 校验一个挂载点的能力是否在凭证能力范围内。
+//
+// 空串在能力串里的含义是「不额外限制」，所以：
+//   - 挂载点不写 cap：继承凭证级 cap，永远合法
+//   - 凭证级不写 cap（= rwx）：任何挂载点 cap 都是它的子集
+//   - 两边都写了：挂载点必须是子集
+//
+// 剩下的组合（两边都写了但不相交）在运行期会被算成空集，
+// 而空集在该体系里另有含义（不额外限制）——签出这种凭证
+// 等于把一个矛盾藏到权限判定里去。宁可现在拒绝。
+func validateMountCap(credCap string, pt auth.MountPoint) error {
+	if pt.Cap == "" {
+		return nil
+	}
+	for _, ch := range pt.Cap {
+		if !strings.ContainsRune("rwx", ch) {
+			return fmt.Errorf("挂载点 %s 的 cap %q 只能由 rwx 组成", pt.Project, pt.Cap)
+		}
+	}
+	if credCap == "" {
+		return nil
+	}
+	for _, ch := range pt.Cap {
+		if !strings.ContainsRune(credCap, ch) {
+			return fmt.Errorf("挂载点 %s 的 cap %q 超出了凭证能力 %q（挂载点只能更窄，不能更宽）",
+				pt.Project, pt.Cap, credCap)
+		}
+	}
+	return nil
+}
+
 // runToken 分发 token 子命令。
 func runToken(args []string) int {
 	if len(args) == 0 {
@@ -130,6 +161,17 @@ func runTokenMint(args []string) int {
 				capStr, branch, _ := strings.Cut(capRest, "@")
 				pt.Cap = strings.TrimSpace(capStr)
 				pt.Branch = strings.TrimSpace(branch)
+			}
+			// 挂载点的能力必须是凭证能力的子集。
+			//
+			// 不校验的后果不是「多给了权限」——运行期取交集会把超出的
+			// 部分删掉——而是「交集可能为空」，而空集在代码里另有含义
+			// （不额外限制）。签一张 cap=r、挂载点 cap=w 的凭证，
+			// 写权限的实际判定就变得依赖另一处的哨兵值，而不是这一处的
+			// 声明。矛盾配置就该在签发时被拒，而不是留到运行期去猜。
+			if err := validateMountCap(*cap, pt); err != nil {
+				fmt.Fprintf(os.Stderr, "zero-memcp: %v\n", err)
+				return 1
 			}
 			mountList = append(mountList, pt)
 		}

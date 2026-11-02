@@ -454,7 +454,15 @@ batch 要么全部成功，要么一个都不落。
 
 支持的操作：put / cp / mv / delete / tag / commit。
 
-例：batch {"ops":[{"op":"delete","addr":"proj/memories@main/x.md"},{"op":"commit"}]}
+字段名是 action / target，不是 op / addr：
+  {"action":"put","target":"proj@main","text":"..."}
+  {"action":"delete","target":"proj@main/x.md"}
+  {"action":"cp","from":"proj@main/a.md","to":"proj@main/b.md"}
+  {"action":"mv","from":"proj@main/a.md","to":"proj@main/b.md"}
+  {"action":"tag","project":"proj","name":"v1","ref":"main"}
+  {"action":"commit","target":"proj@main","message":"..."}
+
+例：batch {"ops":[{"action":"delete","target":"proj@main/x.md"},{"action":"commit","target":"proj@main"}]}
 `), true
 
 	case "config":
@@ -485,9 +493,18 @@ reload
 		return strings.TrimSpace(`
 whoami
 
-回显当前调用方的凭证主体、有效角色、能力位与挂载范围。
+回显当前调用方的身份、能力位与挂载范围。
 
 用于自省与调试：排查「为什么我写不进去」时先看这张卡片。
+
+输出三行：
+  User       凭证主体（签 token 时的 sub）
+  Privilege  root 或普通用户
+  Groups     所属组（非 root 时才列）
+
+注意它只描述「我是谁」，不描述「我能做什么」——
+具体某个项目某个分支能不能读写，取决于挂载表与 TOML 两层取交集，
+那件事用 status / projects 看，不是 whoami。
 `), true
 
 	case "users":

@@ -8,6 +8,10 @@ import (
 
 // commitForTreeRef 允许树差分游标使用稳定的 commit SHA，或使用分支名。
 func (r *Repo) commitForTreeRef(ref string) (commitObj, error) {
+	// 空 ref 表示空树，是 Diff/SubtreeDiff 的合法基线（例如首次同步）。
+	if ref == "" {
+		return commitObj{}, nil
+	}
 	if validSHA(ref) != nil {
 		return r.commitOf(ref)
 	}

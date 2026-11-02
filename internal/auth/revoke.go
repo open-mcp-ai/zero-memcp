@@ -17,7 +17,7 @@ const JTILen = 16
 func NewJTI() (string, error) {
 	b := make([]byte, JTILen/2)
 	if _, err := rand.Read(b); err != nil {
-		return "", fmt.Errorf("生成 jti: %w", err)
+		return "", fmt.Errorf("generate jti: %w", err)
 	}
 	return hex.EncodeToString(b), nil
 }
@@ -65,7 +65,7 @@ func (r *Revocations) RecordParent(child, parent string) error {
 	}
 	dir := r.parentsDir()
 	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return fmt.Errorf("建父链目录 %s: %w", dir, err)
+		return fmt.Errorf("create parent-chain directory %s: %w", dir, err)
 	}
 	return os.WriteFile(filepath.Join(dir, child), []byte(parent), 0o444)
 }
@@ -105,17 +105,17 @@ func (r *Revocations) Revoke(jti string) error {
 		return err
 	}
 	if r.dir == "" {
-		return fmt.Errorf("未配置吊销目录")
+		return fmt.Errorf("revocation directory is not configured")
 	}
 	if err := os.MkdirAll(r.dir, 0o750); err != nil {
-		return fmt.Errorf("建吊销目录 %s: %w", r.dir, err)
+		return fmt.Errorf("create revocation directory %s: %w", r.dir, err)
 	}
 	f, err := os.OpenFile(r.path(jti), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o444)
 	if err != nil {
 		if os.IsExist(err) {
 			return nil
 		}
-		return fmt.Errorf("写吊销标记 %s: %w", jti, err)
+		return fmt.Errorf("write revocation marker %s: %w", jti, err)
 	}
 	return f.Close()
 }
@@ -126,7 +126,7 @@ func (r *Revocations) Unrevoke(jti string) error {
 		return err
 	}
 	if err := os.Remove(r.path(jti)); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("删除吊销标记 %s: %w", jti, err)
+		return fmt.Errorf("remove revocation marker %s: %w", jti, err)
 	}
 	return nil
 }
@@ -156,11 +156,11 @@ func (r *Revocations) List() ([]string, error) {
 // ValidateJTI 校验 jti 的形态。它同时是文件名，所以必须挡掉路径分隔符。
 func ValidateJTI(jti string) error {
 	if len(jti) != JTILen {
-		return fmt.Errorf("jti 应为 %d 位十六进制，得到 %q", JTILen, jti)
+		return fmt.Errorf("jti must be %d hex characters, got %q", JTILen, jti)
 	}
 	for _, c := range jti {
 		if !strings.ContainsRune("0123456789abcdef", c) {
-			return fmt.Errorf("jti 只能是小写十六进制，得到 %q", jti)
+			return fmt.Errorf("jti must be lowercase hexadecimal, got %q", jti)
 		}
 	}
 	return nil

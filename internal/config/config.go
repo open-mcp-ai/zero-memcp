@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -36,6 +37,15 @@ type Server struct {
 	// 分支是「这份记忆的版本线」，不是「谁在用」——
 	// 所以它是一个存储参数，而不是身份参数。
 	DefaultBranch string
+	// EnforceAuth 为真时，即使是回环地址也强制要求凭证。
+	EnforceAuth bool
+	// WebUI enables the admin surface on the main listen address.
+	//
+	// Without [[listen]] blocks there is only one port, so this is the only way
+	// to turn the admin surface on. With [[listen]] blocks the per-port
+	// webui = true is what counts, because the whole point is deciding which
+	// port may host it.
+	WebUI bool
 }
 
 // ListenBlock 是一个独立的监听端口及其安全策略。
@@ -51,6 +61,8 @@ type ListenBlock struct {
 	Require string
 	// Mount 格式与 token 的 mount 一致，端口级兜底收窄
 	Mount []MountSpec
+	// WebUI 为真时，这个端口才注册管理面路由，默认关闭。
+	WebUI bool
 }
 
 type MountSpec struct {
@@ -158,7 +170,7 @@ func Default() File {
 func Load(path string) (*File, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return nil, fmt.Errorf("读配置 %s: %w", path, err)
+		return nil, fmt.Errorf("read config %s: %w", path, err)
 	}
 	f, err := ParseFile(raw)
 	if err != nil {
@@ -171,14 +183,14 @@ func Load(path string) (*File, error) {
 // 每个分节允许的键。写错一个键名不能被静默忽略——
 // 那会变成「配置里写了但没生效」，而症状是权限不对、不是报错。
 var knownKeys = map[string]map[string]bool{
-	"server":  {"data": true, "listen": true, "endpoint": true, "default_branch": true},
+	"server":  {"data": true, "listen": true, "endpoint": true, "default_branch": true, "enforce_auth": true, "webui": true},
 	"commit":  {"interval": true, "count": true},
 	"gc":      {"interval": true},
 	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
 	"group":   {"name": true, "members": true},
 	"project": {"name": true, "owner": true, "group": true, "mode": true},
 	"access":  {"user": true, "project": true, "perm": true},
-	"listen":  {"addr": true, "allow": true, "require": true, "mount": true},
+	"listen":  {"addr": true, "allow": true, "require": true, "mount": true, "webui": true},
 	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true},
 }
 
@@ -187,23 +199,23 @@ func checkKeys(doc *Document) error {
 	for name, sec := range doc.Sections {
 		allowed, ok := knownKeys[name]
 		if !ok {
-			return fmt.Errorf("未知分节 [%s]（拼写错了？）", name)
+			return fmt.Errorf("unknown section [%s] (typo?)", name)
 		}
 		for k, v := range sec {
 			if !allowed[k] {
-				return fmt.Errorf("[%s] 里的未知键 %q（第 %d 行）", name, k, v.Line)
+				return fmt.Errorf("unknown key %q in [%s] (line %d)", name, k, v.Line)
 			}
 		}
 	}
 	for name, list := range doc.Arrays {
 		allowed, ok := knownKeys[name]
 		if !ok {
-			return fmt.Errorf("未知数组表 [[%s]]（拼写错了？）", name)
+			return fmt.Errorf("unknown array table [[%s]] (typo?)", name)
 		}
 		for i, sec := range list {
 			for k, v := range sec {
 				if !allowed[k] {
-					return fmt.Errorf("第 %d 个 [[%s]] 里的未知键 %q（第 %d 行）", i+1, name, k, v.Line)
+					return fmt.Errorf("unknown key %q in [[%s]] #%d (line %d)", k, name, i+1, v.Line)
 				}
 			}
 		}
@@ -227,7 +239,12 @@ func ParseFile(raw []byte) (*File, error) {
 		if v, err := str(sec, "server", "data"); err != nil {
 			return nil, err
 		} else if v != "" {
-			f.Server.Data = v
+			// "~/..." is the natural thing to write in a config file, and the
+			// example config uses it. Expanding only the -data flag meant a
+			// config-supplied path created a literal directory named "~" in the
+			// current working directory - data written somewhere nobody looks,
+			// and a stray directory in the repo.
+			f.Server.Data = ExpandHome(v)
 		}
 		if v, err := str(sec, "server", "listen"); err != nil {
 			return nil, err
@@ -243,6 +260,16 @@ func ParseFile(raw []byte) (*File, error) {
 			return nil, err
 		} else if v != "" {
 			f.Server.DefaultBranch = v
+		}
+		if v, err := boolean(sec, "server", "enforce_auth"); err != nil {
+			return nil, err
+		} else {
+			f.Server.EnforceAuth = v
+		}
+		if v, err := boolean(sec, "server", "webui"); err != nil {
+			return nil, err
+		} else {
+			f.Server.WebUI = v
 		}
 	}
 
@@ -289,7 +316,7 @@ func ParseFile(raw []byte) (*File, error) {
 			}
 		}
 		if rm.HostKey != "" && !strings.HasPrefix(rm.HostKey, "SHA256:") {
-			return nil, fmt.Errorf("[[remote]] host_key 必须是 SHA256:... fingerprint")
+			return nil, fmt.Errorf("[[remote]] host_key must be a SHA256:... fingerprint")
 		}
 		if rm.HTTPUser, err = str(sec, "[[remote]]", "http_user"); err != nil {
 			return nil, err
@@ -305,13 +332,13 @@ func ParseFile(raw []byte) (*File, error) {
 		// 凭证名与传输方式必须对得上：ssh_key 配 https、http_token 配 ssh://
 		// 都是「配了却没生效」的典型来源，只有启动期报错才治得住。
 		if rm.SSHKey != "" && (strings.HasPrefix(rm.URL, "http://") || strings.HasPrefix(rm.URL, "https://")) {
-			return nil, fmt.Errorf("[[remote]] %s/%s: ssh_key 不能用于 HTTP 远端，改用 http_token", rm.Project, rm.Name)
+			return nil, fmt.Errorf("[[remote]] %s/%s: ssh_key cannot be used with an HTTP remote; use http_token", rm.Project, rm.Name)
 		}
 		if rm.HTTPToken != "" && !strings.HasPrefix(rm.URL, "http://") && !strings.HasPrefix(rm.URL, "https://") {
-			return nil, fmt.Errorf("[[remote]] %s/%s: http_token 只能用于 http(s) 远端", rm.Project, rm.Name)
+			return nil, fmt.Errorf("[[remote]] %s/%s: http_token only applies to http(s) remotes", rm.Project, rm.Name)
 		}
 		if rm.Project == "" || rm.Name == "" || rm.URL == "" {
-			return nil, fmt.Errorf("[[remote]] 需要 project、name、url")
+			return nil, fmt.Errorf("[[remote]] requires project, name and url")
 		}
 		if err := validateRemoteURL(rm.URL); err != nil {
 			return nil, fmt.Errorf("[[remote]] %s/%s: %w", rm.Project, rm.Name, err)
@@ -378,7 +405,7 @@ func ParseFile(raw []byte) (*File, error) {
 		}
 		p.Perm, err = auth.ParsePerm(mode)
 		if err != nil {
-			return nil, fmt.Errorf("第 %d 个 [[project]] 的 mode: %w", i+1, err)
+			return nil, fmt.Errorf("[[project]] #%d mode: %w", i+1, err)
 		}
 		f.Projects = append(f.Projects, p)
 	}
@@ -406,6 +433,11 @@ func ParseFile(raw []byte) (*File, error) {
 			for _, item := range v {
 				lb.Mount = append(lb.Mount, parseMountSpec(item))
 			}
+		}
+		if v, err := boolean(sec, "[[listen]]", "webui"); err != nil {
+			return nil, err
+		} else {
+			lb.WebUI = v
 		}
 		// 没配 addr 的块直接忽略：宁可少开一个端口，也不要开在意外的地方
 		if lb.Addr == "" {
@@ -440,16 +472,16 @@ func ParseFile(raw []byte) (*File, error) {
 // 「某个身份忽然什么都没有权限」，而不是一条清晰的错误。
 func (f *File) Validate() error {
 	if len(f.Users) == 0 {
-		return fmt.Errorf("至少要有一个 [[user]]（否则没人能拿凭证）")
+		return fmt.Errorf("at least one [[user]] is required (otherwise nobody can hold a credential)")
 	}
 
 	userNames := map[string]bool{}
 	for i, u := range f.Users {
 		if err := auth.ValidateName(u.Name); err != nil {
-			return fmt.Errorf("第 %d 个 [[user]] 的 name: %w", i+1, err)
+			return fmt.Errorf("[[user]] #%d name: %w", i+1, err)
 		}
 		if userNames[u.Name] {
-			return fmt.Errorf("用户 %q 重复声明", u.Name)
+			return fmt.Errorf("duplicate user %q", u.Name)
 		}
 		userNames[u.Name] = true
 	}
@@ -457,10 +489,10 @@ func (f *File) Validate() error {
 	groupNames := map[string]bool{}
 	for i, g := range f.Groups {
 		if err := auth.ValidateName(g.Name); err != nil {
-			return fmt.Errorf("第 %d 个 [[group]] 的 name: %w", i+1, err)
+			return fmt.Errorf("[[group]] #%d name: %w", i+1, err)
 		}
 		if groupNames[g.Name] {
-			return fmt.Errorf("组 %q 重复声明", g.Name)
+			return fmt.Errorf("duplicate group %q", g.Name)
 		}
 		groupNames[g.Name] = true
 	}
@@ -470,14 +502,14 @@ func (f *File) Validate() error {
 	for _, u := range f.Users {
 		for _, g := range u.Groups {
 			if !groupNames[g] {
-				return fmt.Errorf("用户 %q 声明了不存在的组 %q", u.Name, g)
+				return fmt.Errorf("user %q references undeclared group %q", u.Name, g)
 			}
 		}
 	}
 	for _, g := range f.Groups {
 		for _, m := range g.Members {
 			if !userNames[m] {
-				return fmt.Errorf("组 %q 的成员 %q 不是已声明的用户", g.Name, m)
+				return fmt.Errorf("group %q member %q is not a declared user", g.Name, m)
 			}
 		}
 	}
@@ -485,18 +517,18 @@ func (f *File) Validate() error {
 	projNames := map[string]bool{}
 	for i, p := range f.Projects {
 		if err := auth.ValidateRepoName(p.Name); err != nil {
-			return fmt.Errorf("第 %d 个 [[project]] 的 name: %w", i+1, err)
+			return fmt.Errorf("[[project]] #%d name: %w", i+1, err)
 		}
 		if projNames[p.Name] {
-			return fmt.Errorf("项目 %q 重复声明", p.Name)
+			return fmt.Errorf("duplicate project %q", p.Name)
 		}
 		projNames[p.Name] = true
 
 		if p.Owner != "" && !userNames[p.Owner] {
-			return fmt.Errorf("项目 %q 的 owner %q 不是已声明的用户", p.Name, p.Owner)
+			return fmt.Errorf("project %q owner %q is not a declared user", p.Name, p.Owner)
 		}
 		if p.Group != "" && !groupNames[p.Group] {
-			return fmt.Errorf("项目 %q 的 group %q 不是已声明的组", p.Name, p.Group)
+			return fmt.Errorf("project %q group %q is not a declared group", p.Name, p.Group)
 		}
 	}
 
@@ -504,23 +536,23 @@ func (f *File) Validate() error {
 	// 而症状是「明明写对了却 not found」。
 	for _, u := range f.Users {
 		if u.Pwd != "" && !projNames[u.Pwd] {
-			return fmt.Errorf("用户 %q 的 pwd %q 不是已声明的项目", u.Name, u.Pwd)
+			return fmt.Errorf("user %q pwd %q is not a declared project", u.Name, u.Pwd)
 		}
 	}
 
 	for i, a := range f.Access {
 		if !userNames[a.User] {
-			return fmt.Errorf("第 %d 条 [[access]] 的 user %q 不是已声明的用户", i+1, a.User)
+			return fmt.Errorf("[[access]] #%d user %q is not a declared user", i+1, a.User)
 		}
 		if !projNames[a.Project] {
-			return fmt.Errorf("第 %d 条 [[access]] 的 project %q 不是已声明的项目", i+1, a.Project)
+			return fmt.Errorf("[[access]] #%d project %q is not a declared project", i+1, a.Project)
 		}
 		if a.Perm == "" {
-			return fmt.Errorf("第 %d 条 [[access]] 缺 perm", i+1)
+			return fmt.Errorf("[[access]] #%d is missing perm", i+1)
 		}
 		for _, c := range a.Perm {
 			if !strings.ContainsRune("rwx", c) {
-				return fmt.Errorf("第 %d 条 [[access]] 的 perm %q 只能由 rwx 组成", i+1, a.Perm)
+				return fmt.Errorf("[[access]] #%d perm %q may only contain rwx", i+1, a.Perm)
 			}
 		}
 	}
@@ -531,38 +563,59 @@ func (f *File) Validate() error {
 	// 虚拟路径都会静默变成一个「永远不匹配」的挂载项，而症状是
 	// 「这个端口什么都看不到」——一个需要读完 portpolicy.go 才能
 	// 解释的现象。端口策略是安全边界，它的配置就该在启动时校验。
+	// [server] webui only applies when there are no [[listen]] blocks.
+	//
+	// Port blocks replace the implicit single port entirely, so the flag would
+	// silently do nothing once any [[listen]] exists. That is exactly the
+	// "wrote it in the config but it had no effect" failure this validation
+	// exists to prevent - say so at startup instead of leaving the operator
+	// wondering why the admin URL 404s.
+	if f.Server.WebUI && len(f.Listens) > 0 {
+		return fmt.Errorf("[server] webui has no effect when [[listen]] blocks are present; set webui = true on the specific [[listen]] port instead")
+	}
 	seenAddr := map[string]bool{}
 	for i, lb := range f.Listens {
 		if lb.Addr == "" {
 			continue
 		}
 		if seenAddr[lb.Addr] {
-			return fmt.Errorf("[[listen]] 重复监听 %q", lb.Addr)
+			return fmt.Errorf("duplicate [[listen]] addr %q", lb.Addr)
 		}
 		seenAddr[lb.Addr] = true
+		// An empty allow list must be rejected, not guessed.
+		//
+		// The two consumers disagreed: the verb layer treated an empty list as
+		// "everything allowed" while the git layer treated it as "nothing
+		// allowed". A config that forgot `allow` therefore produced a port with
+		// every memory verb enabled - the opposite of what someone writing a
+		// restricted listener intends. There is no safe default here, so demand
+		// the list explicitly.
+		if len(lb.Allow) == 0 {
+			return fmt.Errorf("[[listen]] %q needs an allow list; write allow = [\"*\"] to enable everything", lb.Addr)
+		}
 		for j, m := range lb.Mount {
 			if err := auth.ValidateRepoName(m.Project); err != nil {
-				return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 项目名: %w", i+1, j+1, err)
+				return fmt.Errorf("[[listen]] #%d mount #%d project name: %w", i+1, j+1, err)
 			}
 			if strings.ContainsRune(m.At, 0) || strings.ContainsAny(m.At, `\\:*?\"<>|`) {
-				return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 虚拟路径非法: %q", i+1, j+1, m.At)
+				return fmt.Errorf("[[listen]] #%d mount #%d has an invalid virtual path: %q", i+1, j+1, m.At)
 			}
 			trimmedAt := strings.Trim(m.At, "/") // root "/" is valid
 			if trimmedAt != "" {
 				for _, seg := range strings.Split(trimmedAt, "/") {
 					if seg == "" || seg == "." || seg == ".." {
-						return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 虚拟路径不能含空、. 或 .. 段: %q", i+1, j+1, m.At)
+						return fmt.Errorf("[[listen]] #%d mount #%d virtual path may not contain empty, . or .. segments: %q", i+1, j+1, m.At)
 					}
 				}
 			}
 			for _, c := range m.Cap {
 				if !strings.ContainsRune("rwx", c) {
-					return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 的 cap %q 只能由 rwx 组成", i+1, j+1, m.Cap)
+					return fmt.Errorf("[[listen]] #%d mount #%d cap %q may only contain rwx", i+1, j+1, m.Cap)
 				}
 			}
 			if m.Branch != "" && m.Branch != "*" {
 				if err := auth.ValidateBranchName(m.Branch); err != nil {
-					return fmt.Errorf("第 %d 个 [[listen]] 的第 %d 个 mount 的分支名: %w", i+1, j+1, err)
+					return fmt.Errorf("[[listen]] #%d mount #%d branch name: %w", i+1, j+1, err)
 				}
 			}
 		}
@@ -681,7 +734,7 @@ func str(sec map[string]Value, section, key string) (string, error) {
 		return "", nil
 	}
 	if v.Kind != KindString {
-		return "", fmt.Errorf("%s 里的 %s 应为字符串，第 %d 行", section, key, v.Line)
+		return "", fmt.Errorf("%s in %s must be a string (line %d)", section, key, v.Line)
 	}
 	return v.Str, nil
 }
@@ -692,7 +745,7 @@ func list(sec map[string]Value, section, key string) ([]string, error) {
 		return nil, nil
 	}
 	if v.Kind != KindList {
-		return nil, fmt.Errorf("%s 里的 %s 应为字符串数组，第 %d 行", section, key, v.Line)
+		return nil, fmt.Errorf("%s in %s must be an array of strings (line %d)", section, key, v.Line)
 	}
 	return v.List, nil
 }
@@ -703,7 +756,7 @@ func integer(sec map[string]Value, section, key string) (int64, error) {
 		return 0, nil
 	}
 	if v.Kind != KindInt {
-		return 0, fmt.Errorf("%s 里的 %s 应为整数，第 %d 行", section, key, v.Line)
+		return 0, fmt.Errorf("%s in %s must be an integer (line %d)", section, key, v.Line)
 	}
 	return v.Int, nil
 }
@@ -714,7 +767,7 @@ func boolean(sec map[string]Value, section, key string) (bool, error) {
 		return false, nil
 	}
 	if v.Kind != KindBool {
-		return false, fmt.Errorf("%s 里的 %s 应为 true/false，第 %d 行", section, key, v.Line)
+		return false, fmt.Errorf("%s in %s must be true/false (line %d)", section, key, v.Line)
 	}
 	return v.Bool, nil
 }
@@ -726,10 +779,10 @@ func dur(sec map[string]Value, section, key string) (time.Duration, error) {
 	}
 	d, err := time.ParseDuration(s)
 	if err != nil {
-		return 0, fmt.Errorf("%s 里的 %s 不是合法时长（要 30s / 5m / 24h），得到 %q", section, key, s)
+		return 0, fmt.Errorf("%s in %s is not a valid duration (want 30s / 5m / 24h), got %q", section, key, s)
 	}
 	if d < 0 {
-		return 0, fmt.Errorf("%s 里的 %s 不能为负", section, key)
+		return 0, fmt.Errorf("%s in %s must not be negative", section, key)
 	}
 	return d, nil
 }
@@ -788,13 +841,13 @@ func validateRemoteURL(url string) error {
 			if at := strings.Index(rest, "@"); at > 0 {
 				userinfo := rest[:at]
 				if strings.Contains(userinfo, ":") {
-					return fmt.Errorf("远端地址不能内嵌密码（用 credential helper 或 SSH agent）")
+					return fmt.Errorf("remote URL must not embed a password (use a credential helper or SSH agent)")
 				}
 			}
 		}
 	}
 	if strings.HasPrefix(url, "-") {
-		return fmt.Errorf("远端地址不能以 - 开头")
+		return fmt.Errorf("remote address must not start with -")
 	}
 	return nil
 }
@@ -813,13 +866,37 @@ func (f *File) RemotesOf(project string) []Remote {
 // ValidateSSHKeyName accepts a short, path-safe identifier, never key material.
 func ValidateSSHKeyName(name string) error {
 	if len(name) == 0 || len(name) > 64 {
-		return fmt.Errorf("SSH key 名称长度须为 1..64 字符")
+		return fmt.Errorf("SSH key name must be 1..64 characters")
 	}
 	for i, r := range name {
 		ok := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || i > 0 && (r == '-' || r == '_' || r == '.')
 		if !ok {
-			return fmt.Errorf("SSH key 名称只允许字母、数字及 ._-：%q", name)
+			return fmt.Errorf("SSH key name may only contain letters, digits and ._- : %q", name)
 		}
 	}
 	return nil
+}
+
+// ExpandHome replaces a leading "~" with the user's home directory.
+//
+// Config files and command-line flags both go through this: a path like
+// "~/.zero-memcp/data" is what people write, and leaving it unexpanded creates
+// a directory literally named "~" in the working directory instead.
+func ExpandHome(p string) string {
+	if p == "" || !strings.HasPrefix(p, "~") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return p
+	}
+	rest := strings.TrimPrefix(p, "~")
+	if rest == "" {
+		return home
+	}
+	if !strings.HasPrefix(rest, "/") && !strings.HasPrefix(rest, string(filepath.Separator)) {
+		// "~user/..." is not supported; leave it alone rather than guess.
+		return p
+	}
+	return filepath.Join(home, rest)
 }

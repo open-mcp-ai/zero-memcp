@@ -67,6 +67,18 @@ type Claims struct {
 	// 不在表里的项目对这张凭证完全不可见。空表表示全命名空间（root）。
 	Mount []MountPoint `json:"mount,omitempty"`
 
+	// Gated 列出 cap 中**默认不生效**的能力位（rwx 子集）。
+	//
+	// 它把「这张凭证的能力上限」和「此刻被放行到哪一步」分成两件事：
+	// cap 是天花板，Gated 是其中暂时按住的部分。WebUI 按
+	// JTI + 项目 + 分支 + 期限把被按住的某几位打开，到期或撤销后重新按住。
+	//
+	// 为什么是「若干位」而不是一个布尔：只按 w 等于把功能做成了写锁，
+	// 而「临时放开读」「临时允许注入」同样是真实需求。
+	//
+	// 空串（旧凭证默认值）表示没有任何位被按住，行为与从前一致。
+	Gated string `json:"gated,omitempty"`
+
 	// Ticket 为真表示这是一张兑换券，不是正式凭证。
 	//
 	// 券只用于换取正式 token，一次性、分钟级有效期。这样即使在对话里
@@ -173,36 +185,36 @@ func (ts *TokenStore) Sign(claims Claims) (string, error) {
 func (ts *TokenStore) Verify(tokenString string) (*Claims, error) {
 	parts := strings.Split(tokenString, ".")
 	if len(parts) != 3 {
-		return nil, errors.New("非法 JWT 格式：应为三段式")
+		return nil, errors.New("invalid JWT format: expected three segments")
 	}
 
 	signingInput := parts[0] + "." + parts[1]
 	sig, err := base64.RawURLEncoding.DecodeString(parts[2])
 	if err != nil {
-		return nil, fmt.Errorf("解码签名失败: %w", err)
+		return nil, fmt.Errorf("decode signature: %w", err)
 	}
 
 	mac := hmac.New(sha256.New, ts.secret)
 	mac.Write([]byte(signingInput))
 	if !hmac.Equal(sig, mac.Sum(nil)) {
-		return nil, errors.New("凭证签名无效或已篡改")
+		return nil, errors.New("credential signature is invalid or has been tampered with")
 	}
 
 	claimsBytes, err := base64.RawURLEncoding.DecodeString(parts[1])
 	if err != nil {
-		return nil, fmt.Errorf("解码 payload 失败: %w", err)
+		return nil, fmt.Errorf("decode payload: %w", err)
 	}
 
 	var claims Claims
 	if err := json.Unmarshal(claimsBytes, &claims); err != nil {
-		return nil, fmt.Errorf("解析 claims 失败: %w", err)
+		return nil, fmt.Errorf("parse claims: %w", err)
 	}
 
 	if claims.Exp > 0 && time.Now().Unix() > claims.Exp {
-		return nil, fmt.Errorf("凭证已于 %s 过期", time.Unix(claims.Exp, 0).Format(time.RFC3339))
+		return nil, fmt.Errorf("credential expired at %s", time.Unix(claims.Exp, 0).Format(time.RFC3339))
 	}
 	if claims.Sub == "" {
-		return nil, errors.New("凭证缺少 sub")
+		return nil, errors.New("credential is missing sub")
 	}
 
 	return &claims, nil

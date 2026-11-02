@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
+	"os"
+	"path/filepath"
 )
 
 func mustParse(t *testing.T, src string) *File {
@@ -415,7 +417,7 @@ project = "blackegg/me"
 name = "github"
 url = "https://user:secret@example.invalid/private/me.git"
 `))
-	if err == nil || !strings.Contains(err.Error(), "不能内嵌密码") {
+	if err == nil || !strings.Contains(err.Error(), "must not embed a password") {
 		t.Fatalf("内嵌凭证必须在配置解析期拒绝，实际: %v", err)
 	}
 }
@@ -485,5 +487,91 @@ url     = "git@example.invalid:org/me.git"
 				t.Fatal("应当在配置解析期失败")
 			}
 		})
+	}
+}
+
+// [server] webui is the single-port switch. Once [[listen]] blocks exist they
+// replace the implicit port entirely, so the flag would silently do nothing -
+// and the symptom ("the admin URL 404s") is not something you can read off the
+// config file.
+func TestServerWebUIConflictsWithListenBlocks(t *testing.T) {
+	_, err := ParseFile([]byte(`
+[server]
+data = "/tmp/x"
+webui = true
+
+[[user]]
+name = "zero"
+root = true
+
+[[listen]]
+addr = "127.0.0.1:1729"
+allow = ["read"]
+`))
+	if err == nil || !strings.Contains(err.Error(), "has no effect") {
+		t.Fatalf("expected a conflict error, got %v", err)
+	}
+
+	// Without listen blocks the same config is fine.
+	f2 := mustParse(t, `
+[server]
+data = "/tmp/x"
+webui = true
+
+[[user]]
+name = "zero"
+root = true
+`)
+	if err := f2.Validate(); err != nil {
+		t.Fatalf("[server] webui alone should validate, got %v", err)
+	}
+	if !f2.Server.WebUI {
+		t.Fatal("[server] webui should be parsed into Server.WebUI")
+	}
+}
+
+// A config file is where people naturally write "~/...". Expanding it only for
+// the -data flag meant the config-supplied path created a directory literally
+// named "~" in whatever the working directory happened to be.
+func TestServerDataExpandsHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory available")
+	}
+	f := mustParse(t, `
+[server]
+data = "~/.zero-memcp/data"
+
+[[user]]
+name = "zero"
+root = true
+`)
+	if f.Server.Data != filepath.Join(home, ".zero-memcp", "data") {
+		t.Fatalf("data should expand ~ to the home directory, got %q", f.Server.Data)
+	}
+	if got := filepath.Base(f.Server.Data); got == "~" {
+		t.Fatalf("path still starts with a literal ~ component")
+	}
+}
+
+func TestExpandHome(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		t.Skip("no home directory available")
+	}
+	cases := []struct{ in, want string }{
+		{"", ""},
+		{"/absolute/path", "/absolute/path"},
+		{"relative/path", "relative/path"},
+		{"~", home},
+		{"~/data", filepath.Join(home, "data")},
+		// "~user" is a different user's home; we do not guess it.
+		{"~other/data", "~other/data"},
+		{"~deploy", "~deploy"},
+	}
+	for _, c := range cases {
+		if got := ExpandHome(c.in); got != c.want {
+			t.Errorf("ExpandHome(%q) = %q, want %q", c.in, got, c.want)
+		}
 	}
 }

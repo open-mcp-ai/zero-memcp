@@ -24,6 +24,30 @@ type TokenRecord struct {
 	Sub     string `json:"sub"`
 	Exp     int64  `json:"exp"`
 	Created int64  `json:"created"`
+
+	// Cap 与 Mount 记录签发时的能力上限与挂载表。
+	//
+	// 为什么要存下来：签发之后，这张凭证能干什么只存在于 JWT 载荷里，
+	// 而 JWT 是不可读的（要验签才能解）。审计的人想知道「这张纸能写
+	// 哪条分支」时，只剩两个选择——拿密钥解一遍，或者猜。
+	//
+	// 这两个字段**不参与验签**，改它不影响凭证能否使用。它们是记录，
+	// 不是权威：权威永远是 JWT 载荷本身。
+	//
+	// 旧记录没有这两个字段，读出后是零值。零值在能力串里表示
+	// 「不额外限制」，会让人误以为是一张全权凭证——所以用
+	// CapRecorded/MountRecorded 区分「没记」和「记了空值」。
+	Cap   string       `json:"cap,omitempty"`
+	Mount []MountPoint `json:"mount,omitempty"`
+	// CapRecorded 表示 Cap 字段可信；false 说明这是旧记录，能力未知。
+	CapRecorded bool `json:"cap_recorded,omitempty"`
+	// MountRecorded 表示 Mount 字段可信（含「空表 = 全命名空间」这一事实）。
+	MountRecorded bool `json:"mount_recorded,omitempty"`
+
+	// Gated 是签发时被按住的能力位（cap 的子集）。
+	//
+	// 这些位要生效必须有 WebUI 的临时授权。与 Claims.Gated 同源。
+	Gated string `json:"gated,omitempty"`
 }
 
 // Expired 报告该凭证是否已过期。
@@ -38,7 +62,7 @@ func TokenDir(dataDir string) string { return filepath.Join(dataDir, "system", "
 func SaveTokenRecord(dataDir string, rec TokenRecord) error {
 	dir := TokenDir(dataDir)
 	if err := os.MkdirAll(dir, 0o750); err != nil {
-		return fmt.Errorf("建目录 %s: %w", dir, err)
+		return fmt.Errorf("create directory %s: %w", dir, err)
 	}
 	if err := ValidateName(rec.Name); err != nil {
 		return err
@@ -50,10 +74,10 @@ func SaveTokenRecord(dataDir string, rec TokenRecord) error {
 	path := filepath.Join(dir, rec.Name+".json")
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return fmt.Errorf("写 %s: %w", tmp, err)
+		return fmt.Errorf("write %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
-		return fmt.Errorf("提交 %s: %w", path, err)
+		return fmt.Errorf("commit %s: %w", path, err)
 	}
 	return nil
 }

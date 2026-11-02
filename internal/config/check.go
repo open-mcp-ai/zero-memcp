@@ -63,33 +63,33 @@ func Check(l *Lookup, user, project string, perm uint8) bool {
 func Explain(l *Lookup, user, project string, perm uint8) string {
 	u, ok := l.User(user)
 	if !ok {
-		return fmt.Sprintf("用户 %q 不存在", user)
+		return fmt.Sprintf("user %q does not exist", user)
 	}
 	p, declared := l.Project(project)
 	if !declared {
-		return fmt.Sprintf("项目 %q 未在配置里声明", project)
+		return fmt.Sprintf("project %q is not declared in the config", project)
 	}
 	if u.Root {
 		return "root"
 	}
 	if granted, ok := l.AccessFor(user, project); ok {
 		if hasPerm(granted, perm) {
-			return "显式授权允许"
+			return "explicit access grant allows this operation"
 		}
-		return fmt.Sprintf("显式授权仅允许 %s，缺少 %s", granted, permName(perm))
+		return fmt.Sprintf("explicit access grant only allows %s; missing %s", granted, permName(perm))
 	}
 	switch {
 	case p.Owner != "" && p.Owner == user:
-		return fmt.Sprintf("属主 %s（项目 %s，%s）缺少 %s 权限",
+		return fmt.Sprintf("owner %s (project %s, %s) lacks %s permission",
 			user, project, p.Perm.String(), permName(perm))
 	default:
 		for _, g := range l.GroupsOf(user) {
 			if g == p.Group {
-				return fmt.Sprintf("属组 %s（项目 %s，%s）缺少 %s 权限",
+				return fmt.Sprintf("group %s (project %s, %s) lacks %s permission",
 					g, project, p.Perm.String(), permName(perm))
 			}
 		}
-		return fmt.Sprintf("用户 %s（项目 %s，属主 %q，属组 %q，%s）其他位缺少 %s 权限",
+		return fmt.Sprintf("user %s (project %s, owner %q, group %q, %s) lacks %s permission via other bits",
 			user, project, p.Owner, p.Group, p.Perm.String(), permName(perm))
 	}
 }

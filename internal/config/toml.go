@@ -85,11 +85,11 @@ func Parse(data []byte) (*Document, error) {
 		// [[name]]
 		if strings.HasPrefix(line, "[[") {
 			if !strings.HasSuffix(line, "]]") {
-				return nil, fmt.Errorf("第 %d 行：数组表声明应以 ]] 结尾，得到 %q", lineNo, line)
+				return nil, fmt.Errorf("line %d: array-table declaration must end with ]], got %q", lineNo, line)
 			}
 			name := strings.TrimSpace(line[2 : len(line)-2])
 			if err := validName(name); err != nil {
-				return nil, fmt.Errorf("第 %d 行：%w", lineNo, err)
+				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
 			m := map[string]Value{}
 			doc.Arrays[name] = append(doc.Arrays[name], m)
@@ -105,14 +105,14 @@ func Parse(data []byte) (*Document, error) {
 		// [name]
 		if strings.HasPrefix(line, "[") {
 			if !strings.HasSuffix(line, "]") {
-				return nil, fmt.Errorf("第 %d 行：分节声明应以 ] 结尾，得到 %q", lineNo, line)
+				return nil, fmt.Errorf("line %d: section declaration must end with ], got %q", lineNo, line)
 			}
 			name := strings.TrimSpace(line[1 : len(line)-1])
 			if err := validName(name); err != nil {
-				return nil, fmt.Errorf("第 %d 行：%w", lineNo, err)
+				return nil, fmt.Errorf("line %d: %w", lineNo, err)
 			}
 			if _, ok := doc.Sections[name]; ok {
-				return nil, fmt.Errorf("第 %d 行：分节 %q 重复声明", lineNo, name)
+				return nil, fmt.Errorf("line %d: section %q is declared more than once", lineNo, name)
 			}
 			doc.Sections[name] = map[string]Value{}
 			section = name
@@ -125,14 +125,14 @@ func Parse(data []byte) (*Document, error) {
 		// key = value
 		key, valText, ok := strings.Cut(line, "=")
 		if !ok {
-			return nil, fmt.Errorf("第 %d 行：缺 = 号，得到 %q", lineNo, line)
+			return nil, fmt.Errorf("line %d: missing =, got %q", lineNo, line)
 		}
 		key = strings.TrimSpace(key)
 		if key == "" {
-			return nil, fmt.Errorf("第 %d 行：键名为空", lineNo)
+			return nil, fmt.Errorf("line %d: key name is empty", lineNo)
 		}
 		if sectionMap == nil {
-			return nil, fmt.Errorf("第 %d 行：键 %q 出现在任何分节之前", lineNo, key)
+			return nil, fmt.Errorf("line %d: key %q appears before any section", lineNo, key)
 		}
 		val, err := parseValue(strings.TrimSpace(valText), lineNo)
 		if err != nil {
@@ -141,9 +141,9 @@ func Parse(data []byte) (*Document, error) {
 		if _, dup := sectionMap[key]; dup {
 			where := section
 			if arrayName != "" {
-				where = "[[" + arrayName + "]] 的某一项"
+				where = "[[" + arrayName + "an item in ]]"
 			}
-			return nil, fmt.Errorf("第 %d 行：%s 里的键 %q 重复", lineNo, where, key)
+			return nil, fmt.Errorf("line %d: duplicate key %q in %s", lineNo, where, key)
 		}
 		sectionMap[key] = val
 	}
@@ -174,17 +174,17 @@ func stripComment(line string) string {
 
 func parseValue(s string, lineNo int) (Value, error) {
 	if s == "" {
-		return Value{}, fmt.Errorf("第 %d 行：缺值", lineNo)
+		return Value{}, fmt.Errorf("line %d: missing value", lineNo)
 	}
 
 	// 字符串
 	if strings.HasPrefix(s, `"`) {
 		v, rest, err := parseString(s)
 		if err != nil {
-			return Value{}, fmt.Errorf("第 %d 行：%w", lineNo, err)
+			return Value{}, fmt.Errorf("line %d: %w", lineNo, err)
 		}
 		if strings.TrimSpace(rest) != "" {
-			return Value{}, fmt.Errorf("第 %d 行：字符串后面还有东西：%q", lineNo, rest)
+			return Value{}, fmt.Errorf("line %d: unexpected trailing content after string: %q", lineNo, rest)
 		}
 		return Value{Str: v, Kind: KindString, Line: lineNo}, nil
 	}
@@ -193,7 +193,7 @@ func parseValue(s string, lineNo int) (Value, error) {
 	if strings.HasPrefix(s, "[") {
 		list, err := parseList(s)
 		if err != nil {
-			return Value{}, fmt.Errorf("第 %d 行：%w", lineNo, err)
+			return Value{}, fmt.Errorf("line %d: %w", lineNo, err)
 		}
 		return Value{List: list, Kind: KindList, Line: lineNo}, nil
 	}
@@ -211,7 +211,7 @@ func parseValue(s string, lineNo int) (Value, error) {
 		return Value{Int: n, Kind: KindInt, Line: lineNo}, nil
 	}
 
-	return Value{}, fmt.Errorf("第 %d 行：无法识别的值 %q（字符串要加引号）", lineNo, s)
+	return Value{}, fmt.Errorf("line %d: unrecognized value %q (strings must be quoted)", lineNo, s)
 }
 
 func parseString(s string) (string, string, error) {
@@ -220,7 +220,7 @@ func parseString(s string) (string, string, error) {
 		switch s[i] {
 		case '\\':
 			if i+1 >= len(s) {
-				return "", "", fmt.Errorf("字符串以反斜杠结尾")
+				return "", "", fmt.Errorf("string ends with a backslash")
 			}
 			i++
 			switch s[i] {
@@ -233,7 +233,7 @@ func parseString(s string) (string, string, error) {
 			case 't':
 				b.WriteByte('\t')
 			default:
-				return "", "", fmt.Errorf("不支持的转义 \\%c", s[i])
+				return "", "", fmt.Errorf("unsupported escape sequence \\%c", s[i])
 			}
 		case '"':
 			return b.String(), s[i+1:], nil
@@ -241,12 +241,12 @@ func parseString(s string) (string, string, error) {
 			b.WriteByte(s[i])
 		}
 	}
-	return "", "", fmt.Errorf("字符串没有闭合的引号")
+	return "", "", fmt.Errorf("string has an unclosed quote")
 }
 
 func parseList(s string) ([]string, error) {
 	if !strings.HasSuffix(s, "]") {
-		return nil, fmt.Errorf("数组应以 ] 结尾，得到 %q", s)
+		return nil, fmt.Errorf("array must end with ], got %q", s)
 	}
 	body := strings.TrimSpace(s[1 : len(s)-1])
 	if body == "" {
@@ -259,7 +259,7 @@ func parseList(s string) ([]string, error) {
 			break
 		}
 		if !strings.HasPrefix(body, `"`) {
-			return nil, fmt.Errorf("数组元素必须是加引号的字符串，得到 %q", body)
+			return nil, fmt.Errorf("array elements must be quoted strings, got %q", body)
 		}
 		v, rest, err := parseString(body)
 		if err != nil {
@@ -271,7 +271,7 @@ func parseList(s string) ([]string, error) {
 			break
 		}
 		if !strings.HasPrefix(rest, ",") {
-			return nil, fmt.Errorf("数组元素之间要有逗号，得到 %q", rest)
+			return nil, fmt.Errorf("array elements must be separated by commas, got %q", rest)
 		}
 		body = rest[1:]
 	}
@@ -280,13 +280,13 @@ func parseList(s string) ([]string, error) {
 
 func validName(name string) error {
 	if name == "" {
-		return fmt.Errorf("分节名为空")
+		return fmt.Errorf("section name is empty")
 	}
 	for _, c := range name {
 		ok := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' ||
 			c >= '0' && c <= '9' || c == '_' || c == '-' || c == '.'
 		if !ok {
-			return fmt.Errorf("分节名 %q 含非法字符 %q（只允许字母数字 _ - .）", name, c)
+			return fmt.Errorf("section name %q contains invalid character %q (only letters, digits, _, - and . are allowed)", name, c)
 		}
 	}
 	return nil

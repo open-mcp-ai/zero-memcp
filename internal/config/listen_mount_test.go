@@ -32,36 +32,41 @@ mode = "rwx------"
 	}{
 		{
 			name:   "合法挂载",
-			listen: "addr = \"127.0.0.1:1\"\nmount = [\"proj=/:rw@main\"]",
+			listen: "addr = \"127.0.0.1:1\"\nallow = [\"*\"]\nmount = [\"proj=/:rw@main\"]",
 		},
 		{
 			name:   "根路径合法",
-			listen: "addr = \"127.0.0.1:1\"\nmount = [\"proj=/\"]",
+			listen: "addr = \"127.0.0.1:1\"\nallow = [\"*\"]\nmount = [\"proj=/\"]",
 		},
 		{
 			name:    "cap 有非法字符",
-			listen:  "addr = \"127.0.0.1:1\"\nmount = [\"proj=/:rz\"]",
-			wantErr: "只能由 rwx 组成",
+			listen:  "addr = \"127.0.0.1:1\"\nallow = [\"*\"]\nmount = [\"proj=/:rz\"]",
+			wantErr: "may only contain rwx",
 		},
 		{
 			name:    "项目名带 ..",
-			listen:  "addr = \"127.0.0.1:1\"\nmount = [\"../evil=/\"]",
-			wantErr: "项目名",
+			listen:  "addr = \"127.0.0.1:1\"\nallow = [\"*\"]\nmount = [\"../evil=/\"]",
+			wantErr: "project name",
 		},
 		{
 			name:    "虚拟路径带 ..",
-			listen:  "addr = \"127.0.0.1:1\"\nmount = [\"proj=/a/../b\"]",
-			wantErr: "虚拟路径",
+			listen:  "addr = \"127.0.0.1:1\"\nallow = [\"*\"]\nmount = [\"proj=/a/../b\"]",
+			wantErr: "virtual path",
 		},
 		{
 			name:    "分支名带 ..",
-			listen:  "addr = \"127.0.0.1:1\"\nmount = [\"proj=/:rw@../evil\"]",
-			wantErr: "分支名",
+			listen:  "addr = \"127.0.0.1:1\"\nallow = [\"*\"]\nmount = [\"proj=/:rw@../evil\"]",
+			wantErr: "branch name",
 		},
 		{
 			name:    "重复监听同一地址",
+			listen:  "addr = \"127.0.0.1:1\"\nallow = [\"*\"]",
+			wantErr: "duplicate [[listen]]",
+		},
+		{
+			name:    "allow list missing",
 			listen:  "addr = \"127.0.0.1:1\"",
-			wantErr: "重复监听",
+			wantErr: "needs an allow list",
 		},
 	}
 

@@ -52,13 +52,13 @@ const (
 func ParsePerm(s string) (Perm, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
-		return Perm{}, fmt.Errorf("权限位为空")
+		return Perm{}, fmt.Errorf("permission mode is empty")
 	}
 
 	if s[0] == '0' || (len(s) == 3 && isOctal(s)) {
 		v, err := strconv.ParseUint(strings.TrimPrefix(s, "0"), 8, 32)
 		if err != nil || v > 0777 {
-			return Perm{}, fmt.Errorf("非法八进制权限 %q", s)
+			return Perm{}, fmt.Errorf("invalid octal permission mode %q", s)
 		}
 		return Perm{
 			Owner: uint8(v>>6) & 7,
@@ -68,7 +68,7 @@ func ParsePerm(s string) (Perm, error) {
 	}
 
 	if len(s) != 9 {
-		return Perm{}, fmt.Errorf("权限位必须是九位（rwxr-x---）或八进制（0750），得到 %q", s)
+		return Perm{}, fmt.Errorf("permission mode must be nine characters (rwxr-x---) or octal (0750), got %q", s)
 	}
 	rwx := func(tri string, at int) (uint8, error) {
 		var v uint8
@@ -81,7 +81,7 @@ func ParsePerm(s string) (Perm, error) {
 			case ch == '-' || ch == ' ':
 				// 没有这位
 			default:
-				return 0, fmt.Errorf("第 %d 位应是 %c 或 -，得到 %c（整体 %q）", at+i+1, want, ch, s)
+				return 0, fmt.Errorf("position %d must be %c or -, got %c (full mode %q)", at+i+1, want, ch, s)
 			}
 		}
 		return v, nil

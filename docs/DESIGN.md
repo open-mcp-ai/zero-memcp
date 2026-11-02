@@ -291,6 +291,56 @@ internal/
   manifest/     SKILL.md frontmatter 解析（inject / index 声明）
   weights/      阅读频次（影响排序，不影响授权）
   server/       MCP 动词实现、HTTP 路由、端口策略、树外科手术
-cmd/zero-memcp/ 主程序与子命令（serve / token / keygen / gc）
+cmd/zero-memcp/ CLI 入口（serve / help / version；凭证与维护操作在 WebUI）
 pkg/zeromem/    对外 SDK 门面（New / Tool / Mux）
 ```
+
+## 管理面设计
+
+### 为什么 CLI 不做凭证管理
+
+`token` / `gc` 这类命令在 CLI 上存在过，然后被删掉了。原因是它们本质上要求第二个进程去动在线服务的数据目录：
+
+- 签发票据要写 `system/tokens/`，吊销要写 `system/revoked/`，与在线进程并发写同一份状态；
+- `gc` 直接重写对象库，与后台维护循环同时打包同一个仓库会损坏它。
+
+所以运行期只有服务这一个写者，运维动作走服务自己的管理面；进程级互斥由 `<data>/system/instance.lock` 上的内核文件锁保证（不是 PID 文件：进程崩溃时内核自动释放，也不需要清理陈旧锁）。
+
+CLI 因此只剩 `serve` / `help` / `version`：装配与诊断，不是客户端。
+
+### 为什么管理面不是「另一个端口就完事」
+
+同一个 HTTP 服务上挂两种鉴权，只有在**两个方向都拒绝对方的凭据**时才成立：
+
+| 凭据 | MCP 通道 | 管理通道 |
+|---|---|---|
+| `Authorization: Bearer <jwt>` | 接受 | 403 |
+| 会话 cookie `zmcp_ui` | 401（即使同时带有效 Bearer） | 接受 |
+
+「Bearer 优先」不算隔离：那样一条请求同时带两种凭据就能跨过去，事后无法判断这次调用来自 Agent 还是来自人。因此 MCP 侧在鉴权**之前**检查会话 cookie。
+
+会话侧再加三道：`SameSite=Strict` + HttpOnly、Origin/Referer 与 Host 比对、登录失败 5 次锁 5 分钟。
+
+### 路由表就是边界
+
+没开 `webui` 的端口上，管理面路由根本不注册，访问得到 404 而不是 403。403 会告诉探测者「这里有管理面，去猜口令」；404 不承认它存在。
+
+### 能力门（gated）
+
+`cap` 是这张凭证的能力上限，`gated` 是其中「先按住、要用再说」的子集。授权按 (JTI, 项目, 分支) 存储，记录被放行的位集合；一次判定读一次盘，撤销即时生效。
+
+授权不是提权通道，只能打开本来就属于这张凭证、且被刻意按住的位。因此签发时就要求：
+
+```
+grant.cap ⊆ gated ⊆ cap ∩ mount.cap
+```
+
+配置层（`[[project]]` / `[[access]]`）仍在其后独立判定，授权永远盖不过它。
+
+把 `w` 单独硬编码成「写锁」是早期版本的做法：它让临时授权只有一种用途，也让「只读但要能注入」「能写但不能注入」这类真实需求无处安放。改成位集合之后，同一张凭证可以被分别放行 `r` / `w` / `x` 中的任意几个，也能被随时收回其中一位而保留其他。
+
+### 口令不进配置
+
+`config show` 是把配置原样回显给 Agent 的动词。所以管理口令只存在 `system/ui.passwd`（argon2id 摘要），或由环境变量 `ZERO_MEMCP_UI_PASS` 提供；TOML 里写了口令会被配置校验直接拒绝。
+
+首次启动生成的随机口令只打印一次，并被读取即清空（`TakeBootstrapPassword`）：否则它在进程整个生命周期里都可再次取得，「打印一次」就成了空话。

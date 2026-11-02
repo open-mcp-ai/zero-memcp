@@ -28,6 +28,12 @@ type Caller struct {
 
 	// JTI 是这张凭证的编号，写审计用。
 	JTI string
+
+	// Gated 是这张凭证上被按住、需要临时授权才生效的能力位。
+	//
+	// 它不是「额外能力」，而是给 cap 已有的位加一道闸门：凭证声明
+	// 「我能到 rw」，但要不要现在放它 r 或 w，由 WebUI 逐次决定。
+	Gated string
 }
 
 // canRead / canWrite / canInject 是 cap 这一层的判定。
@@ -84,20 +90,20 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 	// 为什么信箱不开例外：信箱里躺着的是跨端点投递的未确认消息，
 	// 谁都能读就等于破坏了端到端的隔离。
 	if strings.HasPrefix(r.URL.Path, "/repos/") && token == "" {
-		return Caller{}, fmt.Errorf("该端点需要凭证：请带 Authorization: Bearer <jwt>")
+		return Caller{}, fmt.Errorf("this endpoint requires credentials: provide Authorization: Bearer <jwt>")
 	}
 
 	if token != "" {
 		claims, err := s.tokens.Verify(token)
 		if err != nil {
-			return Caller{}, fmt.Errorf("无效凭证: %w", err)
+			return Caller{}, fmt.Errorf("invalid credential: %w", err)
 		}
 		if s.rev.Revoked(claims.JTI) {
-			return Caller{}, fmt.Errorf("凭证已被吊销 (jti=%s)", claims.JTI)
+			return Caller{}, fmt.Errorf("credential has been revoked (jti=%s)", claims.JTI)
 		}
 		// 兑换券不能当正式凭证用：它只能去换 token，不能读写记忆。
 		if claims.Ticket {
-			return Caller{}, fmt.Errorf("这是一张兑换券（tkt），不能直接用于读写；请用它换取正式凭证")
+			return Caller{}, fmt.Errorf("this is an exchange ticket (tkt), not valid for read or write; exchange it for a regular credential")
 		}
 
 		isRoot := false
@@ -138,7 +144,7 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 		if hasBlk && len(blk.Mount) > 0 {
 			narrowed := narrowByPort(mount, blk.Mount)
 			if len(narrowed) == 0 {
-				return Caller{}, fmt.Errorf("这张凭证的挂载范围与本端口的挂载范围没有交集，拒绝访问（端口 %s）", blk.Addr)
+				return Caller{}, fmt.Errorf("this credential's mount scope does not intersect this port's mount scope; access denied (port %s)", blk.Addr)
 			}
 			mount = narrowed
 		}
@@ -160,6 +166,7 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 			Mount:    NewMount(mount, s.defaultBranch),
 			Cap:      capStr,
 			JTI:      claims.JTI,
+			Gated:    claims.Gated,
 		}, nil
 	}
 
@@ -170,7 +177,7 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 	// 任何能在这台机器上跑进程的东西（包括被攻破的其他服务）
 	// 都能拿到 root 权限。端口自己声明 require 才算数。
 	if hasBlk && strings.EqualFold(blk.Require, "bearer") {
-		return Caller{}, fmt.Errorf("这个端口要求 Authorization: Bearer <jwt>")
+		return Caller{}, fmt.Errorf("this port requires Authorization: Bearer <jwt>")
 	}
 
 	if s.isLocal(r) && !s.cfg.EnforceAuth {
@@ -178,7 +185,7 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 		return s.rootCaller(), nil
 	}
 
-	return Caller{}, fmt.Errorf("缺少授权凭证 (请提供 Authorization: Bearer <jwt>)")
+	return Caller{}, fmt.Errorf("authorization credential missing (provide Authorization: Bearer <jwt>)")
 }
 
 func (s *Server) isLocal(r *http.Request) bool {
@@ -191,7 +198,7 @@ func (s *Server) execWhoami(c Caller) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("User: %s\n", c.User))
 	if c.Root {
-		sb.WriteString("Privilege: root (拥有全局直通权限)\n")
+		sb.WriteString("Privilege: root (unrestricted global access)\n")
 	} else if s.cfgIndex() != nil {
 		groups := s.cfgIndex().GroupsOf(c.User)
 		if len(groups) > 0 {
@@ -204,7 +211,7 @@ func (s *Server) execWhoami(c Caller) string {
 // execUsers 列出配置里的用户与组（只读）。
 func (s *Server) execUsers() TermResult {
 	if s.cfgIndex() == nil {
-		return TermResult{Text: "（无配置文件，当前为单机全放行模式）"}
+		return TermResult{Text: "(no config file; running in standalone unrestricted mode)"}
 	}
 	var sb strings.Builder
 	sb.WriteString("USER             ROOT  GROUPS\n")

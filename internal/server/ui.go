@@ -3,6 +3,7 @@ package server
 import (
 	"embed"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"sort"
 	"strings"
@@ -25,15 +26,11 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	data, err := uiFS.ReadFile("static/index.html")
 	if err != nil {
-		http.Error(w, "面板资源缺失", http.StatusInternalServerError)
+		http.Error(w, "admin panel assets are missing", http.StatusInternalServerError)
 		return
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_, _ = w.Write(data)
-}
-
-func (s *Server) handleUI(w http.ResponseWriter, r *http.Request) {
-	s.handleAPI(w, r)
 }
 
 // buildTreeFromBlocks 把一个项目的所有块组织成树形 JSON。
@@ -93,6 +90,11 @@ func buildTreeFromBlocks(projectName string, blocks []memory.Block) map[string]a
 	return res
 }
 
+// handleAPI 是 Agent 通道上的数据接口（Bearer 鉴权）。
+//
+// 管理台不用它——面板走 handleAPIAsUI，判据是会话。
+// 两者共用同一段读取逻辑，但身份来源必须分开：一旦共用一个
+// 鉴权函数，「本机免签降级成 root」就会顺着管理面漏进来。
 func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 	caller, authErr := s.authenticate(r)
 	if authErr != nil {
@@ -100,6 +102,18 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, authErr.Error(), http.StatusUnauthorized)
 		return
 	}
+	s.serveAPI(w, r, caller)
+}
+
+// handleAPIAsUI 用管理台身份提供同一批数据。
+//
+// 管理台是所有者视角，所以身份是 root——但这不等于「可以绕过一切」：
+// 它仍然只做读（recent / tree / read），没有任何写路径。
+func (s *Server) handleAPIAsUI(w http.ResponseWriter, r *http.Request) {
+	s.serveAPI(w, r, Caller{User: "ui", Identity: "webui", Root: true, Cap: "rwx"})
+}
+
+func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, caller Caller) {
 	w.Header().Set("Content-Type", "application/json")
 
 	switch r.URL.Query().Get("action") {
@@ -152,17 +166,64 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 
 	case "read":
 		addr := r.URL.Query().Get("addr")
-		// 曾经这里硬编码 Caller{Root:true}：任何能通过鉴权的调用者
-		// 都能从这个端点读到任意仓库的任意文件，把整个挂载表旁路掉。
-		// 读路径的判据只能有一个——就是调用者本来的身份。
-		out, err := s.execTerm("read "+addr, Viewer{}, caller)
+		// Never build a DSL line out of request data.
+		//
+		// `"read " + addr` looks harmless until addr contains a newline:
+		// the remainder is executed as another verb under this caller's
+		// identity, so a read-only caller could reach a write verb. The
+		// project rule is that payloads travel in vars/args and are never
+		// concatenated into the command line; this endpoint has to obey the
+		// same rule it demands of agents.
+		text, err := s.readAddr(addr, caller)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusNotFound)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]string{"content": out.Text})
+		_ = json.NewEncoder(w).Encode(map[string]string{"content": text})
 
 	default:
 		http.Error(w, "unknown action", http.StatusBadRequest)
 	}
+}
+
+// readAddr 按调用者身份读取一个地址，不经过 DSL 解析。
+//
+// 这是 /api?action=read 的实现。它直接走 resolveAddr + allowed + repo.Read，
+// 与 read 动词共用同一套判定，但入口不接受命令文本——地址就是地址。
+//
+// 复用动词实现看似省事，代价是把「参数」和「命令」混成一层：
+// 地址里出现换行或空格时，后半段会变成另一个动词，而权限判定发生在
+// 动词解析之后，于是调用者能借自己的读权限触发写路径。
+func (s *Server) readAddr(addr string, c Caller) (string, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", errors.New("addr is required")
+	}
+	// 地址是单个 token，出现空白说明它本来就不是一个地址。
+	if strings.ContainsAny(addr, " \t\r\n") {
+		return "", errors.New("addr must not contain whitespace")
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	proj, br, path, err := s.resolveAddr(addr, c)
+	if err != nil {
+		return "", err
+	}
+	if !s.allowed(c, proj, br, configBitRead) {
+		return "", errors.New(s.denyReason(c, proj, br, configBitRead))
+	}
+	repo, err := s.projects.Get(proj)
+	if err != nil {
+		return "", err
+	}
+	d, err := repo.Read(br, path)
+	if err != nil {
+		return "", err
+	}
+	nowUnix := time.Now().Unix()
+	s.weights.Bump(proj+"@"+br+"/"+path, nowUnix)
+	s.weights.Bump(proj+"/"+path, nowUnix)
+	return string(d), nil
 }

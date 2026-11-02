@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>zero-memcp</title>
@@ -42,126 +42,289 @@
   .empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--muted)}
   .meta{padding:7px 11px;border-top:1px solid var(--border);color:var(--muted);font-size:11px;display:flex;gap:14px;flex-wrap:wrap}
   .meta span b{color:var(--text);font-weight:500}
+  .gate{position:fixed;inset:0;background:rgba(1,4,9,.92);display:flex;align-items:center;justify-content:center;z-index:100}
+  .gate-box{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:22px;width:340px;display:flex;flex-direction:column;gap:9px}
+  .gate-box h2{font-size:14px;color:#f0f6fc;font-weight:600}
+  .gate-hint{color:var(--muted);font-size:11px;line-height:1.6}
+  .gate-box input{background:var(--bg);border:1px solid var(--border);color:#fff;padding:7px 10px;border-radius:4px;font-size:12px;width:100%}
+  .gate-box input:focus{outline:none;border-color:var(--accent)}
+  .gate-box button{background:var(--accent);border:none;color:#0d1117;padding:7px 12px;border-radius:4px;font-size:12px;cursor:pointer;font-weight:600}
+  .gate-err{color:#f85149;font-size:11px;min-height:15px}
+  .tabs{display:flex;gap:5px;margin-bottom:11px}
+  .tab{padding:5px 12px;border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:12px;color:var(--muted);background:var(--card)}
+  .tab.on{color:#f0f6fc;border-color:var(--accent);background:rgba(88,166,255,.12)}
+  .page{display:none}
+  .page.on{display:block}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{text-align:left;padding:5px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+  th{color:var(--muted);font-weight:600;font-size:11px}
+  code{background:rgba(255,255,255,.05);padding:1px 4px;border-radius:3px;font-size:11px}
+  .bad{color:#f85149}
+  .good{color:var(--green)}
+  .warn{color:var(--gold)}
+  .row-form{display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin:9px 0}
+  .row-form input,.row-form select{background:var(--bg);border:1px solid var(--border);color:#fff;padding:5px 8px;border-radius:4px;font-size:12px}
+  .row-form button{background:var(--green);border:none;color:#0d1117;padding:5px 11px;border-radius:4px;font-size:12px;cursor:pointer;font-weight:600}
+  .btn-sm{background:var(--card);border:1px solid var(--border);color:var(--text);padding:3px 8px;border-radius:4px;font-size:11px;cursor:pointer}
+  .btn-sm:hover{border-color:var(--accent)}
+  .tok{word-break:break-all;font-size:10px;color:var(--gold);max-width:520px;display:block}
 </style>
 </head>
 <body>
 
-<div class="header">
-  <h1>zero-memcp · 文件系统</h1>
-  <div class="stats" id="stats">连接中…</div>
+<!-- Login / change-password overlay. Shown by default, removed after login.
+     This is presentation only, not the security boundary: the real check is
+     server-side (both /api and /ui/api/* require a session cookie). -->
+<div id="gate" class="gate">
+  <div class="gate-box">
+    <h2 id="gate-title">zero-memcp admin</h2>
+    <p id="gate-hint" class="gate-hint"></p>
+    <div id="gate-login">
+      <input type="password" id="pw" placeholder="Admin password" autocomplete="current-password">
+      <button id="pw-btn" onclick="doLogin()">Sign in</button>
+    </div>
+    <div id="gate-change" style="display:none">
+      <input type="password" id="pw-old" placeholder="Current password" autocomplete="current-password">
+      <input type="password" id="pw-new" placeholder="New password (at least 8 characters)" autocomplete="new-password">
+      <input type="password" id="pw-new2" placeholder="Repeat the new password" autocomplete="new-password">
+      <button onclick="doChangePassword()">Set new password</button>
+    </div>
+    <p id="gate-err" class="gate-err"></p>
+  </div>
 </div>
 
+<div class="header">
+  <h1>zero-memcp &middot; admin</h1>
+  <div class="stats" id="stats">connecting...</div>
+</div>
+
+<div class="tabs">
+  <div class="tab on" id="tab-files" onclick="showTab('files')">Files</div>
+  <div class="tab" id="tab-admin" onclick="showTab('admin')">Permissions &amp; credentials</div>
+  <div class="tab" onclick="doLogout()">Sign out</div>
+</div>
+
+<div class="page on" id="page-files">
 <div class="layout">
   <div class="panel">
     <div class="search-bar">
-      <input type="text" id="q" placeholder="语义搜索（走 BM25 索引）…" onkeydown="if(event.key==='Enter')doSearch();if(event.key==='Escape')clearSearch()">
-      <button onclick="doSearch()">搜</button>
+      <input type="text" id="q" placeholder="Semantic search (BM25 index)..." onkeydown="if(event.key==='Enter')doSearch();if(event.key==='Escape')clearSearch()">
+      <button onclick="doSearch()">Search</button>
     </div>
-    <div class="panel-head" id="tree-head">目录树</div>
-    <div class="tree" id="tree"><div class="empty">加载中…</div></div>
+    <div class="panel-head" id="tree-head">Directory tree</div>
+    <div class="tree" id="tree"><div class="empty">loading...</div></div>
+  </div>
+  <div class="panel">
+    <div class="panel-head" id="title">Select a file</div>
+    <div class="viewer" id="viewer"><div class="empty">Pick a file on the left to view its content</div></div>
+    <div class="meta" id="meta"></div>
+  </div>
+</div>
+</div>
+
+<div class="page" id="page-admin">
+  <div class="panel" style="margin-bottom:12px">
+    <div class="panel-head">Instance overview</div>
+    <div style="padding:9px 11px" id="overview">loading...</div>
+  </div>
+
+  <div class="panel" style="margin-bottom:12px">
+    <div class="panel-head">Credentials</div>
+    <div style="padding:9px 11px">
+      <table id="tokens"><tr><td class="muted">loading...</td></tr></table>
+      <div class="row-form">
+        <input id="nt-user" placeholder="user (must be declared in the config)">
+        <input id="nt-name" placeholder="credential name (empty = user)">
+        <input id="nt-cap" placeholder="capability ceiling: rwx subset, e.g. rw" style="width:200px">
+        <input id="nt-gated" placeholder="held until granted: subset, e.g. w or rx" style="width:210px">
+        <input id="nt-hours" placeholder="hours until expiry (0 = never)" style="width:150px">
+        <button onclick="mintToken()">Mint</button>
+      </div>
+      <div class="row-form">
+        <input id="nt-mount-project" placeholder="mount project (required)" style="width:200px">
+        <input id="nt-mount-at" placeholder="virtual path (e.g. / or /notes)" style="width:230px">
+        <input id="nt-mount-branch" placeholder="branch (empty = server default)" style="width:240px">
+        <input id="nt-mount-cap" placeholder="mount cap subset (e.g. rw)" style="width:200px">
+      </div>
+      <p class="gate-hint">New credentials require an explicit capability ceiling and a mount. In this model an empty cap or mount means unrestricted, so the form never guesses that for you.</p>
+      <p class="gate-hint">cap is the credential ceiling. gated lists bits that are withheld by default; temporary grants may open only those bits, and TOML permissions still apply.</p>
+      <pre id="mint-out" style="white-space:pre-wrap;font-size:11px;color:var(--gold);margin-top:6px"></pre>
+    </div>
   </div>
 
   <div class="panel">
-    <div class="panel-head" id="title">选择一个文件</div>
-    <div class="viewer" id="viewer"><div class="empty">点击左侧文件查看内容</div></div>
-    <div class="meta" id="meta"></div>
+    <div class="panel-head">Temporary write grants (activate / revoke)</div>
+    <div style="padding:9px 11px">
+      <table id="grants"><tr><td class="muted">loading...</td></tr></table>
+      <div class="row-form">
+        <select id="gr-jti"></select>
+        <input id="gr-proj" placeholder="project name" style="width:160px">
+        <input id="gr-branch" placeholder="branch (empty = server default branch)" style="width:220px">
+        <input id="gr-cap" placeholder="bits to grant, e.g. w or rx" style="width:180px">
+        <input id="gr-min" placeholder="minutes (0 = no expiry)" style="width:150px">
+        <button onclick="addGrant()">Grant selected bits</button>
+      </div>
+      <p class="gate-hint">Grant only bits listed in that credential's gated field. The grant is also limited by its cap, mount table, and TOML permissions.</p>
+    </div>
+  </div>
+
+  <div class="panel" style="margin-top:12px">
+    <div class="panel-head">Maintenance</div>
+    <div style="padding:9px 11px">
+      <button class="btn-sm" onclick="runGC()">Repack objects (gc)</button>
+      <pre id="gc-out" style="white-space:pre-wrap;font-size:11px;color:var(--muted);margin-top:6px"></pre>
+    </div>
   </div>
 </div>
 
 <script>
+// The front end only renders and forwards. Every permission decision is
+// server-side: /api and /ui/api/* require a session cookie and reject Bearer.
 let currentAddr = "";
 const collapsed = new Set();
+let searching = false;
+let authed = false;
 
+function $(id){ return document.getElementById(id); }
+function showErr(msg){ $("gate-err").textContent = msg || ""; }
+
+function showGate(mode){
+  $("gate").style.display = "flex";
+  authed = false;
+  const login = $("gate-login"), change = $("gate-change");
+  if(mode === "change"){
+    $("gate-title").textContent = "Set a new password";
+    $("gate-hint").textContent = "The current password is the initial one (possibly generated at random; see the server startup log). It works once and becomes invalid as soon as you replace it.";
+    login.style.display = "none"; change.style.display = "flex";
+    change.style.flexDirection = "column";
+    change.style.gap = "9px";
+    $("pw-old").value = ""; $("pw-new").value = ""; $("pw-new2").value = "";
+  }else{
+    $("gate-title").textContent = "zero-memcp admin";
+    $("gate-hint").textContent = "The admin surface and the agent channel use separate credentials: this page only accepts a password login and never an MCP Bearer token.";
+    login.style.display = "flex"; change.style.display = "none";
+    login.style.flexDirection = "column";
+    login.style.gap = "9px";
+    $("pw").value = "";
+  }
+}
+function hideGate(){ $("gate").style.display = "none"; authed = true; showErr(""); }
+
+async function doLogin(){
+  const pw = $("pw").value;
+  if(!pw){ showErr("Enter the password"); return; }
+  try{
+    const r = await fetch("/ui/login", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({password: pw})
+    });
+    if(!r.ok){ showErr(await r.text()); return; }
+    const d = await r.json();
+    if(d.must_change){ showGate("change"); $("pw-old").value = pw; return; }
+    hideGate();
+    boot();
+  }catch(e){ showErr("Sign-in failed: " + e); }
+}
+
+async function doChangePassword(){
+  const oldPw = $("pw-old").value, a = $("pw-new").value, b = $("pw-new2").value;
+  if(a.length < 8){ showErr("The new password must be at least 8 characters"); return; }
+  if(a !== b){ showErr("The two entries do not match"); return; }
+  try{
+    const r = await fetch("/ui/password", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({old: oldPw, new: a})
+    });
+    if(!r.ok){ showErr(await r.text()); return; }
+    hideGate();
+    boot();
+  }catch(e){ showErr("Password change failed: " + e); }
+}
+
+async function doLogout(){
+  try{ await fetch("/ui/logout", {method:"POST"}); }catch(e){}
+  location.reload();
+}
+
+function showTab(name){
+  for(const n of ["files","admin"]){
+    $("page-"+n).classList.toggle("on", n === name);
+    $("tab-"+n).classList.toggle("on", n === name);
+  }
+  if(name === "admin") loadAdmin();
+}
+
+// -- file browsing ------------------------------------------
 async function refreshStats(){
   try{
-    const d = await (await fetch("/api")).json();
-    document.getElementById("stats").innerHTML =
-      `<b>${d.docs}</b> 块 · <b>${d.terms}</b> 词项`;
+    const r = await fetch("/ui/api/overview");
+    if(r.status === 401){ showGate("login"); return; }
+    const d = await r.json();
+    $("stats").innerHTML = `<b>${d.docs}</b> blocks &middot; <b>${d.terms}</b> terms &middot; v${d.version}`;
   }catch(e){}
 }
 
-let searching = false;
-
 async function doSearch(){
-  const q = document.getElementById("q").value.trim();
+  const q = $("q").value.trim();
   if(!q){ clearSearch(); return; }
   searching = true;
-  const el = document.getElementById("tree");
-  document.getElementById("tree-head").innerText = "搜索结果（BM25 索引）";
-  el.innerHTML = '<div class="empty">搜索中…</div>';
+  const el = $("tree");
+  $("tree-head").innerText = "Search results (BM25 index)";
+  el.innerHTML = '<div class="empty">searching...</div>';
   try{
-    const d = await (await fetch("/recall", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({text:q, limit:20})
-    })).json();
+    // Admin search uses the admin API so it never shares the agent channel credentials.
+    const r = await fetch("/ui/api/search?q=" + encodeURIComponent(q));
+    if(!r.ok){ el.innerHTML = '<div class="empty">Search failed: ' + await r.text() + '</div>'; return; }
+    const d = await r.json();
     const hits = d.hits || [];
-    if(!hits.length){ el.innerHTML='<div class="empty">无命中</div>'; return; }
+    if(!hits.length){ el.innerHTML='<div class="empty">no matches</div>'; return; }
     el.innerHTML = hits.map(h => `
       <div class="node hit" onclick="openFile('${h.addr}','${h.addr}')">
-        <span class="icon">📄</span>
+        <span class="icon">&#128196;</span>
         <span class="nm">${h.addr}</span>
-        <span class="score">${h.score.toFixed(1)}</span>
-      </div>
-    `).join("");
-  }catch(e){
-    el.innerHTML = '<div class="empty">搜索失败: '+e+'</div>';
-  }
+        <span class="score">${(h.score||0).toFixed(1)}</span>
+      </div>`).join("");
+  }catch(e){ el.innerHTML = '<div class="empty">Search failed: ' + e + '</div>'; }
 }
 
 function clearSearch(){
-  document.getElementById("q").value = "";
-  searching = false;
-  document.getElementById("tree-head").innerText = "目录树";
+  $("q").value = ""; searching = false;
+  $("tree-head").innerText = "Directory tree";
   loadTree();
 }
 
 async function loadTree(){
   if(searching) return;
   try{
-    const roots = await (await fetch("/api?action=tree")).json();
-    const el = document.getElementById("tree");
-    if(!roots || !roots.length){ el.innerHTML='<div class="empty">无内容</div>'; return; }
-    el.innerHTML = roots.map(r => renderNode(r, "", 0, true)).join("");
-  }catch(e){
-    document.getElementById("tree").innerHTML='<div class="empty">加载失败</div>';
-  }
+    const r = await fetch("/api?action=tree");
+    if(r.status === 401){ showGate("login"); return; }
+    const roots = await r.json();
+    const el = $("tree");
+    if(!roots || !roots.length){ el.innerHTML='<div class="empty">empty</div>'; return; }
+    el.innerHTML = roots.map(x => renderNode(x, "", 0, true)).join("");
+  }catch(e){ $("tree").innerHTML='<div class="empty">load failed</div>'; }
 }
 
-// rootDepth：根节点（me/ daily/）只用来显示分组，不算进 addr。
-// zero-memcp 的 addr 是相对扫描根的路径，例如 skills/01-me/04-names.md。
 function renderNode(n, pathPrefix, depth, isRoot){
   const treePath = pathPrefix ? pathPrefix + "/" + n.name : n.name;
   const pad = "padding-left:" + (8 + depth*14) + "px";
-
   if(n.type === "dir"){
     const isOpen = !collapsed.has(treePath);
-    const caret = isOpen ? "▼" : "▶";
     let html = `<div class="node dir" style="${pad}" onclick="toggle('${treePath}')">
-      <span class="caret">${caret}</span>
-      <span class="icon">📁</span>
-      <span class="nm">${n.name}</span>
-    </div>`;
-    if(isOpen && n.children){
-      html += n.children.map(c => renderNode(c, treePath, depth+1, false)).join("");
-    }
+      <span class="caret">${isOpen ? "&#9660;" : "&#9654;"}</span>
+      <span class="icon">&#128193;</span><span class="nm">${n.name}</span></div>`;
+    if(isOpen && n.children){ html += n.children.map(c => renderNode(c, treePath, depth+1, false)).join(""); }
     return html;
   }
-
   const tags = [];
-  if(n.inject) tags.push('<span class="tg t-inj">注入</span>');
-  if(n.index === false) tags.push('<span class="tg t-no">无索引</span>');
-  if(n.recall === false) tags.push('<span class="tg t-no">不可读</span>');
+  if(n.inject) tags.push('<span class="tg t-inj">inject</span>');
+  if(n.index === false) tags.push('<span class="tg t-no">no index</span>');
+  if(n.recall === false) tags.push('<span class="tg t-no">unreadable</span>');
   const tagHtml = tags.length ? `<span class="tags">${tags.join("")}</span>` : "";
   const size = n.size > 1024 ? (n.size/1024).toFixed(1)+"K" : n.size+"B";
-
-  // 直接用服务端给的 n.addr 读取，显示用 treePath
   return `<div class="node ${currentAddr===n.addr?'active':''}" style="${pad}" onclick="openFile('${n.addr}','${treePath}')">
-    <span class="caret"></span>
-    <span class="icon">📄</span>
-    <span class="nm">${n.name}</span>
-    ${tagHtml}
-    <span class="sz">${size}</span>
-  </div>`;
+    <span class="caret"></span><span class="icon">&#128196;</span>
+    <span class="nm">${n.name}</span>${tagHtml}<span class="sz">${size}</span></div>`;
 }
 
 function toggle(path){
@@ -171,25 +334,185 @@ function toggle(path){
 
 async function openFile(path, shown){
   currentAddr = path;
-  document.getElementById("title").innerText = shown || path;
-  document.getElementById("viewer").innerText = "读取中…";
-  document.getElementById("meta").innerHTML = "";
+  $("title").innerText = shown || path;
+  $("viewer").innerText = "reading...";
+  $("meta").innerHTML = "";
   try{
-    const d = await (await fetch("/api?action=read&addr="+encodeURIComponent(path))).json();
-    if(d.content !== undefined){
-      document.getElementById("viewer").innerText = d.content;
-    }else{
-      document.getElementById("viewer").innerText = "(无法读取)";
-    }
-  }catch(e){
-    document.getElementById("viewer").innerText = "读取失败: "+e;
-  }
+    const r = await fetch("/api?action=read&addr=" + encodeURIComponent(path));
+    if(!r.ok){ $("viewer").innerText = "Read failed: " + await r.text(); return; }
+    const d = await r.json();
+    $("viewer").innerText = d.content !== undefined ? d.content : "(could not read)";
+  }catch(e){ $("viewer").innerText = "Read failed: " + e; }
   loadTree();
 }
 
-refreshStats();
-loadTree();
-setInterval(refreshStats, 5000);
+// -- permissions and credentials ----------------------------
+async function loadAdmin(){
+  await loadOverview();
+  await loadTokens();
+  await loadGrants();
+}
+
+async function loadOverview(){
+  try{
+    const d = await (await fetch("/ui/api/overview")).json();
+    const pend = Object.keys(d.pending || {});
+    $("overview").innerHTML = `
+      <div>version <code>${d.version}</code> &middot; listening <code>${d.listen}</code> &middot; default branch <code>${d.default_branch}</code></div>
+      <div>slices <b>${d.docs}</b> &middot; terms <b>${d.terms}</b> &middot; sessions <b>${d.sessions}</b> (TTL ${d.session_ttl})</div>
+      <div>enforce auth <span class="${d.enforce_auth?'good':'warn'}">${d.enforce_auth?'on':'off'}</span>
+        ${d.enforce_auth?'':'<span class="warn">- loopback fallback is still active: local processes can read without a credential</span>'}</div>
+      <div>pending commits: ${pend.length? pend.map(p=>`<code>${p}</code>=${d.pending[p]}`).join(" ") : "none"}</div>`;
+  }catch(e){ $("overview").textContent = "Load failed: " + e; }
+}
+
+async function loadTokens(){
+  const d = await (await fetch("/ui/api/tokens")).json();
+  const rows = (d.tokens||[]).map(t => {
+    const cap = t.cap_known ? `<code>${t.cap || "(unrestricted)"}</code>` : '<span class="warn">unknown</span>';
+    const mount = t.mount_known
+      ? (t.mount && t.mount.length ? t.mount.map(m=>`<code>${m.project}${m.branch?"@"+m.branch:""}=${m.at||"/"}${m.cap?":"+m.cap:""}</code>`).join(" ") : '<span class="muted">all namespaces</span>')
+      : '<span class="warn">unknown</span>';
+    const state = t.revoked ? '<span class="bad">revoked</span>' : (t.expired ? '<span class="warn">expired</span>' : '<span class="good">valid</span>');
+    const exp = t.exp ? new Date(t.exp*1000).toLocaleString() : "never";
+    const act = t.revoked
+      ? `<button class="btn-sm" onclick="revokeToken('${t.jti}', true)">Restore</button>`
+      : `<button class="btn-sm" onclick="revokeToken('${t.jti}', false)">Revoke</button>`;
+    return `<tr>
+      <td><code>${t.name}</code>${t.gated?` <span class="warn">gated: ${t.gated}</span>`:''}</td>
+      <td>${t.sub}</td><td>${cap}</td><td>${mount}</td>
+      <td>${state}</td><td>${exp}</td>
+      <td><code>${t.jti}</code></td><td>${act}</td></tr>`;
+  }).join("");
+  $("tokens").innerHTML = `<tr><th>credential</th><th>user</th><th>cap</th><th>mount</th><th>state</th><th>expires</th><th>JTI</th><th></th></tr>`
+    + (rows || '<tr><td colspan="8" class="muted">(no credentials yet)</td></tr>');
+  if(d.errors && d.errors.length){
+    $("tokens").innerHTML += `<tr><td colspan="8" class="bad">${d.errors.join("; ")}</td></tr>`;
+  }
+  const sel = $("gr-jti");
+  sel.innerHTML = (d.tokens||[]).filter(t=>t.gated && !t.revoked)
+    .map(t=>`<option value="${t.jti}">${t.name} [gated ${t.gated}] (${t.jti})</option>`).join("")
+    || '<option value="">(no credentials have gated bits)</option>';
+}
+
+async function mintToken(){
+  // Structured mount fields, no shorthand parsing.
+  //
+  // The old free-text field tried to parse "project=/:rw@branch" and silently
+  // mangled anything it did not expect - and an unparsed value became an empty
+  // mount table, which the token model reads as "all namespaces". A typo must
+  // never widen a credential.
+  const mountProject = $("nt-mount-project").value.trim();
+  if(!mountProject){
+    $("mint-out").textContent = "Mint failed: mount project is required";
+    return;
+  }
+  const mounts = [{
+    project: mountProject,
+    at: $("nt-mount-at").value.trim() || "/",
+    branch: $("nt-mount-branch").value.trim(),
+    cap: $("nt-mount-cap").value.trim(),
+  }];
+  const body = {
+    user: $("nt-user").value.trim(),
+    name: $("nt-name").value.trim(),
+    cap: $("nt-cap").value.trim(),
+    expires_hours: parseInt($("nt-hours").value || "0", 10) || 0,
+    gated: $("nt-gated").value.trim(),
+    mounts: mounts,
+  };
+  const r = await fetch("/ui/api/tokens/mint", {
+    method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)
+  });
+  const txt = await r.text();
+  if(!r.ok){ $("mint-out").textContent = "Mint failed: " + txt; return; }
+  const d = JSON.parse(txt);
+  $("mint-out").textContent = `Credential ${d.name} minted (jti=${d.jti})\n\n${d.token}\n\nThis token is shown only once - copy it now.`;
+  await loadTokens();
+}
+
+async function revokeToken(jti, undo){
+  const r = await fetch("/ui/api/tokens/revoke", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({jti: jti, undo: !!undo})
+  });
+  if(!r.ok){ alert("Operation failed: " + await r.text()); }
+  await loadTokens(); await loadGrants();
+}
+
+async function loadGrants(){
+  const d = await (await fetch("/ui/api/grants")).json();
+  const rows = (d.grants||[]).map(g => {
+    const exp = g.expires ? new Date(g.expires*1000).toLocaleString() : "no expiry";
+    const st = g.expired ? '<span class="warn">expired</span>' : '<span class="good">active</span>';
+    return `<tr><td><code>${g.name||"?"}</code></td><td><code>${g.jti}</code></td>
+      <td><code>${g.project}</code></td><td><code>${g.branch}</code></td>
+      <td><code>${g.cap}</code></td><td>${st}</td><td>${exp}</td>
+      <td><button class="btn-sm" onclick="revokeGrant('${g.jti}','${g.project}','${g.branch}')">Revoke</button></td></tr>`;
+  }).join("");
+  $("grants").innerHTML = `<tr><th>credential</th><th>JTI</th><th>project</th><th>branch</th><th>granted bits</th><th>state</th><th>expires</th><th></th></tr>`
+    + (rows || '<tr><td colspan="8" class="muted">(no temporary grants)</td></tr>');
+}
+
+async function addGrant(){
+  const body = {
+    jti: $("gr-jti").value,
+    project: $("gr-proj").value.trim(),
+    branch: $("gr-branch").value.trim(),
+    cap: $("gr-cap").value.trim(),
+    minutes: parseInt($("gr-min").value || "0", 10) || 0,
+  };
+  if(!body.jti || !body.project){ alert("Select a credential and enter a project"); return; }
+  if(!body.cap){ alert("Enter the bits to grant (r, w and/or x)"); return; }
+  const r = await fetch("/ui/api/grants/grant", {
+    method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)
+  });
+  if(!r.ok){ alert("Activation failed: " + await r.text()); return; }
+  $("gr-proj").value = ""; $("gr-branch").value = ""; $("gr-cap").value = ""; $("gr-min").value = "";
+  await loadGrants();
+}
+
+async function revokeGrant(jti, project, branch){
+  const r = await fetch("/ui/api/grants/revoke", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({jti: jti, project: project, branch: branch})
+  });
+  if(!r.ok){ alert("Revoke failed: " + await r.text()); }
+  await loadGrants();
+}
+
+async function runGC(){
+  $("gc-out").textContent = "repacking...";
+  const r = await fetch("/ui/api/gc", {method:"POST"});
+  if(!r.ok){ $("gc-out").textContent = "Failed: " + await r.text(); return; }
+  const d = await r.json();
+  $("gc-out").textContent = (d.results||[]).map(x =>
+    x.error ? `${x.project}: failed ${x.error}` : `${x.project}: ${x.objects} objects, removed ${x.removed} loose objects`
+  ).join("\n") || "(no projects)";
+}
+
+// Startup: check whether the session is still valid, otherwise show the login gate.
+async function boot(){
+  try{
+    const r = await fetch("/ui/api/overview");
+    if(r.status === 401){ showGate("login"); return; }
+    if(r.status === 403){
+      const t = await r.text();
+      if(t.indexOf("initial password") >= 0){ showGate("change"); return; }
+      showGate("login"); showErr(t); return;
+    }
+    if(!r.ok){ showGate("login"); showErr(await r.text()); return; }
+    const d = await r.json();
+    if(d.must_change){ showGate("change"); return; }
+    hideGate();
+    refreshStats(); loadTree();
+  }catch(e){ showGate("login"); showErr("Cannot reach the server: " + e); }
+}
+
+$("pw").addEventListener("keydown", e => { if(e.key === "Enter") doLogin(); });
+$("pw-new2").addEventListener("keydown", e => { if(e.key === "Enter") doChangePassword(); });
+boot();
+setInterval(() => { if(authed) refreshStats(); }, 5000);
 </script>
 </body>
 </html>

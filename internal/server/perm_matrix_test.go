@@ -339,24 +339,40 @@ func TestTagListingRespectsMount(t *testing.T) {
 	}
 }
 
-// REST /api?action=read 曾经把调用者硬编码成 root，等于把挂载表整个旁路。
+// REST 读取必须按调用者身份判定，不得旁路挂载表。
+//
+// /api has moved into the admin surface (session-only), so the old Bearer-route
+// assertion is no longer meaningful. Assert the underlying readAddr directly.
 func TestAPIReadUsesRealCaller(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
-	tok := mintRestricted(t, dataDir, auth.Claims{
-		Sub:   "zero",
-		Name:  "narrow",
-		Cap:   "rwx",
-		Mount: []auth.MountPoint{{Project: "blackegg/me", At: "/", Branch: "zero"}},
-	})
-	h := srv.muxFor(ListenBlock{Addr: "127.0.0.1:0"})
-	rec := httptest.NewRecorder()
+	_ = dataDir
+	narrow := Caller{
+		User: "zero", Identity: "narrow", Cap: "rwx",
+		Mount: NewMount([]auth.MountPoint{{Project: "blackegg/me", At: "/", Branch: "zero"}}, "zero"),
+	}
+
+	if _, err := srv.readAddr("01-shape.md", narrow); err != nil {
+		t.Fatalf("address inside the chroot should be readable: %v", err)
+	}
+
+	// A chroot mount at "/" reinterprets every address inside the mounted
+	// project, so another project's path cannot resolve at all. The property
+	// under test is that its content never comes back, whichever layer stops it.
+	out, err := srv.readAddr("other/secret/x.md", narrow)
+	if err == nil {
+		t.Fatalf("address outside the mount table must not return content, got %q", out)
+	}
+	if strings.Contains(out, "机密") || strings.Contains(err.Error(), "机密") {
+		t.Fatalf("API read leaked outside the mount table: %s", out)
+	}
+
+	h := srv.muxFor(ListenBlock{Addr: "127.0.0.1:0", Allow: []string{"*"}})
 	req := httptest.NewRequest(http.MethodGet, "/api?action=read&addr=other/secret/x.md", nil)
 	req.RemoteAddr = "127.0.0.1:12345"
-	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-
-	if strings.Contains(rec.Body.String(), "机密") {
-		t.Fatalf("API 读不得绕过挂载表: %s", rec.Body.String())
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("agent port without webui should have no /api route, got %d", rec.Code)
 	}
 }
 

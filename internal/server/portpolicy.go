@@ -18,13 +18,19 @@ type ListenBlock struct {
 	Allow   []string
 	Require string
 	Mount   []auth.MountPoint
+	// WebUI 为真时这个端口注册管理面路由。
+	//
+	// 管理面与 Agent 通道共用同一个 http.Server，但路由表不同：
+	// 没开 WebUI 的端口上，/、/api、/ui/* 根本不存在（404），
+	// 而不是「存在但会拒绝」。结构性不存在比判断更可靠。
+	WebUI bool
 }
 
 // FromConfig 把配置里的端口块翻译成运行期结构。
 func FromConfig(blks []config.ListenBlock) []ListenBlock {
 	out := make([]ListenBlock, 0, len(blks))
 	for _, b := range blks {
-		lb := ListenBlock{Addr: b.Addr, Allow: b.Allow, Require: b.Require}
+		lb := ListenBlock{Addr: b.Addr, Allow: b.Allow, Require: b.Require, WebUI: b.WebUI}
 		for _, m := range b.Mount {
 			lb.Mount = append(lb.Mount, auth.MountPoint{
 				Project: m.Project,
@@ -49,12 +55,13 @@ func portPolicyFrom(ctx context.Context) (ListenBlock, bool) {
 	return blk, ok
 }
 
-// allowedOnPort 报告某个动词在这个端口上是否被允许。
+// allowedOnPort reports whether a verb is enabled on this port.
+//
+// An empty list is "nothing allowed", matching portPolicy.allows. The two used
+// to disagree (verbs: everything, git: nothing), so a listener missing `allow`
+// silently opened every verb. Config validation now rejects that case, and both
+// layers share this one reading of the list.
 func allowedOnPort(blk ListenBlock, verb string) bool {
-	// 没配 allow 视为全量（老配置的单 listen 走这条路）
-	if len(blk.Allow) == 0 {
-		return true
-	}
 	for _, a := range blk.Allow {
 		if a == "*" || a == verb {
 			return true
@@ -65,7 +72,7 @@ func allowedOnPort(blk ListenBlock, verb string) bool {
 
 // portError 生成一条能让人看懂「是哪个端口拦的」的错误。
 func portError(blk ListenBlock, verb string) error {
-	return fmt.Errorf("动词 %q 没有在这个端口上开启（%s 允许：%s）",
+	return fmt.Errorf("verb %q is not enabled on this port (%s allowed: %s)",
 		verb, blk.Addr, strings.Join(blk.Allow, " "))
 }
 

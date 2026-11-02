@@ -33,7 +33,7 @@ func TestRecallConcurrentWithReload(t *testing.T) {
 				return
 			default:
 			}
-			if _, err := callMCP(t, srv, tok, "recall 形状"); err != nil && !strings.Contains(err.Error(), "无命中") {
+			if _, err := callMCP(t, srv, tok, "recall 形状"); err != nil && !strings.Contains(err.Error(), "no matches") {
 				t.Errorf("recall 出错: %v", err)
 				return
 			}

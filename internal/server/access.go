@@ -43,7 +43,19 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 	if pc := c.Mount.CapOf(project, branch); pc != "" {
 		effective = intersectCap(c.Cap, pc)
 	}
-	if !hasCap(effective, capBit(perm)) {
+
+	// cap 里被按住的那几位，要靠临时授权打开。
+	//
+	// 判定顺序是「先问这个位在不在上限里，再问它此刻有没有被放行」，
+	// 而不是「有授权就给这个位」——后者会让授权变成绕开 cap 的通道。
+	// 所以 Gated 必须同时是 cap 的子集（签发时已校验），
+	// 而授权又必须是 Gated 的子集（管理台已校验）：
+	// 三层各自收窄，谁也不能往上顶。
+	bit := capBit(perm)
+	if !hasCap(effective, bit) {
+		return false
+	}
+	if gatedHas(c.Gated, bit) && !s.grantAllows(c, project, branch, bit) {
 		return false
 	}
 	// 配置层
@@ -108,7 +120,7 @@ func (s *Server) requireRootCap(c Caller, bit rune) error {
 		return err
 	}
 	if !hasCap(c.Cap, bit) {
-		return fmt.Errorf("凭证能力受限（缺少 %c 权限）", bit)
+		return fmt.Errorf("credential capability denied (missing %c permission)", bit)
 	}
 	return nil
 }
@@ -125,7 +137,7 @@ func (s *Server) requireRootGlobal(c Caller, bit rune) error {
 		return err
 	}
 	if !c.Mount.Empty() {
-		return fmt.Errorf("这是一张受限凭证（挂载被限制在某处），全局管理动词需要不受限的凭证")
+		return fmt.Errorf("this is a restricted credential (mounts are limited); global administration verbs require an unrestricted credential")
 	}
 	return nil
 }
@@ -137,10 +149,10 @@ func (s *Server) denyReason(c Caller, project, branch string, perm uint8) string
 	// 否则调用者会看到「不在这张凭证的可见范围内」——而它明明挂载着
 	// 这个项目，于是去怀疑配置、怀疑 token，查很久才想到锁。
 	if !s.rootUnrestricted(c) && s.branchLocked(project, branch) {
-		return fmt.Sprintf("%s@%s 已被 root 锁定，非 root 凭证的读写都被暂停", project, branch)
+		return fmt.Sprintf("%s@%s is locked by root; read and write access for non-root credentials is suspended", project, branch)
 	}
 	if !c.Mount.Visible(project, branch) {
-		return fmt.Sprintf("项目 %q 不在这张凭证的可见范围内", project)
+		return fmt.Sprintf("project %q is outside this credential's visible scope", project)
 	}
 	effective := c.Cap
 	if pc := c.Mount.CapOf(project, branch); pc != "" {
@@ -148,10 +160,13 @@ func (s *Server) denyReason(c Caller, project, branch string, perm uint8) string
 	}
 	bit := capBit(perm)
 	if !hasCap(effective, bit) {
-		return fmt.Sprintf("凭证/挂载点能力受限（缺少 %s 权限）", string(bit))
+		return fmt.Sprintf("credential or mount capability denied (missing %s permission)", string(bit))
+	}
+	if gatedHas(c.Gated, bit) && !s.grantAllows(c, project, branch, bit) {
+		return fmt.Sprintf("%s access to %s@%s is not active (this credential holds that bit until the admin panel grants it)", string(bit), project, branch)
 	}
 	if s.cfgIndex() == nil {
-		return "无权访问"
+		return "access denied"
 	}
 	// 这一层只剩配置（TOML 的 mode/owner/group）。
 	// 早先这里还有一段「被角色挡住」的判定，逐请求切换身份的
@@ -275,4 +290,20 @@ func (s *Server) rootCaller() Caller {
 // reload 会原子替换指针，直接读字段会绕过 atomic 的可见性保证。
 func (s *Server) cfgIndex() *config.Lookup {
 	return s.cfgLookup.Load()
+}
+
+// grantAllows 报告某张凭证在 (project, branch) 上是否被临时授予了某个能力位。
+//
+// 每次判定都读盘，不缓存——与吊销名单同一个理由：权限回收必须是即时的。
+// 缓存会让「刚收回的权限还能用一会儿」，而那一会儿足够写进不该写的东西。
+func (s *Server) grantAllows(c Caller, project, branch string, bit rune) bool {
+	if s.grants == nil || c.JTI == "" {
+		return false
+	}
+	return s.grants.Allowed(c.JTI, project, branch, bit)
+}
+
+// gatedHas 报告某个能力位是否在这张凭证被按住的集合里。
+func gatedHas(gated string, bit rune) bool {
+	return strings.ContainsRune(gated, bit)
 }

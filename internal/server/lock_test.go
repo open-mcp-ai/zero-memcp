@@ -43,17 +43,17 @@ func TestLockBlocksNonRootOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("lock 失败: %v", err)
 	}
-	if !strings.Contains(out, "已锁定") {
-		t.Fatalf("lock 回显异常: %s", out)
+	if !strings.Contains(out, "locked") {
+		t.Fatalf("lock output did not report the lock: %s", out)
 	}
 
 	// 非 root：读被拒
 	readOut, readErr := callMCP(t, srv, agentTok, "read blackegg/me@chat/a.md")
 	if readErr != nil {
-		if !strings.Contains(readErr.Error(), "锁定") {
+		if !strings.Contains(readErr.Error(), "locked") {
 			t.Fatalf("拒绝理由应提到锁，实际: %v", readErr)
 		}
-	} else if !strings.Contains(readOut, "锁定") || strings.Contains(readOut, "待回收的内容") {
+	} else if !strings.Contains(readOut, "locked") || strings.Contains(readOut, "待回收的内容") {
 		t.Fatalf("锁住后读请求必须被拒绝且不能返回正文: %s", readOut)
 	}
 	// 非 root：写被拒
@@ -104,7 +104,7 @@ func TestUnlockRestoresAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unlock 失败: %v", err)
 	}
-	if !strings.Contains(out, "已解锁") || !strings.Contains(out, "期间没有写入") {
+	if !strings.Contains(out, "unlocked") || !strings.Contains(out, "no writes occurred") {
 		t.Fatalf("unlock 回显应说明期间有无写入: %s", out)
 	}
 
@@ -121,7 +121,7 @@ func TestUnlockRestoresAccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("重复 unlock 不该报错: %v", err)
 	}
-	if !strings.Contains(again, "本来就没有锁") {
+	if !strings.Contains(again, "is not locked") {
 		t.Fatalf("重复 unlock 回显异常: %s", again)
 	}
 }
@@ -152,7 +152,7 @@ func TestUnlockReportsChangesDuringLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "推进到") {
+	if !strings.Contains(out, "advanced from") {
 		t.Fatalf("锁定期间有写入时必须报告: %s", out)
 	}
 }
@@ -174,8 +174,14 @@ func TestLockSurvivesRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 真正的重启必须先关闭旧实例；两个活实例共用一个 dataDir
+	// 正是跨进程实例锁要拒绝的状态。
+	cfgPath := srv.cfg.ConfigFile
+	if err := srv.Close(); err != nil {
+		t.Fatal(err)
+	}
 	// 用同一个 dataDir 起一个新实例
-	srv2, err := New(Config{DataDir: dataDir, ConfigFile: srv.cfg.ConfigFile})
+	srv2, err := New(Config{DataDir: dataDir, ConfigFile: cfgPath})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,8 +242,8 @@ func TestBranchListMarksLocked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "已锁定") {
-		t.Fatalf("branch 列表应标出锁: %s", out)
+	if !strings.Contains(out, "[locked]") {
+		t.Fatalf("branch list did not mark the lock: %s", out)
 	}
 }
 
@@ -265,7 +271,7 @@ func TestUnlockAfterArchiveReportsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unlock 不该报错: %v", err)
 	}
-	if !strings.Contains(out, "已不存在") {
+	if !strings.Contains(out, "no longer exists") {
 		t.Fatalf("分支被归档后 unlock 必须说明它已不存在: %s", out)
 	}
 }

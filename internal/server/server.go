@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -59,7 +60,25 @@ type Config struct {
 	DefaultBranch string
 
 	// EnforceAuth 即使在 127.0.0.1 也强制要求带 JWT Token。
+	//
+	// 除了代码里传（SDK），也可以由配置 [server] enforce_auth 打开。
+	// 后者必须存在：运维的人不会改 Go 代码。早先这个开关只有 SDK 字段，
+	// 于是「本机免签即 root」这条降级没法靠配置关掉——
+	// 而同机任意进程不带凭证就能读走全部记忆，是记忆库里最大的洞。
 	EnforceAuth bool
+
+	// WebUI 控制这个实例是否提供管理面（在没有 [[listen]] 块时的默认端口）。
+	//
+	// 默认关闭：不是怕管理员麻烦，而是管理面一旦开在错误的端口上，
+	// 就等于把「谁能签发凭证」交给网络。显式声明才算意图。
+	WebUI bool
+
+	// UIBootstrapPassword 是首次启动时自动生成的管理口令。
+	//
+	// 非空意味着「这是刚初始化的实例，口令还没被人换过」。
+	// 只在 New 里赋值一次，调用方打印一次后就不再重复提供：
+	// 引导口令的价值就是一次性，重复打印等于把它变成常驻秘密。
+	UIBootstrapPassword string
 }
 
 // Viewer 标识调用方形态。
@@ -105,6 +124,22 @@ type Server struct {
 
 	// rev 是吊销名单。
 	rev *auth.Revocations
+
+	// passwords 是 WebUI 管理口令（argon2id 摘要，落在 system/ui.passwd）。
+	passwords *auth.PasswordStore
+	// sessions 是 WebUI 登录态。只在内存里：重启即全部失效。
+	sessions *auth.SessionStore
+	// grants 是临时写授权表（system/grants/<jti>.json）。
+	//
+	// 它是权限判定的第三个来源：凭证层 ∩ 配置层，再并入有效授权。
+	// 只能加不能减——要减用分支锁。
+	grants *auth.GrantStore
+
+	// uiLimiter 限制管理面登录失败速率（懒初始化）。
+	uiLimiter *uiLoginLimiter
+
+	// lock 是数据目录的跨进程独占锁。进程崩溃时内核自动释放。
+	lock *instanceLock
 
 	// cfgFile 是配置内容，cfgLookup 是它的运行时索引。
 	cfgFile *config.File
@@ -196,6 +231,16 @@ func New(cfg Config) (*Server, error) {
 		if cfg.DataDir == "" && cfgFile.Server.Data != "" {
 			cfg.DataDir = cfgFile.Server.Data
 		}
+		// 配置的 enforce_auth 只在调用方没显式给时代入。
+		if !cfg.EnforceAuth && cfgFile.Server.EnforceAuth {
+			cfg.EnforceAuth = true
+		}
+		// [server] webui is the single-port switch. Per-port webui = true in
+		// [[listen]] blocks takes over when they exist, but OR-ing it here means
+		// one config key is enough for the common single-port deployment.
+		if !cfg.WebUI && cfgFile.Server.WebUI {
+			cfg.WebUI = true
+		}
 		if cfg.Endpoint == "" {
 			cfg.Endpoint = cfgFile.Server.Endpoint
 		}
@@ -210,19 +255,39 @@ func New(cfg Config) (*Server, error) {
 	}
 	host, _, err := net.SplitHostPort(cfg.Listen)
 	if err != nil {
-		return nil, fmt.Errorf("非法地址 %q: %w", cfg.Listen, err)
+		return nil, fmt.Errorf("invalid address %q: %w", cfg.Listen, err)
 	}
 	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
-		return nil, fmt.Errorf("安全拒绝：只能绑定回环地址，得到 %q", host)
+		return nil, fmt.Errorf("refusing to bind to a non-loopback address: %q", host)
 	}
 
 	if cfg.DataDir == "" {
-		return nil, errors.New("必须给数据目录：-data 或 -config 里的 [server] data")
+		return nil, errors.New("data directory required: pass -data or set [server] data in the config file")
 	}
+
+	// 数据目录独占锁。必须在读 jwt.key / ui.passwd 之前拿到：
+	//
+	// 两个实例同时启动时会争着生成签名密钥与管理口令，
+	// 谁先落盘谁说了算，而另一个进程拿着自己刚生成的密钥继续跑——
+	// 结果是同一个数据目录里存在两套互不相认的身份体系。
+	// 把锁放在任何读写 system/ 之前，才能保证「首次启动」只发生一次。
+	startupLock, err := acquireInstanceLock(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	startupOK := false
+	defer func() {
+		// 半途失败时释放锁；成功路径的所有权交给 *Server。
+		// 不能每个 return 都手写一遍 unlock——漏一个就是永久死锁。
+		if startupOK {
+			return
+		}
+		_ = startupLock.Release()
+	}()
 
 	w, err := weights.Open(cfg.WeightsPath)
 	if err != nil {
-		return nil, fmt.Errorf("打开权重状态: %w", err)
+		return nil, fmt.Errorf("open weights state: %w", err)
 	}
 
 	// 签名密钥必须落盘。每次启动重新生成会让所有已签发的 token
@@ -230,14 +295,21 @@ func New(cfg Config) (*Server, error) {
 	// 排查的人会先怀疑网络和配置，最后才想到密钥。
 	var tokens *auth.TokenStore
 	var rev *auth.Revocations
+	var pwStore *auth.PasswordStore
 	if cfg.DataDir != "" {
 		systemDir := filepath.Join(cfg.DataDir, "system")
 		secret, err := auth.LoadOrCreateSecret(filepath.Join(systemDir, "jwt.key"))
 		if err != nil {
-			return nil, fmt.Errorf("加载密钥: %w", err)
+			return nil, fmt.Errorf("load signing key: %w", err)
 		}
 		tokens = auth.NewTokenStore(secret)
 		rev = auth.NewRevocations(filepath.Join(systemDir, "revoked"))
+
+		// The password store is initialized here, but bootstrap is deferred until
+		// the very end of New. If index loading fails after generating a random
+		// password, the caller cannot print it and the next start cannot recover
+		// it. Bootstrap only after all other fallible initialization succeeds.
+		pwStore = auth.NewPasswordStore(systemDir)
 	} else {
 		tokens = auth.NewTokenStore(nil)
 	}
@@ -264,6 +336,10 @@ func New(cfg Config) (*Server, error) {
 		rev:           rev,
 		cfgFile:       cfgFile,
 		defaultBranch: branch,
+		passwords:     pwStore,
+		grants:        auth.NewGrantStore(cfg.DataDir),
+		uiLimiter:     newUILoginLimiter(),
+		lock:          startupLock,
 
 		listens:   FromConfig(listenBlocks(cfgFile)),
 		bcast:     newBroadcaster(),
@@ -280,14 +356,29 @@ func New(cfg Config) (*Server, error) {
 	if lookup != nil {
 		s.cfgLookup.Store(lookup)
 	}
+	// 会话表：改口令时清空全部会话，所以它必须能看到口令状态。
+	s.sessions = auth.NewSessionStore(12*time.Hour, s.passwords.MustChange)
+
 	if cfgFile != nil {
 		rems := cfgFile.Remotes
 		s.remotes.Store(&rems)
 	}
 	if err := s.Reload(); err != nil {
-		return nil, fmt.Errorf("构建初始索引: %w", err)
+		return nil, fmt.Errorf("build initial index: %w", err)
 	}
 
+	if s.UIRoutesEnabled() {
+		if plain, created, berr := s.passwords.Bootstrap(os.Getenv("ZERO_MEMCP_UI_PASS")); berr != nil {
+			return nil, fmt.Errorf("initialize WebUI password: %w", berr)
+		} else if created {
+			s.cfg.UIBootstrapPassword = plain
+		}
+		if !s.passwords.Exists() {
+			return nil, errors.New("WebUI is enabled but its password could not be initialized")
+		}
+	}
+
+	startupOK = true
 	return s, nil
 }
 
@@ -308,7 +399,7 @@ func (s *Server) Reload() error {
 	// 只有当新文件完整解析成功、校验无误之后，才原子替换指针。
 	if s.cfg.ConfigFile != "" {
 		if newFile, err := config.Load(s.cfg.ConfigFile); err != nil {
-			s.logf("警告：reload 重新解析配置失败（保留原配置不变）：%v", err)
+			s.logf("warning: reload failed to re-parse config (keeping the existing config): %v", err)
 		} else {
 			s.cfgMu.Lock()
 			s.cfgFile = newFile
@@ -334,7 +425,7 @@ func (s *Server) Reload() error {
 		for _, b := range t.Indexable() {
 			data, err := s.readBlock(b)
 			if err != nil {
-				return fmt.Errorf("读 %s: %w", b.Addr(), err)
+				return fmt.Errorf("read %s: %w", b.Addr(), err)
 			}
 			idx.AddWithTime(b.ID(), string(data), b.Time)
 
@@ -376,9 +467,9 @@ func (s *Server) Reload() error {
 func (s *Server) DescribeProjects() string {
 	projs := s.declaredProjects()
 	if len(projs) == 0 {
-		return "（无项目）"
+		return "(no projects)"
 	}
-	return fmt.Sprintf("项目 %s（%s）", strings.Join(projs, " "), s.defaultBranch)
+	return fmt.Sprintf("projects %s (%s)", strings.Join(projs, " "), s.defaultBranch)
 }
 
 // Start 按配置里的每个 [[listen]] 块分别起一个监听器。
@@ -399,7 +490,11 @@ func (s *Server) Start() error {
 
 	blocks := s.listens
 	if len(blocks) == 0 {
-		blocks = []ListenBlock{{Addr: s.cfg.Listen, Allow: []string{"*"}}}
+		// WebUI is carried over from cfg on the synthetic fallback block:
+		// this is the single-port mode (no [[listen]] declared), so cfg.WebUI
+		// is exactly what the caller asked for. Leaving it out would mean
+		// sdk.WithAdminUI() starts the agent routes but never the admin ones.
+		blocks = []ListenBlock{{Addr: s.cfg.Listen, Allow: []string{"*"}, WebUI: s.cfg.WebUI}}
 	}
 
 	var servers []*http.Server
@@ -410,7 +505,7 @@ func (s *Server) Start() error {
 			for _, srv := range servers {
 				_ = srv.Close()
 			}
-			return fmt.Errorf("无法监听 %s（端口很可能被占用，按规范立即退出）: %w", blk.Addr, err)
+			return fmt.Errorf("cannot listen on %s (port is probably in use; exiting immediately): %w", blk.Addr, err)
 		}
 		if len(servers) == 0 {
 			s.setListener(ln)
@@ -419,7 +514,7 @@ func (s *Server) Start() error {
 		servers = append(servers, srv)
 		go func(srv *http.Server, ln net.Listener, addr string) {
 			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-				s.logf("端口 %s 服务结束: %v", addr, err)
+				s.logf("server on port %s stopped: %v", addr, err)
 			}
 		}(srv, ln, blk.Addr)
 	}
@@ -435,8 +530,15 @@ func (s *Server) Start() error {
 // muxFor 为一个监听端口构建路由。
 func (s *Server) muxFor(blk ListenBlock) http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", s.handleIndex)
-	mux.HandleFunc("/api", s.handleAPI)
+	// 管理面只在显式声明 webui 的端口上注册。
+	//
+	// 没开的端口上这些路径根本不存在（404），而不是「存在但拒绝」。
+	// 结构性不存在比判断更可靠：它连「这里有个管理台」都不告诉人。
+	if blk.WebUI {
+		s.uiMux(mux)
+		mux.HandleFunc("/", s.handleIndex)
+		mux.HandleFunc("/api", s.handleUIAPICompat)
+	}
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/identity", s.handleIdentity)
@@ -445,6 +547,19 @@ func (s *Server) muxFor(blk ListenBlock) http.Handler {
 	mux.HandleFunc("/mcp", s.handleMCP)
 	mux.HandleFunc("/repos/", s.handleGitHTTP)
 	return &portPolicy{blk: blk, next: mux}
+}
+
+// handleUIAPICompat 让旧面板的 /api?action=... 走管理面鉴权。
+//
+// 为什么必须换掉：早先 /api 用的是通用 authenticate()，
+// 而那条路径在本机且未强制鉴权时会降级成 root——
+// 于是同机任何进程不带凭证就能通过 /api?action=read 读走全部正文。
+// 面板属于管理面，判据只能是会话。
+func (s *Server) handleUIAPICompat(w http.ResponseWriter, r *http.Request) {
+	if !s.uiAuthGuard(w, r, false) {
+		return
+	}
+	s.handleAPIAsUI(w, r)
 }
 
 // portPolicy 是端口级策略中间件。
@@ -460,16 +575,16 @@ func (p *portPolicy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		readOK := p.allows("git-upload-pack")
 		pushOK := p.allows("git-receive-pack")
 		if !readOK && !pushOK {
-			http.Error(w, "这个端口没有开启 HTTP Git", http.StatusForbidden)
+			http.Error(w, "HTTP Git is not enabled on this port", http.StatusForbidden)
 			return
 		}
 		if strings.Contains(r.URL.Path, "git-receive-pack") || r.URL.Query().Get("service") == "git-receive-pack" {
 			if !pushOK {
-				http.Error(w, "这个端口没有开启 git-receive-pack（推送入口默认关闭）", http.StatusForbidden)
+				http.Error(w, "git-receive-pack is not enabled on this port (push is disabled by default)", http.StatusForbidden)
 				return
 			}
 		} else if !readOK {
-			http.Error(w, "这个端口没有开启拉取", http.StatusForbidden)
+			http.Error(w, "fetch is not enabled on this port", http.StatusForbidden)
 			return
 		}
 		p.next.ServeHTTP(w, r.WithContext(withPortPolicy(r.Context(), p.blk)))
@@ -481,12 +596,7 @@ func (p *portPolicy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // allows 报告本端口是否允许某个能力。
 func (p *portPolicy) allows(name string) bool {
-	for _, a := range p.blk.Allow {
-		if a == "*" || a == name {
-			return true
-		}
-	}
-	return false
+	return allowedOnPort(p.blk, name)
 }
 
 // Close 停止全部监听器。
@@ -514,6 +624,23 @@ func (s *Server) Close() error {
 	}
 	if s.projects != nil {
 		if err := s.projects.Close(); err != nil && lastErr == nil {
+			lastErr = err
+		}
+	}
+	// Flush read-frequency state before releasing the instance lock.
+	//
+	// weights writes lazily (500ms after the last read). Closing without
+	// draining that timer drops the most recent reads, so a restart quietly
+	// loses ranking signal that was already paid for by real reads.
+	if s.weights != nil {
+		if err := s.weights.Close(); err != nil && lastErr == nil {
+			lastErr = err
+		}
+	}
+	// 释放实例锁要放在最后：仓库写者还没关完时放开锁，
+	// 下一个进程就能在旧进程还在收尾时进来。
+	if s.lock != nil {
+		if err := s.lock.Release(); err != nil && lastErr == nil {
 			lastErr = err
 		}
 	}
@@ -604,7 +731,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	resp := map[string]any{
 		"ok":      true,
 		"service": "zero-memcp",
-		"version": "0.1.0",
+		"version": Version,
 		"listen":  s.Addr(),
 	}
 
@@ -749,6 +876,16 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
+	// Reject admin sessions before authenticating.
+	//
+	// This has to run first, not only on the failure path: with a valid Bearer
+	// present, authenticate() succeeds and a request carrying both credentials
+	// would be served. The two channels are meant to be mutually exclusive, and
+	// "Bearer wins" would make it impossible to tell whether a call came from
+	// the agent credential or the human admin session.
+	if uiForbiddenIfBearer(w, r) {
+		return
+	}
 	caller, authErr := s.authenticate(r)
 	if authErr != nil {
 		w.Header().Set("WWW-Authenticate", `Bearer realm="zero-memcp"`)
@@ -833,50 +970,50 @@ func (s *Server) dispatchMCP(ctx context.Context, method string, params json.Raw
 			"tools": []map[string]any{
 				{
 					"name": "term",
-					"description": "termcp 协议入口（本服务实现 termcp 协议）。收一行 DSL：\n" +
-						"  recall <text> [--scope T] 语义联想（返回地址 + 摘要片段）\n" +
-						"  read <addr> [<addr>...]  读全文，可一次多篇\n" +
-						"  grep <regex>             正则扫全文，带前后一行上下文（找符号/数字/专名用它，比 recall 准）\n" +
-						"  log [N]                  按时间倒序看最近 N 篇（缺省 5）的日期和摘要\n" +
-						"  ls [date]                列出某天的切片\n" +
-						"  put [<tree>] -- $TEXT    把正文写进记忆树（正文走 vars/args，不与 DSL 混写）\n" +
-						"  put <tree> --ref <addr>  在树里追加已有记忆的引用\n" +
-						"  trees <project>[@<branch>]  查看树目录\n" +
-						"  remind [<tree>]          锚定一棵树；它变动时收到通知\n" +
-						"  since <tree> <commit>    取回自上次提交以来的树差分\n" +
-						"  status                   索引规模\n" +
-						"  help [<verb>]            这个动词怎么用；空命令也返回总览\n" +
-						"这是你的持久记忆体：put 成功即已落进本地持久记录，重启后仍可读。\n" +
-						"什么时候用哪个：问「关于X我之前怎么想的」→ recall；\n" +
-						"找精确串（IP、端口、QQ号、函数名）→ grep；\n" +
-						"问「最近做到哪了」→ log。\n" +
-						"第一个词若是下游 MCP 的名字，剩余部分原样透传。",
+					"description": "termcp protocol entry point (implemented by this service). Accepts one line of DSL:\n" +
+						"  recall <text> [--scope T] semantic search (returns addresses and excerpts)\n" +
+						"  read <addr> [<addr>...]  read full text; accepts multiple addresses\n" +
+						"  grep <regex>             search full text with surrounding lines (better than recall for symbols, numbers, and names)\n" +
+						"  log [N]                  show dates and summaries of the most recent N entries (default 5)\n" +
+						"  ls [date]                list entries for a date\n" +
+						"  put [<tree>] -- $TEXT    write content to a memory tree (pass content through vars/args, not in the DSL)\n" +
+						"  put <tree> --ref <addr>  append a reference to existing memory in a tree\n" +
+						"  trees <project>[@<branch>]  view the tree directory\n" +
+						"  remind [<tree>]          watch a tree and receive notifications when it changes\n" +
+						"  since <tree> <commit>    retrieve tree changes since a commit\n" +
+						"  status                   index size\n" +
+						"  help [<verb>]            show usage for a verb; an empty command shows the overview\n" +
+						"This is your persistent memory: a successful put is stored locally and remains available after a restart.\n" +
+						"When to use each: ask \"what did I think about X?\" -> recall;\n" +
+						"search for exact strings (IP, port, QQ number, function name) -> grep;\n" +
+						"ask \"what was I working on recently?\" -> log.\n" +
+						"If the first word is the name of a downstream MCP, pass the rest through unchanged.",
 					"inputSchema": map[string]any{
 						"type": "object",
 						"properties": map[string]any{
 							"cmd": map[string]any{
 								"type":        "string",
-								"description": "DSL 命令行，例如 'recall napcat' 或 'put -- $TEXT'。正文放进 vars/args，用 $NAME / $1 引用；引用必须独占一个词。",
+								"description": "DSL command line, e.g. 'recall napcat' or 'put -- $TEXT'. Pass content in vars/args and reference it with $NAME / $1; a reference must occupy a whole word.",
 							},
 							"args": map[string]any{
 								"type":        "array",
 								"items":       map[string]any{"type": "string"},
-								"description": "位置参数，供 cmd 里的 $1、$2 引用。引用必须独占一个词，值不做任何转义或拼接——正文放这里，不要拼进 cmd。",
+								"description": "Positional arguments referenced as $1, $2, etc. in cmd. A reference must occupy a whole word. Values are not escaped or concatenated; pass content here instead of embedding it in cmd.",
 							},
 							"vars": map[string]any{
 								"type":                 "object",
 								"additionalProperties": map[string]any{"type": "string"},
-								"description":          "命名参数，供 cmd 里的 $NAME 引用。与 args 同一条规则：引用独占一个词，传了就必须被引用。",
+								"description":          "Named arguments referenced as $NAME in cmd. The same rule as args applies: a reference must occupy a whole word, and every supplied value must be referenced.",
 							},
 							"content": map[string]any{
 								"type":        "boolean",
 								"default":     true,
-								"description": "是否返回文本投影（给智能体读）。程序消费者可设为 false。",
+								"description": "Whether to return a text projection for agents. Set to false for programmatic consumers.",
 							},
 							"structured_content": map[string]any{
 								"type":        "boolean",
 								"default":     false,
-								"description": "是否返回结构化投影（给程序读）。与 content:false 搭配可只拿 JSON。",
+								"description": "Whether to return a structured projection for programs. Combine with content:false to return only JSON.",
 							},
 						},
 						"required": []string{"cmd"},
@@ -891,7 +1028,7 @@ func (s *Server) dispatchMCP(ctx context.Context, method string, params json.Raw
 			Arguments json.RawMessage `json:"arguments"`
 		}
 		if err := json.Unmarshal(params, &call); err != nil {
-			return nil, fmt.Errorf("解析 call 参数: %w", err)
+			return nil, fmt.Errorf("parse call arguments: %w", err)
 		}
 		return s.callTool(ctx, call.Name, call.Arguments, c)
 
@@ -907,7 +1044,7 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	// 不一致是这类服务最容易出的事：清单上看不到的东西还能调用，
 	// 而调用方不会知道自己用了一个没被声明的接口。
 	if name != "term" {
-		return nil, fmt.Errorf("unknown tool: %s（本服务只暴露 term）", name)
+		return nil, fmt.Errorf("unknown tool: %s (this service exposes only term)", name)
 	}
 	var a struct {
 		Cmd string `json:"cmd"`
@@ -940,7 +1077,7 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 		StructuredContent bool `json:"structured_content"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
-		return nil, fmt.Errorf("解析 term 参数: %w", err)
+		return nil, fmt.Errorf("parse term arguments: %w", err)
 	}
 
 	// 参数替换发生在任何动词分发之前，且只做一次。
@@ -973,7 +1110,7 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	// 但如果它连 structuredContent 也不要，这条命令就一个字节都不需要返回。
 	// 那不是宽容，那是参数写错了——直接报错让它知道。
 	if !wantText && !a.StructuredContent {
-		return nil, errors.New("content:false 与 structured_content:false 同时成立时没有任何投影可返回；至少要一个")
+		return nil, errors.New("content:false and structured_content:false leave no projection to return; enable at least one")
 	}
 
 	// 端口级动词白名单：这个端口没开这个动词，就在这里拒绝。
@@ -1086,7 +1223,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		if detail, ok := helpVerb(strings.Fields(arg)[0]); ok {
 			return TermResult{Text: detail}, nil
 		}
-		return TermResult{}, fmt.Errorf("没有 %q 这个动词\n\n%s", strings.Fields(arg)[0], helpOverview())
+		return TermResult{}, fmt.Errorf("unknown verb %q\n\n%s", strings.Fields(arg)[0], helpOverview())
 
 	case "recall":
 		// recall <text>
@@ -1154,7 +1291,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		s.mu.RUnlock()
 		if len(hits) == 0 {
 			return TermResult{
-				Text:       "无命中",
+				Text:       "no matches",
 				Structured: map[string]any{"hits": []any{}, "count": 0},
 			}, nil
 		}
@@ -1205,7 +1342,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 			fields[i] = restorePayload(fields[i])
 		}
 		if len(fields) == 0 {
-			return TermResult{}, errors.New("read 语法: read <addr> [<addr> ...]")
+			return TermResult{}, errors.New("read syntax: read <addr> [<addr> ...]")
 		}
 		s.mu.RLock()
 		defer s.mu.RUnlock()
@@ -1215,7 +1352,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		for _, addr := range fields {
 			proj, br, path, err := s.resolveAddr(addr, c)
 			if err == nil && !s.allowed(c, proj, br, configBitRead) {
-				out.WriteString("read: " + addr + " → " + s.denyReason(c, proj, br, configBitRead) + "\n\n")
+				out.WriteString("read: " + addr + " -> " + s.denyReason(c, proj, br, configBitRead) + "\n\n")
 				continue
 			}
 			if err != nil {
@@ -1224,7 +1361,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 			}
 			repo, err := s.projects.Get(proj)
 			if err != nil {
-				missing = append(missing, addr+"(项目不存在)")
+				missing = append(missing, addr+"(project does not exist)")
 				continue
 			}
 			d, err := repo.Read(br, path)
@@ -1238,7 +1375,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 			s.weights.Bump(proj+"@"+br+"/"+path, nowUnix)
 			s.weights.Bump(proj+"/"+path, nowUnix)
 			if len(fields) > 1 {
-				out.WriteString("════ " + addr + " ════\n")
+				out.WriteString("==== " + addr + " ====\n")
 			}
 			out.WriteString(string(d))
 			out.WriteString("\n")
@@ -1247,7 +1384,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 			return TermResult{}, fmt.Errorf("not found: %s", strings.Join(missing, ", "))
 		}
 		if len(missing) > 0 {
-			out.WriteString("\n[未取到] " + strings.Join(missing, ", ") + "\n")
+			out.WriteString("\n[not retrieved] " + strings.Join(missing, ", ") + "\n")
 		}
 		return TermResult{Text: out.String()}, nil
 
@@ -1277,7 +1414,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 
 	case "push":
 		if !c.canWrite() {
-			return TermResult{}, fmt.Errorf("推送需要 w 能力")
+			return TermResult{}, fmt.Errorf("push requires w capability")
 		}
 		return s.execPush(rest, c)
 
@@ -1366,7 +1503,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		if err := s.Reload(); err != nil {
 			return TermResult{}, err
 		}
-		return TermResult{Text: "索引已重建"}, nil
+		return TermResult{Text: "index rebuilt"}, nil
 
 	case "whoami":
 		return TermResult{Text: s.execWhoami(c)}, nil
@@ -1423,7 +1560,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		// 会把命中堆到与本次无关的项目上。
 		pattern, scope := splitScope(rest)
 		if pattern == "" {
-			return TermResult{}, errors.New("grep 语法: grep <pattern> [--scope <tree>]")
+			return TermResult{}, errors.New("grep syntax: grep <pattern> [--scope <tree>]")
 		}
 		grepText, grepErr := s.execGrep(pattern, scope, c)
 		if grepErr != nil {
@@ -1460,9 +1597,9 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 
 	default:
 		if suggestion := suggestVerb(verb); suggestion != "" {
-			return TermResult{}, fmt.Errorf("没有 %q 这个动词；你是不是想输入 %q？", verb, suggestion)
+			return TermResult{}, fmt.Errorf("unknown verb %q; did you mean %q?", verb, suggestion)
 		}
-		return TermResult{}, fmt.Errorf("没有 %q 这个动词（若对接了下游 MCP，此处应透传）\n\n%s", verb, helpOverview())
+		return TermResult{}, fmt.Errorf("unknown verb %q (if connected to a downstream MCP, this should be passed through)\n\n%s", verb, helpOverview())
 	}
 }
 
@@ -1487,19 +1624,19 @@ func (s *Server) Report(w io.Writer, c Caller) {
 		}
 		fmt.Fprintf(w, "\n=== %s ===\n", t.Project)
 		for _, b := range t.Blocks {
-			tag := "索引"
+			tag := "index"
 			if b.Injectable() {
-				tag = "注入"
+				tag = "inject"
 			}
 			if v := c.Mount.ToVirtual(b.Project, b.Branch, b.Path); v != "" {
 				fmt.Fprintf(w, "  [%s] %7d  %s\n", tag, b.Size, v)
 			}
 		}
 		st := t.Stats()
-		fmt.Fprintf(w, "  --- %d 块 / 规则 %d 块 / 索引 %d 字节\n",
+		fmt.Fprintf(w, "  --- %d blocks / %d rules / %d index bytes\n",
 			st.Blocks, st.Rules, st.IndexBytes)
 	}
-	fmt.Fprintf(w, "\n索引：%d 块 / %d 词\n", s.idx.Docs(), s.idx.Terms())
+	fmt.Fprintf(w, "\nIndex: %d blocks / %d terms\n", s.idx.Docs(), s.idx.Terms())
 }
 
 // snippet 取一块内容的摘要：优先返回命中词附近的那段，取不到就返回开头。
@@ -1571,7 +1708,7 @@ func (s *Server) snippet(addr, query string, limit int) string {
 	r := []rune(text[start:])
 	if len(r) > limit {
 		r = r[:limit]
-		return string(r) + "…"
+		return string(r) + "..."
 	}
 	return string(r)
 }
@@ -1602,7 +1739,7 @@ func (s *Server) weightCount(addr string) int {
 func (s *Server) execGrep(pattern, scope string, c Caller) (string, error) {
 	re, err := regexp.Compile("(?i)" + pattern)
 	if err != nil {
-		return "", fmt.Errorf("非法正则: %w", err)
+		return "", fmt.Errorf("invalid regular expression: %w", err)
 	}
 
 	s.mu.RLock()
@@ -1635,7 +1772,7 @@ func (s *Server) execGrep(pattern, scope string, c Caller) (string, error) {
 				if re.MatchString(line) {
 					if !blockHit {
 						blockHit = true
-						sb.WriteString("── " + c.Mount.ToVirtual(b.Project, b.Branch, b.Path) + " ──\n")
+						sb.WriteString("-- " + c.Mount.ToVirtual(b.Project, b.Branch, b.Path) + " --\n")
 					}
 					// 打印上下文：命中行前一行 + 命中行 + 后一行
 					start := i - 1
@@ -1655,7 +1792,7 @@ func (s *Server) execGrep(pattern, scope string, c Caller) (string, error) {
 					}
 					totalHits++
 					if totalHits >= 30 {
-						sb.WriteString("\n[已截断：命中过多，只显示前 30 处]\n")
+						sb.WriteString("\n[truncated: too many matches; showing the first 30]\n")
 						return sb.String(), nil
 					}
 				}
@@ -1666,7 +1803,7 @@ func (s *Server) execGrep(pattern, scope string, c Caller) (string, error) {
 		}
 	}
 	if totalHits == 0 {
-		return "无命中", nil
+		return "no matches", nil
 	}
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
@@ -1703,7 +1840,7 @@ func (s *Server) execLog(n int, c Caller) (string, error) {
 		if virt == "" {
 			continue
 		}
-		sb.WriteString(fmt.Sprintf("[%d] %s (%s, %d 字节)\n", i+1, virt, t, b.Size))
+		sb.WriteString(fmt.Sprintf("[%d] %s (%s, %d bytes)\n", i+1, virt, t, b.Size))
 		if snip := s.snippet(b.Addr(), "", 160); snip != "" {
 			for _, line := range strings.Split(snip, "\n") {
 				sb.WriteString("    " + line + "\n")
@@ -1737,7 +1874,7 @@ func (s *Server) execLs(day string, c Caller) (string, error) {
 		}
 	}
 	if len(matches) == 0 {
-		return "无匹配切片", nil
+		return "no matching entries", nil
 	}
 	sort.Slice(matches, func(i, j int) bool {
 		return c.Mount.ToVirtual(matches[i].Project, matches[i].Branch, matches[i].Path) <
@@ -1750,7 +1887,7 @@ func (s *Server) execLs(day string, c Caller) (string, error) {
 		if virt == "" {
 			virt = b.Path
 		}
-		sb.WriteString(fmt.Sprintf("%-50s %6d 字节\n", virt, b.Size))
+		sb.WriteString(fmt.Sprintf("%-50s %6d bytes\n", virt, b.Size))
 	}
 	return strings.TrimRight(sb.String(), "\n"), nil
 }
@@ -1786,7 +1923,13 @@ func (s *Server) ExecLine(ctx context.Context, line string) (string, error) {
 
 // Mux 返回完整的路由表，供嵌入式宿主整体挂载。
 func (s *Server) Mux() http.Handler {
-	return s.muxFor(ListenBlock{Allow: []string{"*"}})
+	// 管理面是否出现，只能由调用方显式要求。
+	//
+	// 早先这里写死 WebUI: true，于是 SDK 宿主把整个 mux 挂出去时
+	// 会带上一套管理接口——而口令引导只在配置里声明 webui 时才发生，
+	// 结果是「管理台在、但没人能登录」，同时它还多占了 / 与 /api
+	// 两个路由，把宿主的同名路径挤掉。
+	return s.muxFor(ListenBlock{Allow: []string{"*"}, WebUI: s.cfg.WebUI})
 }
 
 // ReposMux 只暴露 HTTP Git 端点（/repos/）。

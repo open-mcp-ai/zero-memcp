@@ -100,7 +100,7 @@ mode  = "rwx------"
 	if err != nil {
 		t.Fatalf("grep 不应报错: %v", err)
 	}
-	if !strings.Contains(out, "无命中") {
+	if !strings.Contains(out, "no matches") {
 		t.Fatalf("范围不存在时应无命中，实际: %s", out)
 	}
 

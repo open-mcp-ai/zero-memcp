@@ -370,7 +370,7 @@ gotTreeEvent:
 	if err != nil {
 		t.Fatalf("since 失败: %v", err)
 	}
-	if !strings.Contains(again, "没有变化") {
+	if !strings.Contains(again, "has not changed") {
 		t.Fatalf("同一 commit 应无变化: %s", again)
 	}
 }

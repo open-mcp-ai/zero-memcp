@@ -29,7 +29,7 @@ import (
 // requireRoot 检查调用方是否是 root。
 func (s *Server) requireRoot(c Caller) error {
 	if !c.Root {
-		return fmt.Errorf("这组动词只对 root 开放（当前身份 %s）", c.User)
+		return fmt.Errorf("these verbs are restricted to root (current identity: %s)", c.User)
 	}
 	return nil
 }
@@ -67,7 +67,7 @@ func (s *Server) execBranch(rest string, c Caller, defaultBranch string) (string
 	}
 	repo, err := s.projects.Get(project)
 	if err != nil {
-		return "", fmt.Errorf("打开项目 %s: %w", project, err)
+		return "", fmt.Errorf("open project %s: %w", project, err)
 	}
 
 	sha, err := repo.Resolve(src)
@@ -75,7 +75,7 @@ func (s *Server) execBranch(rest string, c Caller, defaultBranch string) (string
 		return "", err
 	}
 	if sha == "" {
-		return "", fmt.Errorf("源分支 %q 不存在", src)
+		return "", fmt.Errorf("source branch %q does not exist", src)
 	}
 	if err := repo.Fork(src, newBranch); err != nil {
 		return "", err
@@ -83,7 +83,7 @@ func (s *Server) execBranch(rest string, c Caller, defaultBranch string) (string
 	if err := s.Reload(); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("已从 %s@%s 分叉出 %s@%s（%s）", project, src, project, newBranch, sha[:8]), nil
+	return fmt.Sprintf("created branch %s@%s from %s@%s (%s)", project, src, project, newBranch, sha[:8]), nil
 }
 
 // listBranches 列出分支。
@@ -102,7 +102,7 @@ func (s *Server) listBranches(project string, c Caller) string {
 			}
 		}
 		if !found {
-			return fmt.Sprintf("没有 %q 这个项目", project)
+			return fmt.Sprintf("project %q does not exist", project)
 		}
 		projects = []string{project}
 	}
@@ -156,15 +156,15 @@ func (s *Server) listBranches(project string, c Caller) string {
 			}
 			lockMark := ""
 			if locked[name] {
-				lockMark = "  [已锁定]"
+				lockMark = "  [locked]"
 			}
 			// 还没 commit 的分支标出来：否则「0 篇 + 空 sha」
 			// 看起来像一条坏掉的记录。
 			pendingMark := ""
 			if sha == "" && repo.Pending(name) > 0 {
-				pendingMark = "  [待提交]"
+				pendingMark = "  [pending commit]"
 			}
-			body.WriteString(fmt.Sprintf("  %s %-16s %5d 篇  %s  %s%s%s\n", marked, name, len(n), when, shortSHA(sha), pendingMark, lockMark))
+			body.WriteString(fmt.Sprintf("  %s %-16s %5d entries  %s  %s%s%s\n", marked, name, len(n), when, shortSHA(sha), pendingMark, lockMark))
 		}
 		if body.Len() == 0 {
 			continue
@@ -173,9 +173,9 @@ func (s *Server) listBranches(project string, c Caller) string {
 		sb.WriteString(body.String())
 	}
 	if sb.Len() == 0 {
-		return "没有任何分支"
+		return "no branches"
 	}
-	sb.WriteString("\n* 表示当前默认分支")
+	sb.WriteString("\n* indicates the current default branch")
 	return sb.String()
 }
 
@@ -204,10 +204,10 @@ func (s *Server) execTag(rest string, c Caller, defaultBranch string) (string, e
 
 	if args[0] == "-d" || args[0] == "--delete" {
 		if len(args) < 3 {
-			return "", fmt.Errorf("用法：tag -d <project> <name>")
+			return "", fmt.Errorf("usage: tag -d <project> <name>")
 		}
 		if !s.projectWritableFor(c, args[1]) {
-			return "", fmt.Errorf("项目 %q 不在这张凭证的可写范围内", args[1])
+			return "", fmt.Errorf("project %q is outside this credential's writable scope", args[1])
 		}
 		repo, err := s.projects.Get(args[1])
 		if err != nil {
@@ -216,7 +216,7 @@ func (s *Server) execTag(rest string, c Caller, defaultBranch string) (string, e
 		if err := repo.Untag(args[2]); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("已移除 tag %s@%s（留在 refs/tags-removed/）", args[1], args[2]), nil
+		return fmt.Sprintf("removed tag %s@%s (retained in refs/tags-removed/)", args[1], args[2]), nil
 	}
 
 	project := args[0]
@@ -240,7 +240,7 @@ func (s *Server) execTag(rest string, c Caller, defaultBranch string) (string, e
 		return "", err
 	}
 	sha, _ := repo.Resolve(ref)
-	return fmt.Sprintf("已打 tag %s → %s@%s（%s）", name, project, ref, shortSHA(sha)), nil
+	return fmt.Sprintf("created tag %s -> %s@%s (%s)", name, project, ref, shortSHA(sha)), nil
 }
 
 func (s *Server) listTags(project string, c Caller) string {
@@ -272,7 +272,7 @@ func (s *Server) listTags(project string, c Caller) string {
 		}
 	}
 	if sb.Len() == 0 {
-		return "没有任何 tag"
+		return "no tags"
 	}
 	return sb.String()
 }
@@ -290,17 +290,17 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 	}
 	left, right, ok := strings.Cut(rest, "->")
 	if !ok {
-		return "", fmt.Errorf("用法：%s <project>@<branch>/<path> ... -> <project>@<branch>/[<path>]", map[bool]string{true: "mv", false: "cp"}[isMove])
+		return "", fmt.Errorf("usage: %s <project>@<branch>/<path> ... -> <project>@<branch>/[<path>]", map[bool]string{true: "mv", false: "cp"}[isMove])
 	}
 	srcs := strings.Fields(left)
 	if len(srcs) == 0 {
-		return "", fmt.Errorf("缺少源地址")
+		return "", fmt.Errorf("source address is required")
 	}
 	dst := strings.TrimSpace(right)
 
 	dstProj, dstBranch, dstPath, err := s.parseBranchAddr(dst)
 	if err != nil {
-		return "", fmt.Errorf("目标地址: %w", err)
+		return "", fmt.Errorf("destination address: %w", err)
 	}
 	// 目标写成目录（空路径或以 / 结尾）时，保留源的完整相对路径。
 	//
@@ -310,7 +310,7 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 	dstIsDir := dstPath == "" || strings.HasSuffix(dst, "/")
 
 	if !c.Mount.Visible(dstProj, dstBranch) {
-		return "", fmt.Errorf("目标 %s@%s 不在挂载表内", dstProj, dstBranch)
+		return "", fmt.Errorf("destination %s@%s is not in the mount table", dstProj, dstBranch)
 	}
 	if !s.allowed(c, dstProj, dstBranch, configBitWrite) {
 		return "", fmt.Errorf("%s", s.denyReason(c, dstProj, dstBranch, configBitWrite))
@@ -320,7 +320,7 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 	for _, raw := range srcs {
 		srcProj, srcBranch, srcPath, perr := s.parseBranchAddr(raw)
 		if perr != nil {
-			return "", fmt.Errorf("源地址 %q: %w", raw, perr)
+			return "", fmt.Errorf("source address %q: %w", raw, perr)
 		}
 		if !s.allowed(c, srcProj, srcBranch, configBitRead) {
 			return "", fmt.Errorf("%s", s.denyReason(c, srcProj, srcBranch, configBitRead))
@@ -330,7 +330,7 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 			return "", fmt.Errorf("%s", s.denyReason(c, srcProj, srcBranch, configBitWrite))
 		}
 		if srcProj != dstProj {
-			return "", fmt.Errorf("暂不支持跨项目搬运（%s → %s）", srcProj, dstProj)
+			return "", fmt.Errorf("cross-project transfers are not supported (%s -> %s)", srcProj, dstProj)
 		}
 
 		repo, err := s.projects.Get(srcProj)
@@ -350,19 +350,19 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 			}
 		} else {
 			if err := repo.CopyAs(srcBranch, srcPath, dstBranch, target); err != nil {
-				return "", fmt.Errorf("复制 %s@%s/%s: %w", srcProj, srcBranch, srcPath, err)
+				return "", fmt.Errorf("copy %s@%s/%s: %w", srcProj, srcBranch, srcPath, err)
 			}
 		}
 
 		// 立刻提交两端，让这次手术当场生效
 		if isMove {
-			if _, cerr := repo.Commit(srcBranch, fmt.Sprintf("mem: %s 取出 %s", verbName(isMove), srcPath)); cerr != nil {
-				return "", fmt.Errorf("提交源分支: %w", cerr)
+			if _, cerr := repo.Commit(srcBranch, fmt.Sprintf("mem: %s removed %s", verbName(isMove), srcPath)); cerr != nil {
+				return "", fmt.Errorf("commit source branch: %w", cerr)
 			}
 		}
 		if srcBranch != dstBranch {
-			if _, cerr := repo.Commit(dstBranch, fmt.Sprintf("mem: %s 收入 %s", verbName(isMove), target)); cerr != nil {
-				return "", fmt.Errorf("提交目标分支: %w", cerr)
+			if _, cerr := repo.Commit(dstBranch, fmt.Sprintf("mem: %s received %s", verbName(isMove), target)); cerr != nil {
+				return "", fmt.Errorf("commit destination branch: %w", cerr)
 			}
 		}
 
@@ -372,17 +372,17 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 			s.notifyTreeChange(dstProj, dstBranch, "")
 		}
 
-		moved = append(moved, fmt.Sprintf("  %s@%s/%s → %s@%s/%s", srcProj, srcBranch, srcPath, dstProj, dstBranch, target))
+		moved = append(moved, fmt.Sprintf("  %s@%s/%s -> %s@%s/%s", srcProj, srcBranch, srcPath, dstProj, dstBranch, target))
 	}
 
 	if err := s.Reload(); err != nil {
 		return "", err
 	}
-	verb := "复制"
+	verb := "copy"
 	if isMove {
-		verb = "剪切"
+		verb = "move"
 	}
-	return fmt.Sprintf("%s %d 个文件：\n%s", verb, len(moved), strings.Join(moved, "\n")), nil
+	return fmt.Sprintf("%s %d files:\n%s", verb, len(moved), strings.Join(moved, "\n")), nil
 }
 
 func verbName(isMove bool) string {
@@ -423,7 +423,7 @@ func modeOf(repo *gitstore.Repo, branch, path string) gitstore.Mode {
 func (s *Server) parseBranchAddr(addr string) (project, branch, path string, err error) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
-		return "", "", "", fmt.Errorf("地址不能为空")
+		return "", "", "", fmt.Errorf("address cannot be empty")
 	}
 
 	def := s.defaultBranch
@@ -440,7 +440,7 @@ func (s *Server) parseBranchAddr(addr string) (project, branch, path string, err
 		// 没写分支：按已声明项目做最长前缀匹配，剩下的都是路径
 		pj, p, ok := memory.SplitAddrWithProjects(addr, s.declaredProjects())
 		if !ok {
-			return "", "", "", fmt.Errorf("无法从 %q 解析出项目；需要 <project>@<branch>/<path>", addr)
+			return "", "", "", fmt.Errorf("cannot determine project from %q; expected <project>@<branch>/<path>", addr)
 		}
 		project = pj
 		path = p
@@ -448,7 +448,7 @@ func (s *Server) parseBranchAddr(addr string) (project, branch, path string, err
 	}
 
 	if project == "" {
-		return "", "", "", fmt.Errorf("无法从 %q 解析出项目", addr)
+		return "", "", "", fmt.Errorf("cannot determine project from %q", addr)
 	}
 	if branch == "" {
 		branch = def
@@ -477,7 +477,7 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 	// 1. 无参：全部提交
 	if rest == "" {
 		if !c.Mount.Empty() {
-			return "", fmt.Errorf("受限挂载凭证必须指定 commit <project>@<branch>")
+			return "", fmt.Errorf("a restricted mount credential must specify commit <project>@<branch>")
 		}
 		if err := s.requireRoot(c); err != nil {
 			return "", err
@@ -489,7 +489,7 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 		if err := s.Reload(); err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("已提交 %d 个项目的待提交区", n), nil
+		return fmt.Sprintf("committed pending changes for %d projects", n), nil
 	}
 
 	// 2. 指定了项目（可能带 @branch）
@@ -509,7 +509,7 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 		return "", err
 	}
 	if repo.Pending(branch) == 0 && len(repo.Deleted(branch)) == 0 {
-		return fmt.Sprintf("%s@%s 没有未提交的内容", proj, branch), nil
+		return fmt.Sprintf("%s@%s has no uncommitted changes", proj, branch), nil
 	}
 
 	count := repo.Pending(branch) + len(repo.Deleted(branch))
@@ -519,7 +519,7 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 
 	sha, err := repo.Commit(branch, msg)
 	if err != nil {
-		return "", fmt.Errorf("提交失败: %w", err)
+		return "", fmt.Errorf("commit failed: %w", err)
 	}
 	// 显式提交同样推进了分支头：锚定者必须收到脉冲，
 	// 否则「手动封箱」会变成一次无人知晓的静默变更。
@@ -528,7 +528,7 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 	if err := s.Reload(); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("已提交 %s@%s（%d 条，%s）", proj, branch, count, shortSHA(sha)), nil
+	return fmt.Sprintf("committed %s@%s (%d entries, %s)", proj, branch, count, shortSHA(sha)), nil
 }
 
 // execDiff 实现 diff 动词（分支比对 / 未审脏流提取）。
@@ -543,7 +543,7 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 func (s *Server) execDiff(rest string, c Caller, defaultBranch string) (string, error) {
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
-		return "", fmt.Errorf("用法：diff <project>@<branch> 或 diff <project>@<from> -> <project>@<to>")
+		return "", fmt.Errorf("usage: diff <project>@<branch> or diff <project>@<from> -> <project>@<to>")
 	}
 
 	var fromAddr, toAddr string
@@ -556,14 +556,14 @@ func (s *Server) execDiff(rest string, c Caller, defaultBranch string) (string, 
 
 	fromProj, fromBranch, _, err := s.parseBranchAddr(fromAddr)
 	if err != nil && fromAddr != "" {
-		return "", fmt.Errorf("源: %w", err)
+		return "", fmt.Errorf("source: %w", err)
 	}
 	toProj, toBranch, _, err := s.parseBranchAddr(toAddr)
 	if err != nil {
-		return "", fmt.Errorf("目标: %w", err)
+		return "", fmt.Errorf("destination: %w", err)
 	}
 	if fromAddr != "" && fromProj != toProj {
-		return "", fmt.Errorf("暂不支持跨项目比对（%s vs %s）", fromProj, toProj)
+		return "", fmt.Errorf("cross-project comparisons are not supported (%s vs %s)", fromProj, toProj)
 	}
 	if !s.allowed(c, toProj, toBranch, configBitRead) {
 		return "", fmt.Errorf("%s", s.denyReason(c, toProj, toBranch, configBitRead))
@@ -583,9 +583,9 @@ func (s *Server) execDiff(rest string, c Caller, defaultBranch string) (string, 
 	}
 	if len(changes) == 0 {
 		if fromAddr == "" {
-			return fmt.Sprintf("%s@%s 是空的", toProj, toBranch), nil
+			return fmt.Sprintf("%s@%s is empty", toProj, toBranch), nil
 		}
-		return fmt.Sprintf("%s@%s 与 %s@%s 没有差异", toProj, toBranch, fromProj, fromBranch), nil
+		return fmt.Sprintf("%s@%s and %s@%s have no differences", toProj, toBranch, fromProj, fromBranch), nil
 	}
 
 	var added, modified, deleted []string
@@ -602,26 +602,26 @@ func (s *Server) execDiff(rest string, c Caller, defaultBranch string) (string, 
 
 	var sb strings.Builder
 	if fromAddr == "" {
-		sb.WriteString(fmt.Sprintf("%s@%s 共 %d 个文件\n", toProj, toBranch, len(changes)))
+		sb.WriteString(fmt.Sprintf("%s@%s: %d files\n", toProj, toBranch, len(changes)))
 	} else {
-		sb.WriteString(fmt.Sprintf("%s@%s → %s@%s 共 %d 处变化\n", fromProj, fromBranch, toProj, toBranch, len(changes)))
+		sb.WriteString(fmt.Sprintf("%s@%s -> %s@%s: %d changes\n", fromProj, fromBranch, toProj, toBranch, len(changes)))
 	}
 	writeGroup := func(title string, items []string, limit int) {
 		if len(items) == 0 {
 			return
 		}
-		sb.WriteString(fmt.Sprintf("\n%s（%d）\n", title, len(items)))
+		sb.WriteString(fmt.Sprintf("\n%s (%d)\n", title, len(items)))
 		for i, p := range items {
 			if i >= limit {
-				sb.WriteString(fmt.Sprintf("  … 还有 %d 个\n", len(items)-limit))
+				sb.WriteString(fmt.Sprintf("  ... and %d more\n", len(items)-limit))
 				break
 			}
 			sb.WriteString("  " + p + "\n")
 		}
 	}
-	writeGroup("新增", added, 40)
-	writeGroup("修改", modified, 20)
-	writeGroup("删除", deleted, 20)
+	writeGroup("added", added, 40)
+	writeGroup("modified", modified, 20)
+	writeGroup("deleted", deleted, 20)
 	return sb.String(), nil
 }
 
@@ -639,7 +639,7 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 	}
 	args := strings.Fields(rest)
 	if len(args) == 0 {
-		return "", fmt.Errorf("用法：delete <project>@<branch>/<path> [...]")
+		return "", fmt.Errorf("usage: delete <project>@<branch>/<path> [...]")
 	}
 
 	proj, branch, firstPath, err := s.parseBranchAddr(args[0])
@@ -647,7 +647,7 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 		return "", err
 	}
 	if !c.Mount.Visible(proj, branch) {
-		return "", fmt.Errorf("%s@%s 不在这张凭证的可见范围内", proj, branch)
+		return "", fmt.Errorf("%s@%s is outside this credential's visible scope", proj, branch)
 	}
 	if !s.allowed(c, proj, branch, configBitWrite) {
 		return "", errors.New(s.denyReason(c, proj, branch, configBitWrite))
@@ -685,7 +685,7 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 				}
 			}
 			if hit == 0 {
-				return "", fmt.Errorf("%s 下没有文件（%s@%s）", p, proj, branch)
+				return "", fmt.Errorf("no files under %s (%s@%s)", p, proj, branch)
 			}
 			continue
 		}
@@ -695,7 +695,7 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 		// 于是一次手误得到「已标记删除 1 个文件」，而文件还在原地。
 		// 删除是少数几个不能沉默的操作。
 		if _, rerr := repo.Read(branch, p); rerr != nil {
-			return "", fmt.Errorf("%s 不存在（%s@%s）", p, proj, branch)
+			return "", fmt.Errorf("%s does not exist (%s@%s)", p, proj, branch)
 		}
 		if err := repo.Delete(branch, p); err != nil {
 			return "", err
@@ -704,13 +704,13 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 	}
 
 	if len(removed) == 0 {
-		return "没有任何文件被删除", nil
+		return "no files were deleted", nil
 	}
 	// 删除也得重算内存索引，否则被删的切片还能被 recall 搜到
 	if err := s.Reload(); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("已标记删除 %d 个文件（%s@%s，需 commit 才生效）：\n  %s",
+	return fmt.Sprintf("marked %d files for deletion (%s@%s; commit to apply):\n  %s",
 		len(removed), proj, branch, strings.Join(removed, "\n  ")), nil
 }
 
@@ -729,7 +729,7 @@ func (s *Server) execArchive(rest string, c Caller) (string, error) {
 	}
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
-		return "", fmt.Errorf("用法：archive <project>@<branch> [-> <project>@<as>]")
+		return "", fmt.Errorf("usage: archive <project>@<branch> [-> <project>@<as>]")
 	}
 
 	srcAddr := rest
@@ -754,7 +754,7 @@ func (s *Server) execArchive(rest string, c Caller) (string, error) {
 		}
 	}
 	if dstBranch == branch {
-		return "", fmt.Errorf("归档目标和源分支不能同名")
+		return "", fmt.Errorf("archive destination cannot have the same name as the source branch")
 	}
 	if err := s.requireRootAccess(c, proj, branch, configBitWrite); err != nil {
 		return "", err
@@ -771,7 +771,7 @@ func (s *Server) execArchive(rest string, c Caller) (string, error) {
 	}
 	sha, err := repo.Resolve(branch)
 	if err != nil || sha == "" {
-		return "", fmt.Errorf("分支 %s@%s 不存在或没有任何提交", proj, branch)
+		return "", fmt.Errorf("branch %s@%s does not exist or has no commits", proj, branch)
 	}
 
 	// 归档 = 把 ref 复制成新分支（零字节，只是写一个 sha）
@@ -785,7 +785,7 @@ func (s *Server) execArchive(rest string, c Caller) (string, error) {
 	if err := s.Reload(); err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("已归档 %s@%s → %s@%s（%s）；源 ref 移到 refs/archived/%s",
+	return fmt.Sprintf("archived %s@%s -> %s@%s (%s); source ref moved to refs/archived/%s",
 		proj, branch, proj, dstBranch, shortSHA(sha), branch), nil
 }
 
@@ -803,7 +803,7 @@ func (s *Server) execReset(rest string, c Caller) (string, error) {
 	rest = strings.TrimSpace(rest)
 	left, right, ok := strings.Cut(rest, "from")
 	if !ok {
-		return "", fmt.Errorf("用法：reset <project>@<branch> from <project>@<src>")
+		return "", fmt.Errorf("usage: reset <project>@<branch> from <project>@<src>")
 	}
 	dstAddr := strings.TrimSpace(left)
 	srcAddr := strings.TrimSpace(right)
@@ -817,13 +817,13 @@ func (s *Server) execReset(rest string, c Caller) (string, error) {
 		return "", err
 	}
 	if dstProj != srcProj {
-		return "", fmt.Errorf("暂不支持跨项目重置")
+		return "", fmt.Errorf("cross-project resets are not supported")
 	}
 	if dstBranch == "" || srcBranch == "" {
-		return "", fmt.Errorf("两侧都必须指定分支")
+		return "", fmt.Errorf("both sides must specify a branch")
 	}
 	if dstBranch == srcBranch {
-		return "", fmt.Errorf("源和目标是同一个分支")
+		return "", fmt.Errorf("source and destination are the same branch")
 	}
 	if err := s.requireRootAccess(c, srcProj, srcBranch, configBitRead); err != nil {
 		return "", err
@@ -838,7 +838,7 @@ func (s *Server) execReset(rest string, c Caller) (string, error) {
 	}
 	srcSHA, err := repo.Resolve(srcBranch)
 	if err != nil || srcSHA == "" {
-		return "", fmt.Errorf("源分支 %s@%s 不存在或没有提交", srcProj, srcBranch)
+		return "", fmt.Errorf("source branch %s@%s does not exist or has no commits", srcProj, srcBranch)
 	}
 
 	// 先把当前版本归档一份，再重置——重置不该是单向门
@@ -846,7 +846,7 @@ func (s *Server) execReset(rest string, c Caller) (string, error) {
 	if oldSHA != "" {
 		stamp := time.Now().Format("20060102-150405")
 		if err := repo.Fork(dstBranch, dstBranch+"-reset-"+stamp); err != nil {
-			return "", fmt.Errorf("重置前归档失败: %w", err)
+			return "", fmt.Errorf("failed to archive before reset: %w", err)
 		}
 	}
 	if err := repo.Fork(srcBranch, dstBranch); err != nil {
@@ -855,9 +855,9 @@ func (s *Server) execReset(rest string, c Caller) (string, error) {
 	if err := s.Reload(); err != nil {
 		return "", err
 	}
-	msg := fmt.Sprintf("已重置 %s@%s → %s@%s（%s）", dstProj, dstBranch, srcProj, srcBranch, shortSHA(srcSHA))
+	msg := fmt.Sprintf("reset %s@%s -> %s@%s (%s)", dstProj, dstBranch, srcProj, srcBranch, shortSHA(srcSHA))
 	if oldSHA != "" {
-		msg += fmt.Sprintf("；旧版本已归档为 %s-reset-*", dstBranch)
+		msg += fmt.Sprintf("; previous version archived as %s-reset-*", dstBranch)
 	}
 	return msg, nil
 }
@@ -874,7 +874,7 @@ func (s *Server) execChmod(rest string, c Caller, defaultBranch string) (string,
 	}
 	fields := strings.Fields(rest)
 	if len(fields) != 2 {
-		return "", fmt.Errorf("用法：chmod <project>[@<branch>]/<path> rule|content")
+		return "", fmt.Errorf("usage: chmod <project>[@<branch>]/<path> rule|content")
 	}
 	addr, want := fields[0], fields[1]
 	var mode gitstore.Mode
@@ -884,7 +884,7 @@ func (s *Server) execChmod(rest string, c Caller, defaultBranch string) (string,
 	case "content", "c", "644", "100644":
 		mode = gitstore.ModeContent
 	default:
-		return "", fmt.Errorf("模式只能是 rule 或 content，收到 %q", want)
+		return "", fmt.Errorf("mode must be rule or content, got %q", want)
 	}
 
 	proj, branch, path, err := s.resolveAddr(addr, c)
@@ -892,10 +892,10 @@ func (s *Server) execChmod(rest string, c Caller, defaultBranch string) (string,
 		return "", err
 	}
 	if path == "" {
-		return "", fmt.Errorf("%q 只给出了项目，没有文件路径", addr)
+		return "", fmt.Errorf("%q specifies a project but no file path", addr)
 	}
 	if !s.allowed(c, proj, branch, configBitWrite) {
-		return "", fmt.Errorf("无权修改 %s@%s", proj, branch)
+		return "", fmt.Errorf("not authorized to modify %s@%s", proj, branch)
 	}
 	repo, err := s.projects.Get(proj)
 	if err != nil {
@@ -903,17 +903,17 @@ func (s *Server) execChmod(rest string, c Caller, defaultBranch string) (string,
 	}
 	body, err := repo.Read(branch, path)
 	if err != nil {
-		return "", fmt.Errorf("%s 不存在（%s@%s）", path, proj, branch)
+		return "", fmt.Errorf("%s does not exist (%s@%s)", path, proj, branch)
 	}
 	if err := repo.Write(branch, path, body, mode); err != nil {
 		return "", err
 	}
 	if err := s.Reload(); err != nil {
-		return "", fmt.Errorf("已改模式，但重建索引失败：%w", err)
+		return "", fmt.Errorf("mode changed, but failed to rebuild index: %w", err)
 	}
-	label := "规则（每轮注入）"
+	label := "rule (injected every turn)"
 	if mode == gitstore.ModeContent {
-		label = "普通内容（不注入）"
+		label = "plain content (not injected)"
 	}
-	return fmt.Sprintf("%s@%s/%s → %s，需 commit 才生效", proj, branch, path, label), nil
+	return fmt.Sprintf("%s@%s/%s -> %s; commit to apply", proj, branch, path, label), nil
 }

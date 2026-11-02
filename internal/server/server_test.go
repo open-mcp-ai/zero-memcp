@@ -210,7 +210,7 @@ mode  = "rwxr-xr-x"
 	if strings.Contains(out, "机密") {
 		t.Fatalf("bob 不该能读到机密: %s", out)
 	}
-	if !strings.Contains(out, "缺少 r 权限") {
+	if !strings.Contains(out, "lacks r permission") {
 		t.Fatalf("应给出权限不足的理由，实际: %s", out)
 	}
 
@@ -294,7 +294,7 @@ func TestRevocationEnforced(t *testing.T) {
 
 	// 再次调用必须被拒绝
 	_, err := callMCP(t, srv, tok, "status")
-	if err == nil || !strings.Contains(err.Error(), "吊销") {
+	if err == nil || !strings.Contains(err.Error(), "revoked") {
 		t.Fatalf("吊销后应被拒绝，实际: %v", err)
 	}
 }
@@ -349,7 +349,7 @@ mode  = "rwx------"
 
 	// 显式 commit 之后分支才真正前进。
 	sha, err := callMCP(t, srv, tok, "commit daily@zero")
-	if err != nil || !strings.Contains(sha, "已提交") {
+	if err != nil || !strings.Contains(sha, "committed") {
 		t.Fatalf("commit 失败: %v (%s)", err, sha)
 	}
 	if c, _ := repo.Resolve("zero"); c == "" {
@@ -440,7 +440,7 @@ mode  = "rwxrwxrwx"
 
 	// 子用户显式指定 daily 写入：应当被拒绝，且不能悄悄改写到别的仓库
 	_, err = callMCP(t, srv, bobTok, "put daily -- bob 想写的")
-	if err == nil || !strings.Contains(err.Error(), "缺少 w 权限") {
+	if err == nil || !strings.Contains(err.Error(), "lacks w permission") {
 		t.Fatalf("子用户写 daily 应被拒绝，实际: %v", err)
 	}
 

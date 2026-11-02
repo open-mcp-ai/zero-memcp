@@ -26,7 +26,7 @@ func readPkt(r *bufio.Reader) (string, pktKind, error) {
 	}
 	var n int
 	if _, err := fmt.Sscanf(string(header[:]), "%04x", &n); err != nil {
-		return "", pktData, fmt.Errorf("非法 pkt-line header %q", header)
+		return "", pktData, fmt.Errorf("invalid pkt-line header %q", header)
 	}
 	switch n {
 	case 0:
@@ -37,7 +37,7 @@ func readPkt(r *bufio.Reader) (string, pktKind, error) {
 		return "", pktResponseEnd, nil
 	}
 	if n < 4 || n > 65520 {
-		return "", pktData, fmt.Errorf("pkt-line 长度越界: %d", n)
+		return "", pktData, fmt.Errorf("pkt-line length out of range: %d", n)
 	}
 	payload := make([]byte, n-4)
 	if _, err := io.ReadFull(r, payload); err != nil {
@@ -66,7 +66,7 @@ func readAdvertisementProtocol(r *bufio.Reader) (int, error) {
 	return 0, errNotV2
 }
 
-var errNotV2 = fmt.Errorf("服务端未使用协议 v2")
+var errNotV2 = fmt.Errorf("server did not use protocol v2")
 
 // v2Caps 解析 v2 能力广告，读到 flush 为止。
 func v2Caps(r *bufio.Reader) (map[string]string, error) {
@@ -156,7 +156,7 @@ func parseV2Pack(r *bufio.Reader) ([]byte, error) {
 	for {
 		line, kind, err := readPkt(r)
 		if err != nil {
-			return nil, fmt.Errorf("读取 v2 响应失败: %w", err)
+			return nil, fmt.Errorf("read v2 response: %w", err)
 		}
 		switch kind {
 		case pktFlush, pktDelim, pktResponseEnd:
@@ -164,7 +164,7 @@ func parseV2Pack(r *bufio.Reader) ([]byte, error) {
 		}
 		trimmed := strings.TrimRight(line, "\n")
 		if strings.HasPrefix(trimmed, "ERR ") {
-			return nil, fmt.Errorf("远端拒绝取回: %s", strings.TrimPrefix(trimmed, "ERR "))
+			return nil, fmt.Errorf("remote rejected fetch: %s", strings.TrimPrefix(trimmed, "ERR "))
 		}
 		switch trimmed {
 		case "packfile":
@@ -197,7 +197,7 @@ func readSidebandPack(r *bufio.Reader) ([]byte, error) {
 			if err == io.EOF {
 				break
 			}
-			return nil, fmt.Errorf("读取 pack 分片失败: %w", err)
+			return nil, fmt.Errorf("read pack chunk: %w", err)
 		}
 		if kind != pktData {
 			if kind == pktResponseEnd || kind == pktFlush {
@@ -215,17 +215,17 @@ func readSidebandPack(r *bufio.Reader) ([]byte, error) {
 			// 进度信息：丢弃，但不清空——它不带 pack 内容。
 			continue
 		case 3:
-			return nil, fmt.Errorf("远端在传输中报错: %s", strings.TrimSpace(line[1:]))
+			return nil, fmt.Errorf("remote reported an error during transfer: %s", strings.TrimSpace(line[1:]))
 		default:
 			// 没有通道字节：某些实现直接发裸 pack 数据。
 			pack = append(pack, line...)
 		}
 		if len(pack) > maxAdvertisement {
-			return nil, fmt.Errorf("pack 超过 %d 字节上限", maxAdvertisement)
+			return nil, fmt.Errorf("pack exceeds the %d byte limit", maxAdvertisement)
 		}
 	}
 	if len(pack) == 0 {
-		return nil, fmt.Errorf("远端返回了空的 packfile 段")
+		return nil, fmt.Errorf("remote returned an empty packfile section")
 	}
 	return pack, nil
 }

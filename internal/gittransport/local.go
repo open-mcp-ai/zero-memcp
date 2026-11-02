@@ -42,11 +42,11 @@ func localRepoPath(remoteURL string) (string, bool) {
 func FetchLocal(repo *gitstore.Repo, remoteURL, remote string) (FetchResult, error) {
 	path, ok := localRepoPath(remoteURL)
 	if !ok {
-		return FetchResult{}, fmt.Errorf("不是本地路径远端：%s", remoteURL)
+		return FetchResult{}, fmt.Errorf("not a local-path remote: %s", remoteURL)
 	}
 	src, err := gitstore.Open(path)
 	if err != nil {
-		return FetchResult{}, fmt.Errorf("打开本地远端仓库失败: %w", err)
+		return FetchResult{}, fmt.Errorf("open local remote repository: %w", err)
 	}
 	refs := map[string]string{}
 	var tips []string
@@ -68,7 +68,7 @@ func FetchLocal(repo *gitstore.Repo, remoteURL, remote string) (FetchResult, err
 	}
 	pack, err := src.BuildPack(tips, nil)
 	if err != nil {
-		return res, fmt.Errorf("打包本地远端对象失败: %w", err)
+		return res, fmt.Errorf("pack local remote objects: %w", err)
 	}
 	return applyFetch(repo, remote, refs, pack)
 }
@@ -77,11 +77,11 @@ func FetchLocal(repo *gitstore.Repo, remoteURL, remote string) (FetchResult, err
 func ListLocal(remoteURL string) (map[string]string, error) {
 	path, ok := localRepoPath(remoteURL)
 	if !ok {
-		return nil, fmt.Errorf("不是本地路径远端：%s", remoteURL)
+		return nil, fmt.Errorf("not a local-path remote: %s", remoteURL)
 	}
 	src, err := gitstore.Open(path)
 	if err != nil {
-		return nil, fmt.Errorf("打开本地远端仓库失败: %w", err)
+		return nil, fmt.Errorf("open local remote repository: %w", err)
 	}
 	refs := map[string]string{}
 	list, err := src.Refs("refs/heads/")
@@ -103,7 +103,7 @@ func PushLocal(repo *gitstore.Repo, remoteURL, branch string) (PushResult, error
 	}
 	path, ok := localRepoPath(remoteURL)
 	if !ok {
-		return PushResult{}, fmt.Errorf("不是本地路径远端：%s", remoteURL)
+		return PushResult{}, fmt.Errorf("not a local-path remote: %s", remoteURL)
 	}
 	unlock, err := lockLocalRepo(path, localLockTimeout)
 	if err != nil {
@@ -112,7 +112,7 @@ func PushLocal(repo *gitstore.Repo, remoteURL, branch string) (PushResult, error
 	defer unlock()
 	dst, err := gitstore.Open(path)
 	if err != nil {
-		return PushResult{}, fmt.Errorf("打开本地远端仓库失败: %w", err)
+		return PushResult{}, fmt.Errorf("open local remote repository: %w", err)
 	}
 	refs := map[string]string{}
 	if sha, err := dst.Resolve(branch); err == nil && sha != "" {
@@ -127,13 +127,13 @@ func PushLocal(repo *gitstore.Repo, remoteURL, branch string) (PushResult, error
 	}
 	pack, err := repo.BuildPack([]string{plan.New}, []string{plan.Old})
 	if err != nil {
-		return PushResult{}, fmt.Errorf("打包失败: %w", err)
+		return PushResult{}, fmt.Errorf("pack failed: %w", err)
 	}
 	if len(pack) == 0 {
-		return PushResult{}, errors.New("本地对象库缺少远端尚无的提交对象")
+		return PushResult{}, errors.New("local object database is missing commit objects not yet present on the remote")
 	}
 	if _, err := dst.IngestPack(pack); err != nil {
-		return PushResult{}, fmt.Errorf("写入本地远端失败: %w", err)
+		return PushResult{}, fmt.Errorf("write to local remote: %w", err)
 	}
 	if err := dst.SetRef("refs/heads/"+branch, plan.New); err != nil {
 		return PushResult{}, err
@@ -161,7 +161,7 @@ func lockLocalRepo(path string, timeout time.Duration) (func(), error) {
 			return func() { _ = os.Remove(lockPath) }, nil
 		}
 		if !os.IsExist(err) {
-			return nil, fmt.Errorf("创建仓库锁失败: %w", err)
+			return nil, fmt.Errorf("create repository lock: %w", err)
 		}
 		// 锁文件属于一个已经不存在的进程：直接接管，否则一次崩溃会永久卡住。
 		if staleLock(lockPath) {
@@ -169,7 +169,7 @@ func lockLocalRepo(path string, timeout time.Duration) (func(), error) {
 			continue
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("远端仓库正被另一个进程写入（%s）", lockPath)
+			return nil, fmt.Errorf("remote repository is being written by another process (%s)", lockPath)
 		}
 		time.Sleep(25 * time.Millisecond)
 	}

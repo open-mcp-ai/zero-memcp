@@ -8,52 +8,52 @@ import "strings"
 // 一个只列出动词名的手册，看完还是要猜。
 func helpOverview() string {
 	return strings.TrimSpace(`
-zero-memcp：一个持久记忆体。写入会落进本地持久记录，服务重启后仍可读取。
+zero-memcp: persistent memory. Writes are stored locally and remain available after restart.
 
-put [<tree>] -- $TEXT        把正文写进记忆树（正文通过 vars/args 传入，不和 DSL 混写）
-put <tree> --ref <addr>      在树里追加已有记忆的引用，不复制正文
-recall <text> [--scope tree] 语义回想；默认搜索长期记忆树，可指定范围
-read <addr> [<addr>...]     读全文，可一次多篇
-grep <pattern> [--scope T]  正则扫全文（精确符号、名字、数字）
-log [N]                     最近记忆的时间线
-ls [date]                   列出某天的记忆切片
-trees <project>[@<branch>]  查看树目录
-remind [<tree>]             锚定一棵树；树发生变化时收到通知
-since <tree> <commit|empty> 取回自上次看到的提交以来的树差分
-status                      索引规模
+put [<tree>] -- $TEXT        write content to a memory tree (pass content through vars/args, separately from the DSL)
+put <tree> --ref <addr>      add a reference to existing memory in a tree without copying its content
+recall <text> [--scope tree] semantic search; searches long-term memory by default, with an optional scope
+read <addr> [<addr>...]     read full text; accepts multiple addresses
+grep <pattern> [--scope T]  search full text with a regular expression (exact symbols, names, numbers)
+log [N]                     timeline of recent memories
+ls [date]                   list memory entries for a date
+trees <project>[@<branch>]  view the tree directory
+remind [<tree>]             watch a tree and receive notifications when it changes
+since <tree> <commit|empty> retrieve tree changes since the last seen commit
+status                      index size
 
-记忆同步（远端在配置里声明）：
-remote [<project>]                    查看已配置的记忆副本
-fetch <project> [<remote>]            从远端取回历史，不自动覆盖本地分支
-push <project> [<remote>] <branch>   显式推送一个分支（一次一个，外部 git push 见 README）
-sync <project> [<remote>]             查看本地与远端的差异
-remote-key list | put | delete       root 配置 SSH 私钥（外部 push 用）
-remote-secret list | put | delete    root 配置 HTTP token（外部 push 用）
+Memory sync (remotes are declared in the config):
+remote [<project>]                    list configured memory remotes
+fetch <project> [<remote>]            fetch history from a remote without automatically overwriting local branches
+push <project> [<remote>] <branch>   explicitly push one branch (one at a time; see README for external git push)
+sync <project> [<remote>]             compare local and remote state
+remote-key list | put | delete       root manages SSH private keys (for external push)
+remote-secret list | put | delete    root manages HTTP tokens (for external push)
 
-push 必须显式指定分支，不会替你提交，也不会强推。
+push requires an explicitly named branch; it does not commit or force-push for you.
 
-只有维护记忆结构时才需要的操作（日常读写不需要）：
-commit [<p>[@<br>]] [-m msg]   显式折叠脏层进历史
-diff <p>@<br> [-> <p>@<br>]    比对分支差异（审计用）
-branch [<p> [<new> [from s]]]  列出或分叉分支
-tag [-d] <p> [<name> [<ref>]]  轻量标签
-cp / mv <src> -> <dst>         跨分支搬运切片
-delete <p>@<br>/<path>...      删除切片
-archive <p>@<br>               归档分支
-reset <p>@<br> from <src>      重置分支到另一条分支
-lock / unlock <p>@<br>         锁定/解锁分支（暂停非 root 访问）
-chmod <p>@<br>/<path> mode     修改规则/内容属性
-write <p>@<br>/<path> -- text  精确写文件（规则专用，须 root）
-batch {"ops":[...]}            原子批处理（打包多步为一次提交）
+Commands for maintaining memory structure (not needed for routine reading and writing):
+commit [<p>[@<br>]] [-m msg]   explicitly fold the dirty layer into history
+diff <p>@<br> [-> <p>@<br>]    compare branch differences (for auditing)
+branch [<p> [<new> [from s]]]  list or fork branches
+tag [-d] <p> [<name> [<ref>]]  lightweight tag
+cp / mv <src> -> <dst>         transfer entries across branches
+delete <p>@<br>/<path>...      delete entries
+archive <p>@<br>               archive a branch
+reset <p>@<br> from <src>      reset a branch to another branch
+lock / unlock <p>@<br>         lock/unlock a branch (suspend non-root access)
+chmod <p>@<br>/<path> mode     change rule/content mode
+write <p>@<br>/<path> -- text  write an exact file (for rules only; root required)
+batch {"ops":[...]}            atomic batch (combine multiple steps into one commit)
 
-怎么用：
-  • 想起一件事             → recall
-  • 想把新内容记住         → put
-  • 想把某棵树的变化纳入注意→ remind <tree>
-  • 想把记忆带到另一节点   → sync，再 fetch / push
+How to use:
+  - recall something             -> recall
+  - save new content             -> put
+  - watch changes to a tree      -> remind <tree>
+  - move memory to another node  -> sync, then fetch / push
 
-help <verb>   看某个动词的细节
-help --all    全部细节
+help <verb>   show details for a verb
+help --all    show all details
 `)
 }
 
@@ -65,42 +65,42 @@ func helpVerb(verb string) (string, bool) {
 put [<tree>] -- $TEXT
 put <tree> --ref <addr>
 
-把正文放进记忆树。目标不带时，服务按 SKILL.md 的 stream 声明选择默认落点；
-指定树路径时，正文作为新节点写入该子树。
+Store content in a memory tree. If no target is given, the service chooses a default destination based on the stream declaration in SKILL.md;
+when a tree path is specified, content is written as a new entry in that subtree.
 
-文本必须通过 Termcp 的 vars / args 与 cmd 分开：
+Pass text separately from cmd through Termcp vars / args:
   cmd:  put notes/todo -- $TEXT
-  vars: {"TEXT":"正文，可以含空格、换行和 --"}
+  vars: {"TEXT":"content can include spaces, newlines, and --"}
 
-引用模式不复制正文：
+Reference mode does not copy content:
   cmd: put notes/todo --ref $1
   args: ["memories/2026-08-03/123456-local.md"]
 
-put 返回的地址是稳定文件引用。写入会进入单线程脏层并可立即检索，由策略或 commit 折叠进历史。
+The address returned by put is a stable file reference. Writes enter the single-writer dirty layer and are immediately searchable; policy or commit folds them into history.
 `), true
 
 	case "since":
 		return strings.TrimSpace(`
 since <project>@<branch>[/<tree>] <commit|empty>
 
-列出该树自某个 commit 之后的增量变化。
+List incremental changes in the tree since a commit.
 
-这是断线续传的入口：保存你上次读到的 commit，重连后用它换回差量，
-不必整棵树重读。SHA 相同则返回空——没动过的子树代价是零。
+Use this to resume after disconnecting: save the commit you last read, then use it after reconnecting to retrieve incremental changes,
+without rereading the entire tree. If the SHA is unchanged, the result is empty; unchanged subtrees have zero cost.
 
-例：since proj/memories@main/ctx/team 3f2a1b9
+Example: since proj/memories@main/ctx/team 3f2a1b9
 `), true
 
 	case "remind":
 		return strings.TrimSpace(`
 remind [<project>[@<branch>[/<path>]]]
 
-不带参数列出当前锚定；指定树路径则锚定它。
-该分支对应子树变化时，在线客户端收到 tree 事件；断线后重连应重新锚定，
-并用上次保存的 commit/tree 指针读取差分。
-remind 只登记关注目标，不搬运正文、不分配任务。
+Without arguments, list current watches; specify a tree path to watch it.
+When the subtree on that branch changes, online clients receive a tree event. After reconnecting, watch it again,
+then use the last saved commit/tree pointer to read incremental changes.
+remind only registers a watch; it does not move content or assign tasks.
 
-例：
+Example:
   remind proj/memories@main/ctx/team
   remind
 `), true
@@ -109,41 +109,41 @@ remind 只登记关注目标，不搬运正文、不分配任务。
 		return strings.TrimSpace(`
 trees <project>[@<branch>]
 
-查看当前树目录，用路径选择 put / remind / recall 的范围。
+View the current tree directory and choose paths to scope put / remind / recall.
 `), true
 
 	case "lock", "unlock":
 		return strings.TrimSpace(`lock   <project>@<branch>
 unlock <project>@<branch>
 
-锁住或解锁一条分支：非 root 凭证对它的一切读写都被拒绝，root 不受影响。
+Lock or unlock a branch: all reads and writes by non-root credentials are denied; root is unaffected.
 
-锁的用途是「停下来让 root 处理」——分拣、搬运、归档、重置。
-所以 root 必须仍然能进去：一道连 root 都挡住的闸门等于把分支堵死。
+Locking means "pause for root to handle it": triage, transfer, archive, or reset.
+Root must still be able to access it; a gate that blocks root would make the branch unusable.
 
-锁状态存在仓库内的 zero-memcp/locks/，不进 Git 历史、不会被 clone/push 看到，
-重启后仍然有效。branch 列表里被锁的分支会标 [已锁定]。
+Lock state is stored in zero-memcp/locks/ inside the repository; it is not part of Git history and is not visible to clone/push,
+and persists across restarts. Locked branches are marked [locked] in the branch list.
 
-回收一条分支的典型顺序：
-  lock   proj/notes@work             # 非 root 的下一个请求就 403
-  ls     proj/notes@work             # 分拣：看清楚有什么
+Typical sequence for retiring a branch:
+  lock   proj/notes@work             # the next non-root request gets 403
+  ls     proj/notes@work             # triage: inspect its contents
   cp     proj/notes@work/x.md -> proj/notes@main/lessons/
-  archive proj/notes@work            # 收尾：内容全留，引用移入归档命名空间
-  # 或者决定继续用：unlock proj/notes@work
+  archive proj/notes@work            # finish: preserve content and move the ref to the archive namespace
+  # or keep using it: unlock proj/notes@work
 `), true
 
 	case "chmod":
 		return strings.TrimSpace(`chmod <project>[@<branch>]/<path> rule|content
 
-改动一个块的模式位：
+Change a block's mode:
 
-  rule     100755，每轮注入系统提示（法则、身份、硬约束）
-  content  100644，普通内容，只在被 recall 时出现
+  rule     100755, injected into the system prompt each turn (principles, identity, hard constraints)
+  content  100644, plain content, shown only when recalled
 
-write 与 put 都只能写 content。要把一条已有内容提升为规则，用 chmod；
-它保留正文，只改模式位。改完要 commit 才生效。
+write and put can only write content. To promote existing content to a rule, use chmod;
+it preserves the content and changes only the mode. Commit to apply the change.
 
-例：chmod proj/notes@main/rules/01.md rule
+Example: chmod proj/notes@main/rules/01.md rule
 `), true
 
 	case "remote-secret":
@@ -151,11 +151,11 @@ write 与 put 都只能写 content。要把一条已有内容提升为规则，�
 remote-secret put <name> -- $TOKEN
 remote-secret delete <name>
 
-root 管理 HTTP 推送用的令牌。保存在 system/secrets/<name>（0600），只回显名字，从不回显内容。
-GitHub 用 http_user = "x-access-token"；GitLab 等用你的账号名。
-明文 HTTP 只允许回环地址：token 不能被发到网络上去。
+Root manages tokens for HTTP push. Stored in system/secrets/<name> (0600); only the name is shown, never the contents.
+For GitHub, use http_user = "x-access-token"; for GitLab and others, use your account name.
+Plain HTTP is allowed only on loopback addresses: tokens must not be sent over the network.
 
-例：remote-secret put gh -- $TOKEN
+Example: remote-secret put gh -- $TOKEN
 `), true
 
 	case "remote-key":
@@ -163,55 +163,55 @@ GitHub 用 http_user = "x-access-token"；GitLab 等用你的账号名。
 remote-key put <name> -- $PRIVATE_KEY
 remote-key delete <name>
 
-私钥只能由 root 通过 vars/args 传入，保存到 system/sshkeys/<name>.pem（0600），从不回显。
-只接受未加密 OpenSSH PEM 私钥。远端必须配置 host_key = "SHA256:..." 指纹。
+Only root can pass a private key through vars/args. It is stored in system/sshkeys/<name>.pem (0600) and never echoed.
+Only unencrypted OpenSSH PEM private keys are accepted. Configure the remote host_key = "SHA256:..." fingerprint.
 
-例：remote-key put github-deploy -- $KEY
+Example: remote-key put github-deploy -- $KEY
 `), true
 
 	case "remote", "fetch", "push", "sync":
 		return strings.TrimSpace(`
-remote [<project>]                    列出项目声明的远端
-fetch <project> [<remote>]        取回远端历史到 refs/remotes/<remote>/*
-push <project> [<remote>] <branch>   推送一个分支（SSH 内置实现，不批量）
-sync <project> [<remote>]             报告领先/落后/分叉
-remote-key list | put | delete       root 配置 SSH 私钥
+remote [<project>]                    list remotes declared for a project
+fetch <project> [<remote>]        fetch remote history into refs/remotes/<remote>/*
+push <project> [<remote>] <branch>   push one branch (built-in SSH transport; no batches)
+sync <project> [<remote>]             report ahead/behind/diverged state
+remote-key list | put | delete       root manages SSH private keys
 
-配置在 TOML 里：
+Configure in TOML:
 
   [[remote]]
   project    = "proj/memories"
   name       = "github"
   url        = "git@github.com:org/memories.git"
-  push       = ["main"]             # 空 = 不可推
-  fetch_only = false                # true = 只读远端
-  ssh_key    = "github-deploy"     # SSH push 的 root 私钥名
-  host_key   = "SHA256:..."         # 必须 pin，不信任未知 SSH host key
+  push       = ["main"]             # empty = push disabled
+  fetch_only = false                # true = read-only remote
+  ssh_key    = "github-deploy"     # name of the root SSH key for push
+  host_key   = "SHA256:..."         # must be pinned; unknown SSH host keys are not trusted
 
-HTTP 远端（HTTPS）用 token：
+For HTTP remotes (HTTPS), use a token:
 
   [[remote]]
   project    = "proj/memories"
   name       = "github"
   url        = "https://github.com/org/memories.git"
   push       = ["main"]
-  http_user  = "x-access-token"     # GitHub 的约定
-  http_token = "gh"                 # remote-secret 保存的名字，不是 token 本身
+  http_user  = "x-access-token"     # GitHub convention
+  http_token = "gh"                 # name stored by remote-secret, not the token itself
 
-四条纪律：
-  • 不自动 push：写入只落本地，推送必须显式调用
-  • 不隐式 commit：有未提交内容时 push 直接拒绝并说明条数
-  • 不强推：+refspec 一律拒绝（记忆历史只追加）
-  • 冲突不静默：分叉时保留两边并报错，不自动 merge/rebase
+Four rules:
+  - no automatic push: writes stay local; push must be called explicitly
+  - no implicit commit: push is rejected with a count when there are uncommitted changes
+  - no force push: +refspec is always rejected (memory history is append-only)
+  - conflicts are not silent: preserve both sides and report divergence; do not auto-merge/rebase
 
-fetch / push / sync 全部由内置传输完成，不调用系统 git：
-SSH 走 Go SSH，HTTP(S) 走 smart-HTTP，本地裸仓库路径直接读写对象库。
-三条传输共用同一套协商、pack 生成与快进判定。
-凭证只存在服务端密钥库（remote-key / remote-secret），既不进 TOML，也不转发。
-fetch 优先用协议 v2（ls-refs + fetch），不支持时退回 v0，并且会带上本地分支尖做 have 协商。
-gc 用内置打包器写出 pack + .idx v2，同样不需要系统 git。
+fetch / push / sync use the built-in transports and do not invoke system git:
+SSH uses Go SSH, HTTP(S) uses smart HTTP, and local bare repository paths access the object store directly.
+All three transports share the same negotiation, pack generation, and fast-forward checks.
+Credentials exist only in the server-side key store (remote-key / remote-secret); they are not stored in TOML or forwarded.
+fetch prefers protocol v2 (ls-refs + fetch), falls back to v0 when unsupported, and includes local branch tips in have negotiation.
+gc uses the built-in packer to write pack + .idx v2, also without system git.
 
-例：
+Example:
   sync proj/memories github
   push proj/memories github main
   fetch proj/memories github
@@ -221,43 +221,43 @@ gc 用内置打包器写出 pack + .idx v2，同样不需要系统 git。
 		return strings.TrimSpace(`
 recall <text>
 
-语义搜。返回地址、分数，以及命中行前后约 240 字的摘要。
+Semantic search. Returns addresses, scores, and excerpts of about 240 characters around matching lines.
 
-为什么给摘要而不是光秃秃的地址：只回 "addr (score)" 时看不出这篇讲什么，
-必须逐个 read；读三四篇之后就会换 grep 去翻目录——不是不想用记忆工具，
-是它每回答一个问题都要额外往返好几次。给摘要能把 N 次 read 压成 0 次。
+Why return excerpts instead of bare addresses: "addr (score)" does not show what an entry is about,
+so each entry must be read individually; after reading three or four entries, users switch to grep.
+not because they do not want memory tools, but because each answer requires several extra round trips. Excerpts reduce N reads to zero.
 
-例：recall 端口为什么定1729
+Example: recall why the port is 1729
 `), true
 
 	case "read":
 		return strings.TrimSpace(`
 read <addr> [<addr> ...]
 
-读切片全文。可以一次读多篇，减少往返。
+Read full entries. Multiple entries can be read at once to reduce round trips.
 
-地址就是 recall / log / ls 返回的那个相对路径，例如 2026-10-28/023000-laptop-a1b2c3d4.md。
+An address is the relative path returned by recall / log / ls, e.g. 2026-10-28/023000-laptop-a1b2c3d4.md.
 
-recall: off 的目录读不出来——声明写着"不许被翻到"，read 就不该给全文，
-否则那句声明只是装饰。
+Directories with recall: off cannot be read; if the declaration says "do not surface this," read must not return the full text,
+or the declaration is meaningless.
 
-例：read 2026-10-28/023000-laptop-a1b2c3d4.md
+Example: read 2026-10-28/023000-laptop-a1b2c3d4.md
 `), true
 
 	case "grep":
 		return strings.TrimSpace(`
 grep <pattern> [--scope <tree>]
 
-正则扫全文，带前后行上下文。
+Search full text with a regular expression and surrounding lines.
 
-BM25 不擅长纯符号和专有名词（QQ 号、IP、函数名、变量名），
-这类东西用 grep 比 recall 准得多。这也是模型换 bash 去 rg 的头号原因——
-给它原生的 grep，它就不用换工具了。
+BM25 is not good at pure symbols or proper nouns (QQ numbers, IPs, function names, variable names),
+where grep is much more accurate than recall. This is the main reason models switch to bash and rg:
+provide native grep and there is no need to switch tools.
 
---scope 收窄范围，可写 project、project@branch 或 project@branch/subtree：
-记忆树大了之后，不分范围的全量扫会把命中堆到与本次无关的项目上。
+--scope narrows the search; use project, project@branch, or project@branch/subtree:
+As the memory tree grows, an unscoped search can return matches from projects unrelated to the current task.
 
-例：grep 1729
+Example: grep 1729
     grep 1729 --scope proj/memories
     grep func.*Server --scope proj/notes@main/rules
 `), true
@@ -266,11 +266,11 @@ BM25 不擅长纯符号和专有名词（QQ 号、IP、函数名、变量名）�
 		return strings.TrimSpace(`
 log [N]
 
-按时间倒序看最近 N 篇切片的日期、主题、摘要。缺省 5 篇。
+Show dates, topics, and excerpts for the most recent N entries in reverse chronological order. Defaults to 5.
 
-「最近在干嘛」「上次说到哪了」用这个，不用去 ls 目录。
+Use this for "what have I been doing lately?" or "where did I leave off?" instead of listing directories.
 
-例：log
+Example: log
     log 20
 `), true
 
@@ -278,9 +278,9 @@ log [N]
 		return strings.TrimSpace(`
 ls [date]
 
-列出某一天的全部切片。缺省是今天（没有今天的数据就取最新一天）。
+List all entries for a day. Defaults to today, or the latest day with data if there are no entries for today.
 
-例：ls
+Example: ls
     ls 2026-10-28
 `), true
 
@@ -288,20 +288,20 @@ ls [date]
 		return strings.TrimSpace(`
 status
 
-索引规模：docs（文档数）与 terms（词条数）。
+Index size: docs (document count) and terms (term count).
 
-用来判断索引是不是活着、规模有没有异常。不返回内容。
+Use this to check whether the index is active and its size is reasonable. Returns no content.
 `), true
 
 	case "help":
 		return strings.TrimSpace(`
 help [<verb>] [--all]
 
-不带参数：总览（跟空调用一样）
-带动词：该动词的详细说明
---all：全部细节
+no arguments: overview (same as an empty call)
+with a verb: detailed help for that verb
+--all: all details
 
-例：help
+Example: help
     help put
     help --all
 `), true
@@ -310,16 +310,16 @@ help [<verb>] [--all]
 		return strings.TrimSpace(`
 commit [<project>[@<branch>]] [-m <msg>]
 
-把脏层折叠成 Git 提交，推进分支 ref。
+Fold the dirty layer into a Git commit and advance the branch ref.
 
-put 只负责投递：它把内容写进目录级脏层就返回，不代表历史已经前进。
-折叠要么由显式 commit 触发，要么由后台 [commit] 策略（条数/时间）自动完成。
+put only queues the write: it writes content to the directory-level dirty layer and returns; history has not advanced yet.
+Folding is triggered by an explicit commit or by the background [commit] policy (count/time).
 
-不带参数时提交所有项目；指定项目/分支时只提交那一支。
+With no arguments, commit all projects; with a project/branch, commit only that branch.
 
-例：commit
+Example: commit
     commit proj/memories@main
-    commit proj/memories@main -m "整理端口笔记"
+    commit proj/memories@main -m "organize port notes"
 `), true
 
 	case "diff":
@@ -327,13 +327,13 @@ put 只负责投递：它把内容写进目录级脏层就返回，不代表历�
 diff <project>@<branch>
 diff <project>@<branch> -> <project>@<branch>
 
-分支比对：列出两边路径的差异。
+Branch comparison: list path differences between the two sides.
 
-单分支形式列出该分支相对其父提交的变更；箭头形式对比两条分支。
+The single-branch form lists changes relative to its parent commit; the arrow form compares two branches.
 
-分支比对的入口：diff audited -> raw 提取未审内容。
+Branch comparison entry point: use diff audited -> raw to extract unreviewed content.
 
-例：diff proj/memories@main
+Example: diff proj/memories@main
     diff proj/memories@reviewed -> proj/memories@raw
 `), true
 
@@ -343,13 +343,13 @@ branch
 branch <project>
 branch <project> <new> [from <src>]
 
-不带参数：列出所有项目的分支
-带项目：列出该项目的分支
-带新分支名：从 src（缺省当前分支）分叉出一条新分支
+no arguments: list branches for all projects
+with a project: list its branches
+with a new branch name: fork a branch from src (defaults to the current branch)
 
-分叉是零字节操作：只写一个 ref，不复制任何对象。
+Forking is a zero-byte operation: only a ref is written; no objects are copied.
 
-例：branch
+Example: branch
     branch proj/memories
     branch proj/memories review from main
 `), true
@@ -359,12 +359,12 @@ branch <project> <new> [from <src>]
 tag <project> [<name> [<ref>]]
 tag -d <project> <name>
 
-轻量标签：给某个提交起一个稳定的名字。
+Lightweight tag: assign a stable name to a commit.
 
-不带 name 时列出该项目的全部标签。
--d 删除标签，但不删内容——内容在分支里，标签只是一个指针。
+Without a name, list all tags for the project.
+-d deletes the tag but not its content; content is on the branch, and a tag is only a pointer.
 
-例：tag proj/memories
+Example: tag proj/memories
     tag proj/memories v1 main
     tag -d proj/memories v1
 `), true
@@ -374,14 +374,14 @@ tag -d <project> <name>
 cp <src>@<br>/<path> ... -> <dst>@<br>/[<path>]
 mv <src>@<br>/<path> ... -> <dst>@<br>/[<path>]
 
-跨分支复制（cp）或移动（mv）切片。
+Copy (cp) or move (mv) entries across branches.
 
-这是审计与提纯的搬运工具：把 另一条分支上审过的内容搬进 main，
-不必先把内容读出来再写一遍（那样会丢掉原来的文件时间与模式位）。
+This transfer tool is for auditing and curation: move reviewed content from another branch into main,
+without reading and rewriting it (which would lose the original file timestamp and mode).
 
-mv = cp + delete，两步在同一个提交边界内完成。
+mv = cp + delete; both steps complete within the same commit boundary.
 
-例：cp proj/memories@work/x.md -> proj/memories@main/lessons/
+Example: cp proj/memories@work/x.md -> proj/memories@main/lessons/
     mv proj/notes@work/x.md -> proj/notes@main/lessons/
 `), true
 
@@ -389,25 +389,25 @@ mv = cp + delete，两步在同一个提交边界内完成。
 		return strings.TrimSpace(`
 delete <project>@<branch>/<path> [<path> ...]
 
-从指定分支删除切片。可一次删多个。
+Delete entries from a specified branch. Multiple entries can be deleted at once.
 
-删除同样进脏层，要 commit 才真正从历史里消失（在下一个提交里不再出现）。
+Deletions also enter the dirty layer; commit to remove them from history (they will be absent from the next commit).
 
-例：delete proj/memories@main/2026-10-28/old.md
+Example: delete proj/memories@main/2026-10-28/old.md
 `), true
 
 	case "archive":
 		return strings.TrimSpace(`
 archive <project>@<branch> [-> <project>@<as>]
 
-归档一条分支：把它的 ref 移入 refs/archived/，内容全部保留。
+Archive a branch by moving its ref into refs/archived/; all content is preserved.
 
-归档不是删除：对象还在、历史还在，只是从分支列表里移走，
-不再出现在 clone/push 的默认引用里。
+Archiving is not deletion: objects and history remain; only the branch is removed from the branch list,
+and it no longer appears in the default refs for clone/push.
 
-典型用途：一条任务分支结束了，它的分支不该继续被当作活跃版本线。
+Typical use: when a task branch is complete, it should no longer be treated as an active line of development.
 
-例：archive proj/notes@work
+Example: archive proj/notes@work
     archive proj/notes@work -> proj/notes@work-2026-10
 `), true
 
@@ -415,46 +415,46 @@ archive <project>@<branch> [-> <project>@<as>]
 		return strings.TrimSpace(`
 reset <project>@<branch> from <project>@<src>
 
-把一条分支重置到另一条分支的当前位置。
+Reset a branch to the current position of another branch.
 
-这是覆盖历史，只能由 root 显式执行——push 永远不做这件事。
-重置会清掉目标分支的脏层：重置就是放弃所有未提交状态。
+This overwrites history and can only be done explicitly by root; push never does this.
+Reset clears the dirty layer on the destination branch: resetting discards all uncommitted state.
 
-例：reset proj/memories@main from proj/memories@import
+Example: reset proj/memories@main from proj/memories@import
 `), true
 
 	case "write":
 		return strings.TrimSpace(`
 write <project>[@<branch>]/<path> -- <content>
 
-把内容写到指定路径，文件名与位置完全由你决定。
+Write content to a specified path; you choose the filename and location.
 
-与 put 的区别：put 写的是「切片」（自动时间戳文件名 + frontmatter），
-write 写的是「这个路径上就该是这段内容」。它存在的理由是规则文件：
-SKILL.md 的 frontmatter 决定注入与索引，那不可能靠 put 的自动命名表达。
+Unlike put, which writes an "entry" (automatic timestamp filename + frontmatter),
+write says "this path should contain exactly this content." It exists for rule files:
+SKILL.md frontmatter controls injection and indexing, which cannot be expressed with put's automatic naming.
 
-仅 root：能改 SKILL.md 的人可以改「谁看见什么」，比改内容本身危险。
+Root only: anyone who can edit SKILL.md can change who sees what, which is more dangerous than changing content itself.
 
-正文同样走 vars/args：
+Pass content through vars/args as well:
   cmd:  write proj/notes@main/SKILL.md -- $BODY
   vars: {"BODY": "---\nname: me\n---\n"}
 
-例：write proj/notes@main/rules/01.md -- $TEXT
+Example: write proj/notes@main/rules/01.md -- $TEXT
 `), true
 
 	case "batch":
 		return strings.TrimSpace(`
 batch {"ops":[{...}, ...]}
 
-把多个写操作打包成一次提交。
+Combine multiple write operations into one commit.
 
-为什么需要它：一次要搬运一次性搬运一批切片，
-逐个执行会产生几十个中间提交，历史被切碎，而且中途失败会留下半吊子状态。
-batch 要么全部成功，要么一个都不落。
+Why: when transferring a batch of entries,
+executing them individually creates many intermediate commits, fragments history, and may leave partial state if an operation fails.
+batch either succeeds completely or makes no changes.
 
-支持的操作：put / cp / mv / delete / tag / commit。
+Supported operations: put / cp / mv / delete / tag / commit.
 
-字段名是 action / target，不是 op / addr：
+Field names are action / target, not op / addr:
   {"action":"put","target":"proj@main","text":"..."}
   {"action":"delete","target":"proj@main/x.md"}
   {"action":"cp","from":"proj@main/a.md","to":"proj@main/b.md"}
@@ -462,7 +462,7 @@ batch 要么全部成功，要么一个都不落。
   {"action":"tag","project":"proj","name":"v1","ref":"main"}
   {"action":"commit","target":"proj@main","message":"..."}
 
-例：batch {"ops":[{"action":"delete","target":"proj@main/x.md"},{"action":"commit","target":"proj@main"}]}
+Example: batch {"ops":[{"action":"delete","target":"proj@main/x.md"},{"action":"commit","target":"proj@main"}]}
 `), true
 
 	case "config":
@@ -471,47 +471,47 @@ config show
 config path
 config put <TOML>
 
-查看或更新服务配置文件（仅 root）。
+View or update the service config file (root only).
 
-config show 显示当前加载的有效配置。
-config put 原子覆写配置文件并触发重载（支持通过 vars 传大段 TOML）。
+config show displays the currently loaded effective config.
+config put atomically overwrites the config file and triggers a reload (large TOML values can be passed through vars).
 
-例：config show
+Example: config show
 `), true
 
 	case "reload":
 		return strings.TrimSpace(`
 reload
 
-重新扫描所有项目并重建倒排索引（仅 root）。
+Rescan all projects and rebuild the inverted index (root only).
 
-外部直接改动裸仓库（如人手敲 git commit、或外部工具推送进来）后，
-可以用此动词强制刷新内存状态，无需重启进程。
+After directly modifying a bare repository (for example, running git commit manually or pushing with an external tool),
+use this verb to force a refresh of in-memory state without restarting the process.
 `), true
 
 	case "whoami":
 		return strings.TrimSpace(`
 whoami
 
-回显当前调用方的身份、能力位与挂载范围。
+Show the caller's identity, capabilities, and mount scope.
 
-用于自省与调试：排查「为什么我写不进去」时先看这张卡片。
+For introspection and debugging: check this when investigating "why can't I write?"
 
-输出三行：
-  User       凭证主体（签 token 时的 sub）
-  Privilege  root 或普通用户
-  Groups     所属组（非 root 时才列）
+Output has three lines:
+  User       credential subject (the sub when the token was signed)
+  Privilege  root or regular user
+  Groups     groups (shown only for non-root)
 
-注意它只描述「我是谁」，不描述「我能做什么」——
-具体某个项目某个分支能不能读写，取决于挂载表与 TOML 两层取交集，
-那件事用 status / projects 看，不是 whoami。
+This describes "who I am," not "what I can do":
+read/write access to a specific project and branch depends on the intersection of the mount table and TOML config,
+check status / projects for that, not whoami.
 `), true
 
 	case "users":
 		return strings.TrimSpace(`
 users
 
-列出配置中声明的用户与访问控制摘要（仅 root）。
+List users declared in the config and an access-control summary (root only).
 `), true
 
 	}
@@ -525,8 +525,8 @@ func helpAll() string {
 	b.WriteString("\n\n")
 	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "batch", "config", "reload", "whoami", "users", "help"} {
 		if d, ok := helpVerb(v); ok {
-			b.WriteString("\n── " + v + " ")
-			b.WriteString(strings.Repeat("─", max(0, 60-len(v))))
+			b.WriteString("\n-- " + v + " ")
+			b.WriteString(strings.Repeat("-", max(0, 60-len(v))))
 			b.WriteString("\n\n")
 			b.WriteString(d)
 			b.WriteString("\n")

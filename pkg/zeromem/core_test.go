@@ -112,7 +112,7 @@ func TestPutThenRecall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if strings.Contains(out, "语法") {
+	if strings.Contains(out, "syntax") {
 		t.Fatalf("put 被当成语法错误: %s", out)
 	}
 
@@ -120,7 +120,7 @@ func TestPutThenRecall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recall: %v", err)
 	}
-	if strings.Contains(hits, "无命中") {
+	if strings.Contains(hits, "no matches") {
 		t.Fatalf("刚写入的内容 recall 不到：%s", hits)
 	}
 }
@@ -139,7 +139,7 @@ func TestUnknownVerbSuggests(t *testing.T) {
 	c := newCore(t, nil)
 	_, call := c.Tool()
 	out, err := call(context.Background(), json.RawMessage(`{"cmd":"putt -- x"}`))
-	if err == nil && !strings.Contains(out, "没有") {
+	if err == nil && !strings.Contains(out, "unknown verb") {
 		t.Fatalf("未知动词应报错，得到 %q", out)
 	}
 	if err != nil && !strings.Contains(err.Error(), "put") {

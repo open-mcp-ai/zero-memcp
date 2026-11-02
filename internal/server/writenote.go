@@ -31,11 +31,11 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// 而记忆库的写入方是模型自己。声明能改的东西里不能包含这条。
 	switch kind {
 	case "instruction", "rule":
-		return "", "", "", errors.New("安全拒绝：严禁写入 instruction 或 rule（推断出的指令不进记忆库）")
+		return "", "", "", errors.New("refusing to write instruction or rule (inferred instructions must not enter the memory store)")
 	}
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return "", "", "", errors.New("文本不能为空")
+		return "", "", "", errors.New("text cannot be empty")
 	}
 
 	defaultBranch := s.defaultBranch
@@ -70,7 +70,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 			if br != "" {
 				explicitBranch = br
 				if !c.Mount.Visible(proj, br) {
-					return "", "", "", fmt.Errorf("项目 %s@%s 不在这张凭证的可见范围内", proj, br)
+					return "", "", "", fmt.Errorf("project %s@%s is outside this credential's visible scope", proj, br)
 				}
 				if !s.allowed(c, proj, br, configBitWrite) {
 					return "", "", "", errors.New(s.denyReason(c, proj, br, configBitWrite))
@@ -105,13 +105,13 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 			kind = "fact"
 		}
 	} else if !pol.AllowsKind(kind) {
-		return "", "", "", fmt.Errorf("kind %q 不在本项目的写入策略里（允许 %s）",
+		return "", "", "", fmt.Errorf("kind %q is not allowed by this project's write policy (allowed: %s)",
 			kind, strings.Join(pol.Kinds, " / "))
 	}
 
 	repo, err := s.projects.Ensure(targetProject)
 	if err != nil {
-		return "", "", "", fmt.Errorf("打开写入目标 %s: %w", targetProject, err)
+		return "", "", "", fmt.Errorf("open write target %s: %w", targetProject, err)
 	}
 
 	now := time.Now()
@@ -260,10 +260,10 @@ func (s *Server) writeTarget(c Caller, defaultBranch string) (project, branch st
 		// 说清楚是「看不见」还是「看得见但没 w」，否则排查时只能靠猜。
 		visible := c.Mount.Projects()
 		if len(visible) == 0 {
-			return "", "", manifest.Policy{}, errors.New("这张凭证没有任何可写的仓库（挂载表为空，即全命名空间；请检查 [[project]] 与 mode）")
+			return "", "", manifest.Policy{}, errors.New("this credential has no writable repositories (an empty mount table means the entire namespace; check [[project]] and mode)")
 		}
 		return "", "", manifest.Policy{}, fmt.Errorf(
-			"这张凭证没有任何可写的仓库（可见 %s，能力 %s）",
+			"this credential has no writable repositories (visible: %s, capabilities: %s)",
 			strings.Join(visible, " "), capOf(c))
 	}
 
@@ -287,7 +287,7 @@ func (s *Server) writeTarget(c Caller, defaultBranch string) (project, branch st
 		// 多个流水项目 = 意图不明。此时沉默地选一个，等于让
 		// 「今天的记录写进哪个仓库」变成一次掷骰子。
 		return "", "", manifest.Policy{}, fmt.Errorf(
-			"有 %d 个可写项目声明了 stream: true（%s），无法判断流水该落哪里；请在 put 里显式指定目标",
+			"%d writable projects declare stream: true (%s); the stream destination is ambiguous. Specify a target in put",
 			len(streams), strings.Join(streams, " "))
 	}
 
@@ -376,7 +376,7 @@ func (s *Server) resolveWriteTarget(c Caller, defaultBranch, explicit string) (s
 		}
 	}
 	if !ok || project == "" {
-		return "", "", manifest.Policy{}, fmt.Errorf("目标 %q 不是已声明的项目", explicit)
+		return "", "", manifest.Policy{}, fmt.Errorf("target %q is not a declared project", explicit)
 	}
 	branch := defaultBranch
 	if mountBranch != "" {
@@ -385,7 +385,7 @@ func (s *Server) resolveWriteTarget(c Caller, defaultBranch, explicit string) (s
 		branch = c.Mount.DefaultBranch()
 	}
 	if !c.Mount.Visible(project, branch) {
-		return "", "", manifest.Policy{}, fmt.Errorf("项目 %q 不在这张凭证的可见范围内", project)
+		return "", "", manifest.Policy{}, fmt.Errorf("project %q is outside this credential's visible scope", project)
 	}
 	if !s.allowed(c, project, branch, configBitWrite) {
 		return "", "", manifest.Policy{}, errors.New(s.denyReason(c, project, branch, configBitWrite))
@@ -410,7 +410,7 @@ func capOf(c Caller) string {
 		}
 	}
 	if len(out) == 0 {
-		return "（空）"
+		return "(empty)"
 	}
 	return string(out)
 }

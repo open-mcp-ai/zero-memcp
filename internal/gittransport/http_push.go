@@ -46,7 +46,7 @@ func PushHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, user,
 	}
 	refs := adv.Refs
 	if !adv.Caps["report-status"] {
-		return PushResult{}, errors.New("远端 receive-pack 不支持 report-status；拒绝在无法核实结果时上传")
+		return PushResult{}, errors.New("remote receive-pack does not support report-status; refusing to push without verifying the result")
 	}
 
 	plan, err := planPush(repo, branch, refs)
@@ -79,17 +79,17 @@ func PushHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, user,
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return PushResult{}, fmt.Errorf("连接 %s 失败: %w", redactURL(base), err)
+		return PushResult{}, fmt.Errorf("connect to %s: %w", redactURL(base), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return PushResult{}, fmt.Errorf("远端返回 %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+		return PushResult{}, fmt.Errorf("remote returned %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
 	}
 
 	status, err := readReportStatus(bufio.NewReader(io.LimitReader(resp.Body, maxAdvertisement)))
 	if err != nil {
-		return PushResult{}, fmt.Errorf("远端未确认 push: %w", err)
+		return PushResult{}, fmt.Errorf("remote did not confirm push: %w", err)
 	}
 	if err := checkReportStatus(status, branch); err != nil {
 		return PushResult{}, err
@@ -138,20 +138,20 @@ func discoverHTTPFor(ctx context.Context, client *http.Client, base, service, us
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return advertisement{}, fmt.Errorf("连接 %s 失败: %w", redactURL(base), err)
+		return advertisement{}, fmt.Errorf("connect to %s: %w", redactURL(base), err)
 	}
 	defer resp.Body.Close()
 	switch resp.StatusCode {
 	case http.StatusOK:
 	case http.StatusUnauthorized:
-		return advertisement{}, errors.New("远端拒绝了凭证（401）：检查 http_user / http_token")
+		return advertisement{}, errors.New("remote rejected credentials (401): check http_user / http_token")
 	case http.StatusForbidden:
-		return advertisement{}, fmt.Errorf("远端拒绝 %s（403）：凭证有效但缺权限", service)
+		return advertisement{}, fmt.Errorf("remote rejected %s (403): credentials are valid but lack permission", service)
 	case http.StatusNotFound:
-		return advertisement{}, fmt.Errorf("远端没有这个仓库：%s", redactURL(base))
+		return advertisement{}, fmt.Errorf("remote repository does not exist: %s", redactURL(base))
 	default:
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return advertisement{}, fmt.Errorf("远端返回 %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+		return advertisement{}, fmt.Errorf("remote returned %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
 	}
 	return readAdvertisement(bufio.NewReader(io.LimitReader(resp.Body, maxAdvertisement)))
 }
@@ -160,20 +160,20 @@ func discoverHTTPFor(ctx context.Context, client *http.Client, base, service, us
 func parseHTTPRemote(raw string) (string, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
 	if err != nil {
-		return "", fmt.Errorf("解析 HTTP 远端失败: %w", err)
+		return "", fmt.Errorf("parse HTTP remote: %w", err)
 	}
 	if u.Scheme != "http" && u.Scheme != "https" {
-		return "", fmt.Errorf("不是 HTTP(S) 远端：%s", redactURL(raw))
+		return "", fmt.Errorf("not an HTTP(S) remote: %s", redactURL(raw))
 	}
 	if u.User != nil {
-		return "", errors.New("远端地址不能内嵌凭证：用 remote-secret 保存 token")
+		return "", errors.New("remote URL must not embed credentials; store the token with remote-secret")
 	}
 	if u.Host == "" || strings.Trim(u.Path, "/") == "" {
-		return "", fmt.Errorf("HTTP 远端缺少主机或仓库路径：%s", redactURL(raw))
+		return "", fmt.Errorf("HTTP remote is missing a host or repository path: %s", redactURL(raw))
 	}
 	// token 只能走 TLS。明文 HTTP 只允许回环地址（本机测试/自托管代理）。
 	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
-		return "", fmt.Errorf("拒绝用明文 HTTP 发送凭证（%s）：改用 https:// 或 SSH", u.Hostname())
+		return "", fmt.Errorf("refusing to send credentials over plain HTTP (%s); use https:// or SSH", u.Hostname())
 	}
 	return strings.TrimSuffix(u.String(), "/"), nil
 }
@@ -189,7 +189,7 @@ func isLoopbackHost(host string) bool {
 func redactURL(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return "<无法解析的远端>"
+		return "<unparseable remote>"
 	}
 	u.User = nil
 	return u.String()
@@ -198,10 +198,10 @@ func redactURL(raw string) string {
 // checkReportStatus 把 report-status 翻成错误或成功。
 func checkReportStatus(status map[string]string, branch string) error {
 	if status["unpack"] != "ok" {
-		return fmt.Errorf("远端解包失败: %s", status["unpack"])
+		return fmt.Errorf("remote unpack failed: %s", status["unpack"])
 	}
 	if got := status["refs/heads/"+branch]; got != "ok" {
-		return fmt.Errorf("远端拒绝更新 refs/heads/%s: %s", branch, got)
+		return fmt.Errorf("remote rejected update to refs/heads/%s: %s", branch, got)
 	}
 	return nil
 }

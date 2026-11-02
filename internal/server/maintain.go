@@ -107,7 +107,7 @@ func (s *Server) maintain(done chan struct{}) {
 					pending := repo.Pending()
 					if pending > 0 && (pending >= count || time.Since(st.lastCommit) >= interval) {
 						if n, cerr := s.commitRepo(repo, proj, pending); cerr != nil {
-							s.logf("%s 自动提交失败: %v", proj, cerr)
+							s.logf("%s automatic commit failed: %v", proj, cerr)
 						} else if n > 0 {
 							st.lastCommit = time.Now()
 						}
@@ -117,7 +117,7 @@ func (s *Server) maintain(done chan struct{}) {
 				// gc
 				if gcEvery > 0 && time.Since(st.lastGC) >= gcEvery {
 					if _, err := repo.Repack(); err != nil {
-						s.logf("%s gc 失败: %v", proj, err)
+						s.logf("%s gc failed: %v", proj, err)
 					}
 					st.lastGC = time.Now()
 				}
@@ -201,7 +201,7 @@ func (s *Server) checkExternalUpdates() {
 		})
 	}
 	if changed {
-		s.logf("检测到分支头演进，自动重建索引并广播树差分")
+		s.logf("branch head movement detected; rebuilding the index and broadcasting tree changes")
 		_ = s.Reload()
 	}
 }

@@ -221,7 +221,7 @@ func (m *Mount) ToVirtualAddr(project, branch, addr string) string {
 func (m *Mount) ToReal(virtAddr string) (project, branch, path string, err error) {
 	virtAddr = strings.TrimPrefix(strings.TrimSpace(virtAddr), "/")
 	if m.Empty() {
-		return "", "", "", fmt.Errorf("空挂载表不该走这条路径")
+		return "", "", "", fmt.Errorf("empty mount table should not reach this path")
 	}
 
 	for _, e := range m.entries {
@@ -253,7 +253,7 @@ func (m *Mount) ToReal(virtAddr string) (project, branch, path string, err error
 		}
 	}
 
-	return "", "", "", fmt.Errorf("路径 %q 不在这张凭证的挂载表里", virtAddr)
+	return "", "", "", fmt.Errorf("path %q is not in this credential's mount table", virtAddr)
 }
 
 // isUnderOtherMount 判断路径是否属于某个更具体的挂载点。

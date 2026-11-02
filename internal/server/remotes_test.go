@@ -109,7 +109,7 @@ func TestRemoteVerbListsDeclaredRemotes(t *testing.T) {
 		t.Fatalf("应列出两个远端，实际: %s", out)
 	}
 	// 只读远端必须标出来
-	if !strings.Contains(out, "只读") {
+	if !strings.Contains(out, "read-only") {
 		t.Fatalf("mirror 应标记为只读: %s", out)
 	}
 	// 脱敏后的 URL 里不应出现凭证（本测试 URL 本就没有）
@@ -146,7 +146,7 @@ func TestPushRefusesWhenPendingCommits(t *testing.T) {
 	if err == nil {
 		t.Fatalf("有未提交内容时 push 应被拒绝，实际: %s", out)
 	}
-	if !strings.Contains(err.Error(), "未提交") {
+	if !strings.Contains(err.Error(), "uncommitted") {
 		t.Fatalf("拒绝理由应说明有未提交内容: %v", err)
 	}
 }

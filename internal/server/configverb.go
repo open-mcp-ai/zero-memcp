@@ -29,7 +29,7 @@ func (s *Server) execConfig(rest string, c Caller) (string, error) {
 	}
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
-		return "", fmt.Errorf("用法：config show | config path | config put <TOML 全文>")
+		return "", fmt.Errorf("usage: config show | config path | config put <full TOML>")
 	}
 
 	sub, body, _ := strings.Cut(rest, " ")
@@ -42,7 +42,7 @@ func (s *Server) execConfig(rest string, c Caller) (string, error) {
 			return "", err
 		}
 		if s.cfg.ConfigFile == "" {
-			return "（没有配置文件：本实例用命令行参数启动）", nil
+			return "(no config file; this instance was started with command-line arguments)", nil
 		}
 		abs, _ := filepath.Abs(s.cfg.ConfigFile)
 		return abs, nil
@@ -52,7 +52,7 @@ func (s *Server) execConfig(rest string, c Caller) (string, error) {
 			return "", err
 		}
 		if s.cfg.ConfigFile == "" {
-			return "（没有配置文件：本实例用命令行参数启动）", nil
+			return "(no config file; this instance was started with command-line arguments)", nil
 		}
 		data, err := os.ReadFile(s.cfg.ConfigFile)
 		if err != nil {
@@ -67,22 +67,22 @@ func (s *Server) execConfig(rest string, c Caller) (string, error) {
 		return s.putConfig(body)
 
 	default:
-		return "", fmt.Errorf("未知子命令 %q（可用：show / path / put）", sub)
+		return "", fmt.Errorf("unknown subcommand %q (available: show / path / put)", sub)
 	}
 }
 
 // putConfig 校验、写盘、生效。三步全成功才返回成功。
 func (s *Server) putConfig(body string) (string, error) {
 	if s.cfg.ConfigFile == "" {
-		return "", errors.New("本实例没有配置文件路径，无法写入（请用 -config 启动）")
+		return "", errors.New("this instance has no config file path to write to (start with -config)")
 	}
 	if strings.TrimSpace(body) == "" {
-		return "", errors.New("配置内容为空；要清空请显式写一份最小配置")
+		return "", errors.New("config content is empty; to clear it, explicitly provide a minimal config")
 	}
 
 	// ① 先解析。这一步只碰内存，坏配置在这里被挡住，磁盘还是旧的。
 	if _, err := config.ParseFile([]byte(body)); err != nil {
-		return "", fmt.Errorf("配置有误，未写入（原配置保持不变）：%s: %w", s.cfg.ConfigFile, err)
+		return "", fmt.Errorf("invalid config; not written (existing config unchanged): %s: %w", s.cfg.ConfigFile, err)
 	}
 
 	// ② 写临时文件 + fsync + rename。
@@ -119,7 +119,7 @@ func (s *Server) putConfig(body string) (string, error) {
 	// 重载失败说明新配置在当前环境下不适用（比如端口被占），
 	// 这时 J 报告错误，但文件已经落盘——调用方可以用 config put 写回去。
 	if err := s.Reload(); err != nil {
-		return "", fmt.Errorf("配置已写入，但重载失败：%w", err)
+		return "", fmt.Errorf("config was written, but reload failed: %w", err)
 	}
-	return fmt.Sprintf("配置已写入 %s 并生效", s.cfg.ConfigFile), nil
+	return fmt.Sprintf("config written to %s and applied", s.cfg.ConfigFile), nil
 }

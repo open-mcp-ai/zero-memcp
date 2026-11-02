@@ -43,7 +43,7 @@ func (r *Repo) ReceivePack(body io.Reader, allowRef func(ref string) bool) ([]by
 		return nil, err
 	}
 	if len(cmds) == 0 {
-		return nil, errors.New("客户端没有提交任何 ref 更新")
+		return nil, errors.New("client sent no ref updates")
 	}
 
 	// 剩下的字节就是 pack。
@@ -51,10 +51,10 @@ func (r *Repo) ReceivePack(body io.Reader, allowRef func(ref string) bool) ([]by
 	if body != nil {
 		pack, err = io.ReadAll(io.LimitReader(body, maxIngestBytes+1))
 		if err != nil {
-			return nil, fmt.Errorf("读取 pack 失败: %w", err)
+			return nil, fmt.Errorf("read pack: %w", err)
 		}
 		if len(pack) > maxIngestBytes {
-			return nil, fmt.Errorf("pack 超过 %d 字节上限", maxIngestBytes)
+			return nil, fmt.Errorf("pack exceeds the %d byte limit", maxIngestBytes)
 		}
 	}
 
@@ -86,7 +86,7 @@ func (r *Repo) ReceivePack(body io.Reader, allowRef func(ref string) bool) ([]by
 		results = append(results, fmt.Sprintf("ng %s %s", cmd.Ref, sanitizeReason(reason)))
 	}
 	if applied == 0 {
-		return report("aborted 没有 ref 被更新", results), nil
+		return report("aborted: no ref was updated", results), nil
 	}
 	return report("ok", results), nil
 }
@@ -94,34 +94,34 @@ func (r *Repo) ReceivePack(body io.Reader, allowRef func(ref string) bool) ([]by
 // applyCommand 落一条 ref 更新，返回拒绝理由（空串表示成功）。
 func (r *Repo) applyCommand(cmd receiveCommand, allowRef func(ref string) bool) string {
 	if !strings.HasPrefix(cmd.Ref, "refs/heads/") {
-		return "只接受 refs/heads/* 的推送"
+		return "only pushes to refs/heads/* are accepted"
 	}
 	if cmd.New == zeroOID {
-		return "不允许通过 push 删除分支"
+		return "deleting a branch via push is not allowed"
 	}
 	if validSHA(cmd.New) != nil {
-		return "新的提交号不合法"
+		return "new commit id is invalid"
 	}
 	if allowRef != nil && !allowRef(cmd.Ref) {
-		return "这张凭证没有该分支的写权限"
+		return "this credential has no write access to that branch"
 	}
 	if !r.HasObject(cmd.New) {
-		return "pack 里没有这个提交对象"
+		return "the pack does not contain that commit object"
 	}
 	if cmd.Old != zeroOID {
 		if !r.HasObject(cmd.Old) {
-			return "本仓库缺少远端记录的旧提交，无法判断快进"
+			return "this repository lacks the old commit the remote reported; cannot determine fast-forward"
 		}
 		ok, err := r.IsAncestor(cmd.Old, cmd.New)
 		if err != nil {
-			return "无法判断快进关系：" + err.Error()
+			return "cannot determine fast-forward relationship: " + err.Error()
 		}
 		if !ok {
-			return "非快进：这会改写已有历史（要覆盖请用 reset）"
+			return "not a fast-forward: this would rewrite existing history (use reset to overwrite)"
 		}
 	}
 	if err := r.SetRef(cmd.Ref, cmd.New); err != nil {
-		return "写入 ref 失败：" + err.Error()
+		return "failed to write ref: " + err.Error()
 	}
 	return ""
 }

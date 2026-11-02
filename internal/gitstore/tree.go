@@ -20,7 +20,7 @@ func (r *Repo) commitForTreeRef(ref string) (commitObj, error) {
 		return commitObj{}, err
 	}
 	if typ != "commit" {
-		return commitObj{}, fmt.Errorf("对象 %s 不是 commit", ref)
+		return commitObj{}, fmt.Errorf("object %s is not a commit", ref)
 	}
 	return parseCommit(body), nil
 }
@@ -51,7 +51,7 @@ func (r *Repo) TreeAt(ref, path string) (string, error) {
 		for _, it := range items {
 			if it.name == seg {
 				if it.mode != "40000" {
-					return "", fmt.Errorf("%s 不是目录", seg)
+					return "", fmt.Errorf("%s is not a directory", seg)
 				}
 				found = it.sha
 				break
@@ -75,7 +75,7 @@ func (r *Repo) treeItems(sha string) ([]treeItem, error) {
 		return nil, err
 	}
 	if typ != "tree" {
-		return nil, fmt.Errorf("对象 %s 不是 tree", sha)
+		return nil, fmt.Errorf("object %s is not a tree", sha)
 	}
 	return parseTree(body)
 }
@@ -223,7 +223,7 @@ func (r *Repo) TouchedUnder(commitSHA string, paths []string) ([]string, error) 
 		return nil, err
 	}
 	if typ != "commit" {
-		return nil, fmt.Errorf("对象 %s 不是 commit", commitSHA)
+		return nil, fmt.Errorf("object %s is not a commit", commitSHA)
 	}
 	c := parseCommit(body)
 	newTree := c.Tree
@@ -296,7 +296,7 @@ func (r *Repo) CommitInfoAt(sha string) (tree string, parents []string, err erro
 		return "", nil, err
 	}
 	if typ != "commit" {
-		return "", nil, fmt.Errorf("对象 %s 不是 commit，而是 %s", sha, typ)
+		return "", nil, fmt.Errorf("object %s is not a commit but %s", sha, typ)
 	}
 	c := parseCommit(body)
 	return c.Tree, c.Parents, nil

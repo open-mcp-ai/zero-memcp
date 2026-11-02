@@ -73,7 +73,7 @@ func readFetchPack(r *bufio.Reader) ([]byte, error) {
 	for {
 		line, kind, err := readPkt(r)
 		if err != nil {
-			return nil, fmt.Errorf("读取协商响应失败: %w", err)
+			return nil, fmt.Errorf("read negotiation response: %w", err)
 		}
 		if kind == pktFlush || kind == pktDelim || kind == pktResponseEnd {
 			continue
@@ -83,7 +83,7 @@ func readFetchPack(r *bufio.Reader) ([]byte, error) {
 			continue
 		}
 		if strings.HasPrefix(trimmed, "ERR ") {
-			return nil, fmt.Errorf("远端拒绝取回: %s", strings.TrimPrefix(trimmed, "ERR "))
+			return nil, fmt.Errorf("remote rejected fetch: %s", strings.TrimPrefix(trimmed, "ERR "))
 		}
 		fields := strings.Fields(trimmed)
 		if fields[0] == "NAK" {
@@ -105,12 +105,12 @@ func readFetchPack(r *bufio.Reader) ([]byte, error) {
 func readPackPayload(r *bufio.Reader) ([]byte, error) {
 	var head [4]byte
 	if _, err := io.ReadFull(r, head[:]); err != nil {
-		return nil, fmt.Errorf("读取 pack 失败: %w", err)
+		return nil, fmt.Errorf("read pack: %w", err)
 	}
 	if string(head[:]) == "PACK" {
 		rest, err := io.ReadAll(io.LimitReader(r, maxAdvertisement))
 		if err != nil {
-			return nil, fmt.Errorf("读取 pack 失败: %w", err)
+			return nil, fmt.Errorf("read pack: %w", err)
 		}
 		return append(head[:], rest...), nil
 	}
@@ -128,7 +128,7 @@ func readFramedPack(r io.Reader) ([]byte, error) {
 			if err == io.EOF {
 				break
 			}
-			return nil, fmt.Errorf("读取 pack 分片失败: %w", err)
+			return nil, fmt.Errorf("read pack chunk: %w", err)
 		}
 		if kind != pktData {
 			if kind == pktFlush || kind == pktResponseEnd {
@@ -145,16 +145,16 @@ func readFramedPack(r io.Reader) ([]byte, error) {
 		case 2:
 			continue
 		case 3:
-			return nil, fmt.Errorf("远端在传输中报错: %s", strings.TrimSpace(line[1:]))
+			return nil, fmt.Errorf("remote reported an error during transfer: %s", strings.TrimSpace(line[1:]))
 		default:
 			pack = append(pack, line...)
 		}
 		if len(pack) > maxAdvertisement {
-			return nil, fmt.Errorf("pack 超过 %d 字节上限", maxAdvertisement)
+			return nil, fmt.Errorf("pack exceeds the %d byte limit", maxAdvertisement)
 		}
 	}
 	if len(pack) == 0 {
-		return nil, errors.New("远端没有返回 pack 数据")
+		return nil, errors.New("remote returned no pack data")
 	}
 	return pack, nil
 }
@@ -188,7 +188,7 @@ func applyFetch(repo *gitstore.Repo, remote string, refs map[string]string, pack
 	res := FetchResult{Branches: map[string]string{}}
 	ingested, err := repo.IngestPack(pack)
 	if err != nil {
-		return res, fmt.Errorf("接收远端对象失败: %w", err)
+		return res, fmt.Errorf("receive remote objects: %w", err)
 	}
 	res.Objects = ingested.Objects
 	res.Written = ingested.Written
@@ -209,7 +209,7 @@ func applyFetch(repo *gitstore.Repo, remote string, refs map[string]string, pack
 		res.Branches[branch] = sha
 	}
 	if len(res.Branches) == 0 && len(refs) > 0 {
-		return res, errors.New("远端广告了分支，但取回后没有任何可落地的引用")
+		return res, errors.New("remote advertised branches, but fetch produced no usable refs")
 	}
 	return res, nil
 }
@@ -231,7 +231,7 @@ func FetchSSH(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, priva
 	reader := bufio.NewReader(sess.stdout)
 	adv, err := readAdvertisement(reader)
 	if err != nil {
-		return FetchResult{}, fmt.Errorf("读取 upload-pack 广告失败: %w", err)
+		return FetchResult{}, fmt.Errorf("read upload-pack advertisement: %w", err)
 	}
 	if adv.Version == 2 {
 		return fetchV2SSH(repo, remote, sess, reader, adv)
@@ -242,7 +242,7 @@ func FetchSSH(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, priva
 		return FetchResult{Branches: map[string]string{}}, nil
 	}
 	if _, err := sess.stdin.Write(fetchBody(tips, localHaves(repo))); err != nil {
-		return FetchResult{}, fmt.Errorf("发送 want 失败: %w", err)
+		return FetchResult{}, fmt.Errorf("send want: %w", err)
 	}
 	if err := sess.stdin.Close(); err != nil {
 		return FetchResult{}, err
@@ -269,7 +269,7 @@ func ListSSH(ctx context.Context, remoteURL, privateKeyPEM, hostKey string, time
 	}
 	adv, err := readAdvertisement(bufio.NewReader(sess.stdout))
 	if err != nil {
-		return nil, fmt.Errorf("读取 upload-pack 广告失败: %w", err)
+		return nil, fmt.Errorf("read upload-pack advertisement: %w", err)
 	}
 	return adv.Refs, nil
 }
@@ -332,12 +332,12 @@ func postService(ctx context.Context, client *http.Client, base, user, token, se
 	req.Header.Set("User-Agent", "zero-memcp")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("连接 %s 失败: %w", redactURL(base), err)
+		return nil, fmt.Errorf("connect to %s: %w", redactURL(base), err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		return nil, fmt.Errorf("远端返回 %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
+		return nil, fmt.Errorf("remote returned %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
 	}
 	return io.ReadAll(io.LimitReader(resp.Body, maxAdvertisement))
 }
@@ -357,10 +357,10 @@ func v0PackHTTP(ctx context.Context, client *http.Client, base, user, token stri
 // 好处是两次之间可以只针对需要的分支发 want，不必被整份广告牵着走。
 func fetchV2SSH(repo *gitstore.Repo, remote string, sess *sshSession, reader *bufio.Reader, adv advertisement) (FetchResult, error) {
 	if _, ok := adv.Caps["fetch"]; !ok {
-		return FetchResult{}, errors.New("服务端声称 v2 但没有 fetch 能力")
+		return FetchResult{}, errors.New("server claims protocol v2 but does not support fetch")
 	}
 	if _, err := sess.stdin.Write(v2LsRefsRequest()); err != nil {
-		return FetchResult{}, fmt.Errorf("发送 ls-refs 失败: %w", err)
+		return FetchResult{}, fmt.Errorf("send ls-refs: %w", err)
 	}
 	refs, err := parseV2LsRefs(reader)
 	if err != nil {
@@ -373,7 +373,7 @@ func fetchV2SSH(repo *gitstore.Repo, remote string, sess *sshSession, reader *bu
 		return FetchResult{Branches: map[string]string{}}, nil
 	}
 	if _, err := sess.stdin.Write(v2FetchRequest(tips, localHaves(repo))); err != nil {
-		return FetchResult{}, fmt.Errorf("发送 fetch 失败: %w", err)
+		return FetchResult{}, fmt.Errorf("send fetch: %w", err)
 	}
 	if err := sess.stdin.Close(); err != nil {
 		return FetchResult{}, err

@@ -129,7 +129,7 @@ mode  = "rwx------"
 	if err != nil {
 		t.Fatalf("since 失败: %v", err)
 	}
-	if !strings.Contains(out1, "没有变化") {
+	if !strings.Contains(out1, "has not changed") {
 		t.Fatalf("没有变化时应提示无变化，实际: %s", out1)
 	}
 

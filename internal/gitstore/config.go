@@ -65,7 +65,7 @@ func (r *Repo) Config(key string) string {
 func (r *Repo) SetConfig(key, value string) error {
 	sec, prop, ok := strings.Cut(key, ".")
 	if !ok {
-		return fmt.Errorf("键应为 section.key，得到 %q", key)
+		return fmt.Errorf("key must be section.key, got %q", key)
 	}
 	p := r.configPath()
 	raw, _ := r.FS().ReadFile(p)

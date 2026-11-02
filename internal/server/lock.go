@@ -35,13 +35,13 @@ func (s *Server) execLock(rest string, c Caller) (string, error) {
 		return "", err
 	}
 	if locked, at := repo.BranchLocked(branch); locked {
-		return fmt.Sprintf("%s@%s 已经处于锁定状态（锁在 %s）", proj, branch, shortSHA(at)), nil
+		return fmt.Sprintf("%s@%s is already locked (lock recorded at %s)", proj, branch, shortSHA(at)), nil
 	}
 	sha, err := repo.LockBranch(branch)
 	if err != nil {
 		return "", err
 	}
-	return fmt.Sprintf("已锁定 %s@%s（锁在 %s）：非 root 凭证对该分支的读写将被拒绝；root 不受影响",
+	return fmt.Sprintf("locked %s@%s (lock recorded at %s): read and write access by non-root credentials will be denied; root is unaffected",
 		proj, branch, shortSHA(sha)), nil
 }
 
@@ -69,25 +69,25 @@ func (s *Server) execUnlock(rest string, c Caller) (string, error) {
 		return "", err
 	}
 	if !removed {
-		return fmt.Sprintf("%s@%s 本来就没有锁", proj, branch), nil
+		return fmt.Sprintf("%s@%s is not locked", proj, branch), nil
 	}
 	// 解锁时对照一下：锁定期间这个分支动过没有。
 	//
 	// 不是为了拦截，是为了让「处理完了」这句话有依据——
 	// 如果它已经不在锁定的那个提交上，说明期间有写入（只可能是 root），
 	// 那件事值得被说出来，而不是静静消失。
-	msg := fmt.Sprintf("已解锁 %s@%s", proj, branch)
+	msg := fmt.Sprintf("unlocked %s@%s", proj, branch)
 	now, resolveErr := repo.Resolve(branch)
 	switch {
 	case resolveErr != nil || now == "":
 		// 分支在锁定期间被归档/删掉了：锁解了，但这个分支已经不在。
 		// 直说，不要谎报「停在原处」。
-		msg += "（该分支已不存在——锁定期间被 archive 或 reset 走了）"
+		msg += "(this branch no longer exists; it was archived or reset while locked)"
 	case !wasLocked || at == "":
 	case now == at:
-		msg += fmt.Sprintf("（仍停在锁定时的 %s，期间没有写入）", shortSHA(at))
+		msg += fmt.Sprintf("(still at %s from the time of locking; no writes occurred)", shortSHA(at))
 	default:
-		msg += fmt.Sprintf("（锁定期间从 %s 推进到 %s）", shortSHA(at), shortSHA(now))
+		msg += fmt.Sprintf("(advanced from %s to %s while locked)", shortSHA(at), shortSHA(now))
 	}
 	return msg, nil
 }
@@ -96,17 +96,17 @@ func (s *Server) execUnlock(rest string, c Caller) (string, error) {
 func (s *Server) parseLockAddr(rest string) (project, branch string, err error) {
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
-		return "", "", errors.New("用法：lock|unlock <project>@<branch>")
+		return "", "", errors.New("usage: lock|unlock <project>@<branch>")
 	}
 	if !strings.Contains(rest, "@") {
-		return "", "", fmt.Errorf("必须指定分支：%s@<branch>", rest)
+		return "", "", fmt.Errorf("branch is required: %s@<branch>", rest)
 	}
 	proj, br, _, perr := s.parseBranchAddr(rest)
 	if perr != nil {
 		return "", "", perr
 	}
 	if br == "" {
-		return "", "", fmt.Errorf("必须指定分支：%s@<branch>", proj)
+		return "", "", fmt.Errorf("branch is required: %s@<branch>", proj)
 	}
 	return proj, br, nil
 }

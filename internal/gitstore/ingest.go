@@ -95,7 +95,7 @@ func (r *Repo) resolvePackObj(o *packObj, byOffset map[int]*packObj, memo map[in
 	case 6:
 		b, ok := byOffset[o.baseOff]
 		if !ok {
-			return packBase{}, fmt.Errorf("delta 基对象偏移 %d 不在包内", o.baseOff)
+			return packBase{}, fmt.Errorf("delta base object offset %d is outside the pack", o.baseOff)
 		}
 		base, err = r.resolvePackObj(b, byOffset, memo)
 		if err != nil {
@@ -112,20 +112,20 @@ func (r *Repo) resolvePackObj(o *packObj, byOffset map[int]*packObj, memo map[in
 		}
 		typ, terr := r.objectType(o.baseSHA)
 		if terr != nil {
-			return packBase{}, fmt.Errorf("delta 基对象 %s 不在本地，需要更完整的历史: %w", o.baseSHA, terr)
+			return packBase{}, fmt.Errorf("delta base object %s is not available locally; a fuller history is required: %w", o.baseSHA, terr)
 		}
 		body, rerr := r.readObjectBody(o.baseSHA)
 		if rerr != nil {
-			return packBase{}, fmt.Errorf("读取 delta 基对象 %s: %w", o.baseSHA, rerr)
+			return packBase{}, fmt.Errorf("read delta base object %s: %w", o.baseSHA, rerr)
 		}
 		base = packBase{typ: typ, data: body}
 	default:
-		return packBase{}, fmt.Errorf("未知的 pack 对象类型 %d", o.typ)
+		return packBase{}, fmt.Errorf("unknown pack object type %d", o.typ)
 	}
 
 	merged, err := applyDelta(base.data, o.data)
 	if err != nil {
-		return packBase{}, fmt.Errorf("还原 delta: %w", err)
+		return packBase{}, fmt.Errorf("apply delta: %w", err)
 	}
 	m := packBase{typ: base.typ, data: merged}
 	memo[o.offset] = m
@@ -152,32 +152,32 @@ func findPackObjBySHA(sha string, byOffset map[int]*packObj) *packObj {
 // parsePack 校验并拆出 pack 里的全部条目。
 func parsePack(data []byte) ([]*packObj, error) {
 	if len(data) < 32 {
-		return nil, errors.New("pack 过短")
+		return nil, errors.New("pack is too short")
 	}
 	if len(data) > maxIngestBytes {
-		return nil, fmt.Errorf("pack 超过 %d 字节上限", maxIngestBytes)
+		return nil, fmt.Errorf("pack exceeds the %d byte limit", maxIngestBytes)
 	}
 	if string(data[:4]) != "PACK" {
-		return nil, errors.New("不是 pack 数据（缺 PACK 头）")
+		return nil, errors.New("not pack data (missing PACK header)")
 	}
 	if version := int(be32(data[4:8])); version != 2 && version != 3 {
-		return nil, fmt.Errorf("不支持的 pack 版本 %d", version)
+		return nil, fmt.Errorf("unsupported pack version %d", version)
 	}
 	body := data[:len(data)-20]
 	sum := sha1.Sum(body)
 	if !bytes.Equal(sum[:], data[len(data)-20:]) {
-		return nil, errors.New("pack 校验和不匹配（传输中被截断或损坏）")
+		return nil, errors.New("pack checksum mismatch (truncated or corrupted in transit)")
 	}
 	count := int(be32(data[8:12]))
 	if count < 0 || count > maxIngestBytes/16 {
-		return nil, fmt.Errorf("pack 对象数异常：%d", count)
+		return nil, fmt.Errorf("implausible pack object count: %d", count)
 	}
 
 	objs := make([]*packObj, 0, count)
 	pos := 12
 	for i := 0; i < count; i++ {
 		if pos >= len(body) {
-			return nil, fmt.Errorf("pack 在第 %d 个对象处提前结束", i+1)
+			return nil, fmt.Errorf("pack ended early at object %d", i+1)
 		}
 		start := pos
 		b := body[pos]
@@ -187,7 +187,7 @@ func parsePack(data []byte) ([]*packObj, error) {
 		pos++
 		for b&0x80 != 0 {
 			if pos >= len(body) || shift > 56 {
-				return nil, errors.New("非法的对象头长度编码")
+				return nil, errors.New("invalid object header length encoding")
 			}
 			b = body[pos]
 			pos++
@@ -195,33 +195,33 @@ func parsePack(data []byte) ([]*packObj, error) {
 			shift += 7
 		}
 		if size < 0 || size > maxIngestBytes {
-			return nil, fmt.Errorf("对象 %d 声明大小异常：%d", i+1, size)
+			return nil, fmt.Errorf("object %d declares an implausible size: %d", i+1, size)
 		}
 		cur := &packObj{offset: start, typ: typ}
 
 		switch typ {
 		case 6:
 			if pos >= len(body) {
-				return nil, errors.New("delta 头被截断")
+				return nil, errors.New("delta header is truncated")
 			}
 			c := uint64(body[pos])
 			pos++
 			off := c & 0x7f
 			for c&0x80 != 0 {
 				if pos >= len(body) {
-					return nil, errors.New("delta 偏移被截断")
+					return nil, errors.New("delta offset is truncated")
 				}
 				c = uint64(body[pos])
 				pos++
 				off = ((off + 1) << 7) | (c & 0x7f)
 			}
 			if off > uint64(start) {
-				return nil, errors.New("delta 基对象偏移越界")
+				return nil, errors.New("delta base offset out of range")
 			}
 			cur.baseOff = start - int(off)
 		case 7:
 			if pos+20 > len(body) {
-				return nil, errors.New("delta 基对象哈希被截断")
+				return nil, errors.New("delta base hash is truncated")
 			}
 			cur.baseSHA = hex.EncodeToString(body[pos : pos+20])
 			pos += 20
@@ -232,25 +232,25 @@ func parsePack(data []byte) ([]*packObj, error) {
 		br := bytes.NewReader(body[pos:])
 		zr, err := zlib.NewReader(br)
 		if err != nil {
-			return nil, fmt.Errorf("对象 %d 解压失败: %w", i+1, err)
+			return nil, fmt.Errorf("inflate object %d: %w", i+1, err)
 		}
 		out, rerr := io.ReadAll(io.LimitReader(zr, size+1))
 		cerr := zr.Close()
 		if rerr != nil {
-			return nil, fmt.Errorf("对象 %d 解压中断: %w", i+1, rerr)
+			return nil, fmt.Errorf("inflation of object %d was interrupted: %w", i+1, rerr)
 		}
 		if cerr != nil {
-			return nil, fmt.Errorf("对象 %d 解压收尾失败: %w", i+1, cerr)
+			return nil, fmt.Errorf("finalize inflation of object %d: %w", i+1, cerr)
 		}
 		if int64(len(out)) != size {
-			return nil, fmt.Errorf("对象 %d 大小不符：声明 %d，实得 %d", i+1, size, len(out))
+			return nil, fmt.Errorf("object %d size mismatch: declared %d, got %d", i+1, size, len(out))
 		}
 		pos = len(body) - br.Len()
 		cur.data = out
 		objs = append(objs, cur)
 	}
 	if pos != len(body) {
-		return nil, fmt.Errorf("pack 尾部有多余 %d 字节", len(body)-pos)
+		return nil, fmt.Errorf("pack has %d trailing bytes", len(body)-pos)
 	}
 	return objs, nil
 }

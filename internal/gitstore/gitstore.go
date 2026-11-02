@@ -136,11 +136,11 @@ func OpenWith(path string, storage FS, locker Locker) (*Repo, error) {
 		locker = newLocalLocker()
 	}
 	if _, err := storage.Stat(abs); err != nil {
-		return nil, fmt.Errorf("仓库 %s: %w", abs, err)
+		return nil, fmt.Errorf("repository %s: %w", abs, err)
 	}
 	for _, want := range []string{"HEAD", "objects"} {
 		if _, err := storage.Stat(filepath.Join(abs, want)); err != nil {
-			return nil, fmt.Errorf("%s 不是裸仓库（缺 %s）", abs, want)
+			return nil, fmt.Errorf("%s is not a bare repository (missing %s)", abs, want)
 		}
 	}
 	r := &Repo{Path: abs, fs: storage, locker: locker}
@@ -370,7 +370,7 @@ func (r *Repo) commitOf(ref string) (commitObj, error) {
 		return commitObj{}, err
 	}
 	if typ != "commit" {
-		return commitObj{}, fmt.Errorf("%s 不是 commit，而是 %s", sha, typ)
+		return commitObj{}, fmt.Errorf("%s is not a commit but %s", sha, typ)
 	}
 	return parseCommit(body), nil
 }
@@ -378,7 +378,7 @@ func (r *Repo) commitOf(ref string) (commitObj, error) {
 // List 列出某个分支下的全部条目（干净树 + 脏层覆盖）。
 func (r *Repo) List(ref string) ([]Entry, error) {
 	if err := r.syncDirtyWriter(); err != nil {
-		return nil, fmt.Errorf("处理脏写入队列: %w", err)
+		return nil, fmt.Errorf("process dirty write queue: %w", err)
 	}
 	c, err := r.commitOf(ref)
 	if err != nil {
@@ -454,7 +454,7 @@ func (r *Repo) List(ref string) ([]Entry, error) {
 // Read 读出一个文件的全部内容（脏层优先）。
 func (r *Repo) Read(ref, path string) ([]byte, error) {
 	if err := r.syncDirtyWriter(); err != nil {
-		return nil, fmt.Errorf("处理脏写入队列: %w", err)
+		return nil, fmt.Errorf("process dirty write queue: %w", err)
 	}
 	normRef := normalizeRef(ref)
 	dir, name := splitDirName(path)
@@ -470,7 +470,7 @@ func (r *Repo) Read(ref, path string) ([]byte, error) {
 	if n != nil {
 		if gone := n.del[name]; gone {
 			unlockDirty()
-			return nil, fmt.Errorf("%s 不存在（已删除，尚未提交）", path)
+			return nil, fmt.Errorf("%s does not exist (deleted, not yet committed)", path)
 		}
 		if e, ok := n.set[name]; ok && e.Mode != "40000" {
 			unlockDirty()
@@ -479,7 +479,7 @@ func (r *Repo) Read(ref, path string) ([]byte, error) {
 				return nil, err
 			}
 			if typ != "blob" {
-				return nil, fmt.Errorf("%s 不是文件，而是 %s", path, typ)
+				return nil, fmt.Errorf("%s is not a file but %s", path, typ)
 			}
 			return body, nil
 		}
@@ -492,21 +492,21 @@ func (r *Repo) Read(ref, path string) ([]byte, error) {
 		return nil, err
 	}
 	if c.Tree == "" {
-		return nil, fmt.Errorf("%s 里还没有任何内容", ref)
+		return nil, fmt.Errorf("%s is still empty", ref)
 	}
 	sha, err := r.findInTree(c.Tree, "", path)
 	if err != nil {
 		return nil, err
 	}
 	if sha == "" {
-		return nil, fmt.Errorf("%s 不存在", path)
+		return nil, fmt.Errorf("%s does not exist", path)
 	}
 	typ, body, err := r.readObject(sha)
 	if err != nil {
 		return nil, err
 	}
 	if typ != "blob" {
-		return nil, fmt.Errorf("%s 不是文件，而是 %s", path, typ)
+		return nil, fmt.Errorf("%s is not a file but %s", path, typ)
 	}
 	return body, nil
 }
@@ -527,7 +527,7 @@ func (r *Repo) findInTree(treeSHA, prefix, want string) (string, error) {
 		return "", err
 	}
 	if typ != "tree" {
-		return "", fmt.Errorf("对象 %s 不是 tree", treeSHA)
+		return "", fmt.Errorf("object %s is not a tree", treeSHA)
 	}
 	items, err := parseTree(body)
 	if err != nil {
@@ -540,12 +540,12 @@ func (r *Repo) findInTree(treeSHA, prefix, want string) (string, error) {
 		}
 		if !hasSlash {
 			if it.mode == "40000" {
-				return "", fmt.Errorf("%s 是目录", want)
+				return "", fmt.Errorf("%s is a directory", want)
 			}
 			return it.sha, nil
 		}
 		if it.mode != "40000" {
-			return "", fmt.Errorf("%s 不是目录", head)
+			return "", fmt.Errorf("%s is not a directory", head)
 		}
 		return r.findInTree(it.sha, prefix+head+"/", rest)
 	}
@@ -681,13 +681,13 @@ func (r *Repo) Write(ref, path string, data []byte, mode Mode) error {
 	r.writerMu.Lock()
 	if r.writerDead {
 		r.writerMu.Unlock()
-		return fmt.Errorf("仓库 %s 已关闭，拒绝新投递", filepath.Base(r.Path))
+		return fmt.Errorf("repository %s is closed; refusing new writes", filepath.Base(r.Path))
 	}
 	r.initDirtyWriter()
 	queuedSize := r.writerSize.Load()
 	if len(r.writerCh) >= dirtyQueueCapacity || queuedSize+size > dirtyQueueMaxBytes {
 		r.writerMu.Unlock()
-		return fmt.Errorf("脏写入队列已满（排队 %d 条 / %d 字节），拒绝新投递；请稍后重试", len(r.writerCh), queuedSize)
+		return fmt.Errorf("dirty write queue is full (%d pending / %d bytes); refusing new writes, retry later", len(r.writerCh), queuedSize)
 	}
 	r.writerSize.Add(size)
 	select {
@@ -697,7 +697,7 @@ func (r *Repo) Write(ref, path string, data []byte, mode Mode) error {
 	default:
 		r.writerSize.Add(-size)
 		r.writerMu.Unlock()
-		return fmt.Errorf("脏写入队列已满，拒绝新投递；请稍后重试")
+		return fmt.Errorf("dirty write queue is full; refusing new writes, retry later")
 	}
 }
 
@@ -942,7 +942,7 @@ func (r *Repo) Commit(ref, message string) (string, error) {
 
 	// ④ 唯一的提交点
 	if err := r.updateRef("refs/heads/"+normRef, commitSHA); err != nil {
-		return "", fmt.Errorf("更新 ref: %w", err)
+		return "", fmt.Errorf("update ref: %w", err)
 	}
 
 	// ⑤ 清脏层。失败不算提交失败：内容已经在 ref 里了，
@@ -1124,10 +1124,10 @@ func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
 func (r *Repo) Fork(from, to string) error {
 	// from 要读、to 要写，两个名字都会变成 refs/heads/ 下的文件路径。
 	if err := ValidateBranch(normalizeRef(to)); err != nil {
-		return fmt.Errorf("目标分支名非法: %w", err)
+		return fmt.Errorf("invalid target branch name: %w", err)
 	}
 	if err := ValidateBranch(normalizeRef(from)); err != nil {
-		return fmt.Errorf("源分支名非法: %w", err)
+		return fmt.Errorf("invalid source branch name: %w", err)
 	}
 	normTo := normalizeRef(to)
 	release, err := r.acquireCommitToken(normTo)
@@ -1141,7 +1141,7 @@ func (r *Repo) Fork(from, to string) error {
 		return err
 	}
 	if sha == "" {
-		return fmt.Errorf("分支 %s 不存在", from)
+		return fmt.Errorf("branch %s does not exist", from)
 	}
 	// 重置/分叉时把目标分支的脏层清掉：重置就是放弃所有未提交状态，
 	// 继承源分支的纯净快照。不清掉的话，之前没提交的写入会叠加在
@@ -1171,46 +1171,46 @@ func (r *Repo) BlobHash(data []byte) (string, error) {
 // 只在一处实现之后，「什么名字是合法的」只有一种答案。
 func validateSegments(kind, name string, allowSlash bool) error {
 	if name == "" {
-		return fmt.Errorf("%s不能为空", kind)
+		return fmt.Errorf("%s must not be empty", kind)
 	}
 	if strings.ContainsRune(name, 0) {
-		return fmt.Errorf("%s不能含 NUL：%q", kind, name)
+		return fmt.Errorf("%s must not contain NUL: %q", kind, name)
 	}
 	// ~ ^ 是 Git 的 revision 语法字符，放进去会让 ref 名与命令行解析冲突。
 	// 空格与 : ? * [ \ 同时被 Git 与 Windows 拒绝。
 	if strings.ContainsAny(name, " ~^:?*[\\") {
-		return fmt.Errorf("%s不能含空格 ~ ^ : ? * [ \\ 等字符：%q", kind, name)
+		return fmt.Errorf("%s must not contain space ~ ^ : ? * [ \\ and similar: %q", kind, name)
 	}
 	// Windows 保留字符：同一份记忆要在三个平台上路径一致，一律拒绝。
 	if strings.ContainsAny(name, `"<>|`) {
-		return fmt.Errorf("%s不能含 \" < > | 等字符：%q", kind, name)
+		return fmt.Errorf("%s must not contain \" < > | and similar: %q", kind, name)
 	}
 	if strings.ContainsAny(name, "\n\r\t") {
-		return fmt.Errorf("%s不能含控制字符：%q", kind, name)
+		return fmt.Errorf("%s must not contain control characters: %q", kind, name)
 	}
 	if strings.Contains(name, "..") {
-		return fmt.Errorf("%s不能含 ..：%q", kind, name)
+		return fmt.Errorf("%s must not contain ..: %q", kind, name)
 	}
 	if strings.HasPrefix(name, "/") || strings.HasSuffix(name, "/") {
-		return fmt.Errorf("%s不能以 / 开头或结尾：%q", kind, name)
+		return fmt.Errorf("%s must not start or end with /: %q", kind, name)
 	}
 	if !allowSlash && strings.Contains(name, "/") {
-		return fmt.Errorf("%s不能含路径分隔符：%q", kind, name)
+		return fmt.Errorf("%s must not contain a path separator: %q", kind, name)
 	}
 	for _, seg := range strings.Split(name, "/") {
 		if seg == "" {
-			return fmt.Errorf("%s不能有空段：%q", kind, name)
+			return fmt.Errorf("%s must not contain an empty segment: %q", kind, name)
 		}
 		if seg == "." || seg == ".." {
-			return fmt.Errorf("%s不能含 . 或 .. 段：%q", kind, name)
+			return fmt.Errorf("%s must not contain . or .. segments: %q", kind, name)
 		}
 		// 以 . 开头：Git 自己就禁止；而且 "....//...." 这类绕法的每一段
 		// 都是「. 加尾巴」，不是字面 ".."，路径解析后却仍回到上级。
 		if strings.HasPrefix(seg, ".") {
-			return fmt.Errorf("%s的每一段都不能以 . 开头：%q", kind, name)
+			return fmt.Errorf("no segment of %s may start with .: %q", kind, name)
 		}
 		if strings.HasSuffix(seg, ".") {
-			return fmt.Errorf("%s的每一段都不能以 . 结尾：%q", kind, name)
+			return fmt.Errorf("no segment of %s may end with .: %q", kind, name)
 		}
 	}
 	return nil
@@ -1227,21 +1227,21 @@ func ValidateName(kind, name string, allowSlash bool) error {
 func ValidateBranch(ref string) error { return validateSegments("ref", ref, true) }
 
 // ValidateRepoName 校验项目（裸仓库）名，允许多层如 "blackegg/me"。
-func ValidateRepoName(name string) error { return validateSegments("项目名", name, true) }
+func ValidateRepoName(name string) error { return validateSegments("project name", name, true) }
 
 // ValidateCredName 校验用户名/凭证名：它们不进目录树，不允许斜杠。
-func ValidateCredName(name string) error { return validateSegments("名字", name, false) }
+func ValidateCredName(name string) error { return validateSegments("name", name, false) }
 
 // validPath 校验树内路径。与 ValidateBranch 同源，只是错误措辞不同
 // （路径与分支名对使用者是两件事）。
 func validPath(path string) error {
-	return validateSegments("路径", path, true)
+	return validateSegments("path", path, true)
 }
 
 // validFullRef 校验一个完整 ref，并限制到本仓库使用的命名空间。
 func validFullRef(ref string) error {
 	if !strings.HasPrefix(ref, "refs/") {
-		return fmt.Errorf("ref 必须以 refs/ 开头：%q", ref)
+		return fmt.Errorf("ref must start with refs/: %q", ref)
 	}
 	if err := ValidateBranch(strings.TrimPrefix(ref, "refs/")); err != nil {
 		return err
@@ -1251,7 +1251,7 @@ func validFullRef(ref string) error {
 			return nil
 		}
 	}
-	return fmt.Errorf("拒绝写入 ref %q：只允许 refs/heads、refs/tags、refs/remotes、refs/archived", ref)
+	return fmt.Errorf("refusing to write ref %q: only refs/heads, refs/tags, refs/remotes and refs/archived are allowed", ref)
 }
 
 // normalizeRef 把 "refs/heads/x" 归一成 "x"。
@@ -1337,12 +1337,12 @@ func (r *Repo) Delete(ref, path string) error {
 	r.writerMu.Lock()
 	if r.writerDead {
 		r.writerMu.Unlock()
-		return fmt.Errorf("仓库 %s 已关闭，拒绝删除：%s", filepath.Base(r.Path), path)
+		return fmt.Errorf("repository %s is closed; refusing delete: %s", filepath.Base(r.Path), path)
 	}
 	r.initDirtyWriter()
 	if len(r.writerCh) >= dirtyQueueCapacity {
 		r.writerMu.Unlock()
-		return fmt.Errorf("脏写入队列已满，拒绝删除：%s", path)
+		return fmt.Errorf("dirty write queue is full; refusing delete: %s", path)
 	}
 	select {
 	case r.writerCh <- dirtyTask{op: 'D', ref: ref, path: path}:
@@ -1350,7 +1350,7 @@ func (r *Repo) Delete(ref, path string) error {
 		return nil
 	default:
 		r.writerMu.Unlock()
-		return fmt.Errorf("脏写入队列已满，拒绝删除：%s", path)
+		return fmt.Errorf("dirty write queue is full; refusing delete: %s", path)
 	}
 }
 
@@ -1447,14 +1447,14 @@ func (r *Repo) Tag(name, ref string) error {
 	// updateRef 会校验拼好的 ref，但那里报的是「ref 非法」。
 	// 这里先校验一次是为了让错误信息说清是「tag 名」。
 	if err := ValidateBranch(name); err != nil {
-		return fmt.Errorf("tag 名非法: %w", err)
+		return fmt.Errorf("invalid tag name: %w", err)
 	}
 	sha, err := r.Resolve(ref)
 	if err != nil {
 		return err
 	}
 	if sha == "" {
-		return fmt.Errorf("分支 %q 不存在，无法打 tag", ref)
+		return fmt.Errorf("branch %q does not exist; cannot tag", ref)
 	}
 	return r.updateRef("refs/tags/"+name, sha)
 }
@@ -1465,12 +1465,12 @@ func (r *Repo) Tag(name, ref string) error {
 // 扔掉唯一的入口，而这个操作最容易在事后才被发现是错的。
 func (r *Repo) Untag(name string) error {
 	if err := ValidateBranch(name); err != nil {
-		return fmt.Errorf("tag 名非法: %w", err)
+		return fmt.Errorf("invalid tag name: %w", err)
 	}
 	src := filepath.Join(r.Path, "refs", "tags", filepath.FromSlash(name))
 	b, err := r.FS().ReadFile(src)
 	if err != nil {
-		return fmt.Errorf("tag %q 不存在", name)
+		return fmt.Errorf("tag %q does not exist", name)
 	}
 	dstDir := filepath.Join(r.Path, "refs", "tags-removed")
 	if err := r.FS().MkdirAll(dstDir, 0o750); err != nil {
@@ -1551,7 +1551,7 @@ func (r *Repo) Diff(from, to string) ([]Change, error) {
 	if from != "" {
 		list, err := r.List(from)
 		if err != nil {
-			return nil, fmt.Errorf("读 %s: %w", from, err)
+			return nil, fmt.Errorf("read %s: %w", from, err)
 		}
 		for _, e := range list {
 			oldEntries[e.Path] = e
@@ -1560,7 +1560,7 @@ func (r *Repo) Diff(from, to string) ([]Change, error) {
 
 	newList, err := r.List(to)
 	if err != nil {
-		return nil, fmt.Errorf("读 %s: %w", to, err)
+		return nil, fmt.Errorf("read %s: %w", to, err)
 	}
 
 	var out []Change
@@ -1602,11 +1602,11 @@ func (r *Repo) Exists(ref, path string) bool {
 func (r *Repo) ArchiveRef(branch string) error {
 	name := normalizeRef(branch)
 	if err := ValidateBranch(name); err != nil {
-		return fmt.Errorf("分支名非法: %w", err)
+		return fmt.Errorf("invalid branch name: %w", err)
 	}
 	sha, err := r.Resolve(name)
 	if err != nil || sha == "" {
-		return fmt.Errorf("分支 %q 不存在", branch)
+		return fmt.Errorf("branch %q does not exist", branch)
 	}
 	dstDir := filepath.Join(r.Path, "refs", "archived")
 	if err := r.FS().MkdirAll(dstDir, 0o750); err != nil {

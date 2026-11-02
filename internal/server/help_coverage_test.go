@@ -53,7 +53,7 @@ func TestHelpBatchExampleUsesRealJSONFields(t *testing.T) {
 func TestHelpAllCoversEveryVerb(t *testing.T) {
 	all := helpAll()
 	for _, v := range []string{"commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "batch", "write", "grep"} {
-		if !strings.Contains(all, "── "+v+" ") {
+		if !strings.Contains(all, "-- "+v+" ") {
 			t.Errorf("help --all 缺少 %q 的章节", v)
 		}
 	}

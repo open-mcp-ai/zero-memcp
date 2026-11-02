@@ -111,7 +111,7 @@ func encodeDirtyNode(n *dirtyNode) ([]byte, error) {
 	sort.Strings(dels)
 	for _, name := range dels {
 		if strings.ContainsAny(name, "\t\n") {
-			return nil, fmt.Errorf("脏层项名含制表符或换行：%q", name)
+			return nil, fmt.Errorf("dirty layer entry name contains a tab or newline: %q", name)
 		}
 		fmt.Fprintf(&b, "%c\t%s\n", dirtyOpDelete, name)
 	}
@@ -283,7 +283,7 @@ func sortDirtyDirs(dirs []string) {
 // clearDirtyRef 删掉某分支的整个脏层。
 func (r *Repo) clearDirtyRef(ref string) error {
 	if err := r.FS().RemoveAll(r.dirtyDirPath(ref)); err != nil {
-		return fmt.Errorf("清理脏层: %w", err)
+		return fmt.Errorf("clean up dirty layer: %w", err)
 	}
 	return nil
 }

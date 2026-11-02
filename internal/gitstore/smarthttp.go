@@ -24,13 +24,13 @@ func ReadPktLine(r io.Reader) (string, error) {
 	}
 	var n int
 	if _, err := fmt.Sscanf(string(head[:]), "%04x", &n); err != nil {
-		return "", fmt.Errorf("非法 pkt-line 长度头 %q", string(head[:]))
+		return "", fmt.Errorf("invalid pkt-line length header %q", string(head[:]))
 	}
 	if n == 0 {
 		return "", nil
 	}
 	if n < 4 {
-		return "", fmt.Errorf("pkt-line 长度 %d 小于 4", n)
+		return "", fmt.Errorf("pkt-line length %d is less than 4", n)
 	}
 	body := make([]byte, n-4)
 	if _, err := io.ReadFull(r, body); err != nil {
@@ -164,20 +164,20 @@ func (r *Repo) UploadPackResponseFiltered(body io.Reader, allowSHA func(string) 
 			fields := strings.Fields(strings.SplitN(line, "\x00", 2)[0])
 			if len(fields) >= 2 && validSHA(fields[1]) == nil {
 				if allowSHA != nil && !allowSHA(fields[1]) {
-					return nil, fmt.Errorf("want %s 不是该凭证可读取的 advertised ref", fields[1])
+					return nil, fmt.Errorf("want %s is not an advertised ref this credential may read", fields[1])
 				}
 				wants[fields[1]] = true
 			}
 		}
 	}
 	if len(wants) == 0 {
-		return nil, fmt.Errorf("客户端没有请求任何 want")
+		return nil, fmt.Errorf("client requested no wants")
 	}
 
 	objects := map[string]bool{}
 	for sha := range wants {
 		if err := r.collectReachable(sha, objects); err != nil {
-			return nil, fmt.Errorf("收集对象 %s: %w", sha, err)
+			return nil, fmt.Errorf("collect objects for %s: %w", sha, err)
 		}
 	}
 
@@ -338,7 +338,7 @@ func (r *Repo) BuildPack(tips, exclude []string) ([]byte, error) {
 	want := map[string]bool{}
 	for _, tip := range tips {
 		if err := r.collectReachable(tip, want); err != nil {
-			return nil, fmt.Errorf("收集对象 %s: %w", tip, err)
+			return nil, fmt.Errorf("collect objects for %s: %w", tip, err)
 		}
 	}
 	for _, tip := range exclude {

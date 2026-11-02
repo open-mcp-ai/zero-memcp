@@ -27,7 +27,7 @@ import (
 // execPut 是 put 动词的入口。
 func (s *Server) execPut(rest string, c Caller) (TermResult, error) {
 	if !c.canWrite() {
-		return TermResult{}, fmt.Errorf("凭证缺少 w 能力")
+		return TermResult{}, fmt.Errorf("credential lacks w capability")
 	}
 
 	head, body, hasBody := strings.Cut(rest, "--")
@@ -51,14 +51,14 @@ func (s *Server) execPut(rest string, c Caller) (TermResult, error) {
 
 	if isRef {
 		if refAddr == "" {
-			return TermResult{}, errors.New("put --ref 需要一个地址")
+			return TermResult{}, errors.New("put --ref requires an address")
 		}
 	} else {
 		if !hasBody {
-			return TermResult{}, errors.New("put 语法: put [<tree>] -- $TEXT 或 put <tree> --ref <addr>")
+			return TermResult{}, errors.New("put syntax: put [<tree>] -- $TEXT or put <tree> --ref <addr>")
 		}
 		if body == "" {
-			return TermResult{}, errors.New("正文不能为空")
+			return TermResult{}, errors.New("content cannot be empty")
 		}
 	}
 
@@ -193,10 +193,10 @@ func (s *Server) putBody(target, body, session string, c Caller) (TermResult, er
 func (s *Server) putRef(target, refAddr, session string, c Caller) (TermResult, error) {
 	srcProj, srcBranch, srcPath, err := s.resolveAddr(refAddr, c)
 	if err != nil {
-		return TermResult{}, fmt.Errorf("引用目标 %q 无效: %w", refAddr, err)
+		return TermResult{}, fmt.Errorf("reference target %q is invalid: %w", refAddr, err)
 	}
 	if !s.allowed(c, srcProj, srcBranch, configBitRead) {
-		return TermResult{}, fmt.Errorf("无权读取引用目标 %s@%s", srcProj, srcBranch)
+		return TermResult{}, fmt.Errorf("not authorized to read reference target %s@%s", srcProj, srcBranch)
 	}
 	repo, err := s.projects.Get(srcProj)
 	if err != nil {
@@ -204,7 +204,7 @@ func (s *Server) putRef(target, refAddr, session string, c Caller) (TermResult, 
 	}
 	data, err := repo.Read(srcBranch, srcPath)
 	if err != nil || len(data) == 0 {
-		return TermResult{}, fmt.Errorf("引用目标 %s@%s/%s 不存在", srcProj, srcBranch, srcPath)
+		return TermResult{}, fmt.Errorf("reference target %s@%s/%s does not exist", srcProj, srcBranch, srcPath)
 	}
 
 	body := fmt.Sprintf("ref: %s@%s/%s\n", srcProj, srcBranch, srcPath)
@@ -310,16 +310,16 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		watches := s.treeWatch.List(c.Identity)
 		if len(watches) == 0 {
 			return TermResult{
-				Text:       "当前没有锚定任何树。用 remind <project>[@<branch>[/<path>]] 锚定一棵。",
+				Text:       "no tree is currently watched. Use remind <project>[@<branch>[/<path>]] to watch one.",
 				Structured: map[string]any{"watches": []TreeWatch{}},
 			}, nil
 		}
 		var sb strings.Builder
-		sb.WriteString("当前锚定：\n")
+		sb.WriteString("currently watched:\n")
 		for _, w := range watches {
 			p := w.Path
 			if p == "" {
-				p = "(整棵树)"
+				p = "(entire tree)"
 			}
 			fmt.Fprintf(&sb, "  %s@%s %s\n", w.Project, w.Branch, p)
 		}
@@ -332,7 +332,7 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 	if strings.HasPrefix(rest, "-") {
 		s.treeWatch.Clear(c.Identity)
 		return TermResult{
-			Text:       "已取消全部锚点",
+			Text:       "all watches cleared",
 			Structured: map[string]any{"ok": true, "cleared": true},
 		}, nil
 	}
@@ -342,7 +342,7 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		return TermResult{}, err
 	}
 	if !s.projectVisibleFor(c, proj) {
-		return TermResult{}, fmt.Errorf("项目 %q 不在这张凭证的可见范围内", proj)
+		return TermResult{}, fmt.Errorf("project %q is outside this credential's visible scope", proj)
 	}
 	if !s.allowed(c, proj, branch, configBitRead) {
 		return TermResult{}, fmt.Errorf("%s", s.denyReason(c, proj, branch, configBitRead))
@@ -354,7 +354,7 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		where += "/" + treePath
 	}
 	return TermResult{
-		Text: "已锚定 " + where + "：这棵树变动时会收到脉冲",
+		Text: "watching " + where + ": notifications will be sent when this tree changes",
 		Structured: map[string]any{
 			"ok":      true,
 			"project": proj,
@@ -370,7 +370,7 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 func (s *Server) execTrees(rest string, c Caller) (TermResult, error) {
 	addr := strings.TrimSpace(rest)
 	if addr == "" {
-		return TermResult{}, errors.New("trees 需要 <project>[@<branch>]")
+		return TermResult{}, errors.New("trees requires <project>[@<branch>]")
 	}
 	proj, branch, prefix, err := s.parseBranchAddr(addr)
 	if err != nil {
@@ -413,7 +413,7 @@ func (s *Server) execTrees(rest string, c Caller) (TermResult, error) {
 		}
 	}
 	if len(dirs) == 0 {
-		return TermResult{Text: "（没有子目录）"}, nil
+		return TermResult{Text: "(no subdirectories)"}, nil
 	}
 	var sb strings.Builder
 	for _, d := range dirs {
@@ -506,7 +506,7 @@ func addrUnderScope(addr, scope string) bool {
 func (s *Server) execSince(rest string, c Caller) (TermResult, error) {
 	fields := strings.Fields(rest)
 	if len(fields) != 2 {
-		return TermResult{}, errors.New("since 语法: since <tree> <commit|empty>")
+		return TermResult{}, errors.New("since syntax: since <tree> <commit|empty>")
 	}
 	proj, branch, treePath, err := s.parseTreeAddress(fields[0], c)
 	if err != nil {
@@ -516,7 +516,7 @@ func (s *Server) execSince(rest string, c Caller) (TermResult, error) {
 	if oldCommit == "empty" || oldCommit == "-" {
 		oldCommit = ""
 	} else if len(oldCommit) != 40 {
-		return TermResult{}, fmt.Errorf("since 需要完整 commit SHA（40 位），或首次同步时用 empty；得到 %q", oldCommit)
+		return TermResult{}, fmt.Errorf("since requires a full commit SHA (40 characters), or empty for the first sync; got %q", oldCommit)
 	}
 	if !s.allowed(c, proj, branch, configBitRead) {
 		return TermResult{}, fmt.Errorf("%s", s.denyReason(c, proj, branch, configBitRead))
@@ -530,7 +530,7 @@ func (s *Server) execSince(rest string, c Caller) (TermResult, error) {
 		return TermResult{}, err
 	}
 	if head == "" {
-		return TermResult{Text: "（该分支还没有提交）"}, nil
+		return TermResult{Text: "(this branch has no commits yet)"}, nil
 	}
 
 	var changes []gitstore.Change
@@ -546,13 +546,13 @@ func (s *Server) execSince(rest string, c Caller) (TermResult, error) {
 	if err != nil {
 		// 游标不可达（分支被 reset/archive 过）时退回提示全量重读，
 		// 而不是猜一个近似的起点——那会让漏读变成静默事实。
-		return TermResult{}, fmt.Errorf("无法从 %s 计算增量（该提交可能已不可达）：%w\n请用 log 重新确定起点，或整棵重读", oldCommit, err)
+		return TermResult{}, fmt.Errorf("cannot compute changes from %s (the commit may be unreachable): %w\nUse log to choose a new starting point, or reread the entire tree", oldCommit, err)
 	}
 
 	cur, _ := repo.TreeAt(head, treePath)
 	if len(changes) == 0 {
 		return TermResult{
-			Text: "（这棵树自该提交以来没有变化）",
+			Text: "(this tree has not changed since that commit)",
 			Structured: map[string]any{
 				"project": proj, "branch": branch, "path": treePath,
 				"from": oldCommit, "to": head, "tree": cur, "changes": []any{},
@@ -569,7 +569,7 @@ func (s *Server) execSince(rest string, c Caller) (TermResult, error) {
 	if oldCommit != "" {
 		fromLabel = shortSHA(oldCommit)
 	}
-	fmt.Fprintf(&sb, " 自 %s 起的变化（共 %d 条）：\n", fromLabel, len(changes))
+	fmt.Fprintf(&sb, " changes since %s (%d total):\n", fromLabel, len(changes))
 	items := make([]any, 0, len(changes))
 	for _, ch := range changes {
 		fmt.Fprintf(&sb, "  %-9s %s\n", ch.Kind, ch.Path)

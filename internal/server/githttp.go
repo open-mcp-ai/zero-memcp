@@ -52,13 +52,13 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 	// 分支级可见性无法在这里表达（git 协议按 ref 粒度），
 	// 所以这里只检查「这个项目整体是否对该凭证可见」。
 	if !s.projectVisible(caller, project) {
-		http.Error(w, fmt.Sprintf("项目 %q 不在这张凭证的可见范围内", project), http.StatusForbidden)
+		http.Error(w, fmt.Sprintf("project %q is outside this credential's visible scope", project), http.StatusForbidden)
 		return
 	}
 
 	repo, err := s.projects.Get(project)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("项目 %q: %v", project, err), http.StatusNotFound)
+		http.Error(w, fmt.Sprintf("project %q: %v", project, err), http.StatusNotFound)
 		return
 	}
 
@@ -89,7 +89,7 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 
 		case "git-receive-pack":
 			if !s.gitPushAllowed(caller, project) {
-				http.Error(w, "当前端口未开启 git-receive-pack，或凭证没有写权限", http.StatusForbidden)
+				http.Error(w, "git-receive-pack is not enabled on this port, or the credential lacks write permission", http.StatusForbidden)
 				return
 			}
 			body, err := repo.AdvertiseReceivePack(s.defaultBranch, func(ref string) bool {
@@ -106,7 +106,7 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(body)
 
 		default:
-			http.Error(w, "不支持的 git 服务："+svc, http.StatusBadRequest)
+			http.Error(w, "unsupported git service: "+svc, http.StatusBadRequest)
 		}
 
 	case "git-upload-pack":
@@ -157,7 +157,7 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !s.gitPushAllowed(caller, project) {
-			http.Error(w, "当前端口未开启 git-receive-pack，或凭证没有写权限", http.StatusForbidden)
+			http.Error(w, "git-receive-pack is not enabled on this port, or the credential lacks write permission", http.StatusForbidden)
 			return
 		}
 		in := r.Body
@@ -196,7 +196,7 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 func parseGitPath(p string) (project, action string, err error) {
 	rest := strings.TrimPrefix(p, "/repos/")
 	if rest == p || rest == "" {
-		return "", "", fmt.Errorf("路径应为 /repos/<project>.git/<action>")
+		return "", "", fmt.Errorf("path must be /repos/<project>.git/<action>")
 	}
 	// 动作在后，项目名可能含斜杠
 	for _, act := range []string{"info/refs", "git-upload-pack", "git-receive-pack"} {
@@ -207,11 +207,11 @@ func parseGitPath(p string) (project, action string, err error) {
 		}
 	}
 	if action == "" {
-		return "", "", fmt.Errorf("未知的 git 动作：%s", rest)
+		return "", "", fmt.Errorf("unknown git action: %s", rest)
 	}
 	project = strings.TrimSuffix(project, ".git")
 	if project == "" {
-		return "", "", fmt.Errorf("缺项目名")
+		return "", "", fmt.Errorf("project name is required")
 	}
 	return project, action, nil
 }

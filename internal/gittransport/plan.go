@@ -29,7 +29,7 @@ func (p pushPlan) Result() PushResult {
 func planPush(repo *gitstore.Repo, branch string, refs map[string]string) (pushPlan, error) {
 	newSHA, err := repo.Resolve(branch)
 	if err != nil || newSHA == "" {
-		return pushPlan{}, fmt.Errorf("本地分支 %q 不存在或没有提交", branch)
+		return pushPlan{}, fmt.Errorf("local branch %q does not exist or has no commits", branch)
 	}
 	oldSHA := refs["refs/heads/"+branch]
 	if oldSHA == "" {
@@ -45,10 +45,10 @@ func planPush(repo *gitstore.Repo, branch string, refs map[string]string) (pushP
 	}
 	ok, err := repo.IsAncestor(oldSHA, newSHA)
 	if err != nil {
-		return pushPlan{}, fmt.Errorf("无法验证是否快进（先 fetch 远端历史）：%w", err)
+		return pushPlan{}, fmt.Errorf("cannot verify fast-forward (fetch remote history first): %w", err)
 	}
 	if !ok {
-		return pushPlan{}, fmt.Errorf("拒绝非快进 push：远端 %s 不是本地 %s 的祖先", oldSHA, newSHA)
+		return pushPlan{}, fmt.Errorf("refusing non-fast-forward push: remote %s is not an ancestor of local %s", oldSHA, newSHA)
 	}
 	return plan, nil
 }
@@ -68,10 +68,10 @@ type pushRequest struct {
 func (r pushRequest) body() ([]byte, error) {
 	pack, err := r.repo.BuildPack([]string{r.newSHA}, []string{r.oldSHA})
 	if err != nil {
-		return nil, fmt.Errorf("构建 push pack 失败: %w", err)
+		return nil, fmt.Errorf("build push pack: %w", err)
 	}
 	if len(pack) == 0 {
-		return nil, errors.New("本地对象库缺少远端尚无的提交对象")
+		return nil, errors.New("local object database is missing commit objects not yet present on the remote")
 	}
 	var buf []byte
 	buf = append(buf, pktLine(fmt.Sprintf("%s %s refs/heads/%s\x00report-status\n", r.oldSHA, r.newSHA, r.branch))...)

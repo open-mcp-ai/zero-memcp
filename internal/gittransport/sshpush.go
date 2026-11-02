@@ -42,11 +42,11 @@ func Push(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, privateKe
 	reader := bufio.NewReader(sess.stdout)
 	adv, err := readAdvertisement(reader)
 	if err != nil {
-		return PushResult{}, fmt.Errorf("读取 receive-pack 广告失败: %w", err)
+		return PushResult{}, fmt.Errorf("read receive-pack advertisement: %w", err)
 	}
 	refs := adv.Refs
 	if !adv.Caps["report-status"] {
-		return PushResult{}, errors.New("远端 receive-pack 不支持 report-status；拒绝在无法核实结果时上传")
+		return PushResult{}, errors.New("remote receive-pack does not support report-status; refusing to push without verifying the result")
 	}
 
 	plan, err := planPush(repo, branch, refs)
@@ -65,15 +65,15 @@ func Push(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, privateKe
 		return PushResult{}, err
 	}
 	if _, err := sess.stdin.Write(body); err != nil {
-		return PushResult{}, fmt.Errorf("发送 ref update 与 pack 失败: %w", err)
+		return PushResult{}, fmt.Errorf("send ref update and pack: %w", err)
 	}
 	if err := sess.stdin.Close(); err != nil {
-		return PushResult{}, fmt.Errorf("关闭 SSH stdin: %w", err)
+		return PushResult{}, fmt.Errorf("close SSH stdin: %w", err)
 	}
 
 	status, err := readReportStatus(reader)
 	if err != nil {
-		return PushResult{}, fmt.Errorf("远端未确认 push: %w", err)
+		return PushResult{}, fmt.Errorf("remote did not confirm push: %w", err)
 	}
 	if err := checkReportStatus(status, branch); err != nil {
 		return PushResult{}, err
@@ -191,7 +191,7 @@ func readReportStatus(r *bufio.Reader) (map[string]string, error) {
 		}
 	}
 	if len(status) == 0 {
-		return nil, errors.New("缺少 report-status 内容")
+		return nil, errors.New("missing report-status payload")
 	}
 	return status, nil
 }
@@ -208,11 +208,11 @@ func validSHA(s string) bool {
 
 func validateBranch(branch string) error {
 	if branch == "" || strings.HasPrefix(branch, "-") || strings.ContainsAny(branch, " \t\r\n\x00~^:?*[\\") || strings.Contains(branch, "..") || strings.Contains(branch, "@{") || strings.HasSuffix(branch, "/") || strings.HasSuffix(branch, ".") || strings.Contains(branch, "//") {
-		return fmt.Errorf("非法分支名 %q", branch)
+		return fmt.Errorf("invalid branch name %q", branch)
 	}
 	for _, part := range strings.Split(branch, "/") {
 		if part == "" || part == "." || part == ".." || strings.HasSuffix(part, ".lock") {
-			return fmt.Errorf("非法分支名 %q", branch)
+			return fmt.Errorf("invalid branch name %q", branch)
 		}
 	}
 	return nil

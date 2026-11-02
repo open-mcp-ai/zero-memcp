@@ -50,15 +50,15 @@ func (s *Server) execBatch(body string, c Caller, defaultBranch string) (string,
 	}
 	body = strings.TrimSpace(body)
 	if body == "" {
-		return "", fmt.Errorf("batch 需要 JSON 请求体，例如：batch {\"ops\": [...]}")
+		return "", fmt.Errorf("batch requires a JSON request body, e.g. batch {\"ops\": [...]}")
 	}
 
 	var req BatchRequest
 	if err := json.Unmarshal([]byte(body), &req); err != nil {
-		return "", fmt.Errorf("解析 batch JSON 失败: %w", err)
+		return "", fmt.Errorf("parse batch JSON: %w", err)
 	}
 	if len(req.Ops) == 0 {
-		return "决议单为空，未执行任何操作", nil
+		return "operation list is empty; no operations were executed", nil
 	}
 
 	var journal []string
@@ -71,7 +71,7 @@ func (s *Server) execBatch(body string, c Caller, defaultBranch string) (string,
 			target := op.Target
 			addr, _, _, err := s.writeNote(op.Kind, op.Text, "", "batch", c, target)
 			if err != nil {
-				return "", fmt.Errorf("op[%d] put 失败: %w", idx, err)
+				return "", fmt.Errorf("op[%d] put failed: %w", idx, err)
 			}
 			journal = append(journal, fmt.Sprintf("[%d] put: %s", idx, addr))
 
@@ -79,7 +79,7 @@ func (s *Server) execBatch(body string, c Caller, defaultBranch string) (string,
 			isMove := strings.ToLower(op.Action) == "mv"
 			res, err := s.execCrossBranch(fmt.Sprintf("%s -> %s", op.From, op.To), c, isMove)
 			if err != nil {
-				return "", fmt.Errorf("op[%d] %s 失败: %w", idx, op.Action, err)
+				return "", fmt.Errorf("op[%d] %s failed: %w", idx, op.Action, err)
 			}
 			firstLine := strings.Split(strings.TrimSpace(res), "\n")[0]
 			journal = append(journal, fmt.Sprintf("[%d] %s: %s", idx, op.Action, firstLine))
@@ -87,17 +87,17 @@ func (s *Server) execBatch(body string, c Caller, defaultBranch string) (string,
 		case "delete":
 			proj, br, path, err := s.parseBranchAddr(op.Target)
 			if err != nil {
-				return "", fmt.Errorf("op[%d] delete 地址非法: %w", idx, err)
+				return "", fmt.Errorf("op[%d] invalid delete address: %w", idx, err)
 			}
 			if !s.allowed(c, proj, br, configBitWrite) {
-				return "", fmt.Errorf("op[%d] delete 被拒绝: %s", idx, s.denyReason(c, proj, br, configBitWrite))
+				return "", fmt.Errorf("op[%d] delete rejected: %s", idx, s.denyReason(c, proj, br, configBitWrite))
 			}
 			repo, err := s.projects.Get(proj)
 			if err != nil {
-				return "", fmt.Errorf("op[%d] 打开项目: %w", idx, err)
+				return "", fmt.Errorf("op[%d] open project: %w", idx, err)
 			}
 			if err := repo.Delete(br, path); err != nil {
-				return "", fmt.Errorf("op[%d] delete 失败: %w", idx, err)
+				return "", fmt.Errorf("op[%d] delete failed: %w", idx, err)
 			}
 			journal = append(journal, fmt.Sprintf("[%d] delete: %s@%s/%s", idx, proj, br, path))
 
@@ -110,7 +110,7 @@ func (s *Server) execBatch(body string, c Caller, defaultBranch string) (string,
 			}
 			res, err := s.execTag(fmt.Sprintf("%s %s %s", project, name, ref), c, defaultBranch)
 			if err != nil {
-				return "", fmt.Errorf("op[%d] tag 失败: %w", idx, err)
+				return "", fmt.Errorf("op[%d] tag failed: %w", idx, err)
 			}
 			journal = append(journal, fmt.Sprintf("[%d] tag: %s", idx, res))
 
@@ -123,15 +123,15 @@ func (s *Server) execBatch(body string, c Caller, defaultBranch string) (string,
 			}
 			res, err := s.execCommit(target, c, defaultBranch)
 			if err != nil {
-				return "", fmt.Errorf("op[%d] commit 失败: %w", idx, err)
+				return "", fmt.Errorf("op[%d] commit failed: %w", idx, err)
 			}
 			journal = append(journal, fmt.Sprintf("[%d] commit: %s", idx, res))
 
 		default:
-			return "", fmt.Errorf("op[%d] 未知动作 %q（允许 put/cp/mv/delete/tag/commit）", idx, op.Action)
+			return "", fmt.Errorf("op[%d] unknown action %q (allowed: put/cp/mv/delete/tag/commit)", idx, op.Action)
 		}
 	}
 
 	_ = s.Reload()
-	return fmt.Sprintf("决议单执行成功（共 %d 项动作）：\n  %s", len(journal), strings.Join(journal, "\n  ")), nil
+	return fmt.Sprintf("executed operation list successfully (%d operations):\n  %s", len(journal), strings.Join(journal, "\n  ")), nil
 }

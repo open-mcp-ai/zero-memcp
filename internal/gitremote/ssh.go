@@ -26,12 +26,12 @@ type SSHEndpoint struct {
 func ParseSSHURL(raw string) (SSHEndpoint, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
-		return SSHEndpoint{}, errors.New("SSH 地址为空")
+		return SSHEndpoint{}, errors.New("SSH address is empty")
 	}
 	if strings.HasPrefix(raw, "ssh://") {
 		u, err := url.Parse(raw)
 		if err != nil {
-			return SSHEndpoint{}, fmt.Errorf("解析 SSH 地址失败: %w", err)
+			return SSHEndpoint{}, fmt.Errorf("parse SSH address: %w", err)
 		}
 		ep := SSHEndpoint{User: u.User.Username(), Host: u.Hostname(), Port: u.Port(), Path: strings.TrimPrefix(u.Path, "/")}
 		if ep.User == "" {
@@ -41,19 +41,19 @@ func ParseSSHURL(raw string) (SSHEndpoint, error) {
 			ep.Port = "22"
 		}
 		if ep.Host == "" || ep.Path == "" {
-			return SSHEndpoint{}, fmt.Errorf("SSH 地址缺少主机或路径: %s", Redact(raw))
+			return SSHEndpoint{}, fmt.Errorf("SSH address is missing host or path: %s", Redact(raw))
 		}
 		return ep, nil
 	}
 	at := strings.Index(raw, "@")
 	if at <= 0 {
-		return SSHEndpoint{}, fmt.Errorf("不是 SSH 地址（缺 user@）：%s", Redact(raw))
+		return SSHEndpoint{}, fmt.Errorf("not an SSH address (missing user@): %s", Redact(raw))
 	}
 	user := raw[:at]
 	rest := raw[at+1:]
 	colon := strings.Index(rest, ":")
 	if colon <= 0 {
-		return SSHEndpoint{}, fmt.Errorf("不是 SSH 地址（缺 host:path）：%s", Redact(raw))
+		return SSHEndpoint{}, fmt.Errorf("not an SSH address (expected host:path): %s", Redact(raw))
 	}
 	host := rest[:colon]
 	path := rest[colon+1:]
@@ -62,7 +62,7 @@ func ParseSSHURL(raw string) (SSHEndpoint, error) {
 	}
 	ep := SSHEndpoint{User: user, Host: host, Port: "22", Path: path}
 	if ep.Host == "" || ep.Path == "" {
-		return SSHEndpoint{}, fmt.Errorf("SSH 地址缺少主机或路径: %s", Redact(raw))
+		return SSHEndpoint{}, fmt.Errorf("SSH address is missing host or path: %s", Redact(raw))
 	}
 	return ep, nil
 }

@@ -40,11 +40,11 @@ func dialSSH(ctx context.Context, remoteURL, privateKeyPEM, hostKey string, time
 		return nil, err
 	}
 	if !strings.HasPrefix(hostKey, "SHA256:") {
-		return nil, errors.New("SSH host_key 必须设置为 SHA256:... fingerprint")
+		return nil, errors.New("SSH host_key must be a SHA256:... fingerprint")
 	}
 	signer, err := ssh.ParsePrivateKey([]byte(privateKeyPEM))
 	if err != nil {
-		return nil, fmt.Errorf("解析 SSH 私钥失败（仅支持未加密 OpenSSH 私钥）: %w", err)
+		return nil, fmt.Errorf("parse SSH private key (only unencrypted OpenSSH keys are supported): %w", err)
 	}
 	want := strings.TrimSpace(hostKey)
 	cfg := &ssh.ClientConfig{
@@ -53,7 +53,7 @@ func dialSSH(ctx context.Context, remoteURL, privateKeyPEM, hostKey string, time
 		HostKeyCallback: func(_ string, _ net.Addr, key ssh.PublicKey) error {
 			got := ssh.FingerprintSHA256(key)
 			if got != want {
-				return fmt.Errorf("SSH host key 不匹配：配置 %s，远端 %s", want, got)
+				return fmt.Errorf("SSH host key mismatch: configured %s, remote %s", want, got)
 			}
 			return nil
 		},
@@ -63,7 +63,7 @@ func dialSSH(ctx context.Context, remoteURL, privateKeyPEM, hostKey string, time
 	dialer := &net.Dialer{Timeout: timeout}
 	conn, err := dialer.DialContext(ctx, "tcp", ep.Address())
 	if err != nil {
-		return nil, fmt.Errorf("连接 SSH %s 失败: %w", ep.Host, err)
+		return nil, fmt.Errorf("connect to SSH %s: %w", ep.Host, err)
 	}
 	if deadline, ok := ctx.Deadline(); ok {
 		_ = conn.SetDeadline(deadline)
@@ -71,14 +71,14 @@ func dialSSH(ctx context.Context, remoteURL, privateKeyPEM, hostKey string, time
 	cc, chans, reqs, err := ssh.NewClientConn(conn, ep.Address(), cfg)
 	if err != nil {
 		conn.Close()
-		return nil, fmt.Errorf("SSH 握手失败: %w", err)
+		return nil, fmt.Errorf("SSH handshake: %w", err)
 	}
 	client := ssh.NewClient(cc, chans, reqs)
 
 	session, err := client.NewSession()
 	if err != nil {
 		client.Close()
-		return nil, fmt.Errorf("创建 SSH session 失败: %w", err)
+		return nil, fmt.Errorf("create SSH session: %w", err)
 	}
 	stdin, err := session.StdinPipe()
 	if err != nil {
@@ -116,7 +116,7 @@ func (s *sshSession) setenv(key, value string) error {
 
 func (s *sshSession) start(gitCommand string) error {
 	if err := s.session.Start(gitCommand + " " + shellQuote(s.path)); err != nil {
-		return fmt.Errorf("启动远端 %s 失败: %w", gitCommand, err)
+		return fmt.Errorf("start remote %s: %w", gitCommand, err)
 	}
 	return nil
 }
@@ -125,9 +125,9 @@ func (s *sshSession) wait() error {
 	if err := s.session.Wait(); err != nil {
 		stderr := <-s.stderrDone
 		if len(stderr) != 0 {
-			return fmt.Errorf("远端命令失败: %w: %s", err, strings.TrimSpace(string(stderr)))
+			return fmt.Errorf("remote command failed: %w: %s", err, strings.TrimSpace(string(stderr)))
 		}
-		return fmt.Errorf("远端命令失败: %w", err)
+		return fmt.Errorf("remote command failed: %w", err)
 	}
 	select {
 	case <-s.stderrDone:

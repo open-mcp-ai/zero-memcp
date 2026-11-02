@@ -261,6 +261,6 @@ func (l *localLocker) AcquireCommitToken(normRef string, timeout time.Duration) 
 			releaseOnce.Do(func() { <-ch })
 		}, nil
 	case <-ctx.Done():
-		return nil, fmt.Errorf("分支 %s 提交排队超时（上一个提交占用超过 %v）", normRef, timeout)
+		return nil, fmt.Errorf("timed out waiting to commit branch %s (previous commit held it longer than %v)", normRef, timeout)
 	}
 }

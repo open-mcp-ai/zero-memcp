@@ -37,7 +37,7 @@ func expandArgs(cmd string, vars map[string]string, args []string) (string, erro
 			// 非引用词里出现 $ 一律拒绝：那多半是想把引用塞进句子里，
 			// 而「塞进去」正是注入的入口。
 			if strings.Contains(tok, "$") {
-				return "", fmt.Errorf("引用 %q 必须独占一个词：值只能替换整个词，不能和别的文字拼在一起", tok)
+				return "", fmt.Errorf("reference %q must occupy a whole word: values replace an entire word and cannot be combined with other text", tok)
 			}
 			out = append(out, tok)
 			continue
@@ -45,14 +45,14 @@ func expandArgs(cmd string, vars map[string]string, args []string) (string, erro
 		if name != "" {
 			v, ok := vars[name]
 			if !ok {
-				return "", fmt.Errorf("cmd 引用了 $%s，但 vars 里没有这个名字", name)
+				return "", fmt.Errorf("cmd references $%s, but vars has no such name", name)
 			}
 			usedVar[name] = true
 			out = append(out, encodePayload(v))
 			continue
 		}
 		if pos <= 0 || pos > len(args) {
-			return "", fmt.Errorf("cmd 引用了 $%d，但 args 只有 %d 个", pos, len(args))
+			return "", fmt.Errorf("cmd references $%d, but args has only %d values", pos, len(args))
 		}
 		usedArg[pos] = true
 		out = append(out, encodePayload(args[pos-1]))
@@ -64,12 +64,12 @@ func expandArgs(cmd string, vars map[string]string, args []string) (string, erro
 	// 只会让结果在很久以后显得莫名其妙。
 	for name := range vars {
 		if !usedVar[name] {
-			return "", fmt.Errorf("vars 里的 %s 没有被 cmd 引用（参数被丢弃了）", name)
+			return "", fmt.Errorf("vars value %s is not referenced by cmd (argument was discarded)", name)
 		}
 	}
 	for i := range args {
 		if !usedArg[i+1] {
-			return "", fmt.Errorf("args 里的第 %d 个值没有被 cmd 引用（参数被丢弃了）", i+1)
+			return "", fmt.Errorf("args value %d is not referenced by cmd (argument was discarded)", i+1)
 		}
 	}
 	return strings.Join(out, " "), nil
@@ -92,7 +92,7 @@ func parseRef(tok string) (name string, pos int, isRef bool, err error) {
 		body = body[1 : len(body)-1]
 	}
 	if body == "" {
-		return "", 0, false, fmt.Errorf("空引用 %q", tok)
+		return "", 0, false, fmt.Errorf("empty reference %q", tok)
 	}
 	numeric := true
 	for _, c := range body {
@@ -107,7 +107,7 @@ func parseRef(tok string) (name string, pos int, isRef bool, err error) {
 			n = n*10 + int(c-'0')
 		}
 		if n == 0 {
-			return "", 0, true, fmt.Errorf("$0 不是合法引用：位置参数从 $1 开始")
+			return "", 0, true, fmt.Errorf("$0 is not a valid reference: positional arguments start at $1")
 		}
 		return "", n, true, nil
 	}

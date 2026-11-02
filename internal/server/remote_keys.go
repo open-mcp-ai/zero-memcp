@@ -20,21 +20,21 @@ func (s *Server) putSSHKey(name, text string) error {
 	}
 	text = strings.TrimSpace(text)
 	if _, err := ssh.ParsePrivateKey([]byte(text)); err != nil {
-		return fmt.Errorf("SSH 私钥必须是未加密 OpenSSH 私钥: %w", err)
+		return fmt.Errorf("SSH private key must be an unencrypted OpenSSH key: %w", err)
 	}
 	if err := os.MkdirAll(s.sshKeyDir(), 0o700); err != nil {
 		return err
 	}
 	dirInfo, err := os.Lstat(s.sshKeyDir())
 	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
-		return errors.New("SSH key 目录必须是非符号链接目录")
+		return errors.New("SSH key directory must be a non-symlink directory")
 	}
 	if err := os.Chmod(s.sshKeyDir(), 0o700); err != nil {
 		return err
 	}
 	path := filepath.Join(s.sshKeyDir(), name+".pem")
 	if _, err := os.Lstat(path); err == nil {
-		return fmt.Errorf("SSH 私钥 %q 已存在；要替换请先 remote-key delete，再重新 put", name)
+		return fmt.Errorf("SSH private key %q already exists; run remote-key delete before replacing it with put", name)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -99,7 +99,7 @@ func (s *Server) readSSHKey(name string) ([]byte, error) {
 	}
 	dirInfo, err := os.Lstat(s.sshKeyDir())
 	if err != nil || !dirInfo.IsDir() || dirInfo.Mode()&os.ModeSymlink != 0 {
-		return nil, errors.New("SSH key 目录无效")
+		return nil, errors.New("invalid SSH key directory")
 	}
 	path := filepath.Join(s.sshKeyDir(), name+".pem")
 	st, err := os.Lstat(path)
@@ -107,13 +107,13 @@ func (s *Server) readSSHKey(name string) ([]byte, error) {
 		return nil, err
 	}
 	if !st.Mode().IsRegular() {
-		return nil, errors.New("SSH 私钥必须是普通文件")
+		return nil, errors.New("SSH private key must be a regular file")
 	}
 	if st.Size() > 64<<10 {
-		return nil, errors.New("SSH 私钥文件超过 64 KiB")
+		return nil, errors.New("SSH private key file exceeds 64 KiB")
 	}
 	if st.Mode().Perm() != 0o600 {
-		return nil, fmt.Errorf("SSH 私钥权限不是 0600：%04o", st.Mode().Perm())
+		return nil, fmt.Errorf("SSH private key permissions are not 0600: %04o", st.Mode().Perm())
 	}
 	return os.ReadFile(path)
 }
@@ -134,24 +134,24 @@ func (s *Server) execRemoteKey(rest string, c Caller) (TermResult, error) {
 		arg := strings.TrimSpace(strings.TrimPrefix(rest, "put"))
 		id, payload, ok := strings.Cut(arg, "--")
 		if !ok {
-			return TermResult{}, errors.New("用法：remote-key put <name> -- $PRIVATE_KEY（只接受未加密 OpenSSH 私钥）")
+			return TermResult{}, errors.New("usage: remote-key put <name> -- $PRIVATE_KEY (accepts unencrypted OpenSSH keys only)")
 		}
 		id = strings.TrimSpace(id)
 		payload = strings.TrimSpace(restorePayload(strings.TrimPrefix(payload, " ")))
 		if payload == "" {
-			return TermResult{}, errors.New("私钥为空")
+			return TermResult{}, errors.New("private key is empty")
 		}
 		if err := s.putSSHKey(id, payload); err != nil {
 			return TermResult{}, err
 		}
-		return TermResult{Text: fmt.Sprintf("SSH 私钥 %q 已安全保存；内容不会回显", id), Structured: map[string]any{"ok": true, "name": id}}, nil
+		return TermResult{Text: fmt.Sprintf("SSH private key %q saved securely; contents are not echoed", id), Structured: map[string]any{"ok": true, "name": id}}, nil
 	}
 	fields := strings.Fields(rest)
 	if len(fields) == 2 && (fields[0] == "delete" || fields[0] == "rm") {
 		if err := s.deleteSSHKey(fields[1]); err != nil {
 			return TermResult{}, err
 		}
-		return TermResult{Text: fmt.Sprintf("SSH 私钥 %q 已删除", fields[1]), Structured: map[string]any{"ok": true, "deleted": fields[1]}}, nil
+		return TermResult{Text: fmt.Sprintf("SSH private key %q deleted", fields[1]), Structured: map[string]any{"ok": true, "deleted": fields[1]}}, nil
 	}
-	return TermResult{}, errors.New("用法：remote-key list | put <name> -- $PRIVATE_KEY | delete <name>")
+	return TermResult{}, errors.New("usage: remote-key list | put <name> -- $PRIVATE_KEY | delete <name>")
 }

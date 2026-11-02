@@ -60,7 +60,7 @@ func TestCascadeRevocation(t *testing.T) {
 
 	// 5. 子凭证 C 必须立即被拒绝
 	_, err = callMCP(t, srv, cTok, "read 01-shape.md")
-	if err == nil || !strings.Contains(err.Error(), "吊销") {
+	if err == nil || !strings.Contains(err.Error(), "revoked") {
 		t.Fatalf("父凭证已吊销，子凭证应被级联拒绝，实际: %v", err)
 	}
 }

@@ -25,7 +25,7 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 
 	addr, content, ok := strings.Cut(rest, "--")
 	if !ok {
-		return "", fmt.Errorf("用法：write <project>[@<branch>]/<path> -- <内容>")
+		return "", fmt.Errorf("usage: write <project>[@<branch>]/<path> -- <content>")
 	}
 	// 只吃掉紧跟 -- 的那一个空格，其余原样保留。
 	//
@@ -44,7 +44,7 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 	content = restorePayload(content)
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
-		return "", fmt.Errorf("缺写入路径")
+		return "", fmt.Errorf("write path is required")
 	}
 
 	proj, branch, path, err := s.resolveAddr(addr, c)
@@ -52,10 +52,10 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 		return "", err
 	}
 	if path == "" {
-		return "", fmt.Errorf("%q 只给出了项目，没有文件路径", addr)
+		return "", fmt.Errorf("%q specifies a project but no file path", addr)
 	}
 	if !s.allowed(c, proj, branch, configBitWrite) {
-		return "", fmt.Errorf("无权写入 %s@%s", proj, branch)
+		return "", fmt.Errorf("not authorized to write to %s@%s", proj, branch)
 	}
 
 	repo, err := s.projects.Get(proj)
@@ -68,7 +68,7 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 		return "", err
 	}
 	if err := s.Reload(); err != nil {
-		return "", fmt.Errorf("已写入，但重建索引失败：%w", err)
+		return "", fmt.Errorf("written, but failed to rebuild index: %w", err)
 	}
-	return fmt.Sprintf("已写入 %s@%s/%s（%d 字节），索引已重建", proj, branch, path, len(content)), nil
+	return fmt.Sprintf("written to %s@%s/%s (%d bytes); index rebuilt", proj, branch, path, len(content)), nil
 }

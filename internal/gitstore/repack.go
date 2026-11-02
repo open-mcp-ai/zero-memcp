@@ -56,11 +56,11 @@ func (r *Repo) Repack() (RepackResult, error) {
 	for _, sha := range shas {
 		typ, body, err := r.readObject(sha)
 		if err != nil {
-			return RepackResult{}, fmt.Errorf("读取对象 %s 失败: %w", sha, err)
+			return RepackResult{}, fmt.Errorf("read object %s: %w", sha, err)
 		}
 		total += len(body) + 32
 		if total > maxRepackBytes {
-			return RepackResult{}, fmt.Errorf("对象总量超过 %d 字节上限", maxRepackBytes)
+			return RepackResult{}, fmt.Errorf("total object size exceeds the %d byte limit", maxRepackBytes)
 		}
 		start := pack.Len()
 		if err := writePackObject(&pack, typ, body); err != nil {
@@ -104,10 +104,10 @@ func (r *Repo) Repack() (RepackResult, error) {
 	// 也不要在索引写坏的情况下删掉唯一能读的那份。
 	idxInfo, err := r.parseIdx(filepath.Join(packDir, packName+".idx"))
 	if err != nil {
-		return RepackResult{}, fmt.Errorf("新索引无法解析: %w", err)
+		return RepackResult{}, fmt.Errorf("cannot parse the new index: %w", err)
 	}
 	if len(idxInfo.shas) != len(shas) {
-		return RepackResult{}, fmt.Errorf("新索引条目数 %d 与对象数 %d 不符", len(idxInfo.shas), len(shas))
+		return RepackResult{}, fmt.Errorf("new index has %d entries but there are %d objects", len(idxInfo.shas), len(shas))
 	}
 
 	removed := 0
@@ -188,7 +188,7 @@ func writePackObject(buf *bytes.Buffer, typ string, body []byte) error {
 	case "tag":
 		code = 4
 	default:
-		return fmt.Errorf("未知对象类型 %q", typ)
+		return fmt.Errorf("unknown object type %q", typ)
 	}
 	size := len(body)
 	head := []byte{code<<4 | byte(size&0x0f)}

@@ -264,8 +264,8 @@ func TestIndexParityBetweenWriteAndRebuild(t *testing.T) {
 			t.Fatalf("reload 后 recall %q: %v", q, err)
 		}
 		// 只比「有没有命中」，不比分数：分数含时间衰减，会随秒数变化。
-		liveHit := !strings.Contains(live[q], "无命中")
-		rebuildHit := !strings.Contains(out, "无命中")
+		liveHit := !strings.Contains(live[q], "no matches")
+		rebuildHit := !strings.Contains(out, "no matches")
 		if liveHit != rebuildHit {
 			t.Errorf("查询 %q 的可检索性随重启变化：写入后命中=%v，重建后命中=%v\n写入后: %s\n重建后: %s",
 				q, liveHit, rebuildHit, live[q], out)

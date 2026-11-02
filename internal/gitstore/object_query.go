@@ -38,19 +38,19 @@ func (r *Repo) HasObject(sha string) bool {
 // ref 是本地状态的指针，可以有旧值，因此用 tmp + rename 原子替换。
 func (r *Repo) SetRemoteRef(remote, branch, sha string) error {
 	if err := ValidateBranch(remote); err != nil {
-		return fmt.Errorf("远端名非法: %w", err)
+		return fmt.Errorf("invalid remote name: %w", err)
 	}
 	if err := ValidateBranch(branch); err != nil {
-		return fmt.Errorf("分支名非法: %w", err)
+		return fmt.Errorf("invalid branch name: %w", err)
 	}
 	if err := validSHA(sha); err != nil {
 		return err
 	}
 	if remote == "" || branch == "" {
-		return fmt.Errorf("remote/branch 不能为空")
+		return fmt.Errorf("remote/branch must not be empty")
 	}
 	if strings.ContainsAny(remote+branch, " \t\r\n") || strings.Contains(branch, "..") {
-		return fmt.Errorf("非法的 remote/branch：%q %q", remote, branch)
+		return fmt.Errorf("invalid remote/branch: %q %q", remote, branch)
 	}
 	ref := "refs/remotes/" + remote + "/" + branch
 	path := r.refPath(ref)
@@ -97,7 +97,7 @@ func (r *Repo) SetRef(ref, sha string) error {
 	}
 	ref = strings.TrimPrefix(strings.TrimSpace(ref), "/")
 	if ref == "" || strings.Contains(ref, "..") || strings.ContainsAny(ref, " \t\r\n") {
-		return fmt.Errorf("非法的 ref：%q", ref)
+		return fmt.Errorf("invalid ref: %q", ref)
 	}
 	path := r.refPath(ref)
 	if err := r.FS().MkdirAll(filepath.Dir(path), 0o755); err != nil {

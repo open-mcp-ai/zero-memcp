@@ -15,7 +15,7 @@ import (
 // 所以它来自哪个仓库、哪个分支、哪条路径，上层都不需要知道。
 func (s *Server) readBlock(b memory.Block) ([]byte, error) {
 	if b.Read == nil {
-		return nil, errors.New("块没有绑定读取方式")
+		return nil, errors.New("block has no read method bound")
 	}
 	return b.Read()
 }
@@ -93,7 +93,7 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 		if perr == nil {
 			// 显式分支也必须先过挂载可见性，否则等于绕过 chroot
 			if !c.Mount.Visible(proj, br) {
-				return "", "", "", fmt.Errorf("项目 %s@%s 不在这张凭证的可见范围内", proj, br)
+				return "", "", "", fmt.Errorf("project %s@%s is outside this credential's visible scope", proj, br)
 			}
 			return proj, br, p, nil
 		}
@@ -112,7 +112,7 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 func (s *Server) splitAddrPwd(addr, pwd string) (project, path string, err error) {
 	addr = strings.TrimSpace(addr)
 	if addr == "" {
-		return "", "", errors.New("地址不能为空")
+		return "", "", errors.New("address cannot be empty")
 	}
 
 	clean := strings.TrimPrefix(addr, "/")
@@ -155,7 +155,7 @@ func (s *Server) splitAddrPwd(addr, pwd string) (project, path string, err error
 		for _, p := range projects {
 			if p == first || strings.HasPrefix(p, first+"/") {
 				// 匹配到已知项目的上级或同名，说明调用方是想写全路径但写错了，直接拒绝
-				return "", "", fmt.Errorf("项目 %q 未在配置里声明或地址写错", first)
+				return "", "", fmt.Errorf("project %q is not declared in the config or the address is invalid", first)
 			}
 		}
 	}
@@ -183,10 +183,10 @@ func (s *Server) splitAddrPwd(addr, pwd string) (project, path string, err error
 		return matchProj, clean, nil
 	}
 	if matchCount > 1 {
-		return "", "", fmt.Errorf("相对路径 %q 在多个项目里都存在，请加项目前缀", clean)
+		return "", "", fmt.Errorf("relative path %q exists in multiple projects; add a project prefix", clean)
 	}
 
-	return "", "", errors.New("地址应为 <项目>/<路径>（未匹配到已知项目且相对路径在任何仓库都不存在），得到 " + addr)
+	return "", "", errors.New("address must be <project>/<path> (no known project matched and the relative path does not exist in any repository); got " + addr)
 }
 
 func (s *Server) projectOfAddr(addr string) string {

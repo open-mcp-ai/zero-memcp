@@ -33,7 +33,7 @@ func (r *Repo) LockBranch(branch string) (string, error) {
 		return "", err
 	}
 	if sha == "" {
-		return "", fmt.Errorf("分支 %q 不存在或没有提交", branch)
+		return "", fmt.Errorf("branch %q does not exist or has no commits", branch)
 	}
 	path := r.lockPath(name)
 	if err := r.FS().MkdirAll(filepath.Dir(path), 0o700); err != nil {

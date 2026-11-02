@@ -48,22 +48,22 @@ func (r *Repo) writeObject(typ string, content []byte) (string, error) {
 	}
 
 	if err := r.FS().MkdirAll(filepath.Dir(dst), 0o755); err != nil {
-		return "", fmt.Errorf("建对象目录: %w", err)
+		return "", fmt.Errorf("create object directory: %w", err)
 	}
 
 	// 压缩到临时文件再 rename：通过 FS.WriteAtomicWithSync 原子同步
 	err := r.FS().WriteAtomicWithSync(dst, 0o444, func(w io.Writer) error {
 		zw := zlib.NewWriter(w)
 		if _, err := zw.Write(full); err != nil {
-			return fmt.Errorf("压缩对象: %w", err)
+			return fmt.Errorf("compress object: %w", err)
 		}
 		if err := zw.Close(); err != nil {
-			return fmt.Errorf("关闭压缩流: %w", err)
+			return fmt.Errorf("close compression stream: %w", err)
 		}
 		return nil
 	})
 	if err != nil {
-		return "", fmt.Errorf("落盘对象: %w", err)
+		return "", fmt.Errorf("persist object: %w", err)
 	}
 	return sha, nil
 }
@@ -80,47 +80,47 @@ func (r *Repo) readObject(sha string) (string, []byte, error) {
 			// 任何跑过 gc 或刚 clone 的仓库，对象都在 pack 里。
 			return r.readPacked(sha)
 		}
-		return "", nil, fmt.Errorf("打开对象 %s: %w", sha, err)
+		return "", nil, fmt.Errorf("open object %s: %w", sha, err)
 	}
 	defer f.Close()
 
 	zr, err := zlib.NewReader(f)
 	if err != nil {
-		return "", nil, fmt.Errorf("解压对象 %s: %w", sha, err)
+		return "", nil, fmt.Errorf("inflate object %s: %w", sha, err)
 	}
 	defer zr.Close()
 
 	raw, err := io.ReadAll(zr)
 	if err != nil {
-		return "", nil, fmt.Errorf("读取对象 %s: %w", sha, err)
+		return "", nil, fmt.Errorf("read object %s: %w", sha, err)
 	}
 	nul := bytes.IndexByte(raw, 0)
 	if nul < 0 {
-		return "", nil, fmt.Errorf("对象 %s 头部损坏", sha)
+		return "", nil, fmt.Errorf("object %s has a corrupt header", sha)
 	}
 	head := string(raw[:nul])
 	typ, sizeStr, ok := strings.Cut(head, " ")
 	if !ok {
-		return "", nil, fmt.Errorf("对象 %s 头部格式不对: %q", sha, head)
+		return "", nil, fmt.Errorf("object %s has a malformed header: %q", sha, head)
 	}
 	size, err := strconv.Atoi(sizeStr)
 	if err != nil {
-		return "", nil, fmt.Errorf("对象 %s 大小字段损坏: %q", sha, sizeStr)
+		return "", nil, fmt.Errorf("object %s has a corrupt size field: %q", sha, sizeStr)
 	}
 	body := raw[nul+1:]
 	if len(body) != size {
-		return "", nil, fmt.Errorf("对象 %s 长度不符：声明 %d，实际 %d", sha, size, len(body))
+		return "", nil, fmt.Errorf("object %s length mismatch: declared %d, actual %d", sha, size, len(body))
 	}
 	return typ, body, nil
 }
 
 func validSHA(sha string) error {
 	if len(sha) != 40 {
-		return fmt.Errorf("SHA 应为 40 位十六进制，得到 %q", sha)
+		return fmt.Errorf("SHA must be 40 hex characters, got %q", sha)
 	}
 	for _, c := range sha {
 		if !strings.ContainsRune("0123456789abcdef", c) {
-			return fmt.Errorf("SHA 只能是小写十六进制，得到 %q", sha)
+			return fmt.Errorf("SHA must be lowercase hex, got %q", sha)
 		}
 	}
 	return nil
@@ -139,20 +139,20 @@ func parseTree(body []byte) ([]treeItem, error) {
 	for len(body) > 0 {
 		sp := bytes.IndexByte(body, ' ')
 		if sp < 0 {
-			return nil, fmt.Errorf("tree 条目缺少空格")
+			return nil, fmt.Errorf("tree entry is missing a space")
 		}
 		mode := string(body[:sp])
 		body = body[sp+1:]
 
 		nul := bytes.IndexByte(body, 0)
 		if nul < 0 {
-			return nil, fmt.Errorf("tree 条目缺少 NUL")
+			return nil, fmt.Errorf("tree entry is missing NUL")
 		}
 		name := string(body[:nul])
 		body = body[nul+1:]
 
 		if len(body) < 20 {
-			return nil, fmt.Errorf("tree 条目 %q 的 SHA 不完整", name)
+			return nil, fmt.Errorf("tree entry %q has an incomplete SHA", name)
 		}
 		sha := hex.EncodeToString(body[:20])
 		body = body[20:]
@@ -209,11 +209,11 @@ func (n *treeNode) insert(path, mode, sha string) error {
 	cur := n
 	for i, p := range parts {
 		if p == "" {
-			return fmt.Errorf("路径含空段: %q", path)
+			return fmt.Errorf("path contains an empty segment: %q", path)
 		}
 		if i == len(parts)-1 {
 			if _, isDir := cur.dirs[p]; isDir {
-				return fmt.Errorf("路径 %q 与已有目录冲突", path)
+				return fmt.Errorf("path %q conflicts with an existing directory", path)
 			}
 			cur.blobs[p] = treeItem{mode: mode, name: p, sha: sha}
 			return nil
@@ -221,7 +221,7 @@ func (n *treeNode) insert(path, mode, sha string) error {
 		next, ok := cur.dirs[p]
 		if !ok {
 			if _, isBlob := cur.blobs[p]; isBlob {
-				return fmt.Errorf("路径 %q 与已有文件冲突", path)
+				return fmt.Errorf("path %q conflicts with an existing file", path)
 			}
 			next = newTreeNode()
 			cur.dirs[p] = next
@@ -261,7 +261,7 @@ func (r *Repo) loadTree(sha, prefix string, out map[string]Entry) error {
 		return err
 	}
 	if typ != "tree" {
-		return fmt.Errorf("对象 %s 不是 tree，而是 %s", sha, typ)
+		return fmt.Errorf("object %s is not a tree but %s", sha, typ)
 	}
 	items, err := parseTree(body)
 	if err != nil {

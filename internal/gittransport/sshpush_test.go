@@ -114,7 +114,7 @@ func TestSSHPushRejectsWrongPinnedHostKey(t *testing.T) {
 	addr := listener.Addr().(*net.TCPAddr)
 	url := "ssh://git@127.0.0.1:" + itoa(addr.Port) + "/unused.git"
 	_, err = Push(context.Background(), local, url, "main", string(pem.EncodeToMemory(block)), "SHA256:wrong", time.Second)
-	if err == nil || !strings.Contains(err.Error(), "host key 不匹配") {
+	if err == nil || !strings.Contains(err.Error(), "host key mismatch") {
 		t.Fatalf("want host-key failure; got %v", err)
 	}
 }

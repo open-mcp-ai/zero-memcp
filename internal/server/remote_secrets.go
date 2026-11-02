@@ -24,27 +24,27 @@ func (s *Server) putSecret(name, value string) error {
 	}
 	value = strings.TrimSpace(value)
 	if value == "" {
-		return errors.New("token 为空")
+		return errors.New("token is empty")
 	}
 	if strings.ContainsAny(value, "\r\n") {
-		return errors.New("token 不能包含换行")
+		return errors.New("token cannot contain newlines")
 	}
 	if len(value) > 8<<10 {
-		return errors.New("token 太长（上限 8 KiB）")
+		return errors.New("token is too long (maximum 8 KiB)")
 	}
 	if err := os.MkdirAll(s.secretDir(), 0o700); err != nil {
 		return err
 	}
 	info, err := os.Lstat(s.secretDir())
 	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return errors.New("secret 目录必须是非符号链接目录")
+		return errors.New("secret directory must be a non-symlink directory")
 	}
 	if err := os.Chmod(s.secretDir(), 0o700); err != nil {
 		return err
 	}
 	path := filepath.Join(s.secretDir(), name)
 	if _, err := os.Lstat(path); err == nil {
-		return fmt.Errorf("token %q 已存在；要轮换请先 remote-secret delete", name)
+		return fmt.Errorf("token %q already exists; run remote-secret delete before rotating it", name)
 	} else if !os.IsNotExist(err) {
 		return err
 	}
@@ -113,10 +113,10 @@ func (s *Server) readSecret(name string) (string, error) {
 		return "", err
 	}
 	if !st.Mode().IsRegular() {
-		return "", errors.New("token 必须是普通文件")
+		return "", errors.New("token must be a regular file")
 	}
 	if st.Mode().Perm() != 0o600 {
-		return "", fmt.Errorf("token 权限不是 0600：%04o", st.Mode().Perm())
+		return "", fmt.Errorf("token permissions are not 0600: %04o", st.Mode().Perm())
 	}
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -142,23 +142,23 @@ func (s *Server) execRemoteSecret(rest string, c Caller) (TermResult, error) {
 		arg := strings.TrimSpace(strings.TrimPrefix(rest, "put"))
 		id, payload, ok := strings.Cut(arg, "--")
 		if !ok {
-			return TermResult{}, errors.New("用法：remote-secret put <name> -- $TOKEN")
+			return TermResult{}, errors.New("usage: remote-secret put <name> -- $TOKEN")
 		}
 		id = strings.TrimSpace(id)
 		payload = strings.TrimSpace(restorePayload(strings.TrimPrefix(payload, " ")))
 		if err := s.putSecret(id, payload); err != nil {
 			return TermResult{}, err
 		}
-		return TermResult{Text: fmt.Sprintf("token %q 已安全保存；内容不会回显", id), Structured: map[string]any{"ok": true, "name": id}}, nil
+		return TermResult{Text: fmt.Sprintf("token %q saved securely; contents are not echoed", id), Structured: map[string]any{"ok": true, "name": id}}, nil
 	}
 	fields := strings.Fields(rest)
 	if len(fields) == 2 && (fields[0] == "delete" || fields[0] == "rm") {
 		if err := s.deleteSecret(fields[1]); err != nil {
 			return TermResult{}, err
 		}
-		return TermResult{Text: fmt.Sprintf("token %q 已删除", fields[1]), Structured: map[string]any{"ok": true, "deleted": fields[1]}}, nil
+		return TermResult{Text: fmt.Sprintf("token %q deleted", fields[1]), Structured: map[string]any{"ok": true, "deleted": fields[1]}}, nil
 	}
-	return TermResult{}, errors.New("用法：remote-secret list | put <name> -- $TOKEN | delete <name>")
+	return TermResult{}, errors.New("usage: remote-secret list | put <name> -- $TOKEN | delete <name>")
 }
 
 // optionalSecret 读出可选的凭证：没声明就匿名，声明了但读不出来就报错。
@@ -172,7 +172,7 @@ func (s *Server) optionalSecret(name, field string) (string, error) {
 	}
 	token, err := s.readSecret(name)
 	if err != nil {
-		return "", fmt.Errorf("读取 %s %q 失败: %w", field, name, err)
+		return "", fmt.Errorf("read %s %q: %w", field, name, err)
 	}
 	return token, nil
 }

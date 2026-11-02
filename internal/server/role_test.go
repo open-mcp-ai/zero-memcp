@@ -229,7 +229,7 @@ func TestRecallUsesHitBranch(t *testing.T) {
 		t.Fatalf("recall 失败: %v", err)
 	}
 	// 挂载点是 /，虚拟地址里不带项目名，只看有没有命中内容。
-	if strings.Contains(out, "无命中") || !strings.Contains(out, ".md") {
+	if strings.Contains(out, "no matches") || !strings.Contains(out, ".md") {
 		t.Fatalf("应该能 recall 到自己写的记录，实际: %q", out)
 	}
 }

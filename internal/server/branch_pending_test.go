@@ -18,7 +18,7 @@ func TestBranchListsDirtyOnlyBranch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "feature") || !strings.Contains(out, "待提交") {
+	if !strings.Contains(out, "feature") || !strings.Contains(out, "pending commit") {
 		t.Fatalf("branch 列表应显示待提交的 feature 分支，得到:\n%s", out)
 	}
 }

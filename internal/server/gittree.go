@@ -20,7 +20,7 @@ func (s *Server) loadGitTrees(defaultBranch string) ([]*memory.Tree, error) {
 	for _, proj := range projects {
 		repo, err := s.projects.Get(proj)
 		if err != nil {
-			return nil, fmt.Errorf("打开项目 %s: %w", proj, err)
+			return nil, fmt.Errorf("open project %s: %w", proj, err)
 		}
 
 		// 索引所有分支，不只 defaultBranch。
@@ -57,7 +57,7 @@ func (s *Server) loadGitTrees(defaultBranch string) ([]*memory.Tree, error) {
 			}
 			t, err := s.scanGitProject(repo, proj, br)
 			if err != nil {
-				return nil, fmt.Errorf("扫描 %s/%s: %w", proj, br, err)
+				return nil, fmt.Errorf("scan %s/%s: %w", proj, br, err)
 			}
 			trees = append(trees, t)
 		}

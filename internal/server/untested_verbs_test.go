@@ -64,7 +64,7 @@ func TestDiffReportsAddModifyDelete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("跨分支 diff 失败: %v", err)
 	}
-	if !strings.Contains(out, "new.md") || !strings.Contains(out, "新增") {
+	if !strings.Contains(out, "new.md") || !strings.Contains(out, "added") {
 		t.Fatalf("跨分支 diff 应认出新增文件: %s", out)
 	}
 }
@@ -105,7 +105,7 @@ func TestCommitCustomMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("带 -m commit 失败: %v", err)
 	}
-	if !strings.Contains(out, "已提交") {
+	if !strings.Contains(out, "committed") {
 		t.Fatalf("commit 回显异常: %s", out)
 	}
 

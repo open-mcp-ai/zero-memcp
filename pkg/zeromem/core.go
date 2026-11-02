@@ -51,7 +51,7 @@ type Core struct {
 // 跑记忆引擎和别的东西（比如一个终端引擎），各占各的路由。
 func New(opts Options) (*Core, error) {
 	if opts.DataDir == "" {
-		return nil, fmt.Errorf("zeromem: 必须给 DataDir")
+		return nil, fmt.Errorf("zeromem: DataDir is required")
 	}
 	srv, err := server.New(server.Config{
 		DataDir:       opts.DataDir,
@@ -98,7 +98,7 @@ func (c *Core) call(ctx context.Context, args json.RawMessage) (string, error) {
 		Vars map[string]string `json:"vars"`
 	}
 	if err := json.Unmarshal(args, &a); err != nil {
-		return "", fmt.Errorf("解析 mem 参数: %w", err)
+		return "", fmt.Errorf("parse mem arguments: %w", err)
 	}
 	cmd, err := server.ExpandArgs(a.Cmd, a.Vars, a.Args)
 	if err != nil {

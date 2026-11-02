@@ -125,19 +125,19 @@ func (r *Repo) parseIdx(path string) (*packIdx, error) {
 
 func parseIdxBytes(path string, b []byte) (*packIdx, error) {
 	if len(b) < 8+256*4+40 {
-		return nil, fmt.Errorf("%s 太短，不像 idx", path)
+		return nil, fmt.Errorf("%s is too short to be an idx file", path)
 	}
 	if !bytes.Equal(b[:4], []byte{0xff, 0x74, 0x4f, 0x63}) {
-		return nil, fmt.Errorf("%s 不是 v2 索引", path)
+		return nil, fmt.Errorf("%s is not a v2 index", path)
 	}
 	if v := binary.BigEndian.Uint32(b[4:8]); v != 2 {
-		return nil, fmt.Errorf("%s 索引版本 %d 不支持", path, v)
+		return nil, fmt.Errorf("%s uses unsupported index version %d", path, v)
 	}
 
 	fanout := b[8 : 8+256*4]
 	count := int(binary.BigEndian.Uint32(fanout[255*4:]))
 	if count <= 0 || count > 1<<24 {
-		return nil, fmt.Errorf("%s 对象数异常: %d", path, count)
+		return nil, fmt.Errorf("%s has an implausible object count: %d", path, count)
 	}
 
 	shaStart := 8 + 256*4
@@ -145,7 +145,7 @@ func parseIdxBytes(path string, b []byte) (*packIdx, error) {
 	crcEnd := shaEnd + count*4
 	offEnd := crcEnd + count*4
 	if len(b) < offEnd {
-		return nil, fmt.Errorf("%s 被截断", path)
+		return nil, fmt.Errorf("%s is truncated", path)
 	}
 
 	idx := &packIdx{
@@ -164,7 +164,7 @@ func parseIdxBytes(path string, b []byte) (*packIdx, error) {
 		if v&0x80000000 != 0 {
 			li := int(v & 0x7fffffff)
 			if len(large) < (li+1)*8 {
-				return nil, fmt.Errorf("%s 大偏移越界", path)
+				return nil, fmt.Errorf("%s has a large-offset entry out of range", path)
 			}
 			idx.offsets[i] = int64(binary.BigEndian.Uint64(large[li*8 : li*8+8]))
 		} else {
@@ -202,13 +202,13 @@ func (r *Repo) readPacked(sha string) (string, []byte, error) {
 		}
 		return r.readAt(idx, off, 0)
 	}
-	return "", nil, fmt.Errorf("对象 %s 不在松散库也不在任何 pack 里", sha)
+	return "", nil, fmt.Errorf("object %s is neither loose nor in any pack", sha)
 }
 
 // readAt 从某个 pack 偏移处读对象，depth 防止 delta 链成环。
 func (r *Repo) readAt(idx *packIdx, off int64, depth int) (string, []byte, error) {
 	if depth > 64 {
-		return "", nil, fmt.Errorf("delta 链过深（可能成环）")
+		return "", nil, fmt.Errorf("delta chain too deep (possibly cyclic)")
 	}
 	f, err := r.FS().Open(idx.packPath)
 	if err != nil {
@@ -242,7 +242,7 @@ func (r *Repo) readAt(idx *packIdx, off int64, depth int) (string, []byte, error
 		baseOff := off - rel
 		_, base, err := r.readAt(idx, baseOff, depth+1)
 		if err != nil {
-			return "", nil, fmt.Errorf("读 delta 基对象: %w", err)
+			return "", nil, fmt.Errorf("read delta base object: %w", err)
 		}
 		delta, err := readZlib(br, size)
 		if err != nil {
@@ -267,7 +267,7 @@ func (r *Repo) readAt(idx *packIdx, off int64, depth int) (string, []byte, error
 		baseSHA := fmt.Sprintf("%x", baseRaw)
 		bt, base, err := r.readObject(baseSHA)
 		if err != nil {
-			return "", nil, fmt.Errorf("读 delta 基对象 %s: %w", baseSHA, err)
+			return "", nil, fmt.Errorf("read delta base object %s: %w", baseSHA, err)
 		}
 		delta, err := readZlib(br, size)
 		if err != nil {
@@ -279,7 +279,7 @@ func (r *Repo) readAt(idx *packIdx, off int64, depth int) (string, []byte, error
 		}
 		return bt, out, nil
 	}
-	return "", nil, fmt.Errorf("未知 pack 对象类型 %d", typ)
+	return "", nil, fmt.Errorf("unknown pack object type %d", typ)
 }
 
 // readAtType 只求类型，用于让 OFS_DELTA 的结果继承基对象类型。
@@ -330,7 +330,7 @@ func (r *Repo) readAtType(idx *packIdx, off int64) (string, int64, error) {
 		}
 		_ = baseSHA
 	}
-	return "", 0, fmt.Errorf("无法确定对象类型")
+	return "", 0, fmt.Errorf("cannot determine object type")
 }
 
 func objTypeName(t int) string {
@@ -395,7 +395,7 @@ func readObjHeader(br *byteReader) (typ int, size int64, err error) {
 		size |= int64(c&0x7f) << shift
 		shift += 7
 		if shift > 63 {
-			return 0, 0, fmt.Errorf("对象长度溢出")
+			return 0, 0, fmt.Errorf("object length overflow")
 		}
 	}
 	return typ, size, nil
@@ -446,7 +446,7 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 		var shift uint
 		for {
 			if pos >= len(delta) {
-				return 0, fmt.Errorf("delta 长度字段越界")
+				return 0, fmt.Errorf("delta length field out of range")
 			}
 			c := delta[pos]
 			pos++
@@ -463,7 +463,7 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 		return nil, err
 	}
 	if baseSize != len(base) {
-		return nil, fmt.Errorf("delta 声明的基对象长度 %d 与实际 %d 不符", baseSize, len(base))
+		return nil, fmt.Errorf("delta declares base length %d but actual is %d", baseSize, len(base))
 	}
 	outSize, err := readSize()
 	if err != nil {
@@ -480,7 +480,7 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 			for i := 0; i < 4; i++ {
 				if op&(1<<uint(i)) != 0 {
 					if pos >= len(delta) {
-						return nil, fmt.Errorf("delta 拷贝偏移越界")
+						return nil, fmt.Errorf("delta copy offset out of range")
 					}
 					cpOff |= int(delta[pos]) << uint(8*i)
 					pos++
@@ -489,7 +489,7 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 			for i := 0; i < 3; i++ {
 				if op&(1<<uint(4+i)) != 0 {
 					if pos >= len(delta) {
-						return nil, fmt.Errorf("delta 拷贝长度越界")
+						return nil, fmt.Errorf("delta copy length out of range")
 					}
 					cpLen |= int(delta[pos]) << uint(8*i)
 					pos++
@@ -499,24 +499,24 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 				cpLen = 0x10000
 			}
 			if cpOff < 0 || cpOff+cpLen > len(base) {
-				return nil, fmt.Errorf("delta 拷贝区间越界")
+				return nil, fmt.Errorf("delta copy range out of range")
 			}
 			out = append(out, base[cpOff:cpOff+cpLen]...)
 			continue
 		}
 		if op == 0 {
-			return nil, fmt.Errorf("delta 里出现保留指令 0")
+			return nil, fmt.Errorf("delta contains reserved opcode 0")
 		}
 		// 插入字面量
 		n := int(op)
 		if pos+n > len(delta) {
-			return nil, fmt.Errorf("delta 插入越界")
+			return nil, fmt.Errorf("delta insert out of range")
 		}
 		out = append(out, delta[pos:pos+n]...)
 		pos += n
 	}
 	if len(out) != outSize {
-		return nil, fmt.Errorf("delta 结果长度 %d 与声明 %d 不符", len(out), outSize)
+		return nil, fmt.Errorf("delta result length %d does not match declared %d", len(out), outSize)
 	}
 	return out, nil
 }
@@ -530,7 +530,7 @@ func decodeSHA(sha string) ([20]byte, error) {
 		hi, ok1 := hexVal(sha[i*2])
 		lo, ok2 := hexVal(sha[i*2+1])
 		if !ok1 || !ok2 {
-			return out, fmt.Errorf("非法 SHA %q", sha)
+			return out, fmt.Errorf("invalid SHA %q", sha)
 		}
 		out[i] = hi<<4 | lo
 	}

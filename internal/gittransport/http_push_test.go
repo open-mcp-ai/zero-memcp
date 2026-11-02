@@ -148,7 +148,7 @@ func TestHTTPPushRefusesCleartextToRemoteHost(t *testing.T) {
 	_, _ = local.Commit("main", "seed")
 
 	_, err = PushHTTP(context.Background(), local, "http://git.example.com/repo.git", "main", "u", "tok", time.Second)
-	if err == nil || !strings.Contains(err.Error(), "明文 HTTP") {
+	if err == nil || !strings.Contains(err.Error(), "plain HTTP") {
 		t.Fatalf("应拒绝向非回环主机明文发送凭证: %v", err)
 	}
 }

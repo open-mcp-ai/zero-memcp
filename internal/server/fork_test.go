@@ -184,7 +184,7 @@ func TestResetArchivesOldVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reset 失败: %v", err)
 	}
-	if !strings.Contains(out, "已重置") {
+	if !strings.Contains(out, "reset ") {
 		t.Fatalf("reset 回显异常: %s", out)
 	}
 

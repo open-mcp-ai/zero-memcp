@@ -41,7 +41,7 @@ func (s *Server) remotesOf(project string) []config.Remote {
 func (s *Server) findRemote(project, name string) (config.Remote, error) {
 	all := s.remotesOf(project)
 	if len(all) == 0 {
-		return config.Remote{}, fmt.Errorf("项目 %s 没有声明任何远端（在配置里加 [[remote]]）", project)
+		return config.Remote{}, fmt.Errorf("project %s has no declared remotes (add [[remote]] to the config)", project)
 	}
 	if name == "" {
 		if len(all) == 1 {
@@ -52,7 +52,7 @@ func (s *Server) findRemote(project, name string) (config.Remote, error) {
 			names = append(names, r.Name)
 		}
 		sort.Strings(names)
-		return config.Remote{}, fmt.Errorf("项目 %s 有多个远端，请指定其一：%s", project, strings.Join(names, " / "))
+		return config.Remote{}, fmt.Errorf("project %s has multiple remotes; specify one: %s", project, strings.Join(names, " / "))
 	}
 	for _, r := range all {
 		if r.Name == name {
@@ -64,7 +64,7 @@ func (s *Server) findRemote(project, name string) (config.Remote, error) {
 		names = append(names, r.Name)
 	}
 	sort.Strings(names)
-	return config.Remote{}, fmt.Errorf("项目 %s 没有远端 %q（可用：%s）", project, name, strings.Join(names, ", "))
+	return config.Remote{}, fmt.Errorf("project %s has no remote %q (available: %s)", project, name, strings.Join(names, ", "))
 }
 
 // execRemote 处理 remote 动词：列出某个项目的远端声明。
@@ -72,7 +72,7 @@ func (s *Server) execRemote(rest string, c Caller) (TermResult, error) {
 	project := strings.TrimSpace(rest)
 	all := s.remotes.Load()
 	if all == nil {
-		return TermResult{Text: "没有配置任何远端"}, nil
+		return TermResult{Text: "no remotes configured"}, nil
 	}
 	rules := *all
 	if project == "" {
@@ -82,7 +82,7 @@ func (s *Server) execRemote(rest string, c Caller) (TermResult, error) {
 			byProject[r.Project] = append(byProject[r.Project], r)
 		}
 		if len(byProject) == 0 {
-			return TermResult{Text: "没有配置任何远端"}, nil
+			return TermResult{Text: "no remotes configured"}, nil
 		}
 		var projects []string
 		for p := range byProject {
@@ -104,7 +104,7 @@ func (s *Server) execRemote(rest string, c Caller) (TermResult, error) {
 	}
 
 	if !s.projectVisibleFor(c, project) {
-		return TermResult{}, fmt.Errorf("项目 %q 不在这张凭证的可见范围内", project)
+		return TermResult{}, fmt.Errorf("project %q is outside this credential's visible scope", project)
 	}
 	var sb strings.Builder
 	n := 0
@@ -116,7 +116,7 @@ func (s *Server) execRemote(rest string, c Caller) (TermResult, error) {
 		n++
 	}
 	if n == 0 {
-		return TermResult{}, fmt.Errorf("项目 %s 没有声明远端", project)
+		return TermResult{}, fmt.Errorf("project %s has no declared remotes", project)
 	}
 	return TermResult{Text: strings.TrimRight(sb.String(), "\n"), Structured: map[string]any{"remotes": rules}}, nil
 }
@@ -132,13 +132,13 @@ func toGitRemote(r config.Remote) gitremote.Remote {
 }
 
 func renderRemote(project string, r config.Remote) string {
-	mode := "读写"
+	mode := "read/write"
 	if r.FetchOnly {
-		mode = "只读"
+		mode = "read-only"
 	}
-	push := "不推"
+	push := "push disabled"
 	if len(r.Push) > 0 {
-		push = "可推 " + strings.Join(r.Push, ",")
+		push = "push allowed " + strings.Join(r.Push, ",")
 	}
 	return fmt.Sprintf("%-20s %-10s %-28s %s %s", project, r.Name, gitremote.Redact(r.URL), mode, push)
 }
@@ -153,10 +153,10 @@ const remoteTimeout = 90 * time.Second
 func (s *Server) execRemoteFetch(rest string, c Caller) (TermResult, error) {
 	project, name := splitProjectRemote(rest)
 	if project == "" {
-		return TermResult{}, fmt.Errorf("fetch 需要 <project> [<remote>]")
+		return TermResult{}, fmt.Errorf("fetch requires <project> [<remote>]")
 	}
 	if !s.projectVisibleFor(c, project) {
-		return TermResult{}, fmt.Errorf("项目 %q 不在这张凭证的可见范围内", project)
+		return TermResult{}, fmt.Errorf("project %q is outside this credential's visible scope", project)
 	}
 	rm, err := s.findRemote(project, name)
 	if err != nil {
@@ -169,13 +169,13 @@ func (s *Server) execRemoteFetch(rest string, c Caller) (TermResult, error) {
 
 	res, err := s.fetchRemote(c, project, rm, repo)
 	if err != nil {
-		return TermResult{}, fmt.Errorf("fetch %s@%s 失败: %w", project, rm.Name, err)
+		return TermResult{}, fmt.Errorf("fetch %s@%s failed: %w", project, rm.Name, err)
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "fetch %s ← %s（内置传输）\n", project, rm.Name)
+	fmt.Fprintf(&sb, "fetched %s <- %s (built-in transport)\n", project, rm.Name)
 	if len(res.Branches) == 0 {
-		sb.WriteString("（没有可读分支）")
+		sb.WriteString("(no readable branches)")
 	}
 	names := make([]string, 0, len(res.Branches))
 	for b := range res.Branches {
@@ -200,7 +200,7 @@ func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *g
 	case gitremote.IsSSH(rm.URL):
 		key, err := s.readSSHKey(rm.SSHKey)
 		if err != nil {
-			return gittransport.FetchResult{}, fmt.Errorf("读取 SSH 私钥 %q 失败: %w", rm.SSHKey, err)
+			return gittransport.FetchResult{}, fmt.Errorf("read SSH private key %q: %w", rm.SSHKey, err)
 		}
 		res, err := gittransport.FetchSSH(ctx, repo, rm.URL, rm.Name, string(key), rm.HostKey, remoteTimeout)
 		if err != nil {
@@ -225,7 +225,7 @@ func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *g
 		}
 		return res, s.keepReadableBranches(c, project, repo, rm.Name, res)
 	}
-	return gittransport.FetchResult{}, fmt.Errorf("不支持的远端传输：%s", gitremote.Redact(rm.URL))
+	return gittransport.FetchResult{}, fmt.Errorf("unsupported remote transport: %s", gitremote.Redact(rm.URL))
 }
 
 // keepReadableBranches 把结果裁到调用者能读的范围，并删掉不该留的跟踪引用。
@@ -250,8 +250,8 @@ func (s *Server) keepReadableBranches(c Caller, project string, repo *gitstore.R
 func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 	fields := strings.Fields(rest)
 	if len(fields) < 2 {
-		return TermResult{}, fmt.Errorf("push 需要 <project> [<remote>] <branch...>\n" +
-			"  不指定分支会被拒绝：默认推全部等于一次手滑就对外发布")
+		return TermResult{}, fmt.Errorf("push requires <project> [<remote>] <branch...>\n" +
+			"  specifying no branch is rejected: pushing all by default could publish everything by mistake")
 	}
 	project := fields[0]
 	rmName := ""
@@ -264,10 +264,10 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 		}
 	}
 	if len(branches) == 0 {
-		return TermResult{}, fmt.Errorf("push 必须显式指定分支")
+		return TermResult{}, fmt.Errorf("push requires an explicitly specified branch")
 	}
 	if len(branches) != 1 {
-		return TermResult{}, errors.New("SSH 最小闭环一次只推一个分支；多分支逐个确认，避免部分成功被误认为整体成功")
+		return TermResult{}, errors.New("the built-in SSH transport pushes one branch at a time; confirm multiple branches individually to avoid mistaking partial success for complete success")
 	}
 	// 逐分支判写权限：能推主干不等于能推别的分支。
 	// 推送是「让远端历史前进」，它必须和本地写入走同一把尺子。
@@ -289,11 +289,11 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 	pending := s.pendingCount(project)
 	if pending > 0 {
 		return TermResult{}, fmt.Errorf(
-			"项目 %s 有 %d 处未提交内容：push 不会替你 commit。先 commit 再 push", project, pending)
+			"project %s has %d uncommitted changes: push does not commit for you. Commit first, then push", project, pending)
 	}
 
 	if rm.FetchOnly {
-		return TermResult{}, fmt.Errorf("远端 %s 是只读的（fetch_only）", rm.Name)
+		return TermResult{}, fmt.Errorf("remote %s is read-only (fetch_only)", rm.Name)
 	}
 	repo, err := s.projects.Get(project)
 	if err != nil {
@@ -302,51 +302,51 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 	fetchOnly := toGitRemote(rm)
 	branch := strings.TrimPrefix(branches[0], "refs/heads/")
 	if strings.Contains(branch, ":") {
-		return TermResult{}, errors.New("push 只接受分支名，不接受 refspec")
+		return TermResult{}, errors.New("push accepts branch names only, not refspecs")
 	}
 	if !fetchOnly.AllowsPush(branch) {
-		return TermResult{}, fmt.Errorf("远端 %s 未授权推送分支 %q", rm.Name, branch)
+		return TermResult{}, fmt.Errorf("remote %s does not authorize pushing branch %q", rm.Name, branch)
 	}
 
 	var res gittransport.PushResult
 	switch {
 	case gitremote.IsSSH(rm.URL):
 		if rm.SSHKey == "" || rm.HostKey == "" {
-			return TermResult{}, errors.New("SSH push 需要在 [[remote]] 声明 ssh_key 与 host_key（SHA256 fingerprint）")
+			return TermResult{}, errors.New("SSH push requires ssh_key and host_key (SHA256 fingerprint) in [[remote]]")
 		}
 		key, err := s.readSSHKey(rm.SSHKey)
 		if err != nil {
-			return TermResult{}, fmt.Errorf("读取 SSH 私钥 %q 失败: %w", rm.SSHKey, err)
+			return TermResult{}, fmt.Errorf("read SSH private key %q: %w", rm.SSHKey, err)
 		}
 		res, err = gittransport.Push(context.Background(), repo, rm.URL, branch, string(key), rm.HostKey, 90*time.Second)
 		if err != nil {
-			return TermResult{}, fmt.Errorf("push %s@%s → %s 失败: %w", project, branch, rm.Name, err)
+			return TermResult{}, fmt.Errorf("push %s@%s -> %s failed: %w", project, branch, rm.Name, err)
 		}
 	case strings.HasPrefix(rm.URL, "http://"), strings.HasPrefix(rm.URL, "https://"):
 		if rm.HTTPToken == "" {
-			return TermResult{}, errors.New("HTTP push 需要在 [[remote]] 声明 http_token（用 remote-secret 保存的 token 名）")
+			return TermResult{}, errors.New("HTTP push requires http_token in [[remote]] (the token name stored with remote-secret)")
 		}
 		token, err := s.readSecret(rm.HTTPToken)
 		if err != nil {
-			return TermResult{}, fmt.Errorf("读取 token %q 失败: %w", rm.HTTPToken, err)
+			return TermResult{}, fmt.Errorf("read token %q: %w", rm.HTTPToken, err)
 		}
 		res, err = gittransport.PushHTTP(context.Background(), repo, rm.URL, branch, rm.HTTPUser, token, 90*time.Second)
 		if err != nil {
-			return TermResult{}, fmt.Errorf("push %s@%s → %s 失败: %w", project, branch, rm.Name, err)
+			return TermResult{}, fmt.Errorf("push %s@%s -> %s failed: %w", project, branch, rm.Name, err)
 		}
 	default:
 		if _, ok := gittransport.LocalPath(rm.URL); !ok {
-			return TermResult{}, fmt.Errorf("不支持的远端传输：%s（只支持 ssh:// user@host:path、http(s):// 与本地裸仓库路径）", gitremote.Redact(rm.URL))
+			return TermResult{}, fmt.Errorf("unsupported remote transport: %s (supported: ssh:// user@host:path, http(s)://, and local bare repository paths)", gitremote.Redact(rm.URL))
 		}
 		res, err = gittransport.PushLocal(repo, rm.URL, branch)
 		if err != nil {
-			return TermResult{}, fmt.Errorf("push %s@%s → %s 失败: %w", project, branch, rm.Name, err)
+			return TermResult{}, fmt.Errorf("push %s@%s -> %s failed: %w", project, branch, rm.Name, err)
 		}
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "push %s → %s（内置传输，不调用系统 git）\n", project, rm.Name)
-	fmt.Fprintf(&sb, "  %s %s → %s\n", res.Branch, shortSHA(res.Old), shortSHA(res.New))
+	fmt.Fprintf(&sb, "pushed %s -> %s (built-in transport; does not invoke system git)\n", project, rm.Name)
+	fmt.Fprintf(&sb, "  %s %s -> %s\n", res.Branch, shortSHA(res.Old), shortSHA(res.New))
 	return TermResult{
 		Text: strings.TrimRight(sb.String(), "\n"),
 		Structured: map[string]any{
@@ -362,10 +362,10 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 func (s *Server) execSync(rest string, c Caller) (TermResult, error) {
 	project, name := splitProjectRemote(rest)
 	if project == "" {
-		return TermResult{}, fmt.Errorf("sync 需要 <project> [<remote>]")
+		return TermResult{}, fmt.Errorf("sync requires <project> [<remote>]")
 	}
 	if !s.projectVisibleFor(c, project) {
-		return TermResult{}, fmt.Errorf("项目 %q 不在这张凭证的可见范围内", project)
+		return TermResult{}, fmt.Errorf("project %q is outside this credential's visible scope", project)
 	}
 	rm, err := s.findRemote(project, name)
 	if err != nil {
@@ -378,7 +378,7 @@ func (s *Server) execSync(rest string, c Caller) (TermResult, error) {
 
 	remoteRefs, err := s.listRemote(rm)
 	if err != nil {
-		return TermResult{}, fmt.Errorf("读取 %s 的远端广告失败: %w", rm.Name, err)
+		return TermResult{}, fmt.Errorf("read remote advertisement from %s: %w", rm.Name, err)
 	}
 
 	localRefs, _ := repo.Refs("refs/heads/")
@@ -414,9 +414,9 @@ func (s *Server) execSync(rest string, c Caller) (TermResult, error) {
 	rows := make([]row, 0, len(branches))
 	var sb strings.Builder
 	pending := s.pendingCount(project)
-	fmt.Fprintf(&sb, "%s ↔ %s（%s）", project, rm.Name, gitremote.Redact(rm.URL))
+	fmt.Fprintf(&sb, "%s <-> %s (%s)", project, rm.Name, gitremote.Redact(rm.URL))
 	if pending > 0 {
-		fmt.Fprintf(&sb, "  本地未提交 %d 处", pending)
+		fmt.Fprintf(&sb, "  %d uncommitted changes locally", pending)
 	}
 	sb.WriteString("\n")
 
@@ -425,10 +425,10 @@ func (s *Server) execSync(rest string, c Caller) (TermResult, error) {
 		remote := remoteRefs["refs/heads/"+b]
 		state := classifySync(repo, local, remote)
 		rows = append(rows, row{Branch: b, Local: local, Remote: remote, State: state})
-		fmt.Fprintf(&sb, "  %-16s %-12s 本地 %s 远端 %s\n", b, state, shortSHA(local), shortSHA(remote))
+		fmt.Fprintf(&sb, "  %-16s %-12s local %s remote %s\n", b, state, shortSHA(local), shortSHA(remote))
 	}
 	if len(rows) == 0 {
-		sb.WriteString("（没有可读分支）")
+		sb.WriteString("(no readable branches)")
 	}
 	return TermResult{
 		Text: strings.TrimRight(sb.String(), "\n"),
@@ -475,7 +475,7 @@ func (s *Server) listRemote(rm config.Remote) (map[string]string, error) {
 	case gitremote.IsSSH(rm.URL):
 		key, err := s.readSSHKey(rm.SSHKey)
 		if err != nil {
-			return nil, fmt.Errorf("读取 SSH 私钥 %q 失败: %w", rm.SSHKey, err)
+			return nil, fmt.Errorf("read SSH private key %q: %w", rm.SSHKey, err)
 		}
 		return gittransport.ListSSH(ctx, rm.URL, string(key), rm.HostKey, remoteTimeout)
 	case strings.HasPrefix(rm.URL, "http://"), strings.HasPrefix(rm.URL, "https://"):
@@ -488,7 +488,7 @@ func (s *Server) listRemote(rm config.Remote) (map[string]string, error) {
 	if _, ok := gittransport.LocalPath(rm.URL); ok {
 		return gittransport.ListLocal(rm.URL)
 	}
-	return nil, fmt.Errorf("不支持的远端传输：%s", gitremote.Redact(rm.URL))
+	return nil, fmt.Errorf("unsupported remote transport: %s", gitremote.Redact(rm.URL))
 }
 
 // splitProjectRemote 解析 "<project> [<remote>]"。

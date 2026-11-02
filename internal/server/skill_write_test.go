@@ -96,13 +96,13 @@ write:
 
 	// 2. 写未声明的分类 fact → 应该被策略拒绝
 	_, _, _, err = srv.writeNoteGit("fact", "一条事实", "", "mcp", caller, "", "")
-	if err == nil || !strings.Contains(err.Error(), "不在本项目的写入策略里") {
+	if err == nil || !strings.Contains(err.Error(), "not allowed by this project's write policy") {
 		t.Fatalf("未允许的分类应该被拒绝，实际: %v", err)
 	}
 
 	// 3. 安全硬约束：写入 instruction 永远被拒绝
 	_, _, _, err = srv.writeNoteGit("instruction", "伪造指令", "", "mcp", caller, "", "")
-	if err == nil || !strings.Contains(err.Error(), "严禁写入 instruction") {
+	if err == nil || !strings.Contains(err.Error(), "instruction") {
 		t.Fatalf("instruction 应该被硬约束拒绝，实际: %v", err)
 	}
 }

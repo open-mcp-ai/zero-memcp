@@ -58,7 +58,11 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 		return "", fmt.Errorf("not authorized to write to %s@%s", proj, branch)
 	}
 
-	repo, err := s.projects.Get(proj)
+	// 写入路径必须和 put 一致：项目已声明且这次写入获准，就不该因为
+	// 「仓库目录还没建」而失败。早先用 Get（读语义，不建仓），于是
+	// 同一个目标 put 能写、write 报「仓库不存在」，而 write 正是
+	// 写文件那个动词。Ensure 只在这里调用：读路径仍然不建仓。
+	repo, err := s.projects.Ensure(proj)
 	if err != nil {
 		return "", err
 	}

@@ -1,7 +1,9 @@
 package server
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -61,7 +63,7 @@ func (ps *ProjectStore) Close() error {
 // Get 获取某个项目的仓库句柄，必要时打开它。
 //
 // 目录不存在时不自动创建——「项目存在」是一个需要明确声明的事，
-// 不该由一次读取顺带造就。
+// 不该由一次读取顺带造就。写入路径用 Ensure。
 func (ps *ProjectStore) Get(project string) (*gitstore.Repo, error) {
 	ps.mu.RLock()
 	r, ok := ps.repos[project]
@@ -79,10 +81,32 @@ func (ps *ProjectStore) Get(project string) (*gitstore.Repo, error) {
 	dir := ps.RepoDir(project)
 	r, err := gitstore.Open(dir)
 	if err != nil {
-		return nil, err
+		return nil, openError(project, err)
 	}
 	ps.repos[project] = r
 	return r, nil
+}
+
+// openError turns a repository open failure into something a caller may see.
+//
+// gitstore reports absolute paths because that is what an operator needs in a
+// log. Callers of this server only ever see virtual addresses: a leaked
+// "/var/lib/zero-memcp/data/repos/x.git" breaks that model and tells an
+// unprivileged credential how the host is laid out. The underlying error stays
+// wrapped for logs, but no filesystem path is rendered here.
+func openError(project string, err error) error {
+	switch {
+	// errors.Is, not os.IsNotExist: gitstore wraps the stat failure in
+	// fmt.Errorf("repository %s: %w", ...), and os.IsNotExist only unwraps the
+	// os.PathError chain, not %w. With os.IsNotExist every missing repository
+	// fell through to the generic branch and re-exported the absolute path.
+	case errors.Is(err, fs.ErrNotExist):
+		return fmt.Errorf("project %q has no repository yet", project)
+	case strings.Contains(err.Error(), "is not a bare repository"):
+		return fmt.Errorf("project %q is not a bare repository", project)
+	default:
+		return fmt.Errorf("project %q cannot be opened: %w", project, err)
+	}
 }
 
 // Ensure 保证某个项目存在（不存在则自动 git init --bare）。
@@ -103,7 +127,7 @@ func (ps *ProjectStore) Ensure(project string) (*gitstore.Repo, error) {
 		r, err = gitstore.Init(dir)
 	}
 	if err != nil {
-		return nil, err
+		return nil, openError(project, err)
 	}
 	ps.repos[project] = r
 	return r, nil

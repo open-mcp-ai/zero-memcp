@@ -15,11 +15,13 @@ import (
 
 // writeNoteGit 把一条记忆写进可写仓库的当前分支。
 //
-// 文件名完全是时间戳：YYYY-MM-DD/150405.000-endpoint.md。
+// 文件名 = 时间 + 写入序号：YYYY-MM-DD/150405.000000-12-endpoint.md。
 // 不带任何 checksum 尾巴：
 //   - Git 底层本身就是内容寻址（Merkle 树），每个 blob 的 SHA-1 就是它的真名；
 //   - 幂等去重直接通过比较已存在条目的 Blob SHA 实现，既精准又不污染文件名；
 //   - 时间戳本身就是切片的自然时间坐标，人类与机器一眼可读。
+//
+// 序号不是装饰：它是唯一能在同一时刻把两次写入分开的东西。
 func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, explicit, treePrefix string) (addr, project, branch string, err error) {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	// 空 kind 表示「由落点决定」：put 不再要求调用方先给自己分类。
@@ -165,9 +167,15 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	}
 
 	// 纯时间戳文件名，布局由策略决定。
-	// 不带 checksum：内容寻址本身就是权威判据。
-	stamp := fmt.Sprintf("%s.%03d-%s.md",
-		now.Format("150405"), now.Nanosecond()/1e6, endpoint)
+	//
+	// 为什么是微秒 + 序列号而不是早先的毫秒：
+	// 毫秒精度（150405.000）在并发写入或批量导入时极易撞车——实测
+	// 100 条并发写入会有 12 条在同一毫秒拿到完全相同的名字，后写者
+	// 静默覆盖前者，且任何错误都不报。微秒把概率压低，序列号把
+	// 保证做硬：同一毫秒内的并发写按单调序列号分化，绝对不重名。
+	seq := s.writeSeq.Add(1)
+	stamp := fmt.Sprintf("%s.%06d-%d-%s.md",
+		now.Format("150405"), now.Nanosecond()/1000, seq, endpoint)
 	path := stamp
 	if pol.Layout == "date" {
 		path = now.Format("2006-01-02") + "/" + stamp

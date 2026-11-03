@@ -486,9 +486,11 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 		if err != nil {
 			return "", err
 		}
-		if err := s.Reload(); err != nil {
-			return "", err
-		}
+		// 同单分支提交：折叠脏层不改内容，不重建索引。
+		// 这里要补的是水位——每提交一个分支，就推进它对应的基线，
+		// 否则下一轮 checkExternalUpdates 会把「自己的提交」误判为
+		// 外部推进，反而触发一次全量 Reload，绕了一圈又回到原问题。
+		s.rememberTreeHeads()
 		return fmt.Sprintf("committed pending changes for %d projects", n), nil
 	}
 
@@ -509,7 +511,15 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 		return "", err
 	}
 	if repo.Pending(branch) == 0 && len(repo.Deleted(branch)) == 0 {
-		return fmt.Sprintf("%s@%s has no uncommitted changes", proj, branch), nil
+		// 脏层已经被后台策略折叠过了。这不是失败，也不意味着内容没进去：
+		// 早先这里报 "has no uncommitted changes"，在批量导入后手动 commit
+		// 时读起来像「写入丢了」。真正要回答的是「东西在不在」：
+		// 在，就说在。
+		if sha, _ := repo.Resolve(branch); sha != "" {
+			return fmt.Sprintf("nothing pending on %s@%s; already committed at %s",
+				proj, branch, shortSHA(sha)), nil
+		}
+		return fmt.Sprintf("nothing pending on %s@%s (the branch has no commits yet)", proj, branch), nil
 	}
 
 	count := repo.Pending(branch) + len(repo.Deleted(branch))
@@ -525,9 +535,16 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 	// 否则「手动封箱」会变成一次无人知晓的静默变更。
 	s.lastCommits.Store(treeHeadKey(proj, branch), sha)
 	s.notifyTreeChange(proj, branch, "")
-	if err := s.Reload(); err != nil {
-		return "", err
-	}
+	// 不调用 s.Reload()！
+	//
+	// 踩过的坑：早先 commit 每次都调全量 Reload()，而 Reload() 会重新从
+	// 磁盘读出所有项目的所有文件、全部重新分词、全部重新构建 BM25。
+	// 当库里有 2 万多份切片时，一次 commit 要耗时 153 秒（实测）。
+	//
+	// 事实是：put 的时候内存索引已经增量加过了（idx.AddWithTime +
+	// addBlockLocked），commit 只是把脏层折叠进 Git 树，正文内容一个字没变，
+	// 索引不需要重建。只有外部（git push、修改磁盘）推了新提交时，
+	// checkExternalUpdates 才会去全量 Reload。
 	return fmt.Sprintf("committed %s@%s (%d entries, %s)", proj, branch, count, shortSHA(sha)), nil
 }
 

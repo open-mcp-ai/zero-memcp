@@ -12,3 +12,16 @@ bin/
 /zero-memcp
 /zmcp
 .ext-align/
+
+# 模型与动态库：606MB，不进版本库。
+# 用 ./models/fetch.sh 按需下载，校验清单在 models/README.md。
+/models/*.onnx
+/models/*.dylib
+/models/*.so
+/models/*.txt
+/models/*.json
+!/models/README.md
+!/models/fetch.sh
+/assets/*.dylib
+/assets/*.so
+/assets/*.dll

@@ -16,6 +16,7 @@ type File struct {
 	Server   Server
 	Commit   Commit
 	GC       GC
+	Semantic Semantic
 	Users    []User
 	Groups   []Group
 	Listens  []ListenBlock
@@ -25,6 +26,14 @@ type File struct {
 
 	// Path 是它被读出来的位置，仅用于错误信息与日志。
 	Path string
+}
+
+// Semantic 是本地语义向量检索配置。
+type Semantic struct {
+	Lib     string // ONNX Runtime 动态库路径（dylib/so）
+	Model   string // int8 量化 ONNX 模型路径
+	Vocab   string // BERT 词表路径
+	Vectors string // 向量缓存落盘目录，空则在 data/vectors
 }
 
 // Server 是监听与身份。
@@ -176,8 +185,9 @@ func Load(path string) (*File, error) {
 // 每个分节允许的键。写错一个键名不能被静默忽略——
 // 那会变成「配置里写了但没生效」，而症状是权限不对、不是报错。
 var knownKeys = map[string]map[string]bool{
-	"server":  {"data": true, "listen": true, "endpoint": true, "default_branch": true, "enforce_auth": true},
-	"commit":  {"interval": true, "count": true},
+	"server":   {"data": true, "listen": true, "endpoint": true, "default_branch": true, "enforce_auth": true},
+	"semantic": {"lib": true, "model": true, "vocab": true, "vectors": true},
+	"commit":   {"interval": true, "count": true},
 	"gc":      {"interval": true},
 	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
 	"group":   {"name": true, "members": true},
@@ -258,6 +268,29 @@ func ParseFile(raw []byte) (*File, error) {
 			return nil, err
 		} else {
 			f.Server.EnforceAuth = v
+		}
+	}
+
+	if sec, ok := doc.Sections["semantic"]; ok {
+		if v, err := str(sec, "semantic", "lib"); err != nil {
+			return nil, err
+		} else {
+			f.Semantic.Lib = v
+		}
+		if v, err := str(sec, "semantic", "model"); err != nil {
+			return nil, err
+		} else {
+			f.Semantic.Model = v
+		}
+		if v, err := str(sec, "semantic", "vocab"); err != nil {
+			return nil, err
+		} else {
+			f.Semantic.Vocab = v
+		}
+		if v, err := str(sec, "semantic", "vectors"); err != nil {
+			return nil, err
+		} else {
+			f.Semantic.Vectors = v
 		}
 	}
 

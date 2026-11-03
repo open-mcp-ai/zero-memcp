@@ -23,6 +23,10 @@ func runServe(args []string) int {
 		listen      = fs.String("listen", "", "Listen address (default 127.0.0.1:1729)")
 		endpoint    = fs.String("endpoint", "", "Endpoint identity, e.g. blackbox or laptop")
 		weightsPath = fs.String("weights", "", "Read-frequency state file (default: $HOME/.zero-memcp/weights.json)")
+		embedLib    = fs.String("embed-lib", "", "Path to libonnxruntime (enables semantic search when model+vocab also given)")
+		embedModel  = fs.String("embed-model", "", "Path to ONNX embedding model (e.g. bge-small-zh-int8.onnx)")
+		embedVocab  = fs.String("embed-vocab", "", "Path to BERT vocab.txt for the embedding model")
+		vecDir      = fs.String("vector-dir", "", "Vector cache directory (default: <data>/vectors)")
 	)
 	_ = fs.Parse(args)
 
@@ -51,6 +55,31 @@ func runServe(args []string) int {
 		DefaultBranch: branch,
 		Endpoint:      *endpoint,
 		WeightsPath:   wPath,
+	}
+	cfg.Semantic.LibPath = expandHome(*embedLib)
+	cfg.Semantic.ModelPath = expandHome(*embedModel)
+	cfg.Semantic.VocabPath = expandHome(*embedVocab)
+	cfg.Semantic.VectorDir = expandHome(*vecDir)
+	// 语义检索资产：命令行优先，配置文件其次。
+	//
+	// 为什么配置优先于命令行缺省：模型路径是「装好就不动」的本机资产，
+	// 每次启动都背四个长参数不现实。但命令行必须能覆盖它——
+	// 换模型做对比实验时不该去改全局配置。
+	if cfgPth != "" {
+		if f, err := config.Load(cfgPth); err == nil && f != nil {
+			if cfg.Semantic.LibPath == "" {
+				cfg.Semantic.LibPath = expandHome(f.Semantic.Lib)
+			}
+			if cfg.Semantic.ModelPath == "" {
+				cfg.Semantic.ModelPath = expandHome(f.Semantic.Model)
+			}
+			if cfg.Semantic.VocabPath == "" {
+				cfg.Semantic.VocabPath = expandHome(f.Semantic.Vocab)
+			}
+			if cfg.Semantic.VectorDir == "" {
+				cfg.Semantic.VectorDir = expandHome(f.Semantic.Vectors)
+			}
+		}
 	}
 	if *listen != "" {
 		cfg.Listen = *listen

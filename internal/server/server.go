@@ -53,6 +53,19 @@ type Config struct {
 	// <data>/repos/<name>.git 放裸仓库。
 	DataDir string
 
+	// Semantic 控制是否启用向量语义检索。
+	//
+	// 零值（全部空串）等于关闭：不加载模型、不建向量索引、
+	// srecall 返回明确错误。启用需要三样都在：dylib、模型、词表。
+	// 模型约 23MB、dylib 约 33MB，都不进 Git，由部署侧提供。
+	Semantic struct {
+		LibPath   string // libonnxruntime 动态库路径
+		ModelPath string // bge-small-zh ONNX 模型路径
+		VocabPath string // 词表路径
+		// VectorDir 是向量缓存的落盘目录。空则用 <DataDir>/vectors。
+		VectorDir string
+	}
+
 	// ConfigFile 是配置文件路径。
 	ConfigFile string
 
@@ -125,6 +138,15 @@ type Server struct {
 	// 真正需要的是「同一时刻的两次写入必须得到不同的名字」。
 	// 计数器取的是「这一次写入」而非时间，所以单调且不会撞。
 	writeSeq atomic.Uint64
+
+	// semantic 是向量语义检索侧的运行状态。
+	//
+	// 与 idx（BM25）平行存在：两套索引各自独立重建，检索时融合。
+	// 零值即「未启用」，所有方法都要容忍它。
+	semantic semanticState
+
+	// semanticDir 是向量缓存的落盘目录。
+	semanticDir string
 
 	// defaultBranch 是默认版本线。所有仓库共用它。
 	//
@@ -381,6 +403,10 @@ func New(cfg Config) (*Server, error) {
 	if err := s.Reload(); err != nil {
 		return nil, fmt.Errorf("build initial index: %w", err)
 	}
+
+	// 语义向量侧与 BM25 平行异步启动。
+	// 缺失模型配置时静默跳过，不会阻碍服务正常启动。
+	s.initSemantic()
 
 	if s.UIRoutesEnabled() {
 		if plain, created, berr := s.passwords.Bootstrap(os.Getenv("ZERO_MEMCP_UI_PASS")); berr != nil {
@@ -1541,6 +1567,13 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 				"count": len(structHits),
 			},
 		}, nil
+
+	case "srecall":
+		// srecall <text> [--scope <tree>]
+		//
+		// 语义增强召回：向量（跨语言、摸「为什么」）+ BM25（精确字面）
+		// 两路融合。命中 thought 时自动带出同轮 record。
+		return s.execSRecall(rest, c)
 
 	case "read":
 		// read <addr>

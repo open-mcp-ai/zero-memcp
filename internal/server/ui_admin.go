@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"sort"
 	"strings"
@@ -560,20 +561,45 @@ func (s *Server) TakeBootstrapPassword() string {
 	return pw
 }
 
-// UIRoutesEnabled 报告这个实例是否提供管理面。
+// UIRoutesEnabled reports whether this instance serves the admin surface.
 //
-// 调用方（SDK 宿主、CLI）需要它来决定要不要提示用户去登录：
-// 一个没有管理面的实例不该被引导去开浏览器。
+// It is always true: the admin surface is not optional. A deployment where
+// nobody can reach it - a container, an npm wrapper, a daemon - has no other
+// way to change the initial password, mint a credential, or grant a gated
+// capability bit, so "off" would just mean "locked out". What the config can
+// choose is *which* port carries it ([[listen]] webui = true); the default port
+// always does.
 func (s *Server) UIRoutesEnabled() bool {
-	if s.cfg.WebUI {
-		return true
+	return true
+}
+
+// AdminURLs returns the addresses that serve the admin surface.
+//
+// Printed at startup so nobody has to guess which port to open, and so a
+// deployment that moved the surface to a dedicated listener says so out loud.
+func (s *Server) AdminURLs() []string {
+	var out []string
+	blocks := s.listens
+	if len(blocks) == 0 {
+		blocks = []ListenBlock{{Addr: s.cfg.Listen, WebUI: true}}
 	}
-	for _, b := range s.listens {
-		if b.WebUI {
-			return true
+	for _, b := range blocks {
+		if !b.WebUI {
+			continue
 		}
+		addr := b.Addr
+		// A wildcard bind is not something you can paste into a browser.
+		if host, port, err := net.SplitHostPort(addr); err == nil {
+			switch host {
+			case "", "0.0.0.0":
+				addr = net.JoinHostPort("127.0.0.1", port)
+			case "::":
+				addr = net.JoinHostPort("::1", port)
+			}
+		}
+		out = append(out, "http://"+addr+"/")
 	}
-	return false
+	return out
 }
 
 // mountCapFor returns the effective credential/mount capability ceiling for a

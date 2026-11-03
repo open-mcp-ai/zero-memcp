@@ -281,18 +281,17 @@ func TestUILoginRateLimited(t *testing.T) {
 	}
 }
 
-// [server] webui turns the admin surface on for the single-port deployment.
+// Single-port deployment always serves the admin surface.
 //
-// With no [[listen]] blocks there is only one port, so without this key the
-// admin surface would be unreachable no matter what the operator wrote. The
-// password must also be bootstrapped in that mode - a panel nobody can log
-// into is worse than no panel.
-func TestServerWebUIEnablesAdminOnSinglePort(t *testing.T) {
+// In a container or an npm wrapper there are no CLI flags and the user never
+// sees an interactive prompt. The admin surface must be there out of the box
+// on the only exposed port, so the operator can open http://host:port/ and
+// set their password on the first run.
+func TestSinglePortAlwaysServesAdminSurface(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
 data = "__DATA__"
-webui = true
 
 [[user]]
 name = "zero"
@@ -313,30 +312,127 @@ root = true
 	t.Cleanup(func() { _ = srv.Close() })
 
 	if !srv.UIRoutesEnabled() {
-		t.Fatal("cfg.WebUI from [server] should enable the admin surface")
+		t.Fatal("UIRoutesEnabled should be true for single-port deployments")
 	}
 	if pw := srv.TakeBootstrapPassword(); pw == "" {
-		t.Fatal("the admin surface must bootstrap a password in single-port mode")
+		t.Fatal("the admin surface must bootstrap a password on cold start")
 	}
 
-	h := srv.muxFor(ListenBlock{Allow: []string{"*"}, WebUI: srv.cfg.WebUI})
+	h := srv.Mux()
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/ui/api/overview", nil))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("admin route should exist and demand a session, got %d", rec.Code)
 	}
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("index HTML should be 200, got %d", rec2.Code)
+	}
 }
 
-// Without [server] webui the single port stays agent-only.
-func TestServerWithoutWebUIHasNoAdminRoutes(t *testing.T) {
-	srv, _ := newWebUIServer(t)
-	_ = srv.TakeBootstrapPassword()
-	h := srv.muxFor(ListenBlock{Allow: []string{"*"}})
-	for _, path := range []string{"/ui/api/overview", "/ui/login", "/"} {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
-		if rec.Code != http.StatusNotFound && rec.Code != http.StatusMethodNotAllowed {
-			t.Fatalf("%s should not exist on an agent-only port, got %d", path, rec.Code)
-		}
+// Multi-port configuration: if no port asks for the admin surface, the first
+// port gets it automatically so the instance is never left without one.
+func TestMultiPortWithoutExplicitWebUIAssignsToFirstPort(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := `
+[server]
+data = "__DATA__"
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name = "proj"
+owner = "zero"
+mode = "rwx------"
+
+[[listen]]
+addr = "127.0.0.1:19901"
+allow = ["*"]
+
+[[listen]]
+addr = "127.0.0.1:19902"
+allow = ["read"]
+`
+	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		DataDir:    dataDir,
+		ConfigFile: filepath.Join(dataDir, "zero-memcp.toml"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	if len(srv.listens) != 2 {
+		t.Fatalf("expected 2 listeners, got %d", len(srv.listens))
+	}
+	if !srv.listens[0].WebUI {
+		t.Fatal("first port should have WebUI enabled as fallback")
+	}
+	if srv.listens[1].WebUI {
+		t.Fatal("second port should NOT have WebUI enabled")
+	}
+
+	urls := srv.AdminURLs()
+	if len(urls) != 1 || urls[0] != "http://127.0.0.1:19901/" {
+		t.Fatalf("AdminURLs should report the first port, got %v", urls)
+	}
+}
+
+// Multi-port configuration: an explicit webui = true is respected, and ports
+// without it stay 404.
+func TestMultiPortExplicitWebUIIsolation(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := `
+[server]
+data = "__DATA__"
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name = "proj"
+owner = "zero"
+mode = "rwx------"
+
+[[listen]]
+addr = "127.0.0.1:19911"
+allow = ["read"]
+
+[[listen]]
+addr = "127.0.0.1:19912"
+allow = ["*"]
+webui = true
+`
+	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		DataDir:    dataDir,
+		ConfigFile: filepath.Join(dataDir, "zero-memcp.toml"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+
+	if srv.listens[0].WebUI {
+		t.Fatal("first port should NOT have WebUI (second was explicit)")
+	}
+	if !srv.listens[1].WebUI {
+		t.Fatal("second port should have WebUI")
+	}
+
+	urls := srv.AdminURLs()
+	if len(urls) != 1 || urls[0] != "http://127.0.0.1:19912/" {
+		t.Fatalf("AdminURLs should report the explicit port, got %v", urls)
 	}
 }

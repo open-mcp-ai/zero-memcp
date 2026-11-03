@@ -235,12 +235,6 @@ func New(cfg Config) (*Server, error) {
 		if !cfg.EnforceAuth && cfgFile.Server.EnforceAuth {
 			cfg.EnforceAuth = true
 		}
-		// [server] webui is the single-port switch. Per-port webui = true in
-		// [[listen]] blocks takes over when they exist, but OR-ing it here means
-		// one config key is enough for the common single-port deployment.
-		if !cfg.WebUI && cfgFile.Server.WebUI {
-			cfg.WebUI = true
-		}
 		if cfg.Endpoint == "" {
 			cfg.Endpoint = cfgFile.Server.Endpoint
 		}
@@ -490,11 +484,12 @@ func (s *Server) Start() error {
 
 	blocks := s.listens
 	if len(blocks) == 0 {
-		// WebUI is carried over from cfg on the synthetic fallback block:
-		// this is the single-port mode (no [[listen]] declared), so cfg.WebUI
-		// is exactly what the caller asked for. Leaving it out would mean
-		// sdk.WithAdminUI() starts the agent routes but never the admin ones.
-		blocks = []ListenBlock{{Addr: s.cfg.Listen, Allow: []string{"*"}, WebUI: s.cfg.WebUI}}
+		// 单端口模式恒开管理面。
+		//
+		// 这是唯一一个不需要「用户去改配置」的入口：容器里、npm-wrapper 后面
+		// 都拿不到命令行，配置写错一行就永久锁死。所以默认必须有管理面，
+		// 想隔离它的人可以显式写 [[listen]] 把 webui 放到专用回环端口。
+		blocks = []ListenBlock{{Addr: s.cfg.Listen, Allow: []string{"*"}, WebUI: true}}
 	}
 
 	var servers []*http.Server
@@ -1118,11 +1113,16 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	// 检查放在 execTerm 之前而不是里面：execTerm 拿不到 request context，
 	// 而端口策略是跟着请求走的。放在这里也保证「拒绝」发生在任何
 	// 副作用之前——动词自己都还没开始跑。
-	verb := strings.TrimSpace(cmd)
-	if i := strings.IndexAny(verb, " \t"); i > 0 {
-		verb = verb[:i]
-	}
-	if verb != "" {
+	// Check EVERY statement's verb, not just the first.
+	//
+	// A line of several statements is several capabilities. Reading only the
+	// leading verb would let "recall x; put y" through a read-only port: the
+	// write would run while the policy only ever looked at "recall".
+	for _, stmt := range splitStatements(cmd) {
+		verb := verbOf(stmt)
+		if verb == "" {
+			continue
+		}
 		if blk, ok := portPolicyFrom(ctx); ok && !allowedOnPort(blk, verb) {
 			return nil, portError(blk, verb)
 		}
@@ -1183,10 +1183,127 @@ func (s *Server) writeNote(kind, text, session, source string, c Caller, explici
 type TermResult struct {
 	Text       string
 	Structured any
+	// Empty reports "ran fine, found nothing" - the state a caller branches on.
+	//
+	// A query with no hits is not an error, and treating it as one would be
+	// wrong twice over: the reply is still a valid answer, and a credential that
+	// may legitimately see nothing must not look like a broken request. So
+	// conditionals need a flag rather than an error, and they cannot infer it
+	// from the text either - "no matches" is a rendering, and rewording it would
+	// silently invert every "fall back to the next layer" rule built on it.
+	Empty bool
 }
 
-// execTerm 执行 DSL。
+// execTerm runs a DSL line, which may hold several statements.
+//
+// One statement is the common case and behaves exactly as before. Several -
+// separated by ';' or newline - are executed in order in a single request, so a
+// caller that wants "the same query in three layers" spends one round trip
+// instead of three. That matters more here than elsewhere: recall returns three
+// hits, and a layered memory means asking fact, record and thought separately.
+//
+// "&&" and "||" make the next question answerable, which is "should I ask the
+// cheaper layer at all?". A layered memory is mostly queried at the top:
+//
+//	recall q --scope proj@fact || recall q --scope proj@record || recall q --scope proj@thought
+//
+// runs one query most of the time and descends only when the layer above came
+// back empty. Compare the unconditional ';' form, which always pays three
+// searches and always returns three blocks of mostly-redundant text into the
+// prompt.
+//
+// WHAT COUNTS AS SUCCESS: a statement that ran without error AND found
+// something. This is deliberately not shell's rule. In shell, `no matches`
+// would be exit 1; here a query that legitimately finds nothing is a valid
+// answer, not a failure, and if the fallback keyed on errors it would never
+// fire - every recall succeeds, so `||` would always be skipped. TermResult.Empty
+// carries the distinction.
+//
+// Chains are left-associative like shell: "a && b || c" runs b only if a
+// succeeded, and c only if the result of "a && b" was a miss. A skipped
+// statement does not run and contributes no text.
+//
+// Execution stops at the first error, whatever the operator was. A later
+// statement may depend on an earlier one (write then commit), so continuing past
+// a failure would produce a result that looks half-applied and reports success.
+// "||" is for "found nothing", not for "this credential cannot ask here" - those
+// stay fatal, because silently falling through a permission error would report
+// memory from a layer the caller was never allowed to reach as if it were a
+// normal answer.
+//
+// The empty command still returns the overview: with nothing to split, the
+// single-statement path is what answers it.
 func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
+	stmts := splitStatementsWithOps(line)
+	if len(stmts) <= 1 {
+		return s.execStatement(line, v, c)
+	}
+
+	var text strings.Builder
+	results := make([]any, 0, len(stmts))
+	wrote := false
+
+	// truthy is the accumulated result of the chain so far, in the sense above.
+	truthy := true
+	for i, st := range stmts {
+		run := true
+		switch st.Op {
+		case "&&":
+			run = truthy
+		case "||":
+			run = !truthy
+		}
+		if !run {
+			// Skipped: it keeps the chain's truth value, exactly as shell would
+			// keep the exit status of the branch that did not run.
+			results = append(results, map[string]any{
+				"statement": st.Cmd,
+				"verb":      verbOf(st.Cmd),
+				"op":        st.Op,
+				"skipped":   true,
+			})
+			continue
+		}
+
+		res, err := s.execStatement(st.Cmd, v, c)
+		if err != nil {
+			return TermResult{}, fmt.Errorf("statement %d of %d (%q): %w", i+1, len(stmts), verbOf(st.Cmd), err)
+		}
+		truthy = !res.Empty
+
+		if wrote {
+			text.WriteString("\n\n")
+		}
+		wrote = true
+		// Name the statement above its result.
+		//
+		// Without it the blocks run together and the one fact the caller needs -
+		// which layer a hit came from - is lost: addresses are virtualised, so
+		// "za/2026-11-03/...md" does not say fact from thought. It costs a short
+		// line per statement and buys back the whole point of asking per layer.
+		text.WriteString(describeStatement(st.Cmd))
+		text.WriteString("\n")
+		text.WriteString(res.Text)
+		results = append(results, map[string]any{
+			"statement": st.Cmd,
+			"verb":      verbOf(st.Cmd),
+			"op":        st.Op,
+			"empty":     res.Empty,
+			"text":      res.Text,
+			"result":    res.Structured,
+		})
+	}
+	return TermResult{
+		Text: text.String(),
+		Structured: map[string]any{
+			"statements": results,
+			"count":      len(results),
+		},
+	}, nil
+}
+
+// execStatement runs exactly one statement.
+func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, error) {
 	line = strings.TrimSpace(line)
 	if line == "" {
 		// 空命令返回总览。跟 termcp 一样：不知道该问什么的时候，
@@ -1293,6 +1410,7 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 			return TermResult{
 				Text:       "no matches",
 				Structured: map[string]any{"hits": []any{}, "count": 0},
+				Empty:      true,
 			}, nil
 		}
 		var sb strings.Builder
@@ -1562,11 +1680,11 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 		if pattern == "" {
 			return TermResult{}, errors.New("grep syntax: grep <pattern> [--scope <tree>]")
 		}
-		grepText, grepErr := s.execGrep(pattern, scope, c)
+		grepText, grepFound, grepErr := s.execGrep(pattern, scope, c)
 		if grepErr != nil {
 			return TermResult{}, grepErr
 		}
-		return TermResult{Text: grepText}, nil
+		return TermResult{Text: grepText, Empty: !grepFound}, nil
 
 	case "log":
 		// log [N]
@@ -1736,10 +1854,10 @@ func (s *Server) weightCount(addr string) int {
 // 为什么要先剥参数再编译正则：早先整个 rest 直接当正则用，
 // 于是 `grep 1729 --scope daily` 会把 "--scope daily" 也编进模式里，
 // 结果是必然零命中——而报错文本是「无命中」，看上去像内容不存在。
-func (s *Server) execGrep(pattern, scope string, c Caller) (string, error) {
+func (s *Server) execGrep(pattern, scope string, c Caller) (string, bool, error) {
 	re, err := regexp.Compile("(?i)" + pattern)
 	if err != nil {
-		return "", fmt.Errorf("invalid regular expression: %w", err)
+		return "", false, fmt.Errorf("invalid regular expression: %w", err)
 	}
 
 	s.mu.RLock()
@@ -1793,7 +1911,7 @@ func (s *Server) execGrep(pattern, scope string, c Caller) (string, error) {
 					totalHits++
 					if totalHits >= 30 {
 						sb.WriteString("\n[truncated: too many matches; showing the first 30]\n")
-						return sb.String(), nil
+						return sb.String(), true, nil
 					}
 				}
 			}
@@ -1803,9 +1921,13 @@ func (s *Server) execGrep(pattern, scope string, c Caller) (string, error) {
 		}
 	}
 	if totalHits == 0 {
-		return "no matches", nil
+		// The bool is what a conditional branches on; the text is only a
+		// rendering. Returning just the string would force callers to compare
+		// against "no matches", and rewording that message would silently invert
+		// every "fall back to the next layer" rule.
+		return "no matches", false, nil
 	}
-	return strings.TrimRight(sb.String(), "\n"), nil
+	return strings.TrimRight(sb.String(), "\n"), true, nil
 }
 
 // execLog 按时间倒序看最近 N 篇的摘要。
@@ -1929,7 +2051,7 @@ func (s *Server) Mux() http.Handler {
 	// 会带上一套管理接口——而口令引导只在配置里声明 webui 时才发生，
 	// 结果是「管理台在、但没人能登录」，同时它还多占了 / 与 /api
 	// 两个路由，把宿主的同名路径挤掉。
-	return s.muxFor(ListenBlock{Allow: []string{"*"}, WebUI: s.cfg.WebUI})
+	return s.muxFor(ListenBlock{Allow: []string{"*"}, WebUI: true})
 }
 
 // ReposMux 只暴露 HTTP Git 端点（/repos/）。

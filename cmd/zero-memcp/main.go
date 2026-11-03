@@ -61,8 +61,12 @@ Permission model:
   grants at mint time; grants are scoped by JTI, project, branch and expiry.
 
 WebUI:
-  The admin surface (/, /ui/*) is registered only on ports that explicitly set
-  webui = true in [[listen]].
+  The admin surface (/, /ui/*) always exists - it is the only way to change the
+  initial password, mint credentials, or grant gated capability bits, and in a
+  container or behind a wrapper nobody can run a command. Which port carries it
+  is configurable: with [[listen]] blocks, set webui = true on one of them to
+  isolate the surface (other ports then serve no admin route at all, and reply
+  404); with none set it lands on the first port. The startup log prints the URL.
   The WebUI authenticates with its own password-backed session; MCP uses Bearer
   credentials. The two never accept each other's credentials.
 `)

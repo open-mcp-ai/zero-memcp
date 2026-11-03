@@ -62,7 +62,11 @@ MCP 只管存取记忆；凭证签发、临时授权、打包这类运维动作�
 
 - 与 MCP 共用同一个 http.Server，但鉴权机制完全不同：管理台只认口令登录的会话 cookie，MCP 只认 `Authorization: Bearer`；
 - 两个方向互相拒绝：拿 Bearer 打管理台会被 403，拿会话 cookie 打 `/mcp` 会被 401（即使同时带了有效 Bearer 也一样，必须一次只用一条通道）；
-- 只在显式开启的端口上注册：`[[listen]] webui = true`，单端口部署用 `[server] webui = true`；没开的端口上 `/`、`/api`、`/ui/*` **根本不存在**（404），而不是"存在但拒绝"；
+- **管理台一定存在，不是开关能关掉的**：容器里、npm-wrapper 后面都拿不到命令行，「默认关闭」等于把用户永久锁死在门外。端口只决定它挂在哪儿——
+  - 单端口部署：那个端口就是入口；
+  - 多端口且没有任何端口写 `webui = true`：自动挂在第一个端口；
+  - 多端口且某端口显式写了 `webui = true`：只挂在那一个上，其余端口的 `/`、`/api`、`/ui/*` **根本不存在**（404），而不是「存在但拒绝」。
+  启动日志会把入口地址打印出来（`WebUI: http://127.0.0.1:1729/`）。
 - 首次启动生成随机初始口令，打印一次到 stderr，首次登录后强制修改；改口令会清空所有会话；
 - 口令以 argon2id 摘要存在 `system/ui.passwd`，不进 TOML（`config show` 会把配置回显给 Agent）。
 
@@ -131,6 +135,24 @@ go build -o zero-memcp ./cmd/zero-memcp
 | `remote-secret` | `remote-secret list/put/delete` | root 管理仅服务端可读的 HTTP token |
 | `status`| `status` | 查看记忆索引与文档规模 |
 | `help` | `help [<verb>]` | 动词手册与用法指南 |
+
+### 一条命令跑多条语句
+
+用 `;` 或换行分隔，一次往返执行多个动词：
+
+```
+recall q --scope proj@fact; recall q --scope proj@record
+```
+
+`&&` 表示「上一条查到了才继续」，`||` 表示「上一条没查到才继续」。分层记忆主要靠后者——它让回落只在需要时才付出代价：
+
+```
+recall q --scope proj@fact || recall q --scope proj@record || recall q --scope proj@thought
+```
+
+上层命中时只查一次；上层为空才下沉。注意这里的「成功」是**查到内容**，不是 shell 的退出码：搜不到不是错误，所以若按退出码判断，`||` 永远不会触发。真正的错误（语法、权限）无论哪种操作符都会中断整条链。
+
+`--` 之后是正文，永不参与解析，所以正文里的 `;` 就是分号。操作符前后要留空格，正文用 `vars`/`args` 传。
 
 ### SSH 远端推送（当前最小闭环）
 

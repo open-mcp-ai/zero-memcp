@@ -39,13 +39,6 @@ type Server struct {
 	DefaultBranch string
 	// EnforceAuth 为真时，即使是回环地址也强制要求凭证。
 	EnforceAuth bool
-	// WebUI enables the admin surface on the main listen address.
-	//
-	// Without [[listen]] blocks there is only one port, so this is the only way
-	// to turn the admin surface on. With [[listen]] blocks the per-port
-	// webui = true is what counts, because the whole point is deciding which
-	// port may host it.
-	WebUI bool
 }
 
 // ListenBlock 是一个独立的监听端口及其安全策略。
@@ -183,7 +176,7 @@ func Load(path string) (*File, error) {
 // 每个分节允许的键。写错一个键名不能被静默忽略——
 // 那会变成「配置里写了但没生效」，而症状是权限不对、不是报错。
 var knownKeys = map[string]map[string]bool{
-	"server":  {"data": true, "listen": true, "endpoint": true, "default_branch": true, "enforce_auth": true, "webui": true},
+	"server":  {"data": true, "listen": true, "endpoint": true, "default_branch": true, "enforce_auth": true},
 	"commit":  {"interval": true, "count": true},
 	"gc":      {"interval": true},
 	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
@@ -265,11 +258,6 @@ func ParseFile(raw []byte) (*File, error) {
 			return nil, err
 		} else {
 			f.Server.EnforceAuth = v
-		}
-		if v, err := boolean(sec, "server", "webui"); err != nil {
-			return nil, err
-		} else {
-			f.Server.WebUI = v
 		}
 	}
 
@@ -563,16 +551,6 @@ func (f *File) Validate() error {
 	// 虚拟路径都会静默变成一个「永远不匹配」的挂载项，而症状是
 	// 「这个端口什么都看不到」——一个需要读完 portpolicy.go 才能
 	// 解释的现象。端口策略是安全边界，它的配置就该在启动时校验。
-	// [server] webui only applies when there are no [[listen]] blocks.
-	//
-	// Port blocks replace the implicit single port entirely, so the flag would
-	// silently do nothing once any [[listen]] exists. That is exactly the
-	// "wrote it in the config but it had no effect" failure this validation
-	// exists to prevent - say so at startup instead of leaving the operator
-	// wondering why the admin URL 404s.
-	if f.Server.WebUI && len(f.Listens) > 0 {
-		return fmt.Errorf("[server] webui has no effect when [[listen]] blocks are present; set webui = true on the specific [[listen]] port instead")
-	}
 	seenAddr := map[string]bool{}
 	for i, lb := range f.Listens {
 		if lb.Addr == "" {

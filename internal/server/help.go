@@ -46,6 +46,17 @@ chmod <p>@<br>/<path> mode     change rule/content mode
 write <p>@<br>/<path> -- text  write an exact file (for rules only; root required)
 batch {"ops":[...]}            atomic batch (combine multiple steps into one commit)
 
+Several statements in one call:
+  Separate verbs with ';' or a newline to run them in one round trip.
+  '&&' runs the next one only if the previous found something.
+  '||' runs the next one only if the previous found nothing - use it to fall
+  back through memory layers without always paying for every layer:
+      recall q --scope p@fact || recall q --scope p@record || recall q --scope p@thought
+  "Found something" means hits, not exit status: a search that legitimately
+  matches nothing is not an error. A real error stops the chain either way.
+  Content passed after '--' is data and is never split, so a ';' inside a body
+  stays in the body. Put the operator next to a space, and pass text via vars.
+
 How to use:
   - recall something             -> recall
   - save new content             -> put

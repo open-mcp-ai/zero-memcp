@@ -94,6 +94,13 @@ func parseRef(tok string) (name string, pos int, isRef bool, err error) {
 	if body == "" {
 		return "", 0, false, fmt.Errorf("empty reference %q", tok)
 	}
+	// A reference glued to a statement separator is a syntax error:
+	// writing $B; means "$B then the next statement", but subst expects references
+	// to occupy a whole word. Report the glued separator explicitly rather than
+	// "no such variable $B;", which would send the caller to check their vars map.
+	if i := strings.IndexAny(body, ";\n"); i >= 0 {
+		return "", 0, true, fmt.Errorf(`reference %q is glued to a statement separator: ';' and newline must stand as their own word (write "$%s ;" not "$%s;")`, tok, body[:i], body[:i])
+	}
 	numeric := true
 	for _, c := range body {
 		if c < '0' || c > '9' {
@@ -119,14 +126,19 @@ func parseRef(tok string) (name string, pos int, isRef bool, err error) {
 // 为什么不能直接 strings.Join 再拆回去：值里的空格、换行、"--" 都會
 // 改变语法。把它编码成无空白原子词，解析完指令骨架后，再只在正文槽
 // 还原原值；数据从头到尾都没有机会参与 DSL 解析。
+const (
+	payloadPrefix = "~ZMEMARG~"
+	payloadSuffix = "~END~"
+)
+
 func encodePayload(value string) string {
-	return "~ZMEMARG~" + base64.RawURLEncoding.EncodeToString([]byte(value)) + "~END~"
+	return payloadPrefix + base64.RawURLEncoding.EncodeToString([]byte(value)) + payloadSuffix
 }
 
 // restorePayload 把原子正文槽还原成原始字节。
 func restorePayload(value string) string {
-	const prefix = "~ZMEMARG~"
-	const suffix = "~END~"
+	const prefix = payloadPrefix
+	const suffix = payloadSuffix
 	var out strings.Builder
 	cursor := 0
 	for cursor < len(value) {

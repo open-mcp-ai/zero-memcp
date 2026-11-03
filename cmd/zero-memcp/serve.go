@@ -73,6 +73,9 @@ func runServe(args []string) int {
 	for _, addr := range srv.ListenAddrs() {
 		fmt.Fprintf(os.Stderr, "zero-memcp: listening on %s (%s)\n", addr, srv.DescribeProjects())
 	}
+	for _, u := range srv.AdminURLs() {
+		fmt.Fprintf(os.Stderr, "  WebUI: %s\n", u)
+	}
 	// 初始管理口令只打印这一次。
 	//
 	// 它会被写进 docker logs 之类的日志，所以它的价值不在保密，

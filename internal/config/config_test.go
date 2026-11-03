@@ -490,11 +490,15 @@ url     = "git@example.invalid:org/me.git"
 	}
 }
 
-// [server] webui is the single-port switch. Once [[listen]] blocks exist they
-// replace the implicit port entirely, so the flag would silently do nothing -
-// and the symptom ("the admin URL 404s") is not something you can read off the
-// config file.
-func TestServerWebUIConflictsWithListenBlocks(t *testing.T) {
+// The admin surface is not an opt-in flag any more.
+//
+// It used to be: [server] webui for the single-port mode and [[listen]] webui
+// for multi-port. That left a deployment with no way in whenever the flag was
+// omitted - and in a container or behind an npm wrapper nobody can pass a flag,
+// so the omission was invisible until every request came back 401. The port
+// still chooses where the surface lives; it can no longer decide whether it
+// exists.
+func TestServerWebUIIsNotAConfigKey(t *testing.T) {
 	_, err := ParseFile([]byte(`
 [server]
 data = "/tmp/x"
@@ -503,30 +507,9 @@ webui = true
 [[user]]
 name = "zero"
 root = true
-
-[[listen]]
-addr = "127.0.0.1:1729"
-allow = ["read"]
 `))
-	if err == nil || !strings.Contains(err.Error(), "has no effect") {
-		t.Fatalf("expected a conflict error, got %v", err)
-	}
-
-	// Without listen blocks the same config is fine.
-	f2 := mustParse(t, `
-[server]
-data = "/tmp/x"
-webui = true
-
-[[user]]
-name = "zero"
-root = true
-`)
-	if err := f2.Validate(); err != nil {
-		t.Fatalf("[server] webui alone should validate, got %v", err)
-	}
-	if !f2.Server.WebUI {
-		t.Fatal("[server] webui should be parsed into Server.WebUI")
+	if err == nil || !strings.Contains(err.Error(), "unknown key") {
+		t.Fatalf("[server] webui should no longer be accepted as a key, got %v", err)
 	}
 }
 

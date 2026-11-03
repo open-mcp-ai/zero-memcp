@@ -27,9 +27,24 @@ type ListenBlock struct {
 }
 
 // FromConfig 把配置里的端口块翻译成运行期结构。
+//
+// WebUI 必须存在：在黑盒环境（Docker 容器、npm-wrapper、守护进程）下，
+// 用户接触不到终端命令行，WebUI 是完成初始改密、凭证签发与授权的唯一
+// 也是必需的通道。
+//
+// 规则：
+//   - 若有任何端口显式配置了 WebUI: true，以显式配置为准（支持端口隔离）；
+//   - 若所有端口均未显式声明 WebUI，默认自动在第一个端口（主端口）启用。
+//
+// 这样高级用户可以把 WebUI 隔在专用回环端口，而默认/极简部署绝不会出现
+// 「服务跑起来了但到处 404 无法管理」的死锁。
 func FromConfig(blks []config.ListenBlock) []ListenBlock {
 	out := make([]ListenBlock, 0, len(blks))
+	hasUI := false
 	for _, b := range blks {
+		if b.WebUI {
+			hasUI = true
+		}
 		lb := ListenBlock{Addr: b.Addr, Allow: b.Allow, Require: b.Require, WebUI: b.WebUI}
 		for _, m := range b.Mount {
 			lb.Mount = append(lb.Mount, auth.MountPoint{
@@ -40,6 +55,9 @@ func FromConfig(blks []config.ListenBlock) []ListenBlock {
 			})
 		}
 		out = append(out, lb)
+	}
+	if len(out) > 0 && !hasUI {
+		out[0].WebUI = true
 	}
 	return out
 }

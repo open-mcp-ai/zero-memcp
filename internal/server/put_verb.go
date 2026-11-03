@@ -465,7 +465,7 @@ func splitScope(rest string) (query, scope string) {
 	for {
 		i := strings.Index(query, "--scope")
 		if i < 0 {
-			return query, scope
+			break
 		}
 		before := strings.TrimSpace(query[:i])
 		after := strings.TrimSpace(query[i+len("--scope"):])
@@ -476,6 +476,30 @@ func splitScope(rest string) (query, scope string) {
 		scope = strings.Trim(fields[0], "/")
 		query = strings.TrimSpace(before + " " + strings.Join(fields[1:], " "))
 	}
+	return query, scope
+}
+
+// unknownFlag 找出 DSL 里被误当搜索词的选项。
+//
+// 为什么必须报错而不是忽略：`grep -c . zero-agi` 的真实后果是
+// 把 "-c" 编进正则、把 "zero-agi" 当搜索词，最后返回 "no matches"——
+// 调用方会得出「库里没有」这个错误结论，而事实是参数写错了。
+// 静默比报错危险得多：报错会停下来，静默会接着往下推。
+func unknownFlag(rest string) (string, bool) {
+	for _, f := range strings.Fields(rest) {
+		if !strings.HasPrefix(f, "-") {
+			continue
+		}
+		// 孤立的 "-" 不算选项（可能是正则的一部分）。
+		if f == "-" {
+			continue
+		}
+		if f == "--scope" {
+			continue
+		}
+		return f, true
+	}
+	return "", false
 }
 
 // addrUnderScope 判断一个索引地址是否落在给定树范围里。

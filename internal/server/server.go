@@ -35,6 +35,18 @@ import (
 // DefaultPort 是约定的固定端口：哈代-拉马努金数 1729。
 const DefaultPort = 1729
 
+// recallMinCoverage 是 recall 的最低查询词覆盖率。
+//
+// 中文按二元组分词，「量子计算机退相干」会拆出「计算」「算机」——
+// 这两个词在几乎任何技术文档里都有。没有覆盖率门槛时，这类与记忆
+// 完全无关的查询会拿到 8 分以上的「命中」，后果有两层：
+//  1. 模型拿到一段不相关的正文，还以为是答案；
+//  2. '||' 回落链彻底失效——上层总是「命中」，下层永远不会被问。
+//
+// 实测 24 个查询：真正相关的 12 个覆盖率全为 1.00，无关的 12 个最高
+// 0.29。取 0.5 两边都有充足余量，不是拟合出来的阈值。
+const recallMinCoverage = 0.5
+
 // Config 启动配置。
 type Config struct {
 	// DataDir 是数据根。<data>/system/ 放密钥与吊销名单，
@@ -430,7 +442,16 @@ func (s *Server) Reload() error {
 			if err != nil {
 				return fmt.Errorf("read %s: %w", b.Addr(), err)
 			}
-			idx.AddWithTime(b.ID(), string(data), b.Time)
+			// 时间优先取正文里的 at:/created:，回退 commit 时间。
+			//
+			// 批量导入会把几千篇历史切片打成同一个 commit 时间，
+			// 那份时间对排序和时效权重都是噪声；正文里那个时刻
+			// 才是这条记忆代表的事件发生时间。
+			stamp := b.Time
+			if at := sliceAtTime(string(data), b.Path); at > 0 {
+				stamp = at
+			}
+			idx.AddWithTime(b.ID(), string(data), stamp)
 
 			// SKILL.md 永远解析策略，不看 b.Rule。
 			//
@@ -702,9 +723,34 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 注入必须以「一个项目 = 一条身份线」为单位。
+	//
+	// 踩过的坑：早先这里直接遍历 s.trees 全量叠加，而 s.trees 是
+	// (项目, 分支) 粒度的——同一个项目有几个分支就有几棵树。
+	// blackegg/me 有 zero / main / chat 三条分支，于是三套身份
+	// 同时进了同一个系统提示：「我是简」与「我是 QQ 群助手」并列，
+	// 同一份规则还被重复注入两遍（addr 完全相同）。模型的反应是
+	// 不知道自己是谁。
+	//
+	// 分支在这里是「版本线」，不是「并存在的多个身份」。
+	// 一次对话只能归属一个身份。
+	byProject := make(map[string][]*memory.Tree)
+	var projects []string
 	for _, t := range s.trees {
 		// 挂载表之外的仓库连「存在」都不该被看到
 		if !caller.Mount.Visible(t.Project, t.Branch) {
+			continue
+		}
+		if _, ok := byProject[t.Project]; !ok {
+			projects = append(projects, t.Project)
+		}
+		byProject[t.Project] = append(byProject[t.Project], t)
+	}
+	sort.Strings(projects)
+
+	for _, proj := range projects {
+		t := s.identityTreeFor(caller, proj, byProject[proj])
+		if t == nil {
 			continue
 		}
 		for _, b := range t.Injectable() {
@@ -725,6 +771,47 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{"blocks": blocks})
+}
+
+// identityTreeFor 从一个项目的多条分支里选出唯一要注入身份的那一条。
+//
+// 优先级：
+//  1. 凭证在挂载表里钉住的分支——这是签发时写死的意图；
+//  2. 服务端默认分支（通常是 zero）；
+//  3. 按分支名字典序取第一个（只为确定性，不表达偏好）。
+//
+// 不选“把所有分支合起来”：那样得到的是几个互相矛盾的身份，不是更全的身份。
+func (s *Server) identityTreeFor(c Caller, project string, trees []*memory.Tree) *memory.Tree {
+	if len(trees) == 0 {
+		return nil
+	}
+	if len(trees) == 1 {
+		return trees[0]
+	}
+
+	// 1. 凭证钉住的分支。通配 "*" 不算钉住：它表示“读得见全部分支”，
+	//    而身份只能归属一条。
+	if bs := c.Mount.BranchesOf(project); len(bs) == 1 {
+		if want := bs[0]; want != "*" && want != "" {
+			for _, t := range trees {
+				if t.Branch == want {
+					return t
+				}
+			}
+		}
+	}
+
+	// 2. 服务端默认分支。
+	for _, t := range trees {
+		if t.Branch == s.defaultBranch {
+			return t
+		}
+	}
+
+	// 3. 确定性兜底。
+	sorted := append([]*memory.Tree(nil), trees...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Branch < sorted[j].Branch })
+	return sorted[0]
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -836,7 +923,7 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	// 多取一些，权限与挂载过滤后再截断——否则受限凭证的 limit=3
 	// 会因为前 3 条都被过滤掉而返回空，看起来像"搜不到"。
-	hits := s.idx.SearchWeighted(req.Text, req.Limit*4, req.Floor, s.weightCount)
+	hits := s.idx.SearchCovered(req.Text, req.Limit*4, req.Floor, recallMinCoverage, s.weightCount, nil)
 	s.mu.RUnlock()
 
 	type HitView struct {
@@ -1385,7 +1472,7 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			}
 			return addrUnderScope(addr, scope)
 		}
-		hits := s.idx.SearchWeightedFiltered(query, 3, 0, s.weightCount, func(addr string) bool {
+		hits := s.idx.SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
 			return allowedHit(addr) && scopeMatch(addr)
 		})
 		permHits := make([]index.Hit, 0, len(hits))
@@ -1493,8 +1580,33 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			}
 			d, err := repo.Read(br, path)
 			if err != nil {
-				missing = append(missing, addr+"(not found)")
-				continue
+				// 没写 @branch 时跨分支兜一次。
+				//
+				// 为什么需要：地址写成 zero-agi/2026-10-28/x.md 时，默认分支通常
+				// 是零号分支（没内容），而文件其实在 record 或 thought 上。
+				// 用户不知道「默认分支」是哪个，也不该知道——他手里只有路径。
+				// 唯一命中就直接给；多分支都有就列出来消歧；都没有才报 not found。
+				if strings.Contains(addr, "@") {
+					missing = append(missing, addr+"(not found)")
+					continue
+				}
+				cands := s.branchCandidates(repo, path, c, proj)
+				switch len(cands) {
+				case 0:
+					missing = append(missing, addr+"(not found)")
+					continue
+				case 1:
+					found, ferr := repo.Read(cands[0], path)
+					if ferr != nil {
+						missing = append(missing, addr+"(not found)")
+						continue
+					}
+					br, d = cands[0], found
+				default:
+					// 多分支同路径：不猜，把选择权交回去。
+					missing = append(missing, fmt.Sprintf("%s(found on %s; add @branch)", addr, strings.Join(cands, ", ")))
+					continue
+				}
 			}
 			// 权重键必须与索引键一致（带分支），否则 read 强化对
 			// 不带分支的地址记账、索引却按带分支的键查，永远对不上。
@@ -1685,6 +1797,12 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		//
 		// --scope 收窄搜索范围：记忆树大了之后，不分范围的全量扫
 		// 会把命中堆到与本次无关的项目上。
+		//
+		// 未知选项必须报错：`grep -c . zero-agi` 早先会把 "-c" 编进正则，
+		// 最后返回 "no matches"——调用方据此得出「库里没有」，而事实只是参数错了。
+		if bad, ok := unknownFlag(rest); ok {
+			return TermResult{}, fmt.Errorf("grep: unknown flag %q (supported: --scope)", bad)
+		}
 		pattern, scope := splitScope(rest)
 		if pattern == "" {
 			return TermResult{}, errors.New("grep syntax: grep <pattern> [--scope <tree>]")
@@ -1953,20 +2071,42 @@ func (s *Server) execLog(n int, c Caller) (string, error) {
 			all = append(all, b)
 		}
 	}
-	// 按 ModTime 倒序，平局按地址倒序
-	sort.Slice(all, func(i, j int) bool {
-		if all[i].Time != all[j].Time {
-			return all[i].Time > all[j].Time
+	// 排序依据：正文里的事件时间优先，commit 时间兜底。
+	//
+	// 为什么不能只看 commit 时间：批量导入会把几千篇历史切片打成
+	// 同一个时间戳，排序随即退化成路径字典序——用户以为看到的是
+	// 「最近」，其实是文件名最大的那批。正文里的 at:/created: 才是
+	// 这条记忆真正代表的那一刻。
+	//
+	// 时间从索引的 docTime 表里取（建索引时已按正文算好），不在
+	// 这里逐篇读盘：log 是高频动词，对 3700 篇逐个解包 frontmatter
+	// 会把一次列举变成一次全库扫描。
+	type entry struct {
+		b memory.Block
+		t int64
+	}
+	entries := make([]entry, len(all))
+	for i, b := range all {
+		t := s.idx.DocTime(b.ID())
+		if t == 0 {
+			t = b.Time
 		}
-		return all[i].Path > all[j].Path
+		entries[i] = entry{b: b, t: t}
+	}
+	sort.SliceStable(entries, func(i, j int) bool {
+		if entries[i].t != entries[j].t {
+			return entries[i].t > entries[j].t
+		}
+		return entries[i].b.Path > entries[j].b.Path
 	})
-	if len(all) > n {
-		all = all[:n]
+	if len(entries) > n {
+		entries = entries[:n]
 	}
 
 	var sb strings.Builder
-	for i, b := range all {
-		t := time.Unix(b.Time, 0).Format("2006-01-02 15:04:05")
+	for i, e := range entries {
+		b := e.b
+		t := time.Unix(e.t, 0).Format("2006-01-02 15:04:05")
 		virt := c.Mount.ToVirtual(b.Project, b.Branch, b.Path)
 		if virt == "" {
 			continue
@@ -2012,13 +2152,27 @@ func (s *Server) execLs(day string, c Caller) (string, error) {
 			c.Mount.ToVirtual(matches[j].Project, matches[j].Branch, matches[j].Path)
 	})
 
+	// 输出上限。
+	//
+	// 为什么必须有：`ls 2026-11-03` 在真实库上会匹配几千篇切片，
+	// 全量倾倒 26 万字符直接打爆上下文窗口——而且它的每一行只值 60 字节，
+	// 却按完整通道计费。给个稳定上限，超出部分只报数字，让人换更窄的查询。
+	total := len(matches)
+	show := matches
+	if total > lsMaxEntries {
+		show = matches[:lsMaxEntries]
+	}
+
 	var sb strings.Builder
-	for _, b := range matches {
+	for _, b := range show {
 		virt := c.Mount.ToVirtual(b.Project, b.Branch, b.Path)
 		if virt == "" {
 			virt = b.Path
 		}
 		sb.WriteString(fmt.Sprintf("%-50s %6d bytes\n", virt, b.Size))
+	}
+	if total > lsMaxEntries {
+		fmt.Fprintf(&sb, "... and %d more entries (total %d). Narrow the query.", total-lsMaxEntries, total)
 	}
 	return strings.TrimRight(sb.String(), "\n"), nil
 }

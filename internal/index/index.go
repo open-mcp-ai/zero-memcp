@@ -109,7 +109,23 @@ func (ix *Index) SearchWeighted(query string, limit int, idfFloor float64, wf We
 //
 // 过滤是安全边界，也是检索相关性的边界：在这张凭证的可见范围里算出来的
 // top-N，才是它该看见的最佳答案。
+// SearchWeightedFiltered 按权重和外部过滤器打分。
 func (ix *Index) SearchWeightedFiltered(query string, limit int, idfFloor float64, wf WeightFunc, filter FilterFunc) []Hit {
+	return ix.SearchCovered(query, limit, idfFloor, 0, wf, filter)
+}
+
+// SearchCovered 增加了最小查询词覆盖率（minCoverage）。
+//
+// 为什么需要它：中日韩文字按二元组（bigram）分词，任何较长的中文查询
+// 几乎都能撞上一两个常见词（例如「量子计算机退相干」里的「计算」「算机」）。
+// BM25 会给这些偶然重合打出大于 0 的分数，导致与事实完全无关的查询
+// 在每层都「命中」——这不仅向模型输出无关正文，还让 '||' 回落链彻底
+// 失效（因为第一层总是「命中」，后面两层永远不会被执行）。
+//
+// 覆盖率 = 命中的不同查询词数 / 查询里去重后的总词数。
+// 阈值 0.5 意味着至少一半的查询词必须出现在文档里才算命中；
+// 0 表示关掉覆盖率检查，保持纯 BM25 行为。
+func (ix *Index) SearchCovered(query string, limit int, idfFloor, minCoverage float64, wf WeightFunc, filter FilterFunc) []Hit {
 	qtokens := Tokenize(query)
 	if len(qtokens) == 0 || ix.totalDocs == 0 {
 		return nil
@@ -182,7 +198,20 @@ func (ix *Index) SearchWeightedFiltered(query string, limit int, idfFloor float6
 	}
 
 	hits := make([]Hit, 0, len(scores))
+	totalQueryTerms := float64(len(uniq))
 	for addr, s := range scores {
+		if minCoverage > 0 && totalQueryTerms > 0 {
+			mTokens := matched[addr]
+			seenM := make(map[Token]bool, len(mTokens))
+			for _, t := range mTokens {
+				seenM[t] = true
+			}
+			coverage := float64(len(seenM)) / totalQueryTerms
+			if coverage < minCoverage {
+				continue
+			}
+		}
+
 		// 时间增益：距离最新条目越近，给 1.0 ~ 1.25x 的乘数
 		boost := 1.0
 		if maxTime > 0 && ix.docTime[addr] > 0 {
@@ -223,6 +252,17 @@ func (ix *Index) Docs() int { return ix.totalDocs }
 
 // Terms 返回索引里的词数。
 func (ix *Index) Terms() int { return len(ix.postings) }
+
+// DocTime 查出一个块的逻辑时间（Unix 秒）。未知返回 0。
+//
+// 供 log 排序与时效衰减复用：避免 log 每次执行都把全库切片
+// 从 git 裸库里解包重读一次 frontmatter。
+func (ix *Index) DocTime(addr string) int64 {
+	if ix == nil {
+		return 0
+	}
+	return ix.docTime[addr]
+}
 
 // Tokenize 把文本切成索引词。
 //

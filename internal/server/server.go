@@ -827,7 +827,20 @@ func (s *Server) identityTreeFor(c Caller, project string, trees []*memory.Tree)
 		}
 	}
 
-	// 2. 服务端默认分支。
+	// 2.5 终局模型：main 分支（人格所在）优先于默认分支。
+	//
+	// 新模型下「项目 = 人格，main = 该人格的本体设定（me/）」。
+	// 老仓库的默认分支叫 zero（zero-agi 时代的历史遗留），里面装的是
+	// 旧分层 SKILL.md——那不是人格，是检索配置。人格在 main 上。
+	// 所以 main 必须排在 defaultBranch 之前：一个同时有 zero 和 main
+	// 的仓库，人格应该从 main 来；没有 main 的老仓库才退回默认分支。
+	for _, t := range trees {
+		if t.Branch == "main" {
+			return t
+		}
+	}
+
+	// 3. 服务端默认分支。
 	for _, t := range trees {
 		if t.Branch == s.defaultBranch {
 			return t
@@ -1644,7 +1657,7 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			// 权重键必须与索引键一致（带分支），否则 read 强化对
 			// 不带分支的地址记账、索引却按带分支的键查，永远对不上。
 			nowUnix := time.Now().Unix()
-			s.weights.Bump(proj+"@"+br+"/"+path, nowUnix)
+			s.weights.Bump(memory.MakeID(proj, br, path), nowUnix)
 			s.weights.Bump(proj+"/"+path, nowUnix)
 			if len(fields) > 1 {
 				out.WriteString("==== " + addr + " ====\n")
@@ -2037,7 +2050,7 @@ func (s *Server) execGrep(pattern, scope string, c Caller) (string, bool, error)
 			}
 			// 范围收窄：把块拼回索引地址形状，复用与 recall 同一套判定，
 			// 避免两处各写一份前缀匹配而慢慢走偏。
-			if scope != "" && !addrUnderScope(b.Project+"@"+b.Branch+"/"+b.Path, scope) {
+			if scope != "" && !addrUnderScope(b.ID(), scope) {
 				continue
 			}
 			data, err := s.readBlock(b)

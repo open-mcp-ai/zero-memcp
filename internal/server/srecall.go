@@ -150,6 +150,37 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	}
 	s.mu.RUnlock()
 
+	// 去重：
+	//
+	// 1) 同轮折叠：A 的 companion 正好是列表里的 B，则 B 已经被
+	//    「↳ 同轮问答结论: B」带出，不该再作为独立命中占一个席位。
+	//    顺序很重要：只有 A 排在 B 前面才删 B；反过来 B 在前就保留 B
+	//    （它是分更高的一方），A 的 ↳ 指针变成对上方条目的引用，
+	//    不重复正文。否则会把高分结论扔掉、只留下低分的推理链。
+	//
+	// 2) 摘要指纹去重：分卷切片（part 1/2）或多分支镜像经常有
+	//    完全相同的开头 240 字节。正文摘要一模一样的只保留最高分一条。
+	var deduped []finalHit
+	consumed := map[string]bool{} // 被已保留条目的 companion 引用过的地址
+	seenSnippets := map[string]bool{}
+	for _, h := range result {
+		if consumed[h.virt] || consumed[h.addr] {
+			continue
+		}
+		normSnip := strings.TrimSpace(h.snippet)
+		if normSnip != "" && seenSnippets[normSnip] {
+			continue
+		}
+		if normSnip != "" {
+			seenSnippets[normSnip] = true
+		}
+		if h.companion != "" {
+			consumed[h.companion] = true
+		}
+		deduped = append(deduped, h)
+	}
+	result = deduped
+
 	if len(result) == 0 {
 		return TermResult{
 			Text:       "no matches",

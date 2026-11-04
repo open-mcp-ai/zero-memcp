@@ -109,8 +109,22 @@ func (s *Server) handleAPI(w http.ResponseWriter, r *http.Request) {
 //
 // 管理台是所有者视角，所以身份是 root——但这不等于「可以绕过一切」：
 // 它仍然只做读（recent / tree / read），没有任何写路径。
+//
+// 用户身份必须取配置里真实存在的 root 用户，不能自己编一个名字。
+//
+// 踩过的坑：这里原先把 User 写死成 "ui"，而配置里只有 zero/chat。
+// allowed() 最后会走到 config.Check → Explain，那里查不到这个用户，
+// 于是每次在面板里点开一个切片都得到：
+//
+//	Read failed: user "ui" does not exist
+//
+// 而 Caller.Root 为真并不能绕过这一步：root 只跳过「项目未声明」那一层，
+// 已声明的项目仍然要查配置。所以直接复用 rootCaller()——它已经在
+// 做「找配置里第一个 root 用户」这件事，身份标识也带上了 endpoint。
 func (s *Server) handleAPIAsUI(w http.ResponseWriter, r *http.Request) {
-	s.serveAPI(w, r, Caller{User: "ui", Identity: "webui", Root: true, Cap: "rwx"})
+	c := s.rootCaller()
+	c.Identity = "webui"
+	s.serveAPI(w, r, c)
 }
 
 func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, caller Caller) {
@@ -223,7 +237,7 @@ func (s *Server) readAddr(addr string, c Caller) (string, error) {
 		return "", err
 	}
 	nowUnix := time.Now().Unix()
-	s.weights.Bump(proj+"@"+br+"/"+path, nowUnix)
+	s.weights.Bump(memory.MakeID(proj, br, path), nowUnix)
 	s.weights.Bump(proj+"/"+path, nowUnix)
 	return string(d), nil
 }

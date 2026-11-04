@@ -431,10 +431,17 @@ func (s *Server) parseBranchAddr(addr string) (project, branch, path string, err
 	if at := strings.Index(addr, "@"); at >= 0 {
 		project = addr[:at]
 		rest := addr[at+1:]
-		b, p, ok := strings.Cut(rest, "/")
-		branch = b
-		if ok {
+		// 新语法：冒号切 ref 与 path（与 Git 的 ref:path 一致）。
+		// ref 内部的斜杠属于分支层级，所以这里不能用 Cut(rest, "/")。
+		if c := strings.Index(rest, ":"); c >= 0 {
+			branch = rest[:c]
+			path = rest[c+1:]
+		} else if b, p, ok := strings.Cut(rest, "/"); ok {
+			// 旧语法兼容：第一个斜杠之前是分支。
+			branch = b
 			path = p
+		} else {
+			branch = rest
 		}
 	} else {
 		// 没写分支：按已声明项目做最长前缀匹配，剩下的都是路径

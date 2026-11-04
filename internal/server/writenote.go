@@ -203,7 +203,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// frontmatter），这里早先只索引 text，于是 source/endpoint/session
 	// 这些词在重启前搜不到、重启后才出现——同一份记忆的可检索性
 	// 随进程生命周期变化，docLen 也跟着变，BM25 分数跟着漂。
-	blockID := targetProject + "@" + writeBranch + "/" + path
+	blockID := memory.MakeID(targetProject, writeBranch, path)
 	s.mu.Lock()
 	s.idx.AddWithTime(blockID, content, now.Unix())
 	s.addBlockLocked(targetProject, repo, writeBranch, path, int64(len(content)), now.Unix())

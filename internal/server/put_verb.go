@@ -98,12 +98,12 @@ func (s *Server) parsePutSpec(target string, c Caller) putSpec {
 		return putSpec{}
 	}
 
-	// 显式分支：proj@branch[/path]
+	// 显式分支：proj@branch[:path] 或旧 proj@branch[/path]
 	if at := strings.Index(target, "@"); at >= 0 {
-		proj := target[:at]
-		rest := target[at+1:]
-		br, p, _ := strings.Cut(rest, "/")
-		return putSpec{Explicit: proj + "@" + br, TreePath: p}
+		proj, br, p, err := s.parseBranchAddr(target)
+		if err == nil && proj != "" {
+			return putSpec{Explicit: proj + "@" + br, TreePath: strings.Trim(p, "/")}
+		}
 	}
 
 	// 已声明项目前缀：proj[/path]
@@ -506,20 +506,36 @@ func unknownFlag(rest string) (string, bool) {
 //
 // 地址形如 project@branch/path；范围可以是 project、project@branch
 // 或 project@branch/subtree。
+// addrUnderScope 判断地址是否在某个 scope 之下。
+//
+// scope 的两种写法：
+//
+//	<project>                整个仓库
+//	<project>@<ref>          某个分支（ref 可含斜杠，如 main/record）
+//	<project>@<ref>:<path>   某个分支下的子路径
+//
+// 注意 ref 与 path 之间是冒号，ref 内部的斜杠属于分支层级——
+// 这是地址语法的根本分界，不能再用 "/" 去区分两者。
 func addrUnderScope(addr, scope string) bool {
 	proj, branch, path, ok := memory.SplitID(addr)
 	if !ok {
 		return false
 	}
-	full := proj + "@" + branch
-	if scope == proj || scope == full {
+	if scope == proj {
 		return true
 	}
-	if strings.HasPrefix(scope, full+"/") {
-		sub := strings.TrimPrefix(scope, full+"/")
-		return path == sub || strings.HasPrefix(path, sub+"/")
+	// scope 带 @ref 时，可能还带 :path
+	sp, sb, spath, okScope := memory.SplitID(scope)
+	if !okScope {
+		return false
 	}
-	return false
+	if sp != proj || sb != branch {
+		return false
+	}
+	if spath == "" {
+		return true
+	}
+	return path == spath || strings.HasPrefix(path, spath+"/")
 }
 
 // execSince 列出某棵子树自给定 commit 之后的增量变化。

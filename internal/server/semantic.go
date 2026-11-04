@@ -28,13 +28,34 @@ import (
 	"github.com/open-mcp-ai/zero-memcp/internal/vecindex"
 )
 
-// isSemanticBranch 判断一个分支是否参与语义索引。
+// isSemanticContent 判断一条内容是否参与语义索引。
 //
-// thought 是原始推理链（语义最深的一层）；
-// review 放的是人工确认过的 L2 知识条目（如 case-1729-v2）。
-// 两者都参与：L2 回答「是什么」，thought 回答「为什么」，成对存在。
-func isSemanticBranch(br string) bool {
-	return br == "thought" || br == "review"
+// 按**路径**判断，不按分支名。
+//
+// 这是地址语法改成 `ref:path` 之后的关键变化：分支只表达「哪条生命线」，
+// 不再需要靠分支名去猜里面装什么内容。早先写成 isSemanticBranch，
+// 靠分支前缀（thought-* / record-*）识别，导致每加一个人就要改代码、
+// 重建索引、重新发版——而且分支名一旦不再携带内容语义，那个函数就全错。
+//
+// 参与索引的路径：
+//   thought/  推理链（回答「为什么」）
+//   record/   一问一答（回答「发生过什么」）
+//   review/   人工确认的共识（回答「定下来什么」）
+//   fact/     提炼过的结论（人为写的，不是会话遗言）
+//
+// 注意 fact/ 与旧模型的 fact 分支不是同一件事：
+// 旧分支里装的是 Pi 会话压缩时自动生成的 Compaction summary，
+// 那是「会话遗言」（待办清单 + 约束清单），不是知识，已废弃不入库。
+// 新结构下的 fact/ 是手动写下的确定结论，与 thought/ 同等待遇。
+//
+// 不参与：me/（每轮注入的规则，不靠检索）、以及任何其他路径。
+func isSemanticContent(path string) bool {
+	for _, p := range []string{"thought/", "record/", "review/", "fact/"} {
+		if strings.HasPrefix(path, p) {
+			return true
+		}
+	}
+	return false
 }
 
 // semanticMinScore 是向量命中的最低余弦相似度。
@@ -158,10 +179,26 @@ func (s *Server) initSemantic() {
 }
 
 // semanticHeads 返回参与语义索引的分支的当前 head，用作缓存失效判据。
+// treeHasSemanticContent 判断一棵树里是否包含需要语义索引的内容。
+func (s *Server) treeHasSemanticContent(t *memory.Tree) bool {
+	// 旧模型兼容：分支名直接叫 thought / review / thought-*
+	if t.Branch == "thought" || t.Branch == "review" || strings.HasPrefix(t.Branch, "thought-") {
+		return true
+	}
+	// 新模型：树里只要有一篇路径符合 isSemanticContent，这棵树就参与
+	for _, b := range t.Indexable() {
+		if isSemanticContent(b.Path) {
+			return true
+		}
+	}
+	return false
+}
+
+// semanticHeads 返回参与语义索引的每个「项目@分支」的当前 head。
 func (s *Server) semanticHeads() map[string]string {
 	heads := map[string]string{}
 	for _, t := range s.snapshotTrees() {
-		if !isSemanticBranch(t.Branch) {
+		if !s.treeHasSemanticContent(t) {
 			continue
 		}
 		repo, err := s.projects.Get(t.Project)
@@ -172,7 +209,7 @@ func (s *Server) semanticHeads() map[string]string {
 		if err != nil {
 			continue
 		}
-		heads[t.Project] = sha
+		heads[t.Project+"@"+t.Branch] = sha
 	}
 	return heads
 }
@@ -197,10 +234,13 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string) erro
 	}
 	var jobs []job
 	for _, t := range s.snapshotTrees() {
-		if !isSemanticBranch(t.Branch) {
-			continue
-		}
 		for _, b := range t.Indexable() {
+			// 按**路径**决定是否进语义索引（isSemanticContent），
+			// 不再看分支名。分支可以是任何名字（main、main/record、
+			// task-1729），只要内容在 thought/ 或 record/ 下就参与。
+			if !isSemanticContent(b.Path) {
+				continue
+			}
 			data, rerr := s.readBlock(b)
 			if rerr != nil {
 				continue
@@ -310,14 +350,32 @@ func (s *Server) semanticSearch(query string) []vecindex.Hit {
 // 匹配不到就返回空——宁可只给推理链，也不拿一篇不相干的 record 冒充结论。
 func (s *Server) companionRecord(thoughtID string) (string, string) {
 	proj, br, path, ok := memory.SplitID(thoughtID)
-	if !ok || !isSemanticBranch(br) {
+	if !ok {
 		return "", ""
 	}
+	// 按路径判断这条是不是推理链，不看分支名。
+	// 新语法下推理链在 thought/ 下，分支可以是任何名字。
+	if !strings.HasPrefix(path, "thought/") {
+		return "", ""
+	}
+	// 同一条生命线里，record 与 thought 是镜像目录：
+	//   main/record:thought/2026-11-04/001.md
+	//   main/record:record/2026-11-04/001.md
+	// 所以把路径前缀换掉就能直接算出对方地址——O(1)，不用扫全库。
+	rel := strings.TrimPrefix(path, "thought/")
+	sameBranchID := memory.MakeID(proj, br, "record/"+rel)
+
+	// 第一优先：同分支镜像路径直接命中。
+	if at := s.semanticTime(sameBranchID); at != 0 {
+		return sameBranchID, s.addrToVirtualFor(sameBranchID)
+	}
+
+	// 第二优先：旧数据布局——thought 与 record 在不同分支、日期目录相同、
+	// 时间戳相近。这条回落链只为历史数据保留，新写入不依赖它。
 	atThought := s.semanticTime(thoughtID)
 	if atThought == 0 {
 		return "", ""
 	}
-	// 日期目录：2026-10-28/2026-11-03/xxx.md → 2026-10-28
 	dir := path
 	if i := strings.LastIndex(path, "/"); i > 0 {
 		dir = path[:i]
@@ -326,10 +384,13 @@ func (s *Server) companionRecord(thoughtID string) (string, string) {
 	var bestID string
 	var bestDelta int64 = 1 << 62
 	for _, t := range s.snapshotTrees() {
-		if t.Project != proj || t.Branch != "record" {
+		if t.Project != proj {
 			continue
 		}
 		for _, b := range t.Indexable() {
+			if !strings.HasPrefix(b.Path, "record/") && t.Branch != "record" {
+				continue
+			}
 			bp := b.Path
 			bdir := bp
 			if i := strings.LastIndex(bp, "/"); i > 0 {
@@ -346,9 +407,6 @@ func (s *Server) companionRecord(thoughtID string) (string, string) {
 			if d < 0 {
 				d = -d
 			}
-			// 同一轮的判定：时间差在 5 分钟内。
-			// 放宽到 5 分钟是因为 record 和 thought 的 at: 未必逐毫秒对齐，
-			// 而一轮对话极少超过 5 分钟。
 			if d > 300 {
 				continue
 			}
@@ -386,7 +444,7 @@ func (s *Server) addrToVirtualFor(id string) string {
 	if br == s.defaultBranch {
 		return proj + "/" + path
 	}
-	return proj + "@" + br + "/" + path
+	return memory.MakeID(proj, br, path)
 }
 
 // semanticStatus 给 status 动词报告向量侧状态。

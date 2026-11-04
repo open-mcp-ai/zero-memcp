@@ -129,3 +129,43 @@ func TestStats(t *testing.T) {
 		t.Fatalf("统计不对: %+v", s)
 	}
 }
+
+func TestSplitIDColonSyntax(t *testing.T) {
+	cases := []struct {
+		id      string
+		wantP   string
+		wantBr  string
+		wantPa  string
+		wantOk  bool
+	}{
+		// 新语法：冒号切 ref 与 path，ref 内部可以带斜杠
+		{"weft@main/record:2026-11-04/001.md", "weft", "main/record", "2026-11-04/001.md", true},
+		{"weft@task-1729/thought:2026-11-04/002.md", "weft", "task-1729/thought", "2026-11-04/002.md", true},
+		{"zero@main:me/SKILL.md", "zero", "main", "me/SKILL.md", true},
+		// 旧语法兼容：没有冒号，按第一个斜杠切
+		{"zero@thought/2026-10-28/001.md", "zero", "thought", "2026-10-28/001.md", true},
+		{"blackegg/daily@zero/2026-10-24/001.md", "blackegg/daily", "zero", "2026-10-24/001.md", true},
+		// 边界
+		{"bare-string", "", "", "", false},
+		{"@empty-project:path", "", "", "", false},
+	}
+	for _, c := range cases {
+		p, b, pa, ok := SplitID(c.id)
+		if ok != c.wantOk || p != c.wantP || b != c.wantBr || pa != c.wantPa {
+			t.Errorf("SplitID(%q) = (%q, %q, %q, %v); want (%q, %q, %q, %v)",
+				c.id, p, b, pa, ok, c.wantP, c.wantBr, c.wantPa, c.wantOk)
+		}
+	}
+}
+
+func TestMakeIDRoundtrip(t *testing.T) {
+	p, b, pa := "weft", "main/record", "thought/2026-11-04/001.md"
+	id := MakeID(p, b, pa)
+	if id != "weft@main/record:thought/2026-11-04/001.md" {
+		t.Fatalf("MakeID 格式错误: %q", id)
+	}
+	p2, b2, pa2, ok := SplitID(id)
+	if !ok || p2 != p || b2 != b || pa2 != pa {
+		t.Fatalf("MakeID 与 SplitID 无法 roundtrip: got (%q, %q, %q, %v)", p2, b2, pa2, ok)
+	}
+}

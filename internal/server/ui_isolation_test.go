@@ -436,3 +436,44 @@ webui = true
 		t.Fatalf("AdminURLs should report the explicit port, got %v", urls)
 	}
 }
+
+// 管理台身份必须是配置里真实存在的用户。
+//
+// 踩过的坑：handleAPIAsUI 硬编码 User:"ui"，配置里没有这个用户。
+// allowed() 走到配置层时查无此人，面板里点开任何切片都是
+// `Read failed: user "ui" does not exist` —— 面板能列出文件、
+// 却打不开任何一个，等于全残。
+//
+// 回归钉：登录后通过 /api?action=read 读一个真实存在的切片，
+// 必须返回内容而不是用户不存在的报错。
+func TestUIReadUsesRealConfigUser(t *testing.T) {
+	srv, _ := newWebUIServer(t)
+	// 引导口令只活到第一次改密为止，未改密前管理接口一律 403。
+	_ = srv.TakeBootstrapPassword()
+	if err := srv.passwords.Set("a-long-enough-password"); err != nil {
+		t.Fatal(err)
+	}
+	cookie := loginUI(t, srv, "a-long-enough-password")
+
+	mux := srv.muxFor(ListenBlock{Allow: []string{"*"}, WebUI: true})
+	req := httptest.NewRequest(http.MethodGet, "/api?action=read&addr=proj/a.md", nil)
+	req.AddCookie(cookie)
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("read 失败: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(resp.Content, "内容") {
+		t.Fatalf("读到错误内容: %q", resp.Content)
+	}
+	if strings.Contains(rec.Body.String(), "does not exist") {
+		t.Fatalf("仍然出现用户不存在的报错: %s", rec.Body.String())
+	}
+}

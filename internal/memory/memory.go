@@ -43,7 +43,7 @@ func (b Block) Addr() string { return b.Project + "/" + b.Path }
 // 为什么索引必须带分支：同一个仓库的两个分支里可以有同名同路径的文件，
 // 内容不同。只用 Addr 当键的话，后写进索引的会覆盖前一个——
 // 而症状是「recall 搜出来的内容是另一个分支的」，且完全不报错。
-func (b Block) ID() string { return b.Project + "@" + b.Branch + "/" + b.Path }
+func (b Block) ID() string { return MakeID(b.Project, b.Branch, b.Path) }
 
 // Injectable 报告它是否每轮注入系统提示。
 func (b Block) Injectable() bool { return b.Rule }
@@ -193,14 +193,25 @@ func (t *Tree) Stats() Stats {
 	return s
 }
 
-// SplitID 把索引键 "project@branch/path" 拆回三段。
+// SplitID 把索引键拆回 project / branch / path 三段。
 //
-// 索引必须用带分支的键：同一个仓库的不同分支里可以有同名同路径的文件，
-// 内容完全不同。只用 "project/path" 当键的话，后写入的会覆盖前一个，
-// 症状是「recall 搜出来的内容是另一个分支的」，而且完全不报错。
+// 语法：`<project>@<ref>:<path>`，分隔符是冒号，与 Git 的
+// `git show <ref>:<path>` 一致。
 //
-// 项目名本身可以带斜杠（blackegg/daily），所以不能用 strings.Cut 找 "/"，
-// 必须按 "@" 切——分支名里不含 "@"。
+// 为什么必须用两个不同的分隔符——这条是踩过的：
+// 早先写成 `project@branch/path`，分支与路径共用 `/`。后果是分支名里
+// 不能有斜杠，于是「main 之下的 record 支流」这种结构无处表达，
+// 只能把层级信息挤进一个词（`main-record`），而检索层又不得不靠
+// 「分支名前缀」猜哪个分支装什么内容——两个语法域共用一个分隔符，
+// 解析器只能靠猜。termcp 早期把 shell 与 DSL 混在一起就是这个病。
+//
+// 用 `:` 切开 ref 与 path 之后：
+//   weft@main/record:2026-11-04/001.md
+//        └───┬────┘ └──────┬───────┘
+//         ref（可含 /）    path（另一个命名空间）
+//
+// 兼容旧地址：没有冒号时退回按第一个 `/` 切。旧索引键与旧调用方
+// （插件、脚本、历史记忆里写下的 refs）全部继续可用。
 func SplitID(id string) (project, branch, path string, ok bool) {
 	at := strings.Index(id, "@")
 	if at <= 0 {
@@ -208,9 +219,22 @@ func SplitID(id string) (project, branch, path string, ok bool) {
 	}
 	project = id[:at]
 	rest := id[at+1:]
+	// 新语法：冒号切 ref 与 path。ref 内部的斜杠属于分支层级。
+	if c := strings.Index(rest, ":"); c >= 0 {
+		return project, rest[:c], rest[c+1:], true
+	}
+	// 旧语法兼容：没有冒号，第一个斜杠之前是分支。
 	slash := strings.Index(rest, "/")
 	if slash < 0 {
 		return project, rest, "", true
 	}
 	return project, rest[:slash], rest[slash+1:], true
+}
+
+// MakeID 是 SplitID 的逆运算，拼出新语法索引键。
+//
+// 统一走这里而不是各处手拼 "proj@"+branch+"/"+path：
+// 地址格式只要有两处独立实现，就会有一处忘记跟着改。
+func MakeID(project, branch, path string) string {
+	return project + "@" + branch + ":" + path
 }

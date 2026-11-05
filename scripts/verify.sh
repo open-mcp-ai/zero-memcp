@@ -50,7 +50,7 @@ check() {
 }
 
 echo '━━━ 1. 分层查询：结论层优先（插件的真实路径）━━━'
-OUT=$(c 'recall 端口为什么是1729 --scope zero@main.record:review')
+OUT=$(c 'recall 端口为什么是1729 --scope dev/zero@main.record:review')
 echo "$OUT" | grep -E '\.md \(' | head -3
 echo '--- 第一名正文片段 ---'
 echo "$OUT" | sed -n '2,5p'
@@ -60,13 +60,13 @@ check "第一名是 review 层的案卷" "$(echo "$OUT" | grep -E '\.md \(' | he
 
 echo
 echo '━━━ 2. 换问法（语义泛化提问，走 srecall 向量路）━━━'
-OUT2=$(c 'srecall 1729这个数字有什么含义 --scope zero@main.record:review')
+OUT2=$(c 'srecall 1729这个数字有什么含义 --scope dev/zero@main.record:review')
 echo "$OUT2" | grep -E '\.md \(' | head -3
 check "语义泛化仍能召回哈代-拉马努金" "$OUT2" "哈代"
 
 echo
 echo '━━━ 3. 跨人格协同：纬读简的案卷 ━━━'
-OUT3=$(c 'recall 端口 1729 --scope zero@main.record:review')
+OUT3=$(c 'recall 端口 1729 --scope dev/zero@main.record:review')
 check "纬能读到简的 review 层" "$OUT3" "review/"
 
 echo
@@ -77,7 +77,7 @@ check "srecall 使用混合检索（semantic / semantic+keyword）" "$OUT4" "sem
 
 echo
 echo '━━━ 5. BM25 纯关键词对照 ━━━'
-OUT5=$(c 'recall 1729 --scope zero')
+OUT5=$(c 'recall 1729 --scope dev/zero')
 check "BM25 仍正常命中答案文档" "$OUT5" "1729"
 
 echo

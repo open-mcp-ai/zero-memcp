@@ -37,7 +37,11 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 //
 // 不需要碰磁盘：块的 Path 已经表达了整个目录结构（例如 "2026-10-30/xxx.md"）。
 // 之前用 os.ReadDir 递归扫描目录，在裸仓库下是无效的（因为工作区根本没有平铺文件）。
-func buildTreeFromBlocks(projectName string, blocks []memory.Block) map[string]any {
+//
+// addrPrefix 是叶子节点 addr 的前缀，形如 "weft@main.record"。
+// 叶子节点的 addr = addrPrefix + ":" + 树内路径，正是
+// /api?action=read 与 read 动词都接受的完整地址。
+func buildTreeFromBlocks(projectName, addrPrefix string, blocks []memory.Block) map[string]any {
 	type node struct {
 		isDir    bool
 		size     int64
@@ -60,13 +64,23 @@ func buildTreeFromBlocks(projectName string, blocks []memory.Block) map[string]a
 		}
 	}
 
-	var walk func(name string, n *node) map[string]any
-	walk = func(name string, n *node) map[string]any {
+	// walk 把节点转成 JSON。filePath 从空串起算，文件节点带着
+	// addrPrefix:path 的完整地址——前端 openFile 直接用它。
+	// 之前只返回 name/size，前端拼 openFile('${n.addr}')
+	// 时 n.addr 是 undefined，点树里任何文件都报
+	// "got undefined"；搜索结果能读纯粹因为那条路径自带 addr。
+	var walk func(name, filePath string, n *node) map[string]any
+	walk = func(name, filePath string, n *node) map[string]any {
 		if !n.isDir {
+			addr := filePath
+			if addrPrefix != "" {
+				addr = addrPrefix + ":" + filePath
+			}
 			return map[string]any{
 				"name": name,
 				"type": "file",
 				"size": n.size,
+				"addr": addr,
 			}
 		}
 		var children []map[string]any
@@ -76,7 +90,11 @@ func buildTreeFromBlocks(projectName string, blocks []memory.Block) map[string]a
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			children = append(children, walk(k, n.children[k]))
+			childPath := k
+			if filePath != "" {
+				childPath = filePath + "/" + k
+			}
+			children = append(children, walk(k, childPath, n.children[k]))
 		}
 		return map[string]any{
 			"name":     name,
@@ -85,7 +103,7 @@ func buildTreeFromBlocks(projectName string, blocks []memory.Block) map[string]a
 		}
 	}
 
-	res := walk(projectName, root)
+	res := walk(projectName, "", root)
 	res["path"] = projectName
 	return res
 }
@@ -174,7 +192,17 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, caller Caller)
 			if name == "" {
 				name = tr.Project
 			}
-			roots = append(roots, buildTreeFromBlocks(name, tr.Blocks))
+			// 树是（项目, 分支）粒度的，但名字只用了项目名——于是一个有
+			// 五条分支的项目在面板上出现五次，每次内容不同，却完全看不出
+			// 哪棵是哪条分支。旧模型里 main.record 和 main 同时存在时，
+			// 用户会看到两个 "weft"，一个装着 me/，另一个装着 record/。
+			//
+			// 根节点的名字带上分支，并把 addrPrefix 一并交给
+			// buildTreeFromBlocks，让叶子节点的 addr 就是完整的
+			// project@branch:path——这是 /api?action=read 能直接接受的
+			// 唯一形式，也是用户从树上点开文件时唯一正确的地址。
+			label := name + "@" + tr.Branch
+			roots = append(roots, buildTreeFromBlocks(label, name+"@"+tr.Branch, tr.Blocks))
 		}
 		_ = json.NewEncoder(w).Encode(roots)
 

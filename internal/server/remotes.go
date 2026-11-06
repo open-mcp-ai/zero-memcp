@@ -430,6 +430,36 @@ func (s *Server) execSync(rest string, c Caller) (TermResult, error) {
 	if len(rows) == 0 {
 		sb.WriteString("(no readable branches)")
 	}
+
+	// 自动同步的现场：上次同步时间、待决议冲突、上次错误。
+	// 排查「为什么我的记忆没到另一台机器」时，这三个比分支状态更有用。
+	if rm.AutoSync {
+		key := project + "@" + rm.Name
+		s.syncState.mu.Lock()
+		if at, ok := s.syncState.lastSync[key]; ok {
+			fmt.Fprintf(&sb, "  auto-sync: last %s ago\n", time.Since(at).Truncate(time.Second))
+		} else {
+			sb.WriteString("  auto-sync: never\n")
+		}
+		if e := s.syncState.lastErr[key]; e != "" {
+			fmt.Fprintf(&sb, "  auto-sync last error: %s\n", e)
+		}
+		var myConflicts []syncConflict
+		for _, c := range s.syncState.conflicts {
+			if c.Project == project {
+				myConflicts = append(myConflicts, c)
+			}
+		}
+		s.syncState.mu.Unlock()
+		if len(myConflicts) > 0 {
+			sb.WriteString("  CONFLICTS awaiting manual resolution:\n")
+			for _, c := range myConflicts {
+				fmt.Fprintf(&sb, "    %s@%s (%d path): %s\n",
+					c.Project, c.Branch, len(c.Paths), strings.Join(c.Paths, ", "))
+			}
+		}
+	}
+
 	return TermResult{
 		Text: strings.TrimRight(sb.String(), "\n"),
 		Structured: map[string]any{

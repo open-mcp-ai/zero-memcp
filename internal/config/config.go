@@ -16,6 +16,7 @@ type File struct {
 	Server   Server
 	Commit   Commit
 	GC       GC
+	Sync     Sync
 	Semantic Semantic
 	Users    []User
 	Groups   []Group
@@ -135,6 +136,23 @@ type GC struct {
 	Interval time.Duration
 }
 
+// Sync 是后台对等同步的全局策略。
+//
+// 触发条件是「时间 或 数据量，看哪个先到」：
+//   - 数据量：maintain 的 [commit] 判定（count 条）折叠成功后立刻踢一次
+//   - 时间：  这里的 Interval 兜底（默认 2 小时），
+//     同时覆盖「本地没写东西但远端有新提交」这种只读场景
+//
+// 为什么时间兜底不能省：只读节点（比如一台专门查询的机器）永远
+// 不会触发「数据量」，没有兜底就永远拉不到别人的更新。
+type Sync struct {
+	// Interval 是兜底同步周期。0 表示用默认值（2h）；
+	// 负数表示禁用后台同步（手动 fetch/merge/push 仍可用）。
+	Interval time.Duration
+	// Disabled 为真时整个后台同步循环不启动。
+	Disabled bool
+}
+
 // User 是一个可以持有凭证的身份。
 type User struct {
 	Name   string
@@ -189,6 +207,12 @@ type Remote struct {
 	HTTPUser string
 	// HTTPToken 是服务端密钥库里的 token 名，不是 token 本身。
 	HTTPToken string
+	// AutoSync 为真时，后台同步循环会把这条远端纳入自动 fetch/merge/push。
+	//
+	// 缺省（false）是保守的：配了一条远端不等于授权它自动双向同步。
+	// 自动同步意味着「本机的记忆会流到那里，那里也会流进本机」，
+	// 这该是一次显式选择，而不是配了 url 就默认发生。
+	AutoSync bool
 }
 
 // AccessRule 是绕过项目 mode 的一条例外授权。
@@ -236,12 +260,13 @@ var knownKeys = map[string]map[string]bool{
 	},
 	"commit":   {"interval": true, "count": true},
 	"gc":      {"interval": true},
+	"sync":    {"interval": true, "disabled": true},
 	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
 	"group":   {"name": true, "members": true},
 	"project": {"name": true, "owner": true, "group": true, "mode": true},
 	"access":  {"user": true, "project": true, "perm": true},
 	"listen":  {"addr": true, "allow": true, "require": true, "mount": true, "webui": true},
-	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true},
+	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true},
 }
 
 // checkKeys 拒绝未知分节与未知键。
@@ -455,6 +480,9 @@ func ParseFile(raw []byte) (*File, error) {
 		if rm.HTTPToken, err = str(sec, "[[remote]]", "http_token"); err != nil {
 			return nil, err
 		}
+		if rm.AutoSync, err = boolean(sec, "[[remote]]", "auto_sync"); err != nil {
+			return nil, err
+		}
 		if rm.HTTPToken != "" {
 			if err := ValidateSSHKeyName(rm.HTTPToken); err != nil {
 				return nil, fmt.Errorf("[[remote]] http_token: %w", err)
@@ -475,6 +503,19 @@ func ParseFile(raw []byte) (*File, error) {
 			return nil, fmt.Errorf("[[remote]] %s/%s: %w", rm.Project, rm.Name, err)
 		}
 		f.Remotes = append(f.Remotes, rm)
+	}
+
+	if sec, ok := doc.Sections["sync"]; ok {
+		if v, err := dur(sec, "sync", "interval"); err != nil {
+			return nil, err
+		} else {
+			f.Sync.Interval = v
+		}
+		if v, err := boolean(sec, "sync", "disabled"); err != nil {
+			return nil, err
+		} else {
+			f.Sync.Disabled = v
+		}
 	}
 
 	if sec, ok := doc.Sections["gc"]; ok {

@@ -157,6 +157,9 @@ type Server struct {
 	// semanticMaint 管理语义索引的后台追平协程。
 	semanticMaint semanticMaintainer
 
+	// syncState 是后台对等同步的进程内状态（冲突队列、上次同步时间）。
+	syncState syncState
+
 	// semanticDir 是向量缓存的落盘目录。
 	semanticDir string
 
@@ -547,6 +550,14 @@ func (s *Server) Start() error {
 		s.maintainStarted = true
 		s.maintainDone = make(chan struct{})
 		go s.maintain(s.maintainDone)
+		// 后台对等同步与 maintain 同生命周期：它依赖提交先发生
+		//（脏层未折叠时 syncOnce 会跳过），两者必须一起跑。
+		s.cfgMu.RLock()
+		disabled := s.cfgFile != nil && s.cfgFile.Sync.Disabled
+		s.cfgMu.RUnlock()
+		if !disabled {
+			s.startSyncLoop()
+		}
 	}
 	s.startMu.Unlock()
 
@@ -667,6 +678,13 @@ func (s *Server) Close() error {
 	s.doneOnce.Do(func() { close(s.done) })
 	// 停语义索引的后台追平：它会读仓库，必须在关仓库之前停。
 	s.stopSemanticMaintainer()
+	// 停后台同步：它会 fetch/push，必须在关仓库之前停。
+	s.syncState.mu.Lock()
+	if s.syncState.stop != nil {
+		close(s.syncState.stop)
+		s.syncState.stop = nil
+	}
+	s.syncState.mu.Unlock()
 	s.netMu.Lock()
 	srvs := s.httpServers
 	s.netMu.Unlock()
@@ -1881,16 +1899,36 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			terms = s.idx.Terms()
 		}
 		s.mu.RUnlock()
+
+		// 语义侧与同步侧必须进 status。
+		//
+		// 这两个子系统都会「悄悄降级」：嵌入后端连不上时召回静默退回 BM25，
+		// 同步失败时记忆只是没到另一台机器。没有状态输出，用户唯一能观察到的
+		// 现象是「好像搜得不准」「好像没同步」——而这两件事本来都有明确原因。
+		//
+		// semanticStatus 早先写了却全仓无人调用，等于没写。
+		sem := s.semanticStatus()
+
 		text := fmt.Sprintf("docs: %d", docs)
 		if c.Mount.Empty() {
 			text = fmt.Sprintf("docs: %d, terms: %d", docs, terms)
 		}
+		text += "\nsemantic: " + sem
+
+		// 同步状态只对全命名空间可见：远端列表与冲突路径属于跨项目信息。
+		syncLines := s.syncStatusLines(c)
+		if len(syncLines) > 0 {
+			text += "\nsync:\n  " + strings.Join(syncLines, "\n  ")
+		}
+
 		return TermResult{
 			Text: text,
 			Structured: map[string]any{
-				"docs":  docs,
-				"terms": terms,
-				"clock": s.Clock(),
+				"docs":     docs,
+				"terms":    terms,
+				"clock":    s.Clock(),
+				"semantic": sem,
+				"sync":     syncLines,
 			},
 		}, nil
 

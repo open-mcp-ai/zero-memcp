@@ -110,6 +110,9 @@ func (s *Server) maintain(done chan struct{}) {
 							s.logf("%s automatic commit failed: %v", proj, cerr)
 						} else if n > 0 {
 							st.lastCommit = time.Now()
+							// 提交成功即踢一次同步：这是「数据量先到」那一半触发。
+							// 「2 小时先到」那一半由 startSyncLoop 的 ticker 兜底。
+							s.kickSync()
 						}
 					}
 				}

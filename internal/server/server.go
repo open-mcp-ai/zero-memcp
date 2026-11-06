@@ -71,6 +71,8 @@ type Config struct {
 		Providers []config.SemanticProvider
 		// BatchSize 批量大小，默认 32。
 		BatchSize int
+		// MaintainInterval 是后台追平的兜底周期。0 用默认 60s。
+		MaintainInterval time.Duration
 	}
 
 	// ConfigFile 是配置文件路径。
@@ -152,6 +154,8 @@ type Server struct {
 	// 与 idx（BM25）平行存在：两套索引各自独立重建，检索时融合。
 	// 零值即「未启用」，所有方法都要容忍它。
 	semantic semanticState
+	// semanticMaint 管理语义索引的后台追平协程。
+	semanticMaint semanticMaintainer
 
 	// semanticDir 是向量缓存的落盘目录。
 	semanticDir string
@@ -661,6 +665,8 @@ func (p *portPolicy) allows(name string) bool {
 // Close 停止全部监听器。
 func (s *Server) Close() error {
 	s.doneOnce.Do(func() { close(s.done) })
+	// 停语义索引的后台追平：它会读仓库，必须在关仓库之前停。
+	s.stopSemanticMaintainer()
 	s.netMu.Lock()
 	srvs := s.httpServers
 	s.netMu.Unlock()

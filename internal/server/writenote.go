@@ -210,6 +210,9 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	s.mu.Unlock()
 
 	s.bumpClock()
+	// 写入改变了树状态：请求一次语义索引追平。
+	// 非阻塞、去重（3 秒窗口攒批），失败由后台周期兜底重试。
+	s.kickSemantic()
 
 	return addr, targetProject, writeBranch, nil
 }

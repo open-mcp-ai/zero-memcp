@@ -1,3 +1,5 @@
+//go:build cgo
+
 // Package embed 把一段文字变成向量，纯本机、不联网。
 //
 // 为什么不用「调用远端 embedding API」：这个库里存的是完整的个人记录，

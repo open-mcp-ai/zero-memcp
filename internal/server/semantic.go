@@ -76,6 +76,10 @@ type semanticState struct {
 	// DestroyEnvironment 在并发下不可靠。
 	emb embed.Embedder
 	err string // 构建失败的原因，供 status 报告
+	// prints 是当前 idx 的内容指纹表（id -> fingerprint(text)）。
+	// 与 idx 同生共死：每次替换 idx 时一起换。后台追平用它做增量比对，
+	// 避免反复从磁盘读 manifest。
+	prints map[string]string
 
 	// building 为真表示后台正在建索引。此时 srecall 回落到 BM25，
 	// 而不是阻塞等——检索是热路径，不能让人等几十秒。
@@ -111,10 +115,14 @@ func (s *Server) initSemantic() {
 	// InitializeEnvironment/DestroyEnvironment 在并发下不可靠。
 	emb, err := embed.OpenChain(s.semanticChainConfig())
 	if err != nil {
+		// 启动时全链不可用不再意味着「语义功能死刑」：
+		// 维护协程会周期性重试 OpenChain，嵌入服务恢复后自动补算。
+		// 这正是「写入时 Ollama 没开，开了之后自动追平」的实现路径。
 		s.semantic.mu.Lock()
 		s.semantic.err = fmt.Sprintf("open embedder: %v", err)
 		s.semantic.mu.Unlock()
-		s.logf("semantic: %s — disabled", s.semantic.err)
+		s.logf("semantic: %s — will retry in background", s.semantic.err)
+		s.startSemanticMaintainer(s.cfg.Semantic.MaintainInterval)
 		return
 	}
 	s.semantic.mu.Lock()
@@ -123,15 +131,12 @@ func (s *Server) initSemantic() {
 	s.logf("semantic: embedder ready (dim=%d, model=%s, providers=%v, active=%s)",
 		emb.Dim(), emb.Name(), emb.Providers(), emb.ActiveLabel())
 
-	heads := s.semanticHeads()
-
 	// 先试缓存。
 	//
 	// 注意这里不再拿 heads 当失效判据：只要模型对、维度对，缓存就
 	// 可用——差异交给增量逻辑按块比对。旧的判定是「任一分支 head
 	// 变了就全废」，日常写一条记忆就要重算 6800 片 12 分钟。
 	var cached *vecindex.Index
-	var cachedPrints map[string]string
 	if vecDir != "" {
 		if ix, prints, err := vecindex.Load(vecDir, emb.Name()); err == nil {
 			if ix.Dim() != emb.Dim() {
@@ -139,21 +144,18 @@ func (s *Server) initSemantic() {
 				// 也不能拿旧向量配新模型——那会静默返回错结果。
 				s.logf("semantic: cache dim %d != model dim %d, rebuilding", ix.Dim(), emb.Dim())
 			} else {
-				cached, cachedPrints = ix, prints
+				cached = ix
 				// 先挂上去：即使接下来要增量补算，检索也已可用，
 				// 不必让 srecall 回落到 BM25 等增量跑完。
 				s.semantic.mu.Lock()
 				s.semantic.idx = ix
+				s.semantic.prints = prints
 				s.semantic.ready = true
 				s.semantic.mu.Unlock()
 				s.logf("semantic: loaded %d vectors from cache (%d prints)", ix.Len(), len(prints))
 			}
 		}
 	}
-
-	s.semantic.mu.Lock()
-	s.semantic.building = true
-	s.semantic.mu.Unlock()
 
 	// 先出声再动工：构建要跑几分钟，日志里必须先有「我开始了」这一行，
 	// 否则排查时无法区分「没启动」和「正在建」。
@@ -163,19 +165,11 @@ func (s *Server) initSemantic() {
 		s.logf("semantic: checking cache for incremental updates")
 	}
 
-	go func() {
-		if err := s.buildSemanticIndex(vecDir, heads, cached, cachedPrints); err != nil {
-			s.semantic.mu.Lock()
-			s.semantic.err = err.Error()
-			s.semantic.building = false
-			s.semantic.mu.Unlock()
-			s.logf("semantic: build failed: %v", err)
-			return
-		}
-		s.semantic.mu.Lock()
-		s.semantic.building = false
-		s.semantic.mu.Unlock()
-	}()
+	// 首轮构建/追平立即跑一次（不等第一个周期）。
+	go s.catchUpSemantic("startup")
+
+	// 之后由后台维护协程持续追平：写入触发 + 周期兜底。
+	s.startSemanticMaintainer(s.cfg.Semantic.MaintainInterval)
 }
 
 // semanticHeads 返回参与语义索引的分支的当前 head，用作缓存失效判据。
@@ -337,6 +331,7 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 
 	s.semantic.mu.Lock()
 	s.semantic.idx = ix
+	s.semantic.prints = prints
 	s.semantic.ready = true
 	s.semantic.mu.Unlock()
 

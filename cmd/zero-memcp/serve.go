@@ -103,6 +103,17 @@ func runServe(args []string) int {
 			if cfg.Semantic.VectorDir == "" {
 				cfg.Semantic.VectorDir = expandHome(f.Semantic.Vectors)
 			}
+			// 降级链与批量参数来自配置文件。命令行没有对应开关：
+			// 链是多条带结构的声明，不适合压成 flag。
+			if len(cfg.Semantic.Providers) == 0 {
+				cfg.Semantic.Providers = f.Semantic.Providers
+			}
+			if cfg.Semantic.BatchSize == 0 {
+				cfg.Semantic.BatchSize = f.Semantic.BatchSize
+			}
+			if cfg.Semantic.MaintainInterval == 0 {
+				cfg.Semantic.MaintainInterval = f.Semantic.MaintainInterval
+			}
 		}
 	}
 	if *listen != "" {

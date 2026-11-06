@@ -49,6 +49,11 @@ type Semantic struct {
 	// BatchSize 是建索引时一次请求的文本条数。0 表示用默认值（32）。
 	// HTTP 后端靠它吃到批处理吞吐，ONNX 后端忽略。
 	BatchSize int
+
+	// MaintainInterval 是后台追平的兜底周期（如 "60s"）。
+	// 0 表示用默认值。这个周期负责「嵌入服务恢复后自动补算」——
+	// 没有它，服务不可用期间写入的记忆要等到下次重启才进索引。
+	MaintainInterval time.Duration
 }
 
 // SemanticProvider 是降级链上的一个向量化后端。
@@ -223,7 +228,7 @@ func Load(path string) (*File, error) {
 // 那会变成「配置里写了但没生效」，而症状是权限不对、不是报错。
 var knownKeys = map[string]map[string]bool{
 	"server":   {"data": true, "listen": true, "endpoint": true, "default_branch": true, "enforce_auth": true},
-	"semantic": {"lib": true, "model": true, "vocab": true, "vectors": true, "batch_size": true},
+	"semantic": {"lib": true, "model": true, "vocab": true, "vectors": true, "batch_size": true, "maintain_interval": true},
 	"semantic.provider": {
 		"label": true, "kind": true, "endpoint": true, "model": true,
 		"dim": true, "api_key": true, "timeout": true,
@@ -338,6 +343,11 @@ func ParseFile(raw []byte) (*File, error) {
 			return nil, err
 		} else if v != 0 {
 			f.Semantic.BatchSize = int(v)
+		}
+		if v, err := dur(sec, "semantic", "maintain_interval"); err != nil {
+			return nil, err
+		} else {
+			f.Semantic.MaintainInterval = v
 		}
 	}
 

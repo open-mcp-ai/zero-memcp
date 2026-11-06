@@ -133,6 +133,7 @@ func TestSemanticIncremental(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// 增量测试里使用短巡检周期
 	s3, err := New(Config{
 		DataDir:       dataDir,
 		DefaultBranch: "main.record",
@@ -143,16 +144,37 @@ func TestSemanticIncremental(t *testing.T) {
 	}
 	s3.cfg.Semantic.VectorDir = vecDir
 	s3.cfg.Semantic.BatchSize = 10
+	s3.cfg.Semantic.MaintainInterval = 50 * time.Millisecond
 	s3.cfg.Semantic.Providers = mockProviders
 	s3.initSemantic()
 
-	waitForSemanticReady(t, s3)
+	// ready 在缓存加载后就置位；增量补算是异步的，
+	// 这里等追平真正完成（embedCalls 达到 3 = 1 probe + 2 块）。
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		s3.semantic.mu.RLock()
+		n := 0
+		if s3.semantic.idx != nil {
+			n = s3.semantic.idx.Len()
+		}
+		s3.semantic.mu.RUnlock()
+		if n >= 4 && embedCalls.Load() >= 3 {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	// 1 probe + 2 块（修改的 1.md + 新增的 4.md）= 3
 	if calls := embedCalls.Load(); calls != 3 {
 		t.Fatalf("部分改动推理次数应为 3（1 probe + 2 块），实际 %d", calls)
 	}
-	if s3.semantic.idx.Len() != 4 {
-		t.Fatalf("增量后向量总数应为 4，实际 %d", s3.semantic.idx.Len())
+	s3.semantic.mu.RLock()
+	n := 0
+	if s3.semantic.idx != nil {
+		n = s3.semantic.idx.Len()
+	}
+	s3.semantic.mu.RUnlock()
+	if n != 4 {
+		t.Fatalf("增量后向量总数应为 4，实际 %d", n)
 	}
 	s3.Close()
 }

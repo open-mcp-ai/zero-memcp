@@ -503,9 +503,20 @@ func (s *Server) semanticStatus() string {
 	var backend string
 	if emb := s.semantic.emb; emb != nil {
 		if ch, ok := emb.(*embed.Chain); ok {
-			backend = fmt.Sprintf(" via %s", ch.ActiveLabel())
-			if le := ch.LastError(); le != "" {
-				backend += " [" + le + "]"
+			backend = " via " + ch.ActiveLabel()
+			// 只在「当前确实在用备用后端」时报降级原因。
+			//
+			// 早先无条件附加 LastError()，而那个值从不被清除，于是出现过
+			// 「ready (7877 vectors) via local-ollama [all providers failed]」
+			// 这种自相矛盾的输出——用户无法判断该信哪半句。
+			// 现在的规则：降级=现在的事实（报），恢复后=历史（不报）。
+			if ch.Degraded() {
+				if msg, at, ok := ch.Note(); ok {
+					backend += fmt.Sprintf(" [DEGRADED %s ago: %s]",
+						time.Since(at).Truncate(time.Second), msg)
+				} else {
+					backend += " [degraded]"
+				}
 			}
 		}
 	}

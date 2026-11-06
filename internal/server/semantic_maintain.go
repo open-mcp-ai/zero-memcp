@@ -137,6 +137,29 @@ func (s *Server) catchUpSemantic(reason string) {
 		emb = chain
 	}
 
+	// 粘性降级恢复：如果当前在用备用后端，探一下链首是否回来了。
+	//
+	// 这是「3060 断网降级到本地，3060 回来后该回 GPU」的唯一实现点。
+	// 早先 Chain 的注释写着「见 health.go」，而那个文件从未存在——
+	// 于是链一旦降级就永久不回头，把临时故障变成了永久迁移。
+	// 无条件调用，不在外面加条件。
+	//
+	// 踩过的坑：这里早先写成 `if ch.Degraded()`。而 Degraded() 是
+	// 「active 不在下标 0」，链首**被 OpenChain 丢弃**时 active 恰好是 0，
+	// 于是条件永远为假，恢复逻辑一次都没跑过——现象是「3060 回来了但
+	// 系统还在用本地」，而且日志里连一行提示都没有。
+	//
+	// 该不该探测的判断属于 Chain 自己（它知道配置里应该有几个后端），
+	// 调用方只负责按周期去敲这个门。
+	if ch, ok := emb.(*embed.Chain); ok {
+		// 仍在降级中时不刷日志：semanticStatus / status 里能看到原因，
+		// 每周期打一行只会把真正重要的迁移日志淹掉。
+		if recovered, _ := ch.HealthCheck(); recovered {
+			s.logf("semantic: recovered to chain head %q (providers=%v)",
+				ch.ActiveLabel(), ch.Providers())
+		}
+	}
+
 	// 正在构建时跳过本轮（避免两个构建并发跑）。
 	s.semantic.mu.Lock()
 	if s.semantic.building {

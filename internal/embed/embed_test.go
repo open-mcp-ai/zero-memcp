@@ -29,7 +29,7 @@ func findAssets(t *testing.T) Config {
 
 func TestEmbedBasic(t *testing.T) {
 	cfg := findAssets(t)
-	emb, err := Open(cfg)
+	emb, err := OpenLocal(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,7 +60,7 @@ func TestEmbedBasic(t *testing.T) {
 
 func TestEmbed1729CrossLingual(t *testing.T) {
 	cfg := findAssets(t)
-	emb, err := Open(cfg)
+	emb, err := OpenLocal(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}

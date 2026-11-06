@@ -34,6 +34,43 @@ type Semantic struct {
 	Model   string // int8 量化 ONNX 模型路径
 	Vocab   string // BERT 词表路径
 	Vectors string // 向量缓存落盘目录，空则在 data/vectors
+
+	// Providers 是降级链，按优先级排列。非空时优先于上面的单后端字段。
+	//
+	// 为什么要链而不是单一后端：目标环境是「3060 主机跑 GPU 推理 +
+	// Mac 本地兜底」。3060 会断网、会休眠、会重启；每次都让人手工改
+	// 配置不现实。链上第一个不可用就降到下一个，粘性降级避免每次
+	// 请求都先吃一次超时。
+	//
+	// 硬约束：链上所有后端必须同模型同维度。不同模型的向量不可比，
+	// 混在一个索引里检索会直接失效。加载时会校验。
+	Providers []SemanticProvider
+
+	// BatchSize 是建索引时一次请求的文本条数。0 表示用默认值（32）。
+	// HTTP 后端靠它吃到批处理吞吐，ONNX 后端忽略。
+	BatchSize int
+}
+
+// SemanticProvider 是降级链上的一个向量化后端。
+type SemanticProvider struct {
+	// Label 是诊断用的名字（"3060"、"local"），出现在日志与 status。
+	Label string
+	// Kind 是 "http" 或 "onnx"。
+	Kind string
+	// Endpoint 是 HTTP 后端的基地址。
+	Endpoint string
+	// Model 是模型标识。同一条链上必须一致。
+	Model string
+	// Dim 是向量维度。同一条链上必须一致；0 表示由首次响应推断。
+	Dim int
+	// APIKey 是 Bearer token（可选）。
+	APIKey string
+	// Timeout 是单次请求超时。远端应设短，让断网快速降级。
+	Timeout time.Duration
+	// ONNX 后端专用路径（不填则继承 [semantic] 的 lib/model/vocab）。
+	LibPath   string
+	ModelPath string
+	VocabPath string
 }
 
 // Server 是监听与身份。
@@ -186,7 +223,12 @@ func Load(path string) (*File, error) {
 // 那会变成「配置里写了但没生效」，而症状是权限不对、不是报错。
 var knownKeys = map[string]map[string]bool{
 	"server":   {"data": true, "listen": true, "endpoint": true, "default_branch": true, "enforce_auth": true},
-	"semantic": {"lib": true, "model": true, "vocab": true, "vectors": true},
+	"semantic": {"lib": true, "model": true, "vocab": true, "vectors": true, "batch_size": true},
+	"semantic.provider": {
+		"label": true, "kind": true, "endpoint": true, "model": true,
+		"dim": true, "api_key": true, "timeout": true,
+		"lib": true, "model_path": true, "vocab": true,
+	},
 	"commit":   {"interval": true, "count": true},
 	"gc":      {"interval": true},
 	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
@@ -292,6 +334,64 @@ func ParseFile(raw []byte) (*File, error) {
 		} else {
 			f.Semantic.Vectors = v
 		}
+		if v, err := integer(sec, "semantic", "batch_size"); err != nil {
+			return nil, err
+		} else if v != 0 {
+			f.Semantic.BatchSize = int(v)
+		}
+	}
+
+	// [[semantic.provider]] 降级链。
+	// 注意：自研 TOML 解析器用 Arrays 存数组段，键名就是段名，
+	// 所以 [[semantic.provider]] 以 "semantic.provider" 为键。
+	for _, sec := range doc.Arrays["semantic.provider"] {
+		var p SemanticProvider
+		var err error
+		const ctx = "[[semantic.provider]]"
+		if p.Label, err = str(sec, ctx, "label"); err != nil {
+			return nil, err
+		}
+		if p.Kind, err = str(sec, ctx, "kind"); err != nil {
+			return nil, err
+		}
+		if p.Endpoint, err = str(sec, ctx, "endpoint"); err != nil {
+			return nil, err
+		}
+		if p.Model, err = str(sec, ctx, "model"); err != nil {
+			return nil, err
+		}
+		if v, err := integer(sec, ctx, "dim"); err != nil {
+			return nil, err
+		} else {
+			p.Dim = int(v)
+		}
+		if p.APIKey, err = str(sec, ctx, "api_key"); err != nil {
+			return nil, err
+		}
+		if v, err := dur(sec, ctx, "timeout"); err != nil {
+			return nil, err
+		} else {
+			p.Timeout = v
+		}
+		if p.LibPath, err = str(sec, ctx, "lib"); err != nil {
+			return nil, err
+		}
+		if p.ModelPath, err = str(sec, ctx, "model_path"); err != nil {
+			return nil, err
+		}
+		if p.VocabPath, err = str(sec, ctx, "vocab"); err != nil {
+			return nil, err
+		}
+		if p.Kind == "" {
+			p.Kind = "http"
+		}
+		if p.Kind != "http" && p.Kind != "onnx" {
+			return nil, fmt.Errorf("[[semantic.provider]] kind: want http or onnx, got %q", p.Kind)
+		}
+		if p.Kind == "http" && p.Endpoint == "" {
+			return nil, fmt.Errorf("[[semantic.provider]] %q: http provider requires endpoint", p.Label)
+		}
+		f.Semantic.Providers = append(f.Semantic.Providers, p)
 	}
 
 	if sec, ok := doc.Sections["commit"]; ok {

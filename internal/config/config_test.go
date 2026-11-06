@@ -558,3 +558,55 @@ func TestExpandHome(t *testing.T) {
 		}
 	}
 }
+
+// TestSemanticProvidersParse 验证 [[semantic.provider]] 降级链的 TOML 解析。
+func TestSemanticProvidersParse(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "cfg.toml")
+	src := `
+[server]
+data = "/tmp/x"
+
+[[user]]
+name = "weft"
+
+[semantic]
+vectors = "/tmp/vec"
+batch_size = 64
+
+[[semantic.provider]]
+label    = "3060"
+kind     = "http"
+endpoint = "http://192.168.1.50:8080"
+model    = "BAAI/bge-m3"
+dim      = 1024
+timeout  = "2s"
+
+[[semantic.provider]]
+label    = "local"
+kind     = "http"
+endpoint = "http://127.0.0.1:8080"
+model    = "BAAI/bge-m3"
+dim      = 1024
+`
+	if err := os.WriteFile(p, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if f.Semantic.BatchSize != 64 {
+		t.Errorf("BatchSize = %d, want 64", f.Semantic.BatchSize)
+	}
+	if len(f.Semantic.Providers) != 2 {
+		t.Fatalf("Providers = %d, want 2", len(f.Semantic.Providers))
+	}
+	p0 := f.Semantic.Providers[0]
+	if p0.Label != "3060" || p0.Kind != "http" || p0.Dim != 1024 || p0.Model != "BAAI/bge-m3" {
+		t.Errorf("provider[0] = %+v", p0)
+	}
+	if p0.Timeout.Seconds() != 2 {
+		t.Errorf("timeout = %v, want 2s", p0.Timeout)
+	}
+}

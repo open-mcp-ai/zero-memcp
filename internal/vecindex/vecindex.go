@@ -103,6 +103,23 @@ func (ix *Index) Has(id string) bool {
 	return ok
 }
 
+// VectorOf 返回某条 ID 的向量副本；不存在返回 nil。
+//
+// 增量重建时用它把**未变**的块原样搬到新索引，跳过推理。
+// 返回副本而不是内部切片：调用方会把它 Add 进另一个 Index，
+// 而 Add 会把内容拷走——但共享底层数组仍会在并发场景下被写方挪动。
+func (ix *Index) VectorOf(id string) []float32 {
+	ix.mu.RLock()
+	defer ix.mu.RUnlock()
+	idx, ok := ix.idMap[id]
+	if !ok {
+		return nil
+	}
+	out := make([]float32, ix.dim)
+	copy(out, ix.vecs[idx*ix.dim:(idx+1)*ix.dim])
+	return out
+}
+
 // Search 全库扫描，返回相似度 >= threshold 的 top-N。
 //
 // 用最小堆维护 top-N，而不是收齐全部再排序：候选可能上万条，
@@ -198,12 +215,24 @@ type Manifest struct {
 	Dim     int               `json:"dim"`
 	Count   int               `json:"count"`
 	Model   string            `json:"model"`
-	Heads   map[string]string `json:"heads"` // 分支 → commit head
+	Heads   map[string]string `json:"heads"` // 分支 → commit head（仅诊断用）
 	IDs     []string          `json:"ids"`
+
+	// Prints 是「块 ID → 被向量化文本的内容指纹」。
+	//
+	// 它是增量索引的唯一真相。为什么用内容指纹而不是 commit head：
+	// head 前进一步并不意味所有块都变了——日常写记忆通常只新增一两篇。
+	// 旧版本拿 head 当判据，只要有一个分支推进就把整份缓存判废，
+	// 全量重算 6800 片要 12 分钟。按内容指纹比对，同样场景只算 1-2 片。
+	//
+	// 指纹算的是「喂给 embedder 的最终文本」（剥掉 frontmatter 之后的），
+	// 而不是原始 blob：语义索引的内容本来就是这段文本。
+	// semanticText 的算法一改，所有指纹全变，自动全量重建——这是对的。
+	Prints map[string]string `json:"prints"`
 }
 
 // Save 原子写出 vectors.bin + manifest.json。
-func (ix *Index) Save(dir, model string, heads map[string]string) error {
+func (ix *Index) Save(dir, model string, heads map[string]string, prints map[string]string) error {
 	ix.mu.RLock()
 	defer ix.mu.RUnlock()
 
@@ -242,6 +271,7 @@ func (ix *Index) Save(dir, model string, heads map[string]string) error {
 		Model:   model,
 		Heads:   heads,
 		IDs:     ix.ids,
+		Prints:  prints,
 	}
 	raw, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
@@ -257,42 +287,40 @@ func (ix *Index) Save(dir, model string, heads map[string]string) error {
 // ErrStale 表示缓存缺失或身份不符，调用方应重建。
 var ErrStale = errors.New("vector cache is stale or missing")
 
-// Load 读回缓存。expectedModel 或 heads 任一对不上都返回 ErrStale。
-func Load(dir, expectedModel string, currentHeads map[string]string) (*Index, error) {
+// Load 读回缓存。expectedModel 对不上返回 ErrStale。
+//
+// heads 不再参与过期判定（增量索引以 manifest 里的内容指纹为判据，
+// 见 Prints 的注释）；它只是存下来供诊断。
+func Load(dir, expectedModel string) (*Index, map[string]string, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
-		return nil, ErrStale
+		return nil, nil, ErrStale
 	}
 	var m Manifest
 	if err := json.Unmarshal(raw, &m); err != nil {
-		return nil, ErrStale
+		return nil, nil, ErrStale
 	}
 	if m.Magic != magic || m.Version != version || m.Dim <= 0 {
-		return nil, ErrStale
+		return nil, nil, ErrStale
 	}
 	if m.Model != expectedModel {
-		return nil, ErrStale
-	}
-	for br, cur := range currentHeads {
-		if cached, ok := m.Heads[br]; !ok || cached != cur {
-			return nil, ErrStale
-		}
+		return nil, nil, ErrStale
 	}
 
 	f, err := os.Open(filepath.Join(dir, "vectors.bin"))
 	if err != nil {
-		return nil, ErrStale
+		return nil, nil, ErrStale
 	}
 	defer f.Close()
 
 	expected := int64(m.Count) * int64(m.Dim) * 4
 	st, err := f.Stat()
 	if err != nil || st.Size() != expected {
-		return nil, ErrStale
+		return nil, nil, ErrStale
 	}
 	buf := make([]byte, expected)
 	if _, err := io.ReadFull(f, buf); err != nil {
-		return nil, ErrStale
+		return nil, nil, ErrStale
 	}
 
 	vecs := make([]float32, m.Count*m.Dim)
@@ -303,5 +331,11 @@ func Load(dir, expectedModel string, currentHeads map[string]string) (*Index, er
 	for i, id := range m.IDs {
 		idMap[id] = i
 	}
-	return &Index{dim: m.Dim, ids: m.IDs, vecs: vecs, idMap: idMap}, nil
+	prints := m.Prints
+	if prints == nil {
+		// 旧格式缓存：没有指纹表。对调用方来说等同于「每块都要重算」，
+		// 但向量本身如果 ID 对得上还是可以复用的——IDs 顺序就是槽位。
+		prints = map[string]string{}
+	}
+	return &Index{dim: m.Dim, ids: m.IDs, vecs: vecs, idMap: idMap}, prints, nil
 }

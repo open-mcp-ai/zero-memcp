@@ -23,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/open-mcp-ai/zero-memcp/internal/config"
 	"github.com/open-mcp-ai/zero-memcp/internal/embed"
 	"github.com/open-mcp-ai/zero-memcp/internal/memory"
 	"github.com/open-mcp-ai/zero-memcp/internal/vecindex"
@@ -73,7 +74,7 @@ type semanticState struct {
 	// emb 是常驻推理会话。模型 449MB，每条查询重新加载会把
 	// 延迟从毫秒推到秒级，而且反复 InitializeEnvironment /
 	// DestroyEnvironment 在并发下不可靠。
-	emb *embed.Embedder
+	emb embed.Embedder
 	err string // 构建失败的原因，供 status 报告
 
 	// building 为真表示后台正在建索引。此时 srecall 回落到 BM25，
@@ -97,32 +98,18 @@ const semanticModelName = "LaBSE-int8"
 // 检索在构建期间回落到 BM25，可用性优先于完整性。
 func (s *Server) initSemantic() {
 	sc := s.cfg.Semantic
-	if sc.LibPath == "" || sc.ModelPath == "" || sc.VocabPath == "" {
-		s.semantic.mu.Lock()
-		s.semantic.err = "semantic search disabled (lib/model/vocab not configured)"
-		s.semantic.mu.Unlock()
-		// 这里必须出声：静默返回就是「看起来在工作、实际没跑」的那个病。
-		// 排查的人需要能从日志直接分辨「没配置」和「配了但在建」。
-		s.logf("semantic: disabled (%s)", s.semantic.err)
-		return
-	}
-
 	vecDir := sc.VectorDir
 	if vecDir == "" && s.dataDir != "" {
 		vecDir = filepath.Join(s.dataDir, "vectors")
 	}
 	s.semanticDir = vecDir
 
-	// 推理会话常驻：449MB 模型只加载一次，构建与查询共用。
+	// 推理会话常驻：模型只加载一次，构建与查询共用。
 	//
 	// 踩过的坑：早先每条查询都 Open/Close 一遍，等于每次检索
-	// 重新载入 449MB——延迟从毫秒变秒级；而且反复
+	// 重新载入整个模型——延迟从毫秒变秒级；而且反复
 	// InitializeEnvironment/DestroyEnvironment 在并发下不可靠。
-	emb, err := embed.Open(embed.Config{
-		LibPath:   sc.LibPath,
-		ModelPath: sc.ModelPath,
-		VocabPath: sc.VocabPath,
-	})
+	emb, err := embed.OpenChain(s.semanticChainConfig())
 	if err != nil {
 		s.semantic.mu.Lock()
 		s.semantic.err = fmt.Sprintf("open embedder: %v", err)
@@ -133,24 +120,33 @@ func (s *Server) initSemantic() {
 	s.semantic.mu.Lock()
 	s.semantic.emb = emb
 	s.semantic.mu.Unlock()
-	s.logf("semantic: embedder ready (dim=%d, model=%s)", emb.Dim(), semanticModelName)
+	s.logf("semantic: embedder ready (dim=%d, model=%s, providers=%v, active=%s)",
+		emb.Dim(), emb.Name(), emb.Providers(), emb.ActiveLabel())
 
 	heads := s.semanticHeads()
 
-	// 先试缓存
+	// 先试缓存。
+	//
+	// 注意这里不再拿 heads 当失效判据：只要模型对、维度对，缓存就
+	// 可用——差异交给增量逻辑按块比对。旧的判定是「任一分支 head
+	// 变了就全废」，日常写一条记忆就要重算 6800 片 12 分钟。
+	var cached *vecindex.Index
+	var cachedPrints map[string]string
 	if vecDir != "" {
-		if ix, err := vecindex.Load(vecDir, semanticModelName, heads); err == nil {
+		if ix, prints, err := vecindex.Load(vecDir, emb.Name()); err == nil {
 			if ix.Dim() != emb.Dim() {
 				// 维度对不上说明缓存是别的模型遗留的。宁可重建，
 				// 也不能拿旧向量配新模型——那会静默返回错结果。
 				s.logf("semantic: cache dim %d != model dim %d, rebuilding", ix.Dim(), emb.Dim())
 			} else {
+				cached, cachedPrints = ix, prints
+				// 先挂上去：即使接下来要增量补算，检索也已可用，
+				// 不必让 srecall 回落到 BM25 等增量跑完。
 				s.semantic.mu.Lock()
 				s.semantic.idx = ix
 				s.semantic.ready = true
 				s.semantic.mu.Unlock()
-				s.logf("semantic: loaded %d vectors from cache", ix.Len())
-				return
+				s.logf("semantic: loaded %d vectors from cache (%d prints)", ix.Len(), len(prints))
 			}
 		}
 	}
@@ -161,10 +157,14 @@ func (s *Server) initSemantic() {
 
 	// 先出声再动工：构建要跑几分钟，日志里必须先有「我开始了」这一行，
 	// 否则排查时无法区分「没启动」和「正在建」。
-	s.logf("semantic: cache miss, building index in background (dir=%s)", vecDir)
+	if cached == nil {
+		s.logf("semantic: cache miss, building index in background (dir=%s)", vecDir)
+	} else {
+		s.logf("semantic: checking cache for incremental updates")
+	}
 
 	go func() {
-		if err := s.buildSemanticIndex(vecDir, heads); err != nil {
+		if err := s.buildSemanticIndex(vecDir, heads, cached, cachedPrints); err != nil {
 			s.semantic.mu.Lock()
 			s.semantic.err = err.Error()
 			s.semantic.building = false
@@ -218,7 +218,7 @@ func (s *Server) semanticHeads() map[string]string {
 //
 // 复用常驻 embedder，不自己 Open：模型 449MB，建完索引后它还要
 // 继续服务查询，不能在这里 Close 掉。
-func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string) error {
+func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cached *vecindex.Index, cachedPrints map[string]string) error {
 	s.semantic.mu.RLock()
 	emb := s.semantic.emb
 	s.semantic.mu.RUnlock()
@@ -255,22 +255,74 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string) erro
 	if len(jobs) == 0 {
 		return fmt.Errorf("no thought slices found to index")
 	}
-	s.logf("semantic: embedding %d thought slices", len(jobs))
+
+	// ── 增量分拣：指纹没变的直接复用旧向量，只推理变了的 ──
+	//
+	// 判据是「喂给 embedder 的最终文本」的内容指纹，不是 commit head：
+	// 日常写一两篇记忆，6800 片里只有那一两片的指纹会变。
+	batchSize := s.cfg.Semantic.BatchSize
+	if batchSize <= 0 {
+		batchSize = 32
+	}
 
 	ix := vecindex.New(dim)
+	prints := make(map[string]string, len(jobs))
+	var toEmbed []job // 指纹变了或新增的，需要真推理
+	var reused int    // 指纹没变直接复用的
 	start := time.Now()
+
+	for _, j := range jobs {
+		fp := fingerprint(j.text)
+		if old, had := cachedPrints[j.id]; had && old == fp && cached != nil && cached.Has(j.id) {
+			// 内容没变：把旧向量原样搬进新索引，零推理开销。
+			if vecs := cached.VectorOf(j.id); vecs != nil {
+				if err := ix.Add(j.id, vecs); err == nil {
+					prints[j.id] = fp
+					reused++
+					continue
+				}
+			}
+		}
+		toEmbed = append(toEmbed, j)
+	}
+
+	if cached != nil {
+		s.logf("semantic: incremental: %d reused, %d changed/new (of %d)", reused, len(toEmbed), len(jobs))
+	} else {
+		s.logf("semantic: embedding %d thought slices (full build)", len(toEmbed))
+	}
+
+	// 批量嵌入：HTTP 后端（TEI/Ollama）靠一次请求吃多条才能真正
+	// 并发起来——逐条调用会让 5,000+ 片的建索引慢一个量级。
+	// ONNX 后端的 EmbedBatch 是加锁循环，行为不变。
 	var failed int
-	for i, j := range jobs {
-		v, eerr := emb.Embed(j.text)
-		if eerr != nil {
-			failed++
+	for i := 0; i < len(toEmbed); i += batchSize {
+		end := i + batchSize
+		if end > len(toEmbed) {
+			end = len(toEmbed)
+		}
+		batch := toEmbed[i:end]
+		batchIn := make([]string, len(batch))
+		for k, j := range batch {
+			batchIn[k] = j.text
+		}
+		vs, berr := emb.EmbedBatch(batchIn)
+		if berr != nil {
+			// 整批失败：降级链已经换过后端还失败，标记全部失败。
+			// 已复用的旧向量不受影响，索引仍可用（只是少了这几片）。
+			failed += len(batch)
+			s.logf("semantic: batch %d-%d failed: %v", i, end, berr)
 			continue
 		}
-		if err := ix.Add(j.id, v); err != nil {
-			failed++
+		for k, v := range vs {
+			if err := ix.Add(batch[k].id, v); err != nil {
+				failed++
+				continue
+			}
+			prints[batch[k].id] = fingerprint(batch[k].text)
 		}
-		if (i+1)%200 == 0 {
-			s.logf("semantic: %d/%d embedded (%.1fs)", i+1, len(jobs), time.Since(start).Seconds())
+		if end%200 < batchSize {
+			s.logf("semantic: %d/%d embedded (%.1fs)", end, len(toEmbed), time.Since(start).Seconds())
 		}
 	}
 	if ix.Len() == 0 {
@@ -278,7 +330,7 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string) erro
 	}
 
 	if vecDir != "" {
-		if err := ix.Save(vecDir, semanticModelName, heads); err != nil {
+		if err := ix.Save(vecDir, emb.Name(), heads, prints); err != nil {
 			s.logf("semantic: cache save failed (will rebuild next start): %v", err)
 		}
 	}
@@ -288,8 +340,8 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string) erro
 	s.semantic.ready = true
 	s.semantic.mu.Unlock()
 
-	s.logf("semantic: ready with %d vectors (%d failed) in %.1fs",
-		ix.Len(), failed, time.Since(start).Seconds())
+	s.logf("semantic: ready with %d vectors (%d reused, %d failed) in %.1fs",
+		ix.Len(), reused, failed, time.Since(start).Seconds())
 	return nil
 }
 
@@ -451,11 +503,22 @@ func (s *Server) addrToVirtualFor(id string) string {
 func (s *Server) semanticStatus() string {
 	s.semantic.mu.RLock()
 	defer s.semantic.mu.RUnlock()
+	// 后端详情（降级链的当前生效应是排查「为什么召回变慢/变差」
+	// 的第一入口）：不依赖锁，Chain 自己是并发安全的。
+	var backend string
+	if emb := s.semantic.emb; emb != nil {
+		if ch, ok := emb.(*embed.Chain); ok {
+			backend = fmt.Sprintf(" via %s", ch.ActiveLabel())
+			if le := ch.LastError(); le != "" {
+				backend += " [" + le + "]"
+			}
+		}
+	}
 	switch {
 	case s.semantic.building:
-		return "building"
+		return "building" + backend
 	case s.semantic.ready && s.semantic.idx != nil:
-		return fmt.Sprintf("ready (%d vectors)", s.semantic.idx.Len())
+		return fmt.Sprintf("ready (%d vectors)%s", s.semantic.idx.Len(), backend)
 	case s.semantic.err != "":
 		return "unavailable: " + s.semantic.err
 	default:
@@ -479,3 +542,77 @@ func contentHash(s string) string {
 }
 
 var _ = os.Getenv // 保留 os 引用，供后续按环境变量覆盖路径
+
+// semanticChainConfig 把服务配置与环境变量组装成降级链。
+//
+// 优先级（高到低）：
+//  1. 环境变量 ZERO_MEMCP_EMBED_ENDPOINT（直接插到链首，便于容器和快速测试）
+//  2. 配置文件里的 [[semantic.provider]] 链
+//  3. 单后端字段 [semantic] lib/model/vocab（向前兼容）
+func (s *Server) semanticChainConfig() embed.ChainConfig {
+	sc := s.cfg.Semantic
+	var providers []embed.ProviderConfig
+
+	// 1. 环境变量直插链首
+	if ep := os.Getenv("ZERO_MEMCP_EMBED_ENDPOINT"); ep != "" {
+		model := os.Getenv("ZERO_MEMCP_EMBED_MODEL")
+		providers = append(providers, embed.ProviderConfig{
+			Label:    "env-http",
+			Kind:     "http",
+			Endpoint: ep,
+			Model:    model,
+			APIKey:   os.Getenv("ZERO_MEMCP_EMBED_APIKEY"),
+			Timeout:  5 * time.Second,
+		})
+	}
+
+	// 2. 配置里的 [[semantic.provider]]
+	for _, p := range s.fileSemanticProviders() {
+		providers = append(providers, embed.ProviderConfig{
+			Label:     p.Label,
+			Kind:      p.Kind,
+			Endpoint:  p.Endpoint,
+			Model:     p.Model,
+			Dim:       p.Dim,
+			APIKey:    p.APIKey,
+			Timeout:   p.Timeout,
+			LibPath:   p.LibPath,
+			ModelPath: p.ModelPath,
+			VocabPath: p.VocabPath,
+		})
+	}
+
+	// 3. 旧单后端兼容（如果链还是空的）
+	if len(providers) == 0 {
+		lib := sc.LibPath
+		if envLib := os.Getenv("ZERO_MEMCP_ORT_LIB"); envLib != "" {
+			lib = envLib
+		}
+		if lib != "" && sc.ModelPath != "" && sc.VocabPath != "" {
+			providers = append(providers, embed.ProviderConfig{
+				Label:     "local-onnx",
+				Kind:      "onnx",
+				LibPath:   lib,
+				ModelPath: sc.ModelPath,
+				VocabPath: sc.VocabPath,
+			})
+		}
+	}
+
+	return embed.ChainConfig{Providers: providers}
+}
+
+// fileSemanticProviders 读配置里的 provider 列表。
+func (s *Server) fileSemanticProviders() []config.SemanticProvider {
+	return s.cfg.Semantic.Providers
+}
+
+// fingerprint 是一块文本的内容指纹（语义索引的增量判据）。
+//
+// 与 contentHash 不同之处：contentHash 服务于别名去重（8 字节够用），
+// 这里是唯一的数据正确性判据——指纹撞了就会错拿旧向量，所以用全长
+// SHA-256。碰撞概率 2^-256，比磁盘位翻转还低。
+func fingerprint(s string) string {
+	h := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(h[:])
+}

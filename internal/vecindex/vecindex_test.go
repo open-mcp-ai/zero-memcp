@@ -83,12 +83,16 @@ func TestSaveLoad(t *testing.T) {
 	ix.Add("p@b/y.md", unitVec(8))
 
 	heads := map[string]string{"b": "abc123"}
-	if err := ix.Save(dir, "test-model", heads); err != nil {
+	prints := map[string]string{
+		"p@b/x.md": "fp-x",
+		"p@b/y.md": "fp-y",
+	}
+	if err := ix.Save(dir, "test-model", heads, prints); err != nil {
 		t.Fatal(err)
 	}
 
-	// 相同身份应能载回
-	ix2, err := Load(dir, "test-model", heads)
+	// 相同身份应能载回，指纹表也要完整还原（增量索引的判据）
+	ix2, gotPrints, err := Load(dir, "test-model")
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -99,21 +103,51 @@ func TestSaveLoad(t *testing.T) {
 	if hits[0].ID != "p@b/x.md" {
 		t.Fatalf("wrong id after reload: %s", hits[0].ID)
 	}
+	if len(gotPrints) != 2 || gotPrints["p@b/x.md"] != "fp-x" {
+		t.Fatalf("prints not restored: %v", gotPrints)
+	}
 
 	// 模型变了 → 必须判过期
-	if _, err := Load(dir, "other-model", heads); err != ErrStale {
+	if _, _, err := Load(dir, "other-model"); err != ErrStale {
 		t.Fatalf("expected ErrStale on model change, got %v", err)
 	}
 
-	// head 变了 → 必须判过期
-	if _, err := Load(dir, "test-model", map[string]string{"b": "def456"}); err != ErrStale {
-		t.Fatalf("expected ErrStale on head change, got %v", err)
+	// 分支 head 变了**不再**判过期：head 只作诊断用，
+	// 真正的失效判据是每块的指纹（见 Manifest.Prints 注释）。
+	if _, _, err := Load(dir, "test-model"); err != nil {
+		t.Fatalf("head change should not invalidate cache, got %v", err)
+	}
+}
+
+// TestVectorOf 验证增量重建的搬运原语。
+func TestVectorOf(t *testing.T) {
+	ix := New(testDim)
+	v := unitVec(5)
+	if err := ix.Add("a", v); err != nil {
+		t.Fatal(err)
+	}
+	got := ix.VectorOf("a")
+	if got == nil {
+		t.Fatal("VectorOf returned nil for existing id")
+	}
+	for i := range v {
+		if got[i] != v[i] {
+			t.Fatalf("VectorOf mismatch at %d", i)
+		}
+	}
+	// 必须是副本：改返回值不应影响索引
+	got[0] = 999
+	if again := ix.VectorOf("a"); again[0] == 999 {
+		t.Fatal("VectorOf must return a copy")
+	}
+	if ix.VectorOf("missing") != nil {
+		t.Fatal("VectorOf should return nil for missing id")
 	}
 }
 
 func TestLoadMissing(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "nope")
-	if _, err := Load(dir, "m", nil); err != ErrStale {
+	if _, _, err := Load(dir, "m"); err != ErrStale {
 		t.Fatalf("expected ErrStale, got %v", err)
 	}
 }
@@ -122,7 +156,7 @@ func TestCorruptBinRejected(t *testing.T) {
 	dir := t.TempDir()
 	ix := New(testDim)
 	ix.Add("a", unitVec(1))
-	if err := ix.Save(dir, "m", nil); err != nil {
+	if err := ix.Save(dir, "m", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	// 截断 bin 文件，模拟写到一半断电
@@ -130,7 +164,7 @@ func TestCorruptBinRejected(t *testing.T) {
 	if err := os.Truncate(p, 100); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Load(dir, "m", nil); err != ErrStale {
+	if _, _, err := Load(dir, "m"); err != ErrStale {
 		t.Fatalf("expected ErrStale on truncated bin, got %v", err)
 	}
 }

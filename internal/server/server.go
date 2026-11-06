@@ -56,14 +56,21 @@ type Config struct {
 	// Semantic 控制是否启用向量语义检索。
 	//
 	// 零值（全部空串）等于关闭：不加载模型、不建向量索引、
-	// srecall 返回明确错误。启用需要三样都在：dylib、模型、词表。
-	// 模型约 23MB、dylib 约 33MB，都不进 Git，由部署侧提供。
+	// srecall 返回明确错误。
+	//
+	// 新版支持 Providers 降级链（3060 GPU 优先 + 本地兜底），
+	// 旧版单后端字段（LibPath/ModelPath/VocabPath）保留向前兼容。
 	Semantic struct {
 		LibPath   string // libonnxruntime 动态库路径
-		ModelPath string // bge-small-zh ONNX 模型路径
+		ModelPath string // ONNX 模型路径
 		VocabPath string // 词表路径
 		// VectorDir 是向量缓存的落盘目录。空则用 <DataDir>/vectors。
 		VectorDir string
+
+		// Providers 降级链（来自配置或命令行）。
+		Providers []config.SemanticProvider
+		// BatchSize 批量大小，默认 32。
+		BatchSize int
 	}
 
 	// ConfigFile 是配置文件路径。

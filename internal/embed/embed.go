@@ -28,11 +28,15 @@ const MaxTokens = 512
 // Embedder 里记录维度：不同模型输出不同（bge 512 / LaBSE 768），
 // 首次推理时实测得出，之后所有调用方以 e.Dim() 为准。
 
-// Embedder 是一个加载好的 embedding 会话。
+// LocalONNX 是进程内 ONNX Runtime 的 embedding 会话。
 //
 // 结构体内含 mutex：ONNX session 不是并发安全的，而索引构建会
 // 开多个 goroutine 并行跑。
-type Embedder struct {
+//
+// 代价与边界（为什么它不再是唯一实现）：CGO dlopen 把二进制绑在
+// 平台上——Mac 的 .dylib 编不出 Linux 二进制，容器化和交叉编译
+// 都被它卡住。它退居「零外部进程」的兜底位，主力让给 HTTP 后端。
+type LocalONNX struct {
 	mu   sync.Mutex
 	sess *ort.DynamicAdvancedSession
 	tok  *BertTokenizer
@@ -40,7 +44,7 @@ type Embedder struct {
 }
 
 // Dim 返回模型输出维度。首次调用会跑一次空推理实测。
-func (e *Embedder) Dim() int {
+func (e *LocalONNX) Dim() int {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.dim
@@ -54,7 +58,7 @@ type Config struct {
 }
 
 // Open 载入运行时与模型。全程本地文件，不发起任何网络请求。
-func Open(cfg Config) (*Embedder, error) {
+func OpenLocal(cfg Config) (*LocalONNX, error) {
 	ort.SetSharedLibraryPath(cfg.LibPath)
 	if err := ort.InitializeEnvironment(); err != nil {
 		return nil, fmt.Errorf("init onnxruntime (lib=%s): %w", cfg.LibPath, err)
@@ -91,23 +95,45 @@ func Open(cfg Config) (*Embedder, error) {
 		return nil, fmt.Errorf("model output dim is dynamic (%v); cannot determine vector size", outDims)
 	}
 	_ = ins
-	return &Embedder{sess: sess, tok: tok, dim: dim}, nil
+	return &LocalONNX{sess: sess, tok: tok, dim: dim}, nil
 }
 
 // Close 释放会话与运行时。
-func (e *Embedder) Close() {
+func (e *LocalONNX) Close() error {
 	if e.sess != nil {
 		e.sess.Destroy()
 		e.sess = nil
 	}
 	ort.DestroyEnvironment()
+	return nil
+}
+
+// Name 返回写入向量缓存 manifest 的模型名。
+func (e *LocalONNX) Name() string {
+	if e.dim == 768 {
+		return "LaBSE-int8"
+	}
+	return fmt.Sprintf("onnx-%d", e.dim)
+}
+
+// EmbedBatch 批量向量化。LocalONNX 目前退化为逐条循环（加锁互斥）。
+func (e *LocalONNX) EmbedBatch(texts []string) ([][]float32, error) {
+	out := make([][]float32, len(texts))
+	for i, t := range texts {
+		v, err := e.Embed(t)
+		if err != nil {
+			return nil, fmt.Errorf("embed text %d: %w", i, err)
+		}
+		out[i] = v
+	}
+	return out, nil
 }
 
 // Embed 把一段文字变成 L2 归一化的向量（模长 1，内积即余弦）。
 //
 // 池化用 mean pooling：把每个有效 token 的隐状态平均。这是 bge 系列的
 // 推荐用法；取 [CLS] 位对这类模型效果更差。
-func (e *Embedder) Embed(text string) ([]float32, error) {
+func (e *LocalONNX) Embed(text string) ([]float32, error) {
 	ids, mask, types := e.tok.Encode(text)
 
 	e.mu.Lock()

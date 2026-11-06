@@ -101,6 +101,13 @@ type MountPoint struct {
 	Branch string `json:"branch,omitempty"`
 	// Cap 是这一个挂载点的能力上限，空表示继承凭证级 cap。
 	Cap string `json:"cap,omitempty"`
+	// Path 把挂载点收窄到分支内的某个子树，空表示整棵分支。
+	//
+	// 这是「同一分支内多个分身互不可见」的实现方式：贴吧分身挂
+	// record/贴吧，群聊分身挂 record/群聊，两者的世界没有交集。
+	// 与 At 的区别：At 是**虚拟**路径（在凭证眼里它长什么样），
+	// Path 是**真实**的树内路径（它到底是哪部分内容）。
+	Path string `json:"path,omitempty"`
 }
 
 // UnmarshalJSON 同时接受三种写法：

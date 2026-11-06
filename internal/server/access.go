@@ -34,6 +34,7 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 	if !c.Mount.Visible(project, branch) {
 		return false
 	}
+
 	// 凭证层：能力上限。
 	//
 	// 两处来源取交集：凭证级 cap（整张凭证的天花板）与

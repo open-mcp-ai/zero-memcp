@@ -1676,7 +1676,12 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			out.WriteString("\n")
 		}
 		if out.Len() == 0 {
-			return TermResult{}, fmt.Errorf("not found: %s", strings.Join(missing, ", "))
+			// 路径越界不叫 not found。
+			//
+			// 「不可见」与「不存在」必须说清楚：前者是凭证边界，
+			// 后者是记忆库真的没有。混在一起会让人以为记忆丢了，
+			// 于是去翻仓库——而事实是这张凭证压根不该看见它。
+			return TermResult{}, fmt.Errorf("%s", strings.Join(missing, ", "))
 		}
 		if len(missing) > 0 {
 			out.WriteString("\n[not retrieved] " + strings.Join(missing, ", ") + "\n")
@@ -1717,37 +1722,58 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		if !c.canWrite() {
 			return TermResult{}, fmt.Errorf("push requires w capability")
 		}
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		return s.execPush(rest, c)
 
 	case "sync":
 		return s.execSync(rest, c)
 
 	case "branch":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// branch [<project> [<new> [from <src>]]]
 		out, err := s.execBranch(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "tag":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// tag [-d] <project> [<name> [<ref>]]
 		out, err := s.execTag(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "cp":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// cp <src>@<br>/<path> ... -> <dst>@<br>/[<path>]
 		out, err := s.execCrossBranch(rest, c, false)
 		return TermResult{Text: out}, err
 
 	case "mv":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// mv <src>@<br>/<path> ... -> <dst>@<br>/[<path>]
 		out, err := s.execCrossBranch(rest, c, true)
 		return TermResult{Text: out}, err
 
 	case "chmod":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// chmod <project>[@<branch>]/<path> rule|content
 		out, err := s.execChmod(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "delete":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// delete <project>@<branch>/<path> [...]
 		out, err := s.execDelete(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
@@ -1763,11 +1789,17 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		return TermResult{Text: out}, err
 
 	case "archive":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// archive <project>@<branch> [-> <project>@<as>]
 		out, err := s.execArchive(rest, c)
 		return TermResult{Text: out}, err
 
 	case "reset":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// reset <project>@<branch> from <project>@<src>
 		out, err := s.execReset(rest, c)
 		return TermResult{Text: out}, err
@@ -1783,11 +1815,17 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		return TermResult{Text: out}, err
 
 	case "commit":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// commit [<project>[@<branch>]] [-m <msg>]
 		out, err := s.execCommit(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
 	case "write":
+		if err := s.requireBranchWide(rest, c); err != nil {
+			return TermResult{}, err
+		}
 		// write <project>[@<branch>]/<path> -- <内容>
 		out, err := s.execWrite(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
@@ -2179,9 +2217,31 @@ func (s *Server) execLog(n int, c Caller) (string, error) {
 }
 
 // execLs 列出某天的切片。
-func (s *Server) execLs(day string, c Caller) (string, error) {
+func (s *Server) execLs(rest string, c Caller) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+
+	// ls [date] [--scope <tree>]
+	//
+	// 踩过的坑：早先把 rest 整个当日期用。调用方写
+	// `ls 2026-11-05 --scope BlackEggAI/zero@main.record:review`，
+	// day 就成了整根字符串，Contains 永远不命中，返回
+	// "no matching entries"——而文件明明在那里。这与 grep/recall
+	// 的 --scope 处理对齐：先拆 scope，剩下的是日期。
+	if bad, ok := unknownFlag(rest); ok {
+		return "", fmt.Errorf("ls: unknown flag %q (supported: --scope)", bad)
+	}
+	day, scope := splitScope(rest)
+	if i := strings.Index(day, " "); i >= 0 {
+		// 剩余参数多于一个（如两个日期）——不猜，直接报。
+		return "", fmt.Errorf("ls: expected one date, got %q", day)
+	}
+	var scopeMatch func(addr string) bool
+	if scope == "" {
+		scopeMatch = func(string) bool { return true }
+	} else {
+		scopeMatch = func(addr string) bool { return addrUnderScope(addr, scope) }
+	}
 
 	var matches []memory.Block
 	for _, tr := range s.trees {
@@ -2195,9 +2255,13 @@ func (s *Server) execLs(day string, c Caller) (string, error) {
 			if virt == "" {
 				continue
 			}
-			if day == "" || strings.Contains(virt, day) {
-				matches = append(matches, b)
+			if day != "" && !strings.Contains(virt, day) {
+				continue
 			}
+			if !scopeMatch(memory.MakeID(b.Project, b.Branch, b.Path)) {
+				continue
+			}
+			matches = append(matches, b)
 		}
 	}
 	if len(matches) == 0 {
@@ -2278,4 +2342,31 @@ func (s *Server) ReposMux() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/repos/", s.handleGitHTTP)
 	return mux
+}
+
+// requireBranchWide 阻止路径受限挂载做分支级操作。
+//
+// 挂载可以收窄到分支内的一个子树（Path，见 Mount.LookupPath）。
+// 子树分身读写自己世界里的内容没问题——那条路走 resolveAddr 的
+// PathVisible 检查；但 branch/tag/reset/push 这些动词的作用域是
+// 整条分支，一个只挂了 record/贴吧 的凭证去 reset main.record
+// 等于用自己的门钥匙拆整栋楼。
+//
+// 全命名空间（空挂载表）与整分支挂载直接放行。
+func (s *Server) requireBranchWide(rest string, c Caller) error {
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return nil
+	}
+	addr := fields[0]
+	proj, br, _, err := s.parseBranchAddr(addr)
+	if err != nil {
+		proj = addr
+		br = ""
+	}
+	if !c.Mount.BranchWide(proj, br) {
+		return fmt.Errorf("%s@%s is mounted with a path subtree (%q); this operation acts on the whole branch and is not available to this credential",
+			proj, br, c.Mount.rootOf(proj, br))
+	}
+	return nil
 }

@@ -81,6 +81,9 @@ func (s *Server) declaredProjects() []string {
 //  2. 无挂载表 → 按已声明项目做最长前缀匹配
 //
 // 任何一步匹配不到都返回错误，绝不回落到「猜一个」。
+// resolveAddr 把用户写的地址翻成 (项目, 分支, 树内路径)。
+// 路径受限挂载（Path 子树收窄）的可见性检查也在这里做：
+// 返回的 (proj, br, path) 已经保证对这张凭证是**路径级可见**的。
 func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path string, err error) {
 	// 地址里显式写了 @<branch> 时直接用它，绕过挂载表的默认分支。
 	//
@@ -95,11 +98,25 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 			if !c.Mount.Visible(proj, br) {
 				return "", "", "", fmt.Errorf("project %s@%s is outside this credential's visible scope", proj, br)
 			}
+			// 路径收窄挂载（root 子树）：路径级可见性。
+			if !c.Mount.PathVisible(proj, br, p) {
+				return "", "", "", fmt.Errorf("path %q is outside this mount's subtree (%s@%s:%s)", p, proj, br, c.Mount.rootOf(proj, br))
+			}
 			return proj, br, p, nil
 		}
 	}
 	if !c.Mount.Empty() {
-		return c.Mount.ToReal(addr)
+		proj, br, p, terr := c.Mount.ToReal(addr)
+		if terr != nil {
+			return "", "", "", terr
+		}
+		// ToReal 已经把 root 加回去了，这里再验一次是防御性的：
+		// ToReal 按「最长虚拟前缀」选挂载项，如果同分支挂了多个
+		// 子树挂载，选中的那条的 root 一定覆盖这个路径。
+		if !c.Mount.PathVisible(proj, br, p) {
+			return "", "", "", fmt.Errorf("path %q is outside this mount's subtree", addr)
+		}
+		return proj, br, p, nil
 	}
 	proj, p, derr := s.splitAddrPwd(addr, "")
 	if derr != nil {

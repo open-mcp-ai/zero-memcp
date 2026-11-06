@@ -139,6 +139,7 @@ func (s *Server) uiTokenMint(w http.ResponseWriter, r *http.Request) {
 			Project string `json:"project"`
 			At      string `json:"at"`
 			Branch  string `json:"branch"`
+			Path    string `json:"path"`
 			Cap     string `json:"cap"`
 		} `json:"mounts"`
 	}
@@ -198,6 +199,7 @@ func (s *Server) uiTokenMint(w http.ResponseWriter, r *http.Request) {
 			Project: strings.TrimSpace(m.Project),
 			At:      strings.TrimSpace(m.At),
 			Branch:  strings.TrimSpace(m.Branch),
+			Path:    strings.TrimSpace(m.Path),
 			Cap:     strings.TrimSpace(m.Cap),
 		}
 		if pt.Project == "" {

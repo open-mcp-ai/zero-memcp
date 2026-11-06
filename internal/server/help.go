@@ -291,12 +291,14 @@ Example: log
 
 	case "ls":
 		return strings.TrimSpace(`
-ls [date]
+ls [date] [--scope <tree>]
 
-List all entries for a day. Defaults to today, or the latest day with data if there are no entries for today.
+List entries, optionally narrowed to a day and/or a subtree.
+Without a date, lists the latest day with data.
 
 Example: ls
     ls 2026-10-28
+    ls 2026-11-05 --scope BlackEggAI/zero@main.record:review
 `), true
 
 	case "status":

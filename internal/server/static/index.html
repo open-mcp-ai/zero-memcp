@@ -144,8 +144,14 @@
         <input id="nt-mount-project" placeholder="mount project (required)" style="width:200px">
         <input id="nt-mount-at" placeholder="virtual path (e.g. / or /notes)" style="width:230px">
         <input id="nt-mount-branch" placeholder="branch (empty = server default)" style="width:240px">
+        <input id="nt-mount-path" placeholder="subtree path (empty = whole branch, e.g. record/贴吧)" style="width:300px">
         <input id="nt-mount-cap" placeholder="mount cap subset (e.g. rw)" style="width:200px">
       </div>
+      <div class="row-form">
+        <button onclick="addMountRow()" style="width:auto">+ add mount</button>
+        <span class="gate-hint" style="margin:0">A credential can carry several mounts (one row each). Subtree path narrows the mount to one folder inside the branch — siblings stay invisible.</span>
+      </div>
+      <table id="nt-mount-rows" style="margin-top:6px"></table>
       <p class="gate-hint">New credentials require an explicit capability ceiling and a mount. In this model an empty cap or mount means unrestricted, so the form never guesses that for you.</p>
       <p class="gate-hint">cap is the credential ceiling. gated lists bits that are withheld by default; temporary grants may open only those bits, and TOML permissions still apply.</p>
       <pre id="mint-out" style="white-space:pre-wrap;font-size:11px;color:var(--gold);margin-top:6px"></pre>
@@ -402,17 +408,11 @@ async function mintToken(){
   // mangled anything it did not expect - and an unparsed value became an empty
   // mount table, which the token model reads as "all namespaces". A typo must
   // never widen a credential.
-  const mountProject = $("nt-mount-project").value.trim();
-  if(!mountProject){
-    $("mint-out").textContent = "Mint failed: mount project is required";
+  const mounts = collectMounts();
+  if(mounts.length === 0){
+    $("mint-out").textContent = "Mint failed: at least one mount is required";
     return;
   }
-  const mounts = [{
-    project: mountProject,
-    at: $("nt-mount-at").value.trim() || "/",
-    branch: $("nt-mount-branch").value.trim(),
-    cap: $("nt-mount-cap").value.trim(),
-  }];
   const body = {
     user: $("nt-user").value.trim(),
     name: $("nt-name").value.trim(),
@@ -429,6 +429,49 @@ async function mintToken(){
   const d = JSON.parse(txt);
   $("mint-out").textContent = `Credential ${d.name} minted (jti=${d.jti})\n\n${d.token}\n\nThis token is shown only once - copy it now.`;
   await loadTokens();
+}
+
+// 多挂载点：模板行 + 「+ add mount」复制一行。每一行是完整的挂载声明。
+function addMountRow(){
+  const tpl = document.querySelector("#nt-mount-rows");
+  const tr = document.createElement("tr");
+  tr.className = "mount-row";
+  tr.innerHTML = `
+    <td><input class="mr-project" placeholder="project" style="width:200px"></td>
+    <td><input class="mr-at" placeholder="virtual path (default /)" style="width:160px"></td>
+    <td><input class="mr-branch" placeholder="branch (empty = default)" style="width:200px"></td>
+    <td><input class="mr-path" placeholder="subtree path (empty = whole branch)" style="width:260px"></td>
+    <td><input class="mr-cap" placeholder="cap (e.g. rw)" style="width:110px"></td>
+    <td><button onclick="this.closest('tr').remove()" style="width:auto">✕</button></td>`;
+  tpl.appendChild(tr);
+}
+
+// collectMounts 收集首行 + 模板行里所有填了 project 的挂载。
+// 空 project 的行静默忽略；project 填了但为无效值的由后端校验报错。
+function collectMounts(){
+  const out = [];
+  const first = $("nt-mount-project").value.trim();
+  if(first){
+    out.push({
+      project: first,
+      at: $("nt-mount-at").value.trim() || "/",
+      branch: $("nt-mount-branch").value.trim(),
+      path: $("nt-mount-path").value.trim(),
+      cap: $("nt-mount-cap").value.trim(),
+    });
+  }
+  document.querySelectorAll("#nt-mount-rows .mount-row").forEach(tr => {
+    const p = tr.querySelector(".mr-project").value.trim();
+    if(!p) return;
+    out.push({
+      project: p,
+      at: tr.querySelector(".mr-at").value.trim() || "/",
+      branch: tr.querySelector(".mr-branch").value.trim(),
+      path: tr.querySelector(".mr-path").value.trim(),
+      cap: tr.querySelector(".mr-cap").value.trim(),
+    });
+  });
+  return out;
 }
 
 async function revokeToken(jti, undo){

@@ -32,6 +32,16 @@ type mountEntry struct {
 	branch  string
 	virtual string // 已规范化，"/" 表示根
 	cap     string
+	// root 是分支内的子路径（树内路径），空表示整棵分支。
+	//
+	// 为什么需要它：挂载粒度到「项目+分支」时，简的多个分身无法隔离——
+	// 贴吧分身和群聊分身都挂 zero@main.record，彼此看得见对方的记录。
+	// 加上 root 之后，贴吧分身只挂 main.record:record/贴吧，
+	// 群聊分身看不到它，这仍然是「不可见」而不是「被拒绝」。
+	//
+	// 语义：root 是这个挂载点的**根**。ToVirtual 会把 root 从路径里剥掉
+	// （所以 / 在贴吧分身眼里就是 record/贴吧），ToReal 会把它加回去。
+	root string
 }
 
 // NewMount 从声明构建。defaultBranch 用于补全省略的 branch。
@@ -57,6 +67,7 @@ func NewMount(points []auth.MountPoint, defaultBranch string) *Mount {
 			branch:  br,
 			virtual: normalizeVirtual(p.At),
 			cap:     strings.TrimSpace(p.Cap),
+			root:    strings.Trim(strings.TrimSpace(p.Path), "/"),
 		})
 	}
 	if len(m.entries) == 0 {
@@ -117,6 +128,9 @@ func (m *Mount) BranchesOf(project string) []string {
 }
 
 // Lookup 找出覆盖 (project, branch) 的挂载项。
+//
+// 这是「分支级」的粗查：只回答「这个分支对这张凭证是否可见」，
+// 不回答「分支里的哪个子树」。需要路径精度时用 LookupPath。
 func (m *Mount) Lookup(project, branch string) (mountEntry, bool) {
 	if m.Empty() {
 		return mountEntry{}, true // 全命名空间
@@ -141,6 +155,112 @@ func (m *Mount) Lookup(project, branch string) (mountEntry, bool) {
 		}
 	}
 	return mountEntry{}, false
+}
+
+// LookupPath 找出覆盖 (project, branch, path) 的挂载项，路径精度。
+//
+// 与 Lookup 的差别：Lookup 只看分支，LookupPath 还要求 path 落在
+// 挂载项的 root 子树内。同一分支挂两次（贴吧 + 群聊）时，只有
+// path 落在对应 root 下的那个挂载项才算命中。
+//
+// 多个挂载项同时覆盖时，取 root 最长的那个——与 virtual 的
+// 「最长前缀优先」同一条原则：更具体的那条说了算。
+func (m *Mount) LookupPath(project, branch, path string) (mountEntry, bool) {
+	if m.Empty() {
+		return mountEntry{}, true
+	}
+	if branch == "" {
+		branch = m.defaultBranch
+	}
+	path = strings.Trim(path, "/")
+
+	var best mountEntry
+	var found bool
+	for _, e := range m.entries {
+		if e.project != project {
+			continue
+		}
+		if e.branch != branch && e.branch != "*" {
+			continue
+		}
+		if e.root != "" && !pathUnderRoot(path, e.root) {
+			continue
+		}
+		if !found || len(e.root) > len(best.root) {
+			best, found = e, true
+		}
+	}
+	return best, found
+}
+
+// PathVisible 报告 (project, branch, path) 是否对这张凭证可见。
+//
+// 与 Visible 的差别：Visible 只看分支，PathVisible 还要求 path 落在
+// 某个挂载项的 root 子树内。同一分支挂多个子树（贴吧 + 群聊）时，
+// 路径决定了哪条挂载项命中，也就决定了该路径是否可见。
+func (m *Mount) PathVisible(project, branch, path string) bool {
+	_, ok := m.LookupPath(project, branch, path)
+	return ok
+}
+
+// BranchWide 报告这张凭证对 (project, branch) 是否拥有「整分支」挂载。
+//
+// 路径受限的挂载（root != ""）返回 false：它能读写自己子树里的内容，
+// 但不能做分支级操作（branch/tag/reset/push）——那些操作的作用域
+// 是整个分支，超出这张凭证的世界。
+func (m *Mount) BranchWide(project, branch string) bool {
+	if m.Empty() {
+		return true
+	}
+	if branch == "" {
+		branch = m.defaultBranch
+	}
+	for _, e := range m.entries {
+		if e.project != project {
+			continue
+		}
+		if e.branch != branch && e.branch != "*" {
+			continue
+		}
+		if e.root == "" {
+			return true
+		}
+	}
+	return false
+}
+
+// rootOf 返回覆盖该分支的挂载项里最长的 root，供错误信息说明边界。
+func (m *Mount) rootOf(project, branch string) string {
+	if m.Empty() {
+		return ""
+	}
+	if branch == "" {
+		branch = m.defaultBranch
+	}
+	best := ""
+	for _, e := range m.entries {
+		if e.project != project {
+			continue
+		}
+		if e.branch != branch && e.branch != "*" {
+			continue
+		}
+		if len(e.root) > len(best) {
+			best = e.root
+		}
+	}
+	return best
+}
+
+// pathUnderRoot 判断 path 是否落在 root 子树内（含 root 本身）。
+func pathUnderRoot(path, root string) bool {
+	if root == "" {
+		return true
+	}
+	if path == root {
+		return true
+	}
+	return strings.HasPrefix(path, root+"/")
 }
 
 // Visible 报告 (project, branch) 对这张凭证是否可见。
@@ -196,14 +316,32 @@ func (m *Mount) ToVirtual(project, branch, path string) string {
 		if e.branch != branch && e.branch != "*" && !(e.branch == m.defaultBranch && branch == "") {
 			continue
 		}
+		// 路径收窄：root 子树外的内容在这张凭证眼里不存在。
+		//
+		// 这里返回空串而不是跳过、让下一个更宽的挂载项接手——
+		// 跳过会让「贴吧分身看不到群聊记录」失效：群聊那条更宽的
+		// 挂载项（如果存在）会把这个路径接走。返回空串是明确的
+		// 「不可见」，调用方据此当作不存在。
+		p := strings.Trim(path, "/")
+		if e.root != "" {
+			if !pathUnderRoot(p, e.root) {
+				continue
+			}
+			// root 变成这张凭证的根：剥掉前缀
+			if p == e.root {
+				p = ""
+			} else {
+				p = strings.TrimPrefix(p, e.root+"/")
+			}
+		}
 		if e.virtual == "/" {
-			return path
+			return p
 		}
 		v := strings.TrimPrefix(e.virtual, "/")
-		if path == "" {
+		if p == "" {
 			return v
 		}
-		return v + "/" + path
+		return v + "/" + p
 	}
 	return ""
 }
@@ -224,32 +362,37 @@ func (m *Mount) ToReal(virtAddr string) (project, branch, path string, err error
 		return "", "", "", fmt.Errorf("empty mount table should not reach this path")
 	}
 
+	// joinRoot 把虚拟路径还原成树内路径：root 是挂载点的根，
+	// 所以凭证眼里的 "贴吧/今天的记录.md" 实际是 "record/贴吧/今天的记录.md"。
+	joinRoot := func(e mountEntry, rel string) string {
+		rel = strings.Trim(rel, "/")
+		if e.root == "" {
+			return rel
+		}
+		if rel == "" {
+			return e.root
+		}
+		return e.root + "/" + rel
+	}
+
 	for _, e := range m.entries {
 		v := strings.TrimPrefix(e.virtual, "/")
+		br := e.branch
+		if br == "*" {
+			br = m.defaultBranch
+		}
 		if v == "" {
 			// "/" 是根：任何不属于更具体挂载点的路径都归它
 			if isUnderOtherMount(virtAddr, m.entries) {
 				continue
 			}
-			br := e.branch
-			if br == "*" {
-				br = m.defaultBranch
-			}
-			return e.project, br, virtAddr, nil
+			return e.project, br, joinRoot(e, virtAddr), nil
 		}
 		if virtAddr == v {
-			br := e.branch
-			if br == "*" {
-				br = m.defaultBranch
-			}
-			return e.project, br, "", nil
+			return e.project, br, joinRoot(e, ""), nil
 		}
 		if strings.HasPrefix(virtAddr, v+"/") {
-			br := e.branch
-			if br == "*" {
-				br = m.defaultBranch
-			}
-			return e.project, br, virtAddr[len(v)+1:], nil
+			return e.project, br, joinRoot(e, virtAddr[len(v)+1:]), nil
 		}
 	}
 

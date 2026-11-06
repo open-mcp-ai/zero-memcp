@@ -16,12 +16,12 @@ import (
 //
 // 这是「越常用的记忆越牢固」的最小实现。要证明两件事：
 //  1. 行为确实发生（b.md 读三次后排在 a.md 前面）
-//  2. 状态确实落盘（weights.json 里 b.md 的计数是 3）
+//  2. 状态确实落盘（分片文件里 b.md 的计数是 3）
 //
 // 块不来自文件系统，而是来自裸仓库的 tree entry。
 func TestReadReinforcesRecall(t *testing.T) {
 	dataDir := t.TempDir()
-	stateFile := filepath.Join(dataDir, "weights.json")
+	stateDir := filepath.Join(dataDir, "weights")
 
 	repo, err := gitstore.Init(filepath.Join(dataDir, "repos", "notes.git"))
 	if err != nil {
@@ -42,7 +42,7 @@ func TestReadReinforcesRecall(t *testing.T) {
 		DataDir:       dataDir,
 		DefaultBranch: "zero",
 		Listen:        "127.0.0.1:0",
-		WeightsPath:   stateFile,
+		WeightsDir:    stateDir,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -85,20 +85,28 @@ func TestReadReinforcesRecall(t *testing.T) {
 		t.Errorf("b.md 被读过 3 次却排在 a.md 之后:\n%s", out.Text)
 	}
 
-	// 等防抖落盘，验证状态持久化
+	// 等防抖落盘，验证状态持久化。新结构按项目分片：
+	// notes@zero 分支的键落在 notes 分片里，键名是 notes@zero:a.md。
 	time.Sleep(900 * time.Millisecond)
-	raw, err := os.ReadFile(stateFile)
+	shardPath := filepath.Join(stateDir, "notes.json")
+	raw, err := os.ReadFile(shardPath)
 	if err != nil {
-		t.Fatalf("weights.json 没生成: %v", err)
+		t.Fatalf("分片文件没生成 %s: %v", shardPath, err)
 	}
 	var w struct {
-		Hits map[string]int `json:"hits"`
+		Version int             `json:"version"`
+		Entries map[string]struct {
+			Hits int   `json:"hits"`
+			Last int64 `json:"last"`
+		} `json:"entries"`
 	}
 	if err := json.Unmarshal(raw, &w); err != nil {
-		t.Fatalf("解析 weights.json: %v", err)
+		t.Fatalf("解析分片文件: %v", err)
 	}
-	if w.Hits["notes/b.md"] != 3 {
-		t.Errorf("期望 notes/b.md 记 3 次，得到 %d（内容: %s）",
-			w.Hits["notes/b.md"], string(raw))
+	if got := w.Entries["notes@zero:b.md"].Hits; got != 3 {
+		t.Errorf("期望 notes@zero:b.md 记 3 次，得到 %d（内容: %s）", got, string(raw))
+	}
+	if got := w.Entries["notes@zero:a.md"].Hits; got != 0 {
+		t.Errorf("a.md 没被读过，计数应为 0，得到 %d", got)
 	}
 }

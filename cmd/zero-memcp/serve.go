@@ -11,6 +11,7 @@ import (
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
 	"github.com/open-mcp-ai/zero-memcp/internal/server"
+	"github.com/open-mcp-ai/zero-memcp/internal/weights"
 )
 
 // runServe 是默认行为：起服务。
@@ -22,7 +23,7 @@ func runServe(args []string) int {
 		defBranch   = fs.String("branch", "", "Default branch (from config or built-in default)")
 		listen      = fs.String("listen", "", "Listen address (default 127.0.0.1:1729)")
 		endpoint    = fs.String("endpoint", "", "Endpoint identity, e.g. blackbox or laptop")
-		weightsPath = fs.String("weights", "", "Read-frequency state file (default: $HOME/.zero-memcp/weights.json)")
+		weightsDir  = fs.String("weights", "", "Read-frequency state directory (default: $HOME/.zero-memcp/weights); a legacy weights.json path is migrated automatically")
 		embedLib    = fs.String("embed-lib", "", "Path to libonnxruntime (enables semantic search when model+vocab also given)")
 		embedModel  = fs.String("embed-model", "", "Path to ONNX embedding model (e.g. bge-small-zh-int8.onnx)")
 		embedVocab  = fs.String("embed-vocab", "", "Path to BERT vocab.txt for the embedding model")
@@ -37,14 +38,37 @@ func runServe(args []string) int {
 		return 2
 	}
 
-	wPath := *weightsPath
-	if wPath == "" {
+	// 权重状态：从「单文件」改成「按项目分片的目录」。
+	//
+	// 旧配置可能还写着 weights.json（文件路径）。遇到这种情况：
+	// 把它的同目录 weights/ 作为分片目录，并在启动前把旧文件迁进去。
+	// 迁移完成后旧文件改名 .migrated，保证只跑一次（迁移是 sum 语义，
+	// 幂等性靠退役机制保证而不是靠合并语义）。
+	wDir := expandHome(*weightsDir)
+	if wDir == "" {
 		home, _ := os.UserHomeDir()
 		if home != "" {
-			wPath = filepath.Join(home, ".zero-memcp", "weights.json")
+			wDir = filepath.Join(home, ".zero-memcp", "weights")
 		}
-	} else {
-		wPath = expandHome(wPath)
+	}
+	var legacyWeights string
+	if strings.HasSuffix(wDir, ".json") {
+		legacyWeights = wDir
+		wDir = filepath.Join(filepath.Dir(wDir), "weights")
+	} else if home, _ := os.UserHomeDir(); home != "" {
+		// 默认位置上的旧文件也要迁
+		cand := filepath.Join(home, ".zero-memcp", "weights.json")
+		if _, err := os.Stat(cand); err == nil {
+			legacyWeights = cand
+		}
+	}
+	if legacyWeights != "" {
+		if n, dropped, err := weights.MigrateLegacy(legacyWeights, wDir); err != nil {
+			fmt.Fprintf(os.Stderr, "zero-memcp: migrate legacy weights %s: %v\n", legacyWeights, err)
+		} else {
+			fmt.Fprintf(os.Stderr, "zero-memcp: migrated %d weight entries (%d bare duplicates dropped) from %s into %s\n",
+				n, dropped, legacyWeights, wDir)
+		}
 	}
 
 	branch := *defBranch
@@ -54,7 +78,7 @@ func runServe(args []string) int {
 		ConfigFile:    cfgPth,
 		DefaultBranch: branch,
 		Endpoint:      *endpoint,
-		WeightsPath:   wPath,
+		WeightsDir:    wDir,
 	}
 	cfg.Semantic.LibPath = expandHome(*embedLib)
 	cfg.Semantic.ModelPath = expandHome(*embedModel)

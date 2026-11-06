@@ -180,10 +180,14 @@ Only unencrypted OpenSSH PEM private keys are accepted. Configure the remote hos
 Example: remote-key put github-deploy -- $KEY
 `), true
 
-	case "remote", "fetch", "push", "sync":
+	case "remote", "fetch", "push", "sync", "merge":
 		return strings.TrimSpace(`
 remote [<project>]                    list remotes declared for a project
 fetch <project> [<remote>]        fetch remote history into refs/remotes/<remote>/*
+merge <project> <branch> from <remote>
+                                     merge fetched remote branch into the local branch
+                                     fast-forward and disjoint changes merge automatically;
+                                     same-path-different-content is refused as a conflict
 push <project> [<remote>] <branch>   push one branch (built-in SSH transport; no batches)
 sync <project> [<remote>]             report ahead/behind/diverged state
 remote-key list | put | delete       root manages SSH private keys
@@ -534,7 +538,7 @@ func helpAll() string {
 	var b strings.Builder
 	b.WriteString(helpOverview())
 	b.WriteString("\n\n")
-	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "batch", "config", "reload", "whoami", "users", "help"} {
+	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "merge", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "batch", "config", "reload", "whoami", "users", "help"} {
 		if d, ok := helpVerb(v); ok {
 			b.WriteString("\n-- " + v + " ")
 			b.WriteString(strings.Repeat("-", max(0, 60-len(v))))

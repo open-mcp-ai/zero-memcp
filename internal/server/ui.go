@@ -266,6 +266,5 @@ func (s *Server) readAddr(addr string, c Caller) (string, error) {
 	}
 	nowUnix := time.Now().Unix()
 	s.weights.Bump(memory.MakeID(proj, br, path), nowUnix)
-	s.weights.Bump(proj+"/"+path, nowUnix)
 	return string(d), nil
 }

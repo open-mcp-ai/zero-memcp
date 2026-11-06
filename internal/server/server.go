@@ -75,8 +75,9 @@ type Config struct {
 	// Endpoint 本端点标识，例如 local / blackbox。
 	Endpoint string
 
-	// WeightsPath 阅读频次状态文件。
-	WeightsPath string
+	// WeightsDir 阅读频次状态的目录。按项目分片存放
+	// （<dir>/BlackEggAI/zero.json 等），不再是一个大文件。
+	WeightsDir string
 
 	// DefaultBranch 是默认分支名。
 	//
@@ -157,7 +158,7 @@ type Server struct {
 
 	// weights 记录哪些块真的被读过。只统计 read，不统计 recall——
 	// recall 只是列出候选，瞄一眼没读说明它没帮上忙。
-	weights *weights.State
+	weights *weights.Store
 
 	// projects 管理所有裸仓库（Git 存储模式）。
 	projects *ProjectStore
@@ -322,7 +323,7 @@ func New(cfg Config) (*Server, error) {
 		_ = startupLock.Release()
 	}()
 
-	w, err := weights.Open(cfg.WeightsPath)
+	w, err := weights.Open(cfg.WeightsDir)
 	if err != nil {
 		return nil, fmt.Errorf("open weights state: %w", err)
 	}
@@ -1656,9 +1657,11 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			}
 			// 权重键必须与索引键一致（带分支），否则 read 强化对
 			// 不带分支的地址记账、索引却按带分支的键查，永远对不上。
+			//
+			// 只 bump 一个键。旧版同时 bump MakeID 键和 proj/path 旧键，
+			// 同一份记忆的计数被劈成两半，权重按一半算。
 			nowUnix := time.Now().Unix()
 			s.weights.Bump(memory.MakeID(proj, br, path), nowUnix)
-			s.weights.Bump(proj+"/"+path, nowUnix)
 			if len(fields) > 1 {
 				out.WriteString("==== " + addr + " ====\n")
 			}
@@ -1696,6 +1699,12 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 
 	case "fetch":
 		return s.execRemoteFetch(rest, c)
+
+	case "merge":
+		if !c.canWrite() {
+			return TermResult{}, fmt.Errorf("merge requires w capability")
+		}
+		return s.execMerge(rest, c)
 
 	case "push":
 		if !c.canWrite() {
@@ -2008,15 +2017,9 @@ func (s *Server) weightCount(addr string) int {
 	if s.weights == nil {
 		return 0
 	}
-	n := s.weights.Count(addr)
-	if n > 0 {
-		return n
-	}
-	// 如果 addr 是 project@branch/path，也查一下无分支的 project/path 兜底
-	if p, _, path, ok := memory.SplitID(addr); ok {
-		return s.weights.Count(p + "/" + path)
-	}
-	return 0
+	// 单一规范键：只查 MakeID 形式。旧版还会兜底查 project/path，
+	// 那是为兼容「双写两个键」而存在的；双写已取消，兜底也一并去掉。
+	return s.weights.Count(addr)
 }
 
 // execGrep 在所有可 recall 的块里正则搜索，返回命中行及其上下文。

@@ -242,89 +242,29 @@ func (s *Server) putRef(target, refAddr, session string, c Caller) (TermResult, 
 	}, nil
 }
 
-// notifyTreeChange 在分支头推进后计算差量并广播。
+// execRemind 登记「我关心这棵树」，并记下此刻的分支头作为基线。
 //
-// 只要这次提交有父提交，就用 SubtreeDiff 算出实际触及的路径集合；
-// 客户端能拿到精准的前缀，没动过的子树绝不收事件。
-func (s *Server) notifyTreeChange(project, branch, relPath string) {
-	repo, err := s.projects.Get(project)
-	if err != nil {
-		return
-	}
-	commitSHA, _ := repo.Resolve(branch)
-	if commitSHA == "" {
-		return
-	}
-	treeSHA, _ := repo.TreeAt(branch, "")
-
-	ev := TreeEvent{
-		Project: project,
-		Branch:  branch,
-		Commit:  commitSHA,
-		Tree:    treeSHA,
-	}
-
-	// 取上一个提交（父提交）作为差分基线。
-	if _, parents, err := repo.CommitInfoAt(commitSHA); err == nil && len(parents) > 0 {
-		ev.Previous = parents[0]
-		{
-			if diff, err := repo.SubtreeDiff(ev.Previous, commitSHA, ""); err == nil {
-				paths := make([]string, 0, len(diff))
-				for _, ch := range diff {
-					paths = append(paths, ch.Path)
-					if len(paths) >= maxEventPaths {
-						ev.Truncated = true
-						break
-					}
-				}
-				ev.Paths = paths
-			}
-		}
-	}
-
-	if relPath != "" {
-		// 单条写入明确知道自己落在哪，直接补齐，防止 diff 计算失败漏通知。
-		found := false
-		for _, p := range ev.Paths {
-			if p == relPath {
-				found = true
-				break
-			}
-		}
-		if !found {
-			ev.Paths = append(ev.Paths, relPath)
-		}
-	}
-
-	s.broadcastTreeEvent(ev)
-}
-
-// execRemind 把当前身份锚定到一棵树上：那棵树动了就通知我。
+// 它不订阅任何东西、不推送任何东西——本服务只有 MCP 一个通道。
+// 变更感知靠调用方主动查：status 报「关注的树动了没有」，
+// since 取真正的差量。
 //
-// remind 不是另一个动词的缩写，也不是消息订阅——它是「注意力锚点」。
-// 锚定关系是派生态：丢了最多重读一次，所以不写进不可变历史。
+// 为什么保留这个动词：它把「我关心什么」这件事记在服务端，
+// 于是调用方不必自己在客户端维护一份列表，也能让 status 回答
+// 「有没有该看的新东西」。这是纯粹的状态登记，零副作用。
 func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 	rest = strings.TrimSpace(rest)
 
 	if rest == "" {
-		watches := s.treeWatch.List(c.Identity)
+		watches := s.watchReport(c)
 		if len(watches) == 0 {
 			return TermResult{
-				Text:       "no tree is currently watched. Use remind <project>[@<branch>[/<path>]] to watch one.",
-				Structured: map[string]any{"watches": []TreeWatch{}},
+				Text:       "no tree is watched. Use remind <project>[@<branch>[/<path>]] to record one, or `status` to see all watched trees.",
+				Structured: map[string]any{"watches": []watchStatus{}},
 			}, nil
 		}
-		var sb strings.Builder
-		sb.WriteString("currently watched:\n")
-		for _, w := range watches {
-			p := w.Path
-			if p == "" {
-				p = "(entire tree)"
-			}
-			fmt.Fprintf(&sb, "  %s@%s %s\n", w.Project, w.Branch, p)
-		}
+		lines := append([]string{"currently watched:"}, formatWatchReport(watches)...)
 		return TermResult{
-			Text:       strings.TrimRight(sb.String(), "\n"),
+			Text:       strings.Join(lines, "\n"),
 			Structured: map[string]any{"watches": watches},
 		}, nil
 	}
@@ -348,18 +288,34 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		return TermResult{}, fmt.Errorf("%s", s.denyReason(c, proj, branch, configBitRead))
 	}
 
-	s.treeWatch.Add(c.Identity, TreeWatch{Project: proj, Branch: branch, Path: treePath})
+	// 记下当前头作为基线：下次 status 就能回答「它动了没有」。
+	// 分支还不存在时留空——关注一个尚未创建的分支是合理的，
+	// 只是暂时答不了「变没变」。
+	since := ""
+	repo, rerr := s.projects.Get(proj)
+	if rerr == nil {
+		if head, herr := repo.Resolve(branch); herr == nil {
+			since = head
+		}
+	}
+
+	s.treeWatch.Add(c.Identity, TreeWatch{Project: proj, Branch: branch, Path: treePath, Since: since})
 	where := proj + "@" + branch
 	if treePath != "" {
 		where += "/" + treePath
 	}
+	msg := "watching " + where + " from " + shortSHA(since)
+	if since == "" {
+		msg = "watching " + where + " (branch is empty; baseline will be set on next remind)"
+	}
 	return TermResult{
-		Text: "watching " + where + ": notifications will be sent when this tree changes",
+		Text: msg + " — check it with `status`, fetch changes with `since`",
 		Structured: map[string]any{
 			"ok":      true,
 			"project": proj,
 			"branch":  branch,
 			"path":    treePath,
+			"since":   since,
 		},
 	}, nil
 }

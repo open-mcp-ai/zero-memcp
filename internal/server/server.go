@@ -160,6 +160,9 @@ type Server struct {
 	// syncState 是后台对等同步的进程内状态（冲突队列、上次同步时间）。
 	syncState syncState
 
+	// resources 是资源变更订阅中心（MCP subscriptions/listen）。
+	resources *resourceHub
+
 	// semanticDir 是向量缓存的落盘目录。
 	semanticDir string
 
@@ -221,8 +224,6 @@ type Server struct {
 	// remotes 是 [[remote]] 的当前快照，随 reload 原子替换。
 	remotes atomic.Pointer[[]config.Remote]
 
-	// bcast 是 SSE 广播器：写记忆时扇出给监听者。
-	bcast *Broadcaster
 
 	// policies 缓存每个项目的写入策略（从 100755 的 SKILL.md 解析而来）。
 	policies sync.Map // project -> manifest.Policy
@@ -394,8 +395,8 @@ func New(cfg Config) (*Server, error) {
 		lock:          startupLock,
 
 		listens:   FromConfig(listenBlocks(cfgFile)),
-		bcast:     newBroadcaster(),
 		treeWatch: newTreeWatchHub(),
+		resources: newResourceHub(),
 		done:      make(chan struct{}),
 		// 默认视为「没有维护循环」：New 之后没 Start 就 Close 的路径
 		// （测试里很常见）不该在这里永久阻塞。
@@ -508,20 +509,13 @@ func (s *Server) Reload() error {
 		}
 	}
 
-	// 比较上一观察水位与文件系统的当前 heads。分支变化的真相在 refs；
-	// 内存水位只是优化在线通知，丢了以后插件可以凭 last commit 调 since。
-	events := s.treeEventsSinceBaseline()
-
 	s.mu.Lock()
 	s.trees = trees
 	s.idx = idx
 	s.mu.Unlock()
 
-	// 先更新水位再广播：并发的下一次 Reload 不会重复发同一批事件。
+	// 更新观察水位：让下一次 checkExternalUpdates 有比对基准。
 	s.rememberTreeHeads()
-	for _, ev := range events {
-		s.broadcastTreeEvent(ev)
-	}
 	return nil
 }
 
@@ -614,7 +608,6 @@ func (s *Server) muxFor(blk ListenBlock) http.Handler {
 		mux.HandleFunc("/api", s.handleUIAPICompat)
 	}
 	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/events", s.handleEvents)
 	mux.HandleFunc("/identity", s.handleIdentity)
 	mux.HandleFunc("/projects", s.handleProjects)
 	mux.HandleFunc("/recall", s.handleRecall)
@@ -1082,6 +1075,13 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+		// subscriptions/listen 是长请求：响应不是一条 JSON 而是一个事件流，
+		// 必须在 dispatchMCP 之前分流（后者只会编码一个对象）。
+		if req.Method == "subscriptions/listen" {
+			s.serveSubscription(w, r, req.ID, req.Params, caller)
+			return
+		}
+
 	result, err := s.dispatchMCP(r.Context(), req.Method, req.Params, caller)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
@@ -1102,19 +1102,91 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) dispatchMCP(ctx context.Context, method string, params json.RawMessage, c Caller) (any, error) {
 	switch method {
 	case "initialize":
+		// 协议版本如实声明为 2026-07-28：这是引入 subscriptions/listen 的
+		// 修订版。早先这里写 2024-11-05，同时 serverInfo.transport 声称
+		// "streamable-http"——两处都是假的（当时只收 POST、没有事件流）。
+		//
+		// 现在这个版本号有依据：本服务实现了 subscriptions/listen、
+		// notifications/subscriptions/acknowledged 与
+		// notifications/resources/updated。
 		return map[string]any{
-			"protocolVersion": "2024-11-05",
-			"capabilities":    map[string]any{"tools": map[string]any{}},
+			"protocolVersion": "2026-07-28",
+			"capabilities": map[string]any{
+				"tools": map[string]any{},
+				// resources 让客户端知道可以订阅资源变更。
+				"resources": map[string]any{
+					"subscribe":   true,
+					"listChanged": false,
+				},
+			},
 			"serverInfo": map[string]any{
-				"name":      "zero-memcp",
-				"version":   "0.1.0",
-				"local":     true,
-				"transport": "streamable-http",
+				"name":    "zero-memcp",
+				"version": "0.1.0",
+				"local":   true,
 			},
 		}, nil
 
 	case "notifications/initialized":
 		return map[string]any{}, nil
+
+	case "resources/list":
+		// 资源 = 关注的记忆树。没有关注时返回空列表——不枚举全部项目，
+		// 那会把「我关心什么」变成「这里有什么」，在受限凭证下还会泄露规模。
+		watches := s.treeWatch.List(c.Identity)
+		return map[string]any{"resources": resourcesListFor(watches)}, nil
+
+	case "resources/read":
+		var p struct {
+			URI string `json:"uri"`
+		}
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, fmt.Errorf("invalid params: %w", err)
+		}
+		project, branch, treePath, err := parseTreeURI(p.URI)
+		if err != nil {
+			return nil, err
+		}
+		if !s.projectVisibleFor(c, project) {
+			return nil, fmt.Errorf("resource %q is outside this credential's visible scope", p.URI)
+		}
+		if !s.allowed(c, project, branch, configBitRead) {
+			return nil, fmt.Errorf("%s", s.denyReason(c, project, branch, configBitRead))
+		}
+		repo, err := s.projects.Get(project)
+		if err != nil {
+			return nil, err
+		}
+		head, _ := repo.Resolve(branch)
+		if head == "" {
+			return nil, fmt.Errorf("branch %s@%s has no commits yet", project, branch)
+		}
+		// 资源内容是**状态摘要**，不是正文。
+		//
+		// 正文必须经 term 工具读回，才会落在 tool_result 的沙盒里；
+		// 从这里塞正文等于绕过了那条约束。摘要只回答「现在是什么状态」。
+		entries, _ := repo.List(branch)
+		var paths []string
+		for _, e := range entries {
+			if treePath != "" && e.Path != treePath && !strings.HasPrefix(e.Path, treePath+"/") {
+				continue
+			}
+			paths = append(paths, e.Path)
+			if len(paths) >= 200 {
+				break
+			}
+		}
+		summary := fmt.Sprintf("branch: %s@%s\nhead: %s\nentries: %d\n", project, branch, head, len(entries))
+		if treePath != "" {
+			summary += fmt.Sprintf("subtree: %s\nmatched: %d\n", treePath, len(paths))
+		}
+		if len(paths) > 0 {
+			summary += "\npaths:\n  " + strings.Join(paths, "\n  ") + "\n"
+		}
+		return map[string]any{
+			"contents": []map[string]any{
+				{"uri": p.URI, "mimeType": "text/plain", "text": summary},
+			},
+		}, nil
 
 	case "tools/list":
 		// 只暴露 term。
@@ -1915,6 +1987,17 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		}
 		text += "\nsemantic: " + sem
 
+		// 关注的树：回答「有没有该看的新东西」。
+		//
+		// 这是原先 SSE 推送的位置。推送通道已移除——它自造了一套协议，
+		// 而本服务的对外契约只有 MCP。这里给出的信息量足够调用方决定
+		// 要不要真的去取：哪棵树往前跑了、从哪个 commit 开始跑的，
+		// 以及该用哪条命令取差量。
+		watchLines := formatWatchReport(s.watchReport(c))
+		if len(watchLines) > 0 {
+			text += "\nwatched:\n  " + strings.Join(watchLines, "\n  ")
+		}
+
 		// 同步状态只对全命名空间可见：远端列表与冲突路径属于跨项目信息。
 		syncLines := s.syncStatusLines(c)
 		if len(syncLines) > 0 {
@@ -2349,10 +2432,12 @@ func (s *Server) Clock() int64 {
 	return s.clock.Load()
 }
 
+// bumpClock 推进逻辑时钟。
+//
+// 时钟本身仍在用（/health、put、status 都会回报它），只是不再对外广播：
+// 广播通道已随 SSE 一起移除。它的语义仍是「有人写过东西」的单调计数。
 func (s *Server) bumpClock() int64 {
-	n := s.clock.Add(1)
-	s.bcast.Send("clock", fmt.Sprintf(`{"clock":%d}`, n))
-	return n
+	return s.clock.Add(1)
 }
 
 // ExecLine 执行一行记忆 DSL，返回文本结果。

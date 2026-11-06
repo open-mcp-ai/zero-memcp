@@ -18,7 +18,7 @@ grep <pattern> [--scope T]  search full text with a regular expression (exact sy
 log [N]                     timeline of recent memories
 ls [date]                   list memory entries for a date
 trees <project>[@<branch>]  view the tree directory
-remind [<tree>]             watch a tree and receive notifications when it changes
+remind [<tree>]             record interest in a tree; status then reports whether it moved
 since <tree> <commit|empty> retrieve tree changes since the last seen commit
 status                      index size
 
@@ -60,7 +60,7 @@ Several statements in one call:
 How to use:
   - recall something             -> recall
   - save new content             -> put
-  - watch changes to a tree      -> remind <tree>
+  - track whether a tree moved   -> remind <tree>, then status / since
   - move memory to another node  -> sync, then fetch / push
 
 help <verb>   show details for a verb
@@ -107,9 +107,9 @@ Example: since proj/memories@main/ctx/team 3f2a1b9
 remind [<project>[@<branch>[/<path>]]]
 
 Without arguments, list current watches; specify a tree path to watch it.
-When the subtree on that branch changes, online clients receive a tree event. After reconnecting, watch it again,
-then use the last saved commit/tree pointer to read incremental changes.
-remind only registers a watch; it does not move content or assign tasks.
+remind only records interest plus the current head as a baseline. It does not
+push anything: this service speaks MCP only. Use status to see whether a
+watched tree moved, and since <tree> <sha> to fetch the actual changes.
 
 Example:
   remind proj/memories@main/ctx/team

@@ -14,8 +14,8 @@
    - `put <tree> --ref <addr>`：在子树中追加已有记忆的引用，不重复复制正文。
 3. **指令与数据彻底分离**：严格遵循 Termcp 规范，`cmd` 只包含指令骨架，真实正文通过 `vars` 或 `args` 传入。未引用的变量直接报错，彻底避免正文拼接引发的命令注入与断句失真。
 4. **子树锚定与差分感知**：
-   - `remind [<tree>]`：将 Agent 的注意力锚定在特定子树上；
-   - 当该子树发生提交演进时，SSE 精准广播树更新事件；
+   - `remind [<tree>]`：登记「我关心这棵树」，并记下当前分支头作为基线；
+   - `status` 报出关注的树有没有往前跑，`since` 取真正的差量；
    - `since <tree> <commit>`：Agent 醒来后比对两次提交之间的子树差异，O(1) 忽略未修改的子树，只取回实际变动的切片。
 5. **写入只投递，封箱由策略决定**：
    - `put` 返回只表示「已进入单线程脏层写者队列」，不等待落盘也不提交；
@@ -126,7 +126,7 @@ go build -o zero-memcp ./cmd/zero-memcp
 | `log` | `log [N]` | 时间线追溯 |
 | `ls` | `ls [date]` | 按日期列出切片条目 |
 | `trees` | `trees <project>[@<branch>]` | 查看子树目录结构 |
-| `remind` | `remind [<tree>]` | 查看或锚定注意力到特定子树 |
+| `remind` | `remind [<tree>]` | 登记/查看关注的树（`status` 会报它动没动） |
 | `since` | `since <tree> <commit>` | 取回自某次提交以来的子树差分 |
 | `sync` | `sync <project> [<remote>]` | 检查与远端的记忆领先/落后差异 |
 | `fetch` | `fetch <project> [<remote>]` | 取回远端历史（不改动本地活动分支） |

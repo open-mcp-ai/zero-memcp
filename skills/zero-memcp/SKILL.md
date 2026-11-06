@@ -56,12 +56,12 @@ grep <pattern> [--scope T]   正则扫全文
 log [N]                      时间线
 ls [date]                    按天列
 trees <project>[@<branch>]   看树目录
-remind [<tree>]              锚定一棵树
+remind [<tree>]              登记关注的树
 since <tree> <commit>        取树差分
 status                       索引规模
 ```
 
-`remind` 只是**锚定**：那棵树变了就给你脉冲。它不搬正文、不分配任务、
+`remind` 只是**登记关注**：记下「我关心哪棵树」和当时的分支头。它不推送、不搬正文、不分配任务。
 不保证实时送达。真正的恢复靠 `since`——记住你上次读到的 commit，
 重连后换回差量；子树没动过时它返回空，代价是零。
 

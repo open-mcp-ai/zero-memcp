@@ -108,7 +108,9 @@ write:
 }
 
 func reqWith(tok string) *http.Request {
-	req := httptest.NewRequest(http.MethodGet, "/events", nil)
+	// 用 /health 构造一个带凭证的请求：它同样走 authenticate()，
+	// 但不依赖任何长连接语义（原来的 /events 已随 SSE 一起移除）。
+	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	req.RemoteAddr = "127.0.0.1:12345"
 	req.Header.Set("Authorization", "Bearer "+tok)
 	return req

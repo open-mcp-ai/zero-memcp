@@ -366,12 +366,6 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 			}
 		}
 
-		// 两端都推进了分支头：各自通知一次，锚定任一侧的人都要知道。
-		s.notifyTreeChange(srcProj, srcBranch, "")
-		if srcBranch != dstBranch || srcProj != dstProj {
-			s.notifyTreeChange(dstProj, dstBranch, "")
-		}
-
 		moved = append(moved, fmt.Sprintf("  %s@%s/%s -> %s@%s/%s", srcProj, srcBranch, srcPath, dstProj, dstBranch, target))
 	}
 
@@ -534,14 +528,22 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 		msg = fmt.Sprintf("mem: %s@%s manual commit of %d", proj, branch, count)
 	}
 
+	// 记下推进前的头，供事件携带（客户端拿它当 since 起点）。
+	prev, _ := repo.Resolve(branch)
+
 	sha, err := repo.Commit(branch, msg)
 	if err != nil {
 		return "", fmt.Errorf("commit failed: %w", err)
 	}
-	// 显式提交同样推进了分支头：锚定者必须收到脉冲，
-	// 否则「手动封箱」会变成一次无人知晓的静默变更。
+	// 更新观察水位：让关注这棵树的调用方下次 status 能看出它动过。
 	s.lastCommits.Store(treeHeadKey(proj, branch), sha)
-	s.notifyTreeChange(proj, branch, "")
+	// 广播资源变更。origin 如实带上写入方——客户端据此区分
+	// 「我自己写的」和「别人写的」，自激循环是否成立交给客户端策略决定。
+	s.publishTreeChange(proj, branch, "", prev, sha, EventOrigin{
+		Identity: c.Identity,
+		Session:  c.Session,
+		Endpoint: s.cfg.Endpoint,
+	})
 	// 不调用 s.Reload()！
 	//
 	// 踩过的坑：早先 commit 每次都调全量 Reload()，而 Reload() 会重新从

@@ -29,6 +29,13 @@ type Caller struct {
 	// JTI 是这张凭证的编号，写审计用。
 	JTI string
 
+	// Session 是调用方声明的会话标识（HTTP 头 X-Memcp-Session）。
+	//
+	// 它不参与鉴权，只用于事件溯源：资源变更事件带上 origin.session，
+	// 客户端据此判断「这次变更是不是我自己这一轮造成的」。没有它，
+	// 「自己写的记忆唤醒自己」就只能靠节流硬压，压不准。
+	Session string
+
 	// Gated 是这张凭证上被按住、需要临时授权才生效的能力位。
 	//
 	// 它不是「额外能力」，而是给 cap 已有的位加一道闸门：凭证声明
@@ -59,6 +66,14 @@ func hasCap(cap string, bit rune) bool {
 //  2. Query:  ?token=<jwt>
 //  3. 本机且未带 token：降级为 root（单机开发直连）
 func (s *Server) authenticate(r *http.Request) (Caller, error) {
+	// 会话标识在入口读一次，所有出口都带上。
+	//
+	// 只挂在 token 分支上是不够的：本机免签路径（未强制鉴权时降级为
+	// root）也照样写记忆、照样推进分支，于是它产生的事件没有 session，
+	// 客户端就无法判断「这次变更是不是我自己造成的」——自激循环的
+	// 第一道防线直接失效。实测就是这么漏的。
+	sess := strings.TrimSpace(r.Header.Get("X-Memcp-Session"))
+
 	token := ""
 	if authHdr := r.Header.Get("Authorization"); strings.HasPrefix(authHdr, "Bearer ") {
 		token = strings.TrimPrefix(authHdr, "Bearer ")
@@ -166,6 +181,9 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 			Mount:    NewMount(mount, s.defaultBranch),
 			Cap:      capStr,
 			JTI:      claims.JTI,
+			// 会话标识由客户端声明，只用于事件溯源，不参与鉴权。
+			// 它不在凭证里：会话是易变的，凭证是长期身份。
+			Session: sess,
 			Gated:    claims.Gated,
 		}, nil
 	}
@@ -181,8 +199,10 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 	}
 
 	if s.isLocal(r) && !s.cfg.EnforceAuth {
-		// 单机未强制鉴权时，降级为配置里的真实 root 用户（全能力、全命名空间）
-		return s.rootCaller(), nil
+		// 单机未强制鉴权时，降级为配置里的真实 root 用户（全能力、全命名空间）。
+		c := s.rootCaller()
+		c.Session = sess
+		return c, nil
 	}
 
 	return Caller{}, fmt.Errorf("authorization credential missing (provide Authorization: Bearer <jwt>)")

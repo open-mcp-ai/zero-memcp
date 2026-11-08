@@ -185,11 +185,12 @@ func TestRemoteKeyFilePermissions(t *testing.T) {
 // callMCPWithVars 把正文放进 vars，验证「数据与指令分离」在 push 路径上也成立。
 func callMCPWithVars(t *testing.T, srv *Server, token, cmd string, vars map[string]string) (string, error) {
 	t.Helper()
+	cmd, _, args := legacyToNative(cmd)
 	payload, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
 			"name":      "term",
-			"arguments": map[string]any{"cmd": cmd, "vars": vars},
+			"arguments": map[string]any{"cmd": cmd, "vars": vars, "args": args},
 		},
 	})
 	if err != nil {

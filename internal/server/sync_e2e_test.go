@@ -91,7 +91,7 @@ auto_sync = true
 
 	// 1. 本地写入达到 count=1 → maintain.go 折叠 → kickSync → 推给 GitHub
 	// 用 put 动词写（走真实写路径）
-	_, err = srv.execTerm("put daily@main.record/record/laptop-1.md -- written from laptop", Viewer{}, rootCaller())
+	_, err = srv.execTermVars("put daily@main.record/record/laptop-1.md $1", nil, []string{"written from laptop"}, Viewer{}, rootCaller())
 	if err != nil {
 		t.Fatalf("put: %v", err)
 	}

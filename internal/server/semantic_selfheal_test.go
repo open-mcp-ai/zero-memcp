@@ -130,7 +130,7 @@ func TestSemanticSelfHealsAfterOutage(t *testing.T) {
 	flaky.SetDown(true)
 	flaky.calls.Store(0)
 	// 用 put 写入，服务自己会更新内存树快照 + 调用 kickSemantic
-	_, perr := srv.execTerm("put daily@main.record/thought/c.md -- written during outage", Viewer{}, rootCaller())
+	_, perr := srv.execTermVars("put daily@main.record/thought/c.md $1", nil, []string{"written during outage"}, Viewer{}, rootCaller())
 	if perr != nil {
 		t.Fatalf("put during outage: %v", perr)
 	}

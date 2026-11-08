@@ -10,8 +10,8 @@ func helpOverview() string {
 	return strings.TrimSpace(`
 zero-memcp: persistent memory. Writes are stored locally and remain available after restart.
 
-put [<tree>] -- $TEXT        write content to a memory tree (pass content through vars/args, separately from the DSL)
-put <tree> --ref <addr>      add a reference to existing memory in a tree without copying its content
+put [<tree>] $TEXT           write content to a memory tree (content comes through vars/args, never inline)
+ref <tree> <addr>            add a reference to existing memory in a tree without copying its content
 recall <text> [--scope tree] semantic search; searches long-term memory by default, with an optional scope
 read <addr> [<addr>...]     read full text; accepts multiple addresses
 grep <pattern> [--scope T]  search full text with a regular expression (exact symbols, names, numbers)
@@ -34,17 +34,16 @@ push requires an explicitly named branch; it does not commit or force-push for y
 
 Commands for maintaining memory structure (not needed for routine reading and writing):
 commit [<p>[@<br>]] [-m msg]   explicitly fold the dirty layer into history
-diff <p>@<br> [-> <p>@<br>]    compare branch differences (for auditing)
+diff <p>@<br> [--to <p>@<br>] compare branch differences (for auditing)
 branch [<p> [<new> [from s]]]  list or fork branches
 tag [-d] <p> [<name> [<ref>]]  lightweight tag
-cp / mv <src> -> <dst>         transfer entries across branches
+cp / mv <src> --to <dst>       transfer entries across branches
 delete <p>@<br>/<path>...      delete entries
 archive <p>@<br>               archive a branch
 reset <p>@<br> from <src>      reset a branch to another branch
 lock / unlock <p>@<br>         lock/unlock a branch (suspend non-root access)
 chmod <p>@<br>/<path> mode     change rule/content mode
-write <p>@<br>/<path> -- text  write an exact file (for rules only; root required)
-batch {"ops":[...]}            atomic batch (combine multiple steps into one commit)
+write <p>@<br>/<path> $TEXT   write an exact file (for rules only; root required)
 
 Several statements in one call:
   Separate verbs with ';' or a newline to run them in one round trip.
@@ -54,8 +53,9 @@ Several statements in one call:
       recall q --scope p@fact || recall q --scope p@record || recall q --scope p@thought
   "Found something" means hits, not exit status: a search that legitimately
   matches nothing is not an error. A real error stops the chain either way.
-  Content passed after '--' is data and is never split, so a ';' inside a body
-  stays in the body. Put the operator next to a space, and pass text via vars.
+  Content ALWAYS travels through vars/args as a variable reference ($TEXT or $1):
+  the protocol refuses an inline body outright. A ';' inside a value stays in
+  that value, because values are spliced in and never re-read as syntax.
 
 How to use:
   - recall something             -> recall
@@ -73,21 +73,35 @@ func helpVerb(verb string) (string, bool) {
 	switch verb {
 	case "put":
 		return strings.TrimSpace(`
-put [<tree>] -- $TEXT
-put <tree> --ref <addr>
+put [<tree>] $TEXT
+ref <tree> <addr>
 
 Store content in a memory tree. If no target is given, the service chooses a default destination based on the stream declaration in SKILL.md;
 when a tree path is specified, content is written as a new entry in that subtree.
 
 Pass text separately from cmd through Termcp vars / args:
-  cmd:  put notes/todo -- $TEXT
+  cmd:  put notes/todo $TEXT
   vars: {"TEXT":"content can include spaces, newlines, and --"}
 
 Reference mode does not copy content:
-  cmd: put notes/todo --ref $1
+  cmd: ref notes/todo $1
   args: ["memories/2026-08-03/123456-local.md"]
 
 The address returned by put is a stable file reference. Writes enter the single-writer dirty layer and are immediately searchable; policy or commit folds them into history.
+`), true
+
+	case "ref":
+		return strings.TrimSpace(`
+ref <tree> <addr>
+
+Add a reference to an existing memory entry without copying its content.
+The new entry records the address instead of the bytes, so the source can be
+committed, archived or expired without duplicating it.
+
+cmd:  ref notes/todo $1
+args: ["memories/2026-08-03/123456-local.md"]
+
+Write permission on <tree> and read permission on <addr> are both required.
 `), true
 
 	case "since":
@@ -159,7 +173,7 @@ Example: chmod proj/notes@main/rules/01.md rule
 
 	case "remote-secret":
 		return strings.TrimSpace(`remote-secret list
-remote-secret put <name> -- $TOKEN
+remote-secret put --name <name> $TOKEN
 remote-secret delete <name>
 
 Root manages tokens for HTTP push. Stored in system/secrets/<name> (0600); only the name is shown, never the contents.
@@ -171,13 +185,13 @@ Example: remote-secret put gh -- $TOKEN
 
 	case "remote-key":
 		return strings.TrimSpace(`remote-key list
-remote-key put <name> -- $PRIVATE_KEY
+remote-key put --name <name> $PRIVATE_KEY
 remote-key delete <name>
 
 Only root can pass a private key through vars/args. It is stored in system/sshkeys/<name>.pem (0600) and never echoed.
 Only unencrypted OpenSSH PEM private keys are accepted. Configure the remote host_key = "SHA256:..." fingerprint.
 
-Example: remote-key put github-deploy -- $KEY
+Example: remote-key put --name github-deploy $KEY
 `), true
 
 	case "remote", "fetch", "push", "sync", "merge":
@@ -342,7 +356,7 @@ Example: commit
 	case "diff":
 		return strings.TrimSpace(`
 diff <project>@<branch>
-diff <project>@<branch> -> <project>@<branch>
+diff <project>@<branch> --to <project>@<branch>
 
 Branch comparison: list path differences between the two sides.
 
@@ -456,30 +470,7 @@ Pass content through vars/args as well:
   cmd:  write proj/notes@main/SKILL.md -- $BODY
   vars: {"BODY": "---\nname: me\n---\n"}
 
-Example: write proj/notes@main/rules/01.md -- $TEXT
-`), true
-
-	case "batch":
-		return strings.TrimSpace(`
-batch {"ops":[{...}, ...]}
-
-Combine multiple write operations into one commit.
-
-Why: when transferring a batch of entries,
-executing them individually creates many intermediate commits, fragments history, and may leave partial state if an operation fails.
-batch either succeeds completely or makes no changes.
-
-Supported operations: put / cp / mv / delete / tag / commit.
-
-Field names are action / target, not op / addr:
-  {"action":"put","target":"proj@main","text":"..."}
-  {"action":"delete","target":"proj@main/x.md"}
-  {"action":"cp","from":"proj@main/a.md","to":"proj@main/b.md"}
-  {"action":"mv","from":"proj@main/a.md","to":"proj@main/b.md"}
-  {"action":"tag","project":"proj","name":"v1","ref":"main"}
-  {"action":"commit","target":"proj@main","message":"..."}
-
-Example: batch {"ops":[{"action":"delete","target":"proj@main/x.md"},{"action":"commit","target":"proj@main"}]}
+Example: write proj/notes@main/rules/01.md $TEXT
 `), true
 
 	case "config":
@@ -540,7 +531,7 @@ func helpAll() string {
 	var b strings.Builder
 	b.WriteString(helpOverview())
 	b.WriteString("\n\n")
-	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "merge", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "batch", "config", "reload", "whoami", "users", "help"} {
+	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "ref", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "merge", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "config", "reload", "whoami", "users", "help"} {
 		if d, ok := helpVerb(v); ok {
 			b.WriteString("\n-- " + v + " ")
 			b.WriteString(strings.Repeat("-", max(0, 60-len(v))))

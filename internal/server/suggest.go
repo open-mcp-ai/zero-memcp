@@ -6,7 +6,7 @@ package server
 // 会把用户引向一个必然失败的调用；少写一个，则拼错时得不到提示。
 var knownVerbs = []string{
 	"help", "recall", "read", "grep", "log", "ls", "put", "trees", "remind", "status",
-	"commit", "diff", "batch", "branch", "tag", "cp", "mv", "delete", "chmod",
+	"commit", "diff", "branch", "tag", "cp", "mv", "delete", "chmod",
 	"lock", "unlock", "archive", "reset", "write", "config", "reload", "whoami",
 	"users", "since", "fetch", "remote", "remote-key", "remote-secret", "push", "sync",
 }

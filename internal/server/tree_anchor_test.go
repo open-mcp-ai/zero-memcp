@@ -100,6 +100,16 @@ mode  = "rwx------"
 
 func callMCPRaw(t *testing.T, srv *Server, tok string, callBody map[string]any) (string, error) {
 	t.Helper()
+	// 脚手架翻译：把 cmd 换成原生语法，并把额外 args 合进 arguments。
+	if params, ok := callBody["arguments"].(map[string]any); ok {
+		if c, ok := params["cmd"].(string); ok {
+			nc, _, extra := legacyToNative(c)
+			params["cmd"] = nc
+			if len(extra) > 0 {
+				params["args"] = extra
+			}
+		}
+	}
 	p, err := json.Marshal(callBody)
 	if err != nil {
 		t.Fatal(err)

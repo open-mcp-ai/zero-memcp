@@ -102,7 +102,7 @@ func TestPutThenRecall(t *testing.T) {
 
 	body := "记忆体的一句话：先落盘，再确认。含 -- 也不该被截断。"
 	args, err := json.Marshal(map[string]any{
-		"cmd":  "put -- $TEXT",
+		"cmd":  "put $TEXT",
 		"vars": map[string]string{"TEXT": body},
 	})
 	if err != nil {

@@ -160,7 +160,7 @@ func TestListenHandshakeAndEvent(t *testing.T) {
 	}
 
 	// 2. 写入并提交
-	if _, err := srv.execTerm("put daily@zero/team -- hello", Viewer{}, srv.rootCaller()); err != nil {
+	if _, err := srv.execTermVars("put daily@zero/team $1", nil, []string{"hello"}, Viewer{}, srv.rootCaller()); err != nil {
 		t.Fatal(err)
 	}
 	repo, _ := srv.projects.Get("daily")
@@ -169,7 +169,7 @@ func TestListenHandshakeAndEvent(t *testing.T) {
 	}
 	prev, _ := repo.Resolve("zero")
 	// 再写一次产生真正的前进
-	if _, err := srv.execTerm("put daily@zero/team -- hello2", Viewer{}, srv.rootCaller()); err != nil {
+	if _, err := srv.execTermVars("put daily@zero/team $1", nil, []string{"hello2"}, Viewer{}, srv.rootCaller()); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := repo.Commit("zero", "test2"); err != nil {

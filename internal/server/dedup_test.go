@@ -22,7 +22,7 @@ name = "alice"
 root = true
 `)
 
-	res1, err := s.ExecLine(context.Background(), "put @sess-1 -- 太阳从东边升起")
+	res1, err := s.ExecLineVars(context.Background(), "put --session sess-1 $1", nil, []string{"太阳从东边升起"})
 	if err != nil {
 		t.Fatalf("第一次写入失败: %v", err)
 	}
@@ -33,7 +33,7 @@ root = true
 	path1 := strings.TrimPrefix(addr1, "ok ")
 
 	// 第二次写一模一样的（同 kind、同 session、同 text）
-	res2, err := s.ExecLine(context.Background(), "put @sess-1 -- 太阳从东边升起")
+	res2, err := s.ExecLineVars(context.Background(), "put --session sess-1 $1", nil, []string{"太阳从东边升起"})
 	if err != nil {
 		t.Fatalf("第二次写入失败: %v", err)
 	}
@@ -45,7 +45,7 @@ root = true
 	}
 
 	// 换个 session 应该作为新记录
-	res3, err := s.ExecLine(context.Background(), "put @sess-2 -- 太阳从东边升起")
+	res3, err := s.ExecLineVars(context.Background(), "put --session sess-2 $1", nil, []string{"太阳从东边升起"})
 	if err != nil {
 		t.Fatalf("第三次写入失败: %v", err)
 	}
@@ -88,7 +88,7 @@ mode  = "rwx------"
 	}
 
 	srv := open()
-	first, err := srv.ExecLine(context.Background(), "put -- 重启也要记得这条")
+	first, err := srv.ExecLineVars(context.Background(), "put $1", nil, []string{"重启也要记得这条"})
 	if err != nil {
 		t.Fatalf("首次写入失败: %v", err)
 	}
@@ -96,7 +96,7 @@ mode  = "rwx------"
 
 	srv2 := open()
 	defer srv2.Close()
-	second, err := srv2.ExecLine(context.Background(), "put -- 重启也要记得这条")
+	second, err := srv2.ExecLineVars(context.Background(), "put $1", nil, []string{"重启也要记得这条"})
 	if err != nil {
 		t.Fatalf("重启后写入失败: %v", err)
 	}

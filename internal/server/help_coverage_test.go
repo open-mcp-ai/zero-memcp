@@ -18,7 +18,7 @@ func TestEveryDispatchedVerbHasHelp(t *testing.T) {
 		"help", "recall", "read", "put", "remind", "trees", "since",
 		"remote-key", "remote-secret", "remote", "fetch", "push", "sync",
 		"branch", "tag", "cp", "mv", "chmod", "delete",
-		"lock", "unlock", "archive", "reset", "batch", "diff",
+		"lock", "unlock", "archive", "reset", "diff", "ref",
 		"commit", "write", "config", "reload", "whoami", "users", "status", "grep", "log", "ls",
 	}
 
@@ -35,24 +35,9 @@ func TestEveryDispatchedVerbHasHelp(t *testing.T) {
 }
 
 // help --all 必须把每个有词条的动词都带上，而不是漏掉几个。
-func TestHelpBatchExampleUsesRealJSONFields(t *testing.T) {
-	detail, ok := helpVerb("batch")
-	if !ok {
-		t.Fatal("batch help entry missing")
-	}
-	for _, key := range []string{`"action"`, `"target"`} {
-		if !strings.Contains(detail, key) {
-			t.Errorf("batch help example must include %s", key)
-		}
-	}
-	if strings.Contains(detail, `"op"`) || strings.Contains(detail, `"addr"`) {
-		t.Fatal("batch help example uses obsolete fields op/addr")
-	}
-}
-
 func TestHelpAllCoversEveryVerb(t *testing.T) {
 	all := helpAll()
-	for _, v := range []string{"commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "batch", "write", "grep"} {
+	for _, v := range []string{"commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "ref", "write", "grep"} {
 		if !strings.Contains(all, "-- "+v+" ") {
 			t.Errorf("help --all 缺少 %q 的章节", v)
 		}

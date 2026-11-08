@@ -38,9 +38,12 @@ term({cmd: "recall 端口为什么定1729"})
 正文**不要拼进 `cmd`**，用 `vars` / `args`：
 
 ```json
-{"cmd": "put team/chat -- $TEXT",
+{"cmd": "put team/chat $TEXT",
  "vars": {"TEXT": "一段可以含空格、换行、-- 的正文"}}
 ```
+
+正文**只能**是一个变量引用。服务端不接受内联正文（`put team/chat 一段话`
+会被协议层拒绝），因为那等于让同一行被两套语法读。
 
 引用必须独占一个词。传了不用的参数会被拒绝——静默丢掉一个参数，
 调用方会以为它生效了。
@@ -48,8 +51,8 @@ term({cmd: "recall 端口为什么定1729"})
 ## 动词
 
 ```
-put [<tree>] -- $TEXT        写入记忆（正文走 vars/args）
-put <tree> --ref <addr>      在树里追加已有记忆的引用，不复制正文
+put [<tree>] $TEXT           写入记忆（正文是一个变量引用，走 vars/args）
+ref <tree> <addr>            在树里追加已有记忆的引用，不复制正文
 recall <text> [--scope T]    语义回想
 read <addr> [<addr>...]      读全文
 grep <pattern> [--scope T]   正则扫全文

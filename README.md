@@ -9,8 +9,8 @@
 
 1. **结构中立的记忆树**：没有额外的「主题」「频道」或「消息总线」概念。树上的路径（如 `team/chat`、`notes`）即为语义域。
 2. **多态原语 `put`**：
-   - `put -- $TEXT`：写入默认流水记忆树，按时间自动分片；
-   - `put <tree> -- $TEXT`：写入指定的子树；
+   - `put $TEXT`：写入默认流水记忆树，按时间自动分片；
+   - `put <tree> $TEXT`：写入指定的子树；
    - `put <tree> --ref <addr>`：在子树中追加已有记忆的引用，不重复复制正文。
 3. **指令与数据彻底分离**：严格遵循 Termcp 规范，`cmd` 只包含指令骨架，真实正文通过 `vars` 或 `args` 传入。未引用的变量直接报错，彻底避免正文拼接引发的命令注入与断句失真。
 4. **子树锚定与差分感知**：
@@ -85,7 +85,7 @@ go build -o zero-memcp ./cmd/zero-memcp
 {
   "name": "term",
   "arguments": {
-    "cmd": "put team/chat -- $TEXT",
+    "cmd": "put team/chat $TEXT",
     "vars": {
       "TEXT": "今天完成记忆体核心架构收敛：纯粹的 Merkle 树模型，取消独立总线。"
     }
@@ -118,7 +118,7 @@ go build -o zero-memcp ./cmd/zero-memcp
 
 | 动词 | 用法 | 说明 |
 |---|---|---|
-| `put` | `put [<tree>] -- $TEXT` | 写入正文，投递至脏层并立即返回确认 |
+| `put` | `put [<tree>] $TEXT` | 写入正文，投递至脏层并立即返回确认 |
 | `put` | `put <tree> --ref <addr>` | 追加已有记忆的稳定指针 |
 | `recall` | `recall <text> [--scope <tree>]` | 语义联想与回想，返回内容摘要与匹配度 |
 | `read` | `read <addr> [...]` | 细读一个或多个具体切片 |

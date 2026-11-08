@@ -6,6 +6,7 @@
 package server
 
 import (
+	"github.com/open-mcp-ai/termcp/term"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1314,24 +1315,14 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 		return nil, fmt.Errorf("parse term arguments: %w", err)
 	}
 
-	// 参数替换发生在任何动词分发之前，且只做一次。
+	// 变量替换现在只发生在一处：termcp 的 Subst（execTermVars 内）。
 	//
-	// 替换后的文本不再被当作模板重新展开：否则值里一个 $NAME 会变成
-	// 第二次替换的入口，等于把数据提升成指令。
+	// 早先这里先跑 expandArgs 把 $BODY 换成 base64 原子，再交给解析器；
+	// 换到 termcp 之后这一步必须删掉——否则引用在到达解析器之前就被
+	// 消费掉了，termcp 只看到一个 base64 原子，于是把原子当内联正文
+	// 提升为 $1，调用方传的 vars 成了「传了但没人引用」，报
+	// "cmd never references $BODY"。两套替换机制并存必然打架，只留一套。
 	cmd := a.Cmd
-	if len(a.Args) > 0 || len(a.Vars) > 0 {
-		expanded, err := expandArgs(a.Cmd, a.Vars, a.Args)
-		if err != nil {
-			return nil, err
-		}
-		cmd = expanded
-	} else if strings.Contains(a.Cmd, "$") {
-		// 没给参数表却写了引用：拒绝，而不是把它当字面量。
-		// 静默保留 $1 会让调用方以为参数生效了。
-		if _, err := expandArgs(a.Cmd, nil, nil); err != nil {
-			return nil, err
-		}
-	}
 
 	wantText := true
 	if a.Content != nil {
@@ -1357,18 +1348,34 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	// A line of several statements is several capabilities. Reading only the
 	// leading verb would let "recall x; put y" through a read-only port: the
 	// write would run while the policy only ever looked at "recall".
-	for _, stmt := range splitStatements(cmd) {
-		verb := verbOf(stmt)
-		if verb == "" {
-			continue
-		}
-		if blk, ok := portPolicyFrom(ctx); ok && !allowedOnPort(blk, verb) {
-			return nil, portError(blk, verb)
+	// 用**同一个**解析器检查，与实际执行同源。
+	//
+	// 早先这里调 splitStatements（自有切分器），而 execTerm 内部用的是
+	// 它自己那套；两套解析器对同一行的理解可以不同，于是策略看的语句
+	// 与真正执行的语句可能不是同一组——这类不一致只在被利用时才显形。
+	// 现在检查与执行都走 termcp 的 Parse。
+	probe, _ := s.newTerm(Viewer{Channel: "mcp"}, c)
+	plan, perr := probe.Parse(cmd, term.Subst{})
+	if perr != nil {
+		// 语法错误交给 execTerm 去报（那里有完整的 usage 提示），
+		// 这里不重复判断——但语法不通的行不可能绕过策略。
+		plan = nil
+	}
+	if plan != nil {
+		if blk, ok := portPolicyFrom(ctx); ok {
+			for _, st := range plan.Statements {
+				if st.Op == "" {
+					continue
+				}
+				if !allowedOnPort(blk, st.Op) {
+					return nil, portError(blk, st.Op)
+				}
+			}
 		}
 	}
 
 	viewer := Viewer{Channel: "mcp"}
-	out, err := s.execTerm(cmd, viewer, c)
+	out, err := s.execTermVars(cmd, a.Vars, a.Args, viewer, c)
 	if err != nil {
 		return nil, err
 	}
@@ -1472,73 +1479,83 @@ type TermResult struct {
 //
 // The empty command still returns the overview: with nothing to split, the
 // single-statement path is what answers it.
+// execTerm 执行一条 TERM/1 命令行。
+//
+// 协议层（语法解析、`;`/`&&`/`||` 切分与短路、208 已报告标记、slot 对齐、
+// 变量注入、payload 边界防护）全部由 open-mcp-ai/termcp/term 提供。
+// 这里只做两件事：把整行交给 Term，再把回复渲染成两种投影。
+//
+// 早先这里是自己实现的（statements.go 的切分器 + 本函数的短路循环）。
+// 换掉的理由不是「自己的不好」，而是那部分逻辑就是协议本身：每种语言
+// 都该只有一个解析器，否则 slot 对齐、跳过分枝的状态码、`&&` 的门槛
+// 迟早会在两处实现里长成两种含义。
 func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
-	stmts := splitStatementsWithOps(line)
-	if len(stmts) <= 1 {
-		return s.execStatement(line, v, c)
+	return s.execTermVars(line, nil, nil, v, c)
+}
+
+// execTermVars 是带 vars/args 注入的执行入口。
+func (s *Server) execTermVars(line string, vars map[string]string, args []string, v Viewer, c Caller) (TermResult, error) {
+	// 变量注入：vars/args 的值进 Subst，DSL 里只留引用。
+	//
+	// 注入发生在解析之前，所以值里有什么字符都不会变成语法——
+	// 这是「正文永不参与解析」的实现方式，由协议层的 PayloadVar
+	// 声明强制（payload 必须恰好是一个引用）。
+	// 复合凭据动词的 list / delete 走直通：它们不带正文、不需要变量展开，
+	// 且子动词不是单独的 Op（remote-key put 需要 payload，而 list/delete 不需要，
+	// 放在同一个 Op 里会被 PayloadVar 规则要求提供变量）。
+	trimmed := strings.TrimSpace(line)
+	// 凭据动词的 list / delete 子命令直送执行层。
+	//
+	// 原因：`remote-key` 是一个 Op，但它的三个子命令形态不同——put 带正文
+	// （PayloadVar 要求必须有 payload），list / delete 没有正文。一个 Op
+	// 声明不了两种形态，所以无正文的那两个绕开语法层。
+	// 它们不带正文、不含变量、不需要链式，直送是安全的。
+	for _, pfx := range []string{"remote-key list", "remote-key delete", "remote-secret list", "remote-secret delete"} {
+		if strings.HasPrefix(trimmed, pfx) {
+			res, err := s.execStatement(trimmed, v, c)
+			if err != nil {
+				return TermResult{}, err
+			}
+			return res, nil
+		}
 	}
 
-	var text strings.Builder
-	results := make([]any, 0, len(stmts))
-	wrote := false
+	t, h := s.newTerm(v, c)
 
-	// truthy is the accumulated result of the chain so far, in the sense above.
-	truthy := true
-	for i, st := range stmts {
-		run := true
-		switch st.Op {
-		case "&&":
-			run = truthy
-		case "||":
-			run = !truthy
-		}
-		if !run {
-			// Skipped: it keeps the chain's truth value, exactly as shell would
-			// keep the exit status of the branch that did not run.
-			results = append(results, map[string]any{
-				"statement": st.Cmd,
-				"verb":      verbOf(st.Cmd),
-				"op":        st.Op,
-				"skipped":   true,
-			})
-			continue
-		}
-
-		res, err := s.execStatement(st.Cmd, v, c)
-		if err != nil {
-			return TermResult{}, fmt.Errorf("statement %d of %d (%q): %w", i+1, len(stmts), verbOf(st.Cmd), err)
-		}
-		truthy = !res.Empty
-
-		if wrote {
-			text.WriteString("\n\n")
-		}
-		wrote = true
-		// Name the statement above its result.
-		//
-		// Without it the blocks run together and the one fact the caller needs -
-		// which layer a hit came from - is lost: addresses are virtualised, so
-		// "za/2026-11-03/...md" does not say fact from thought. It costs a short
-		// line per statement and buys back the whole point of asking per layer.
-		text.WriteString(describeStatement(st.Cmd))
-		text.WriteString("\n")
-		text.WriteString(res.Text)
-		results = append(results, map[string]any{
-			"statement": st.Cmd,
-			"verb":      verbOf(st.Cmd),
-			"op":        st.Op,
-			"empty":     res.Empty,
-			"text":      res.Text,
-			"result":    res.Structured,
-		})
+	// 旧语法（put <tree> -- 正文）在这里规整成 termcp 标准的变量引用，
+	// 同时把 vars/args 装配成 Subst。参见 term_compat.go。
+	normalized, sub, err := normalizeTermInput(line, vars, args)
+	if err != nil {
+		return TermResult{}, err
 	}
-	return TermResult{
-		Text: text.String(),
-		Structured: map[string]any{
-			"statements": results,
-			"count":      len(results),
-		},
-	}, nil
+
+	// 语法错误必须在任何动词执行之前返回。
+	//
+	// Parse 拿到整行并给出全部语句（含被跳过的分支），因此校验发生在
+	// 副作用之前；这是协议的分层，不是这里的顺序约定。
+	file, err := t.Parse(normalized, sub)
+	if err != nil {
+		return TermResult{}, err
+	}
+
+	reply := t.Run(context.Background(), file)
+
+	// 动词失败仍以 error 形式返回，保持调用方契约不变。
+	//
+	// TERM/1 把失败表达为信封里的 4xx/5xx slot（那是协议的正确形态），
+	// 但 zero-memcp 的调用方（MCP 客户端、扩展、CLI）一直靠 error 判断
+	// 「这条命令没成功」。两者不必二选一：信封给协议，error 给 Go 侧。
+	// 早先只返回 slot 时，二十多个「应被拒绝」的权限测试全部翻红——
+	// 拒绝确实发生了，只是从 error 变成了 400，而调用方看不见。
+	// 只把「真错误」转成 error。404 是 zero-memcp 的未命中信号
+	// （`||` 靠它触发回退），它是正常答案，不是错误——保留在
+	// TermResult.Empty 里给调用方分支。
+	for _, sl := range reply.Slots {
+		if sl.Code >= 400 && sl.Code != 404 {
+			return TermResult{}, errors.New(strings.TrimSpace(sl.Body))
+		}
+	}
+	return renderReply(reply, h), nil
 }
 
 // execStatement runs exactly one statement.
@@ -1900,13 +1917,13 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		out, err := s.execReset(rest, c)
 		return TermResult{Text: out}, err
 
-	case "batch":
-		// batch {"ops":[{...}]}
-		out, err := s.execBatch(rest, c, defaultBranch)
-		return TermResult{Text: out}, err
+	case "ref":
+		// ref <tree> <addr>：在树里追加一条指向已有切片的引用（不复制正文）。
+		out, err := s.execRef(rest, c)
+		return TermResult{Text: out.Text, Structured: out.Structured}, err
 
 	case "diff":
-		// diff <project>@<branch>  或  diff a@br -> b@br
+		// diff <project>@<branch>  或  diff a@br --to b@br
 		out, err := s.execDiff(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
@@ -2446,9 +2463,19 @@ func (s *Server) bumpClock() int64 {
 // 无端口策略约束直接跑一条动词。宿主如果自己已经做了鉴权，就不需要
 // 再走一遍 HTTP 中间件；如果它需要收窄，可以通过带上下文的变种调。
 func (s *Server) ExecLine(ctx context.Context, line string) (string, error) {
+	return s.ExecLineVars(ctx, line, nil, nil)
+}
+
+// ExecLineVars 是带 vars/args 的嵌入式入口。
+//
+// 嵌入方（pkg/zeromem）必须走这里而不是先自行展开再传整行：
+// 展开与解析现在都在 termcp 的 Subst 里做，两套并存会把值替换两次
+// （第一次得到 base64 原子，第二次把原子当内联正文再编码一次），
+// 存进库的是原子串而不是原文——实测 recall 因此找不到刚写的内容。
+func (s *Server) ExecLineVars(ctx context.Context, line string, vars map[string]string, args []string) (string, error) {
 	c := s.rootCaller()
 	viewer := Viewer{Channel: "embedded"}
-	res, err := s.execTerm(line, viewer, c)
+	res, err := s.execTermVars(line, vars, args, viewer, c)
 	if err != nil {
 		return "", err
 	}

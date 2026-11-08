@@ -579,3 +579,34 @@ func (s *Server) execSince(rest string, c Caller) (TermResult, error) {
 		},
 	}, nil
 }
+
+// execRef 实现引用写入：`ref [<tree>] @<session> <addr>`。
+//
+// 为什么它是独立动词而不是 `put --ref`：termcp 的 PayloadVar 要求 payload
+// 必须存在，而引用写入没有正文。一个 Op 声明不了「有正文」和「无正文」
+// 两种形态，硬塞在一起就只能放弃 PayloadVar——那等于放弃协议层对正文
+// 边界的强制。拆开之后 put 走 PayloadVar，ref 走位置参数，各归各的。
+func (s *Server) execRef(rest string, c Caller) (TermResult, error) {
+	if !c.canWrite() {
+		return TermResult{}, fmt.Errorf("credential lacks w capability")
+	}
+	var session string
+	var positional []string
+	for _, tok := range strings.Fields(rest) {
+		if strings.HasPrefix(tok, "@") && !strings.Contains(tok, "/") {
+			session = strings.TrimPrefix(tok, "@")
+			continue
+		}
+		positional = append(positional, tok)
+	}
+	// 最后一个非会话词是引用源，其余（若有）是落点树。
+	//
+	// 顺序固定，不能用「含不含斜杠」去猜：地址与树路径都可能含斜杠，
+	// 猜错就把引用写进了错误的树。`ref <addr>`（缺省树）也由这条覆盖。
+	if len(positional) == 0 {
+		return TermResult{}, errors.New("usage: ref <tree> <addr>")
+	}
+	refAddr := positional[len(positional)-1]
+	tree := strings.Join(positional[:len(positional)-1], " ")
+	return s.putRef(tree, refAddr, session, c)
+}

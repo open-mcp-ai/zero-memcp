@@ -270,7 +270,7 @@ Git 里没有中心/边缘 —— 每个仓库对等，能 push 还是只能 fet
 ## 十、未来方向
 
 - **`lock` / `archive` / `reset` 的分支生命周期**：`lock` 在仓库本地元数据里标记分支，暂停派生凭证访问；root 处理并审阅后 `unlock` 或 `archive`。进程生命周期由 termcp 管理，记忆服务不杀进程也不替用户吊销 token。
-- **审计闭环**：脏流分支 → 只读审计 Agent → `diff` 提取未审 → `batch` 原子决议（提纯入主干、载荷隔离到 `private/quarantine`、推进水位 tag）；
+- **审计闭环**：脏流分支 → 只读审计 Agent → `diff` 提取未审 → 逐条决议（`;` 链式调用，提纯入主干、载荷隔离到 `private/quarantine`、推进水位 tag）；
 - **center / edge 拓扑**：中心节点存密钥推上游，边缘节点只实现 `upload-pack`（只读 HTTP Git 已就绪）；
 - **termcp 通道**：工具结果自动落脏流，实现「执行即记录」。
 

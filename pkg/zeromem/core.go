@@ -100,11 +100,9 @@ func (c *Core) call(ctx context.Context, args json.RawMessage) (string, error) {
 	if err := json.Unmarshal(args, &a); err != nil {
 		return "", fmt.Errorf("parse mem arguments: %w", err)
 	}
-	cmd, err := server.ExpandArgs(a.Cmd, a.Vars, a.Args)
-	if err != nil {
-		return "", err
-	}
-	return c.srv.ExecLine(ctx, cmd)
+	// vars/args 原样透传：展开在 termcp 的 Subst 里做。
+	// 早先这里先跑 ExpandArgs 再把整行交给 ExecLine，结果正文被编码两次。
+	return c.srv.ExecLineVars(ctx, a.Cmd, a.Vars, a.Args)
 }
 
 // Close 停止后台维护并释放资源。

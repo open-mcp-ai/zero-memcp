@@ -2,6 +2,8 @@ package server
 
 import (
 	"fmt"
+	"io"
+	"net/http"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -284,5 +286,73 @@ mode  = "rwx------"
 	}
 	if got, _ := repo.Resolve("zero"); got != seed {
 		t.Fatalf("拒绝之后远端历史必须保持 %s，实际 %s", seed, got)
+	}
+}
+
+// 不存在的项目必须 404，不能报成 403「不在可见范围」。
+//
+// 受影响的第一个场景就是 peer 同步：新节点入网时对端仓库经常还不存在，
+// 报 403 会让人去查 token、挂载、cap，而真因是「对端还没写过东西」。
+func TestGitHTTPMissingProjectIs404(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dataDir := t.TempDir()
+	cfg := fmt.Sprintf(`
+[server]
+data = %q
+
+[[user]]
+name = "zero"
+root = true
+
+[[listen]]
+addr  = "127.0.0.1:0"
+allow = ["*", "git-upload-pack", "git-receive-pack"]
+
+[[project]]
+name  = "daily"
+owner = "zero"
+mode  = "rwx------"
+`, dataDir)
+	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := gitstore.Init(filepath.Join(dataDir, "repos", "daily.git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Write("zero", "init.md", []byte("种子\n"), gitstore.ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Commit("zero", "seed"); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(Config{
+		DataDir:     dataDir,
+		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
+		EnforceAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Start() }()
+	defer srv.Close()
+	addr := waitForServerAddr(t, srv)
+
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "reader", Cap: "rwx"})
+
+	for _, project := range []string{"daily/not-yet", "no-such-project"} {
+		url := fmt.Sprintf("http://zero:%s@%s/repos/%s.git/info/refs?service=git-upload-pack", tok, addr, project)
+		resp, err := http.Get(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Errorf("项目 %q 不存在时应返回 404，得到 %d: %s", project, resp.StatusCode, strings.TrimSpace(string(body)))
+		}
 	}
 }

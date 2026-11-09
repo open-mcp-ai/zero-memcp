@@ -135,6 +135,7 @@ func (s *Server) uiTokenMint(w http.ResponseWriter, r *http.Request) {
 		Cap          string `json:"cap"`
 		ExpiresHours int    `json:"expires_hours"`
 		Gated        string `json:"gated"`
+		Unrestricted bool   `json:"unrestricted"`
 		Mounts       []struct {
 			Project string `json:"project"`
 			At      string `json:"at"`
@@ -220,8 +221,31 @@ func (s *Server) uiTokenMint(w http.ResponseWriter, r *http.Request) {
 		mounts = append(mounts, pt)
 	}
 	if len(mounts) == 0 {
-		http.Error(w, "at least one mount is required; an empty mount table means all namespaces", http.StatusBadRequest)
-		return
+		// 空挂载表 = 看得见所有命名空间，所以必须显式要求，不能因为
+		// 「忘了填 mounts」而默认得到它。
+		//
+		// 为什么允许签发它：remote-key / remote-secret 是配置 SSH 私钥与
+		// HTTP token 的唯一入口，而它们要求 rootUnrestricted（即空挂载表）。
+		// 在此之前这两条路互锁——WebUI 要至少一个挂载，动词要空挂载，
+		// 于是跨机同步的凭证根本没法配。容器里连命令都跑不了的时候，
+		// WebUI 就是唯一的管理面，它必须能签发这种凭证。
+		//
+		// 三重约束：用户必须是 root、能力必须是 rwx、且调用方显式声明。
+		if !body.Unrestricted {
+			http.Error(w, "at least one mount is required; an empty mount table means all namespaces, so it has to be requested explicitly with \"unrestricted\": true", http.StatusBadRequest)
+			return
+		}
+		u, _ := s.cfgIndex().User(user)
+		if !u.Root {
+			http.Error(w, fmt.Sprintf("user %q is not root in the config; only a root user can hold an unrestricted credential", user), http.StatusBadRequest)
+			return
+		}
+		for _, bit := range []rune{'r', 'w', 'x'} {
+			if !strings.ContainsRune(capStr, bit) {
+				http.Error(w, fmt.Sprintf("an unrestricted credential needs capability rwx (got %q); root global verbs are gated on all three bits", capStr), http.StatusBadRequest)
+				return
+			}
+		}
 	}
 
 	jti, err := auth.NewJTI()

@@ -218,7 +218,17 @@ func (s *Server) execWhoami(c Caller) string {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("User: %s\n", c.User))
 	if c.Root {
-		sb.WriteString("Privilege: root (unrestricted global access)\n")
+		// 「root」不等于「无限制」：挂载表收窄之后，全局管理动词
+		// （remote-key / remote-secret 等）会被拒。两句话必须一致，
+		// 否则运维拿着一个自称 unrestricted 的凭证去跑全局动词，
+		// 报错时不知道该怀疑哪里。判据直接复用 rootUnrestricted，
+		// 不另外写一份。
+		if s.rootUnrestricted(c) {
+			sb.WriteString("Privilege: root (unrestricted global access)\n")
+		} else {
+			sb.WriteString("Privilege: root (narrowed by mount table; global administration verbs are refused)\n")
+			sb.WriteString(fmt.Sprintf("Mount: %s\n", c.Mount.Describe()))
+		}
 	} else if s.cfgIndex() != nil {
 		groups := s.cfgIndex().GroupsOf(c.User)
 		if len(groups) > 0 {

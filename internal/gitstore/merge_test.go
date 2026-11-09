@@ -91,8 +91,14 @@ func TestMergeDisjointDiverged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(c.Parents) != 2 || c.Parents[0] != cLocal || c.Parents[1] != cPeer {
-		t.Fatalf("merge commit 应有两个 parent [%s, %s]，得到 %v", cLocal, cPeer, c.Parents)
+	// 顺序不再是 [local, other]：父提交按 SHA 排序（见 merge.go 的说明），
+	// 只要求两个 parent 都在。
+	if len(c.Parents) != 2 {
+		t.Fatalf("merge commit 应有两个 parent，得到 %v", c.Parents)
+	}
+	got := map[string]bool{c.Parents[0]: true, c.Parents[1]: true}
+	if !got[cLocal] || !got[cPeer] {
+		t.Fatalf("merge commit 的两个 parent 应是 %s 与 %s，得到 %v", cLocal, cPeer, c.Parents)
 	}
 
 	// 两边的文件都应该在
@@ -174,5 +180,121 @@ func TestMergeRefusesDirty(t *testing.T) {
 	_, err = r.MergeInto("main", "peer")
 	if err == nil {
 		t.Fatal("有脏层时应拒绝合并，却成功了")
+	}
+}
+
+// TestMergeCommitIsDeterministicAcrossPeers 钉住 merge 提交的确定性。
+//
+// 两个 peer 对同一对分叉提交各做一次 merge，必须得到**同一个 SHA**。
+// 之前父顺序是 [local, other]：
+//
+//	A 视角：local=a, other=b → parent a, b
+//	B 视角：local=b, other=a → parent b, a
+//
+// 树、消息、时间全同，只差父顺序，于是两个 SHA 不同：谁也推不上谁
+// （非快进被拒）；而因为两边树相同，「树一样不写空提交」的检查会让
+// 两边都判 up-to-date、各自抱住自己的提交——分叉永久僵持。
+//
+// 这里在同一个仓库里交替扮演两侧，强制走完整 merge 路径（不是快进）。
+func TestMergeCommitIsDeterministicAcrossPeers(t *testing.T) {
+	dir := t.TempDir()
+	r, err := Init(filepath.Join(dir, "r.git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if err := r.Write("main", "a.md", []byte("base"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	base, _ := r.Commit("main", "base")
+
+	// A 侧
+	if err := r.updateRef("refs/heads/main", base); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Write("main", "from-a.md", []byte("A 写的"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	aCommit, _ := r.Commit("main", "a")
+
+	// B 侧
+	if err := r.updateRef("refs/heads/peer", base); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Write("peer", "from-b.md", []byte("B 写的"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	bCommit, _ := r.Commit("peer", "b")
+
+	// A 视角：本地 main=aCommit，merge peer=bCommit
+	resA, err := r.MergeInto("main", "peer")
+	if err != nil || resA.Kind != "merged" {
+		t.Fatalf("A 视角 merge: %v %+v", err, resA)
+	}
+
+	// 回滚成 B 视角：本地 main=bCommit，merge peer=aCommit
+	if err := r.updateRef("refs/heads/main", bCommit); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.updateRef("refs/heads/peer", aCommit); err != nil {
+		t.Fatal(err)
+	}
+	resB, err := r.MergeInto("main", "peer")
+	if err != nil || resB.Kind != "merged" {
+		t.Fatalf("B 视角 merge: %v %+v", err, resB)
+	}
+
+	if resA.Commit != resB.Commit {
+		t.Fatalf("两个 peer 对同一对提交 merge 出了不同 SHA:\n  A 视角=%s\n  B 视角=%s\n这就是双机同步推不上去的根因", resA.Commit, resB.Commit)
+	}
+}
+
+// TestMergeCommitTimestampNotBeforeParents 验证 merge 提交不比父提交更旧。
+func TestMergeCommitTimestampNotBeforeParents(t *testing.T) {
+	dir := t.TempDir()
+	r, err := Init(filepath.Join(dir, "r.git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	if err := r.Write("main", "a.md", []byte("base"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	base, _ := r.Commit("main", "base")
+	if err := r.Write("main", "a2.md", []byte("local"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("main", "a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.updateRef("refs/heads/peer", base); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Write("peer", "b.md", []byte("peer"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("peer", "b"); err != nil {
+		t.Fatal(err)
+	}
+	res, err := r.MergeInto("main", "peer")
+	if err != nil || res.Kind != "merged" {
+		t.Fatalf("merge: %v %v", err, res)
+	}
+
+	typ, body, err := r.readObject(res.Commit)
+	if err != nil || typ != "commit" {
+		t.Fatalf("读 merge 提交: %v", err)
+	}
+	c := parseCommit(body)
+	for _, p := range c.Parents {
+		_, pb, err := r.readObject(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pc := parseCommit(pb); c.When.Before(pc.When) {
+			t.Fatalf("merge 提交时间 %s 早于父提交 %s，拓扑与时间顺序矛盾", c.When, pc.When)
+		}
 	}
 }

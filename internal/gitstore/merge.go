@@ -159,8 +159,40 @@ func (r *Repo) MergeInto(branch, other string) (MergeResult, error) {
 	if otherSHA != "" {
 		parents = append(parents, otherSHA)
 	}
-	msg := fmt.Sprintf("merge %s into %s", other, normRef)
-	commitSHA, err := r.writeCommit(rootTree, parents, msg, time.Now())
+	// 父顺序确定化。
+	//
+	// [#] 为什么必须排序
+	//
+	// 不排序时父顺序是「我在哪一侧」——local 在前、other 在后。于是两个
+	// peer 对**同一对提交**做一次 merge，除了父顺序之外树、消息、时间全相同，
+	// 却得到两个不同的 SHA：
+	//
+	//	c6668915  parent 380ba18, 3b506ee   ← A
+	//	5861d7d   parent 3b506ee, 380ba18   ← B
+	//
+	// 后果是两边永远推不上对方：非快进被拒。而因为树相同，
+	// 「树一样就不写空提交」的检查会在两边都判 up-to-date，各自抱住
+	// 自己的提交——分叉就永久停在那个状态，每轮同步重试一次、失败一次。
+	//
+	// 排序后两台机器产出逐字节相同的 commit，SHA 天然收敛。
+	sort.Strings(parents)
+
+	// 时间戳同样必须确定化：time.Now() 让两个 peer 只要差一秒就永远不合。
+	// 取两亲提交时间的较大者——它只取决于输入，与「谁先算」无关，
+	// 且不会让 merge 提交比它的父提交更旧。
+	when := r.mergeTimestamp(parents)
+
+	// 消息里不能出现 ref 名（`refs/remotes/<remote>/...`）：两个 peer 的
+	// 远端命名可以不同，那会让 SHA 又分叉。用排好序的父提交短 SHA。
+	shorts := make([]string, len(parents))
+	for i, p := range parents {
+		shorts[i] = p
+		if len(shorts[i]) > 7 {
+			shorts[i] = shorts[i][:7]
+		}
+	}
+	msg := fmt.Sprintf("merge %s into %s", strings.Join(shorts, " "), normRef)
+	commitSHA, err := r.writeCommit(rootTree, parents, msg, when)
 	if err != nil {
 		return MergeResult{}, err
 	}
@@ -234,4 +266,32 @@ func (r *Repo) writeTreeFromPaths(paths map[string]Entry) (string, error) {
 		subtreeSHA[dir] = sha
 	}
 	return subtreeSHA[""], nil
+}
+
+// mergeTimestamp 给 merge 提交取一个只由输入决定的时间。
+//
+// 取所有父提交时间的最大值，理由有三：
+//
+//  1. 确定性 —— 它只看提交对象，不看墙钟。两个 peer 算出同一个值。
+//  2. 单调 —— merge 提交不能比它的父提交更旧，否则 git log 的拓扑顺序
+//     与时间顺序会互相矛盾（rebase/fetch 的剪枝策略会因此判断错误）。
+//  3. 无需信任时钟 —— 不依赖两台机器的钟是否同步。
+//
+// 读不到任何父提交时间时退回 time.Now()：这是异常路径（对象损坏），
+// 此时确定性已经无从谈起，让合并先成功比卡在这里重要。
+func (r *Repo) mergeTimestamp(parents []string) time.Time {
+	var newest time.Time
+	for _, p := range parents {
+		typ, body, err := r.readObject(p)
+		if err != nil || typ != "commit" {
+			continue
+		}
+		if c := parseCommit(body); c.When.After(newest) {
+			newest = c.When
+		}
+	}
+	if newest.IsZero() {
+		return time.Now()
+	}
+	return newest
 }

@@ -4,11 +4,14 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
 // Gated capabilities and temporary grants.
@@ -341,4 +344,114 @@ func TestBootstrapPasswordIsSingleRead(t *testing.T) {
 	if second := srv.TakeBootstrapPassword(); second != "" {
 		t.Fatalf("second read must be empty, got %q", second)
 	}
+}
+
+// 无限制凭证必须显式申请，且只发给 root 用户。
+//
+// 之前 WebUI 一律要求至少一个挂载，而 remote-key / remote-secret 又要求
+// 空挂载表——两条路互锁，跨机同步的凭证（SSH 私钥 / HTTP token）根本
+// 没法配。修法是允许显式申请，但三重约束缺一不可。
+// 带一个非 root 用户的 WebUI 服务，用于验证「非 root 拿不到无限制凭证」。
+func newWebUIServerWithGuest(t *testing.T) (*Server, string) {
+	t.Helper()
+	dataDir := t.TempDir()
+	cfg := `
+[server]
+data = "__DATA__"
+
+[[user]]
+name = "zero"
+root = true
+
+[[user]]
+name = "chat"
+
+[[project]]
+name  = "proj"
+owner = "zero"
+mode  = "rwx------"
+`
+	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(cfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r, err := gitstore.Init(filepath.Join(dataDir, "repos", "proj.git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Write("zero", "a.md", []byte("内容"), gitstore.ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Commit("zero", "seed"); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		DataDir:     dataDir,
+		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
+		Listen:      "127.0.0.1:0",
+		EnforceAuth: true,
+		WebUI:       true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = srv.Close() })
+	return srv, dataDir
+}
+
+func TestWebUIMintUnrestrictedCredential(t *testing.T) {
+	srv, _ := newWebUIServerWithGuest(t)
+	if err := srv.passwords.Set("admin-password-x"); err != nil {
+		t.Fatal(err)
+	}
+	cookie := loginUI(t, srv, "admin-password-x")
+	h := srv.muxFor(ListenBlock{Allow: []string{"*"}, WebUI: true})
+	mint := func(t *testing.T, body map[string]any) (int, string) {
+		t.Helper()
+		b, _ := json.Marshal(body)
+		req := httptest.NewRequest(http.MethodPost, "/ui/api/tokens/mint", strings.NewReader(string(b)))
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code, rec.Body.String()
+	}
+
+	t.Run("缺显式声明则拒绝", func(t *testing.T) {
+		code, msg := mint(t, map[string]any{"user": "zero", "name": "x", "cap": "rwx", "mounts": []map[string]string{}})
+		if code != http.StatusBadRequest || !strings.Contains(msg, "unrestricted") {
+			t.Fatalf("应提示显式声明 unrestricted: %d %s", code, msg)
+		}
+	})
+
+	t.Run("非 root 用户拒绝", func(t *testing.T) {
+		// 先声明一个非 root 用户，确保 cfgIndex 认识它
+		code, msg := mint(t, map[string]any{"user": "chat", "name": "x", "cap": "rwx", "unrestricted": true, "mounts": []map[string]string{}})
+		if code != http.StatusBadRequest || !strings.Contains(msg, "root user") {
+			t.Fatalf("非 root 用户应被拒绝: %d %s", code, msg)
+		}
+	})
+
+	t.Run("root + 显式声明 → 可用且真的无限制", func(t *testing.T) {
+		code, msg := mint(t, map[string]any{"user": "zero", "name": "peer-admin", "cap": "rwx", "unrestricted": true, "mounts": []map[string]string{}})
+		if code != http.StatusOK {
+			t.Fatalf("应允许签发: %d %s", code, msg)
+		}
+		var out struct {
+			Token string `json:"token"`
+		}
+		if err := json.Unmarshal([]byte(msg), &out); err != nil || out.Token == "" {
+			t.Fatalf("响应缺少 token: %s (%v)", msg, err)
+		}
+		// 用签出的凭证验证 rootUnrestricted 真的成立
+		caller, err := srv.authenticate(reqWith(out.Token))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !caller.Root || !caller.Mount.Empty() {
+			t.Fatalf("签出的凭证应为空挂载表 root: root=%v empty=%v", caller.Root, caller.Mount.Empty())
+		}
+		if !srv.rootUnrestricted(caller) {
+			t.Fatalf("签出的凭证应通过 rootUnrestricted —— 否则 remote-key 仍然不可达")
+		}
+	})
 }

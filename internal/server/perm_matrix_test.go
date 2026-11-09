@@ -675,3 +675,56 @@ func TestDeleteMissingPathErrors(t *testing.T) {
 		t.Fatalf("存在的文件应可删: %v", err)
 	}
 }
+
+// whoami 的权限标注必须与实际能力一致。
+//
+// 之前窄化 root 被标成 "root (unrestricted global access)"，而同一个凭证
+// 跑 remote-key / remote-secret 会被拒——两个口径打架，运维拿到一个自称
+// unrestricted 的凭证，报错时不知道该怀疑哪里。
+func TestWhoamiLabelsNarrowedRootCorrectly(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	tok := mintRestricted(t, dataDir, auth.Claims{
+		Sub:  "zero",
+		Name: "narrow",
+		Cap:  "rwx",
+		// 挂了表就是窄化：看得见 blackegg/me，看不见别的。
+		Mount: []auth.MountPoint{{Project: "blackegg/me", At: "/", Branch: "*"}},
+	})
+	narrow, err := srv.authenticate(reqWith(tok))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !narrow.Root {
+		t.Fatalf("测试前置：应为 root 凭证")
+	}
+	if srv.rootUnrestricted(narrow) {
+		t.Fatalf("测试前置：带挂载表不应被判为 unrestricted")
+	}
+
+	out := srv.execWhoami(narrow)
+	if strings.Contains(out, "unrestricted global access") {
+		t.Fatalf("带挂载表的 root 不应自称 unrestricted:\n%s", out)
+	}
+	if !strings.Contains(out, "narrowed by mount table") {
+		t.Fatalf("窄化 root 应说清收窄来源:\n%s", out)
+	}
+	if !strings.Contains(out, "Mount:") {
+		t.Fatalf("窄化 root 应列出挂载表:\n%s", out)
+	}
+	if !strings.Contains(out, "blackegg/me") {
+		t.Fatalf("挂载表摘要应包含被挂载的项目:\n%s", out)
+	}
+
+	// 空挂载表的 root：真无限制，且不得被标成 narrowed。
+	free := srv.rootCaller()
+	if !srv.rootUnrestricted(free) {
+		t.Fatalf("测试前置：rootCaller 应是无限制凭证")
+	}
+	freeOut := srv.execWhoami(free)
+	if !strings.Contains(freeOut, "unrestricted global access") {
+		t.Fatalf("空挂载表的 root 应自称 unrestricted:\n%s", freeOut)
+	}
+	if strings.Contains(freeOut, "narrowed") {
+		t.Fatalf("无限制凭证不应被标成 narrowed:\n%s", freeOut)
+	}
+}

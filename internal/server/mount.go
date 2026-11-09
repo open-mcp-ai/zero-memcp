@@ -412,3 +412,32 @@ func isUnderOtherMount(addr string, entries []mountEntry) bool {
 	}
 	return false
 }
+
+// Describe 给出一行摘要：这条凭证实际能被看见的范围。
+//
+// 它服务于 whoami：一个被挂载表收窄过的 root 需要知道自己窄在哪，
+// 否则「我有 root 但全局动词被拒」这件事无从解释。
+// 格式与凭证签发时的写法一致（project@branch:root），便于对照。
+func (m *Mount) Describe() string {
+	if m.Empty() {
+		return "(none: every namespace is visible)"
+	}
+	var parts []string
+	for _, e := range m.entries {
+		s := e.project
+		if e.branch != "" && e.branch != "*" {
+			s += "@" + e.branch
+		} else if e.branch == "*" {
+			s += "@*"
+		}
+		if e.root != "" {
+			s += ":" + e.root
+		}
+		if e.cap != "" {
+			s += " (" + e.cap + ")"
+		}
+		parts = append(parts, s)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ", ")
+}

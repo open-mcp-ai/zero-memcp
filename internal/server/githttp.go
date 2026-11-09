@@ -49,6 +49,18 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 存在性与可见性必须分开报告：
+	//
+	// 项目不存在时必须返回 404，不能落到下面的可见性检查里。
+	// 否则「仓库还没建」会被报成「你没权限」——这两个字的差距就是
+	// 一轮完全跑偏的排查（去检查 token、挂载、cap，而真正的原因是
+	// 对端还没写过任何东西）。受影响的第一个场景就是 peer 同步：
+	// 新节点入网时对端仓库经常还不存在。
+	if _, getErr := s.projects.Get(project); getErr != nil {
+		http.Error(w, fmt.Sprintf("project %q: %v", project, getErr), http.StatusNotFound)
+		return
+	}
+
 	// 分支级可见性无法在这里表达（git 协议按 ref 粒度），
 	// 所以这里只检查「这个项目整体是否对该凭证可见」。
 	if !s.projectVisible(caller, project) {

@@ -213,6 +213,10 @@ type Remote struct {
 	// 自动同步意味着「本机的记忆会流到那里，那里也会流进本机」，
 	// 这该是一次显式选择，而不是配了 url 就默认发生。
 	AutoSync bool
+	// OnReceive 为真时，收到外部针对该项目的推送（且 ref 确实推进了）
+	// 会立即向该远端（以及其他配置了 on_receive 的远端）扇出，
+	// 不需要等待下一个 periodic 轮询周期。
+	OnReceive bool
 }
 
 // AccessRule 是绕过项目 mode 的一条例外授权。
@@ -266,7 +270,7 @@ var knownKeys = map[string]map[string]bool{
 	"project": {"name": true, "owner": true, "group": true, "mode": true},
 	"access":  {"user": true, "project": true, "perm": true},
 	"listen":  {"addr": true, "allow": true, "require": true, "mount": true, "webui": true},
-	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true},
+	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true},
 }
 
 // checkKeys 拒绝未知分节与未知键。
@@ -482,6 +486,12 @@ func ParseFile(raw []byte) (*File, error) {
 		}
 		if rm.AutoSync, err = boolean(sec, "[[remote]]", "auto_sync"); err != nil {
 			return nil, err
+		}
+		if rm.OnReceive, err = boolean(sec, "[[remote]]", "on_receive"); err != nil {
+			return nil, err
+		}
+		if rm.OnReceive && !rm.AutoSync {
+			return nil, fmt.Errorf("[[remote]] on_receive requires auto_sync = true")
 		}
 		if rm.HTTPToken != "" {
 			if err := ValidateSSHKeyName(rm.HTTPToken); err != nil {

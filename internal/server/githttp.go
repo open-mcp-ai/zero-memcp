@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
+
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
 // HTTP Git 端点：支持 clone/pull（git-upload-pack）与 push（git-receive-pack）。
@@ -49,29 +52,36 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 存在性与可见性必须分开报告：
+	// 存在性、可见性、可建性三件事要分开判断。
 	//
-	// 项目不存在时必须返回 404，不能落到下面的可见性检查里。
-	// 否则「仓库还没建」会被报成「你没权限」——这两个字的差距就是
-	// 一轮完全跑偏的排查（去检查 token、挂载、cap，而真正的原因是
-	// 对端还没写过任何东西）。受影响的第一个场景就是 peer 同步：
-	// 新节点入网时对端仓库经常还不存在。
-	if _, getErr := s.projects.Get(project); getErr != nil {
-		http.Error(w, fmt.Sprintf("project %q: %v", project, getErr), http.StatusNotFound)
-		return
-	}
-
-	// 分支级可见性无法在这里表达（git 协议按 ref 粒度），
-	// 所以这里只检查「这个项目整体是否对该凭证可见」。
-	if !s.projectVisible(caller, project) {
-		http.Error(w, fmt.Sprintf("project %q is outside this credential's visible scope", project), http.StatusForbidden)
-		return
-	}
-
-	repo, err := s.projects.Get(project)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("project %q: %v", project, err), http.StatusNotFound)
-		return
+	// 1. 库已有 → 走可见性检查（表外 403）
+	// 2. 库还没有 → 读取一律 404（「对端还没写过东西」不能被报成没权限，
+	//    这个字之差是一整轮跑偏的排查）；推送可以建库，但只限
+	//    配置里声明过的项目或无限制的 root，否则任何人推一个名字就能
+	//    在服务端造出一个空仓库。
+	repo, getErr := s.projects.Get(project)
+	if getErr != nil {
+		if action != "git-receive-pack" {
+			http.Error(w, fmt.Sprintf("project %q has no repository yet", project), http.StatusNotFound)
+			return
+		}
+		if !s.projectDeclared(project) && !s.rootUnrestricted(caller) {
+			http.Error(w, fmt.Sprintf("project %q has no repository yet", project), http.StatusNotFound)
+			return
+		}
+		var ensErr error
+		repo, ensErr = s.projects.Ensure(project)
+		if ensErr != nil {
+			http.Error(w, fmt.Sprintf("project %q: %v", project, ensErr), http.StatusInternalServerError)
+			return
+		}
+	} else {
+		// 分支级可见性无法在这里表达（git 协议按 ref 粒度），
+		// 所以这里只检查「这个项目整体是否对该凭证可见」。
+		if !s.projectVisible(caller, project) {
+			http.Error(w, fmt.Sprintf("project %q is outside this credential's visible scope", project), http.StatusForbidden)
+			return
+		}
 	}
 
 	switch action {
@@ -182,6 +192,13 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 			defer gz.Close()
 			in = gz
 		}
+		// 收之前的 ref 快照：后面用它判断这次推送到底有没有带来新东西。
+		//
+		// 这是「流言止于智者」的判据。重推一个已存在的提交是很常见的
+		// （重试、脚本重复执行），那种情况下 ref 不会推进，此时再扇出
+		// 一轮 fetch/merge/push 只是白跑一个完整网络往返。
+		before := projectHeads(repo)
+
 		body, err := repo.ReceivePack(in, func(ref string) bool {
 			branch := strings.TrimPrefix(ref, "refs/heads/")
 			return s.allowed(caller, project, branch, configBitWrite)
@@ -191,9 +208,18 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// 写入成功后触发重载与脉冲广播：外部推进的 ref 也是真写入，
-		// 内存索引与 SSE 锚定者必须立刻知道。
+		// 内存索引与锚定者必须立刻知道。
 		_ = s.Reload()
 		s.checkExternalUpdates()
+
+		// 只把「真的推进了」的分支拿出去扇出。
+		//
+		// 因为历史是 Merkle 链，「这条消息我见过没有」可以退化成一个
+		// SHA 判断：知道头就知道头以下的一切。所以不需要消息 ID 集合
+		// 或 Bloom filter，比对前后头即可。
+		for _, adv := range advancedRefs(before, projectHeads(repo)) {
+			s.triggerFanout(project, adv.Branch, adv.SHA, "received push")
+		}
 
 		w.Header().Set("Content-Type", "application/x-git-receive-pack-result")
 		w.Header().Set("Cache-Control", "no-cache")
@@ -334,6 +360,69 @@ func (s *Server) gitPushAllowed(c Caller, project string) bool {
 	for _, ref := range refs {
 		branch := strings.TrimPrefix(ref, "refs/heads/")
 		if s.allowed(c, project, branch, configBitWrite) {
+			return true
+		}
+	}
+	return false
+}
+
+// projectHeads 取某个仓库当前所有一级分支的头。
+//
+// 只取 refs/heads/ 下不带斜杠的一级分支名，与其他同步路径的口径一致
+// （sync_loop 里同样只处理一级分支）。
+func projectHeads(repo *gitstore.Repo) map[string]string {
+	out := map[string]string{}
+	refs, err := repo.Refs("refs/heads/")
+	if err != nil {
+		return out
+	}
+	for _, ref := range refs {
+		branch := strings.TrimPrefix(ref, "refs/heads/")
+		if branch == ref || branch == "" || strings.Contains(branch, "/") {
+			continue
+		}
+		if sha, err := repo.Resolve(branch); err == nil && sha != "" {
+			out[branch] = sha
+		}
+	}
+	return out
+}
+
+// advancedRef 是一条真正推进了的分支。
+type advancedRef struct {
+	Branch string
+	SHA    string
+}
+
+// advancedRefs 比对前后快照，返回真的推进了的分支。
+//
+// 三种情况都算推进：
+//
+//	新增分支          before 没有，after 有
+//	分支前进          before 与 after 不同
+//
+// 分支被删除（before 有、after 没有）不算推进——没有新消息可传播，
+// 而删除本身在这个系统里是被禁止的（记忆历史只追加）。
+func advancedRefs(before, after map[string]string) []advancedRef {
+	var out []advancedRef
+	for branch, sha := range after {
+		if before[branch] != sha {
+			out = append(out, advancedRef{Branch: branch, SHA: sha})
+		}
+	}
+	// 顺序稳定，便于日志与测试
+	sort.Slice(out, func(i, j int) bool { return out[i].Branch < out[j].Branch })
+	return out
+}
+
+// projectDeclared 报告某项目是否在配置里显式声明过。
+//
+// 它与「磁盘上有这个目录」不是一回事：声明是意图，目录是事实。
+// 接收推送时只信意图——配置里写了才算「这个项目该存在」，
+// 否则任何人推一个名字就能在服务端造出一个空仓库。
+func (s *Server) projectDeclared(project string) bool {
+	for _, p := range s.declaredProjects() {
+		if p == project {
 			return true
 		}
 	}

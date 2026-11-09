@@ -610,3 +610,46 @@ dim      = 1024
 		t.Errorf("timeout = %v, want 2s", p0.Timeout)
 	}
 }
+
+// on_receive 是「收到推送就立刻扇出」的开关，必须显式声明，
+// 且离开 auto_sync 无意义——一个不自动同步的远端不会被放进同步轮次，
+// 给它配 on_receive 等于写了个不生效的开关，那比没写更坏。
+func TestRemoteOnReceiveParsing(t *testing.T) {
+	base := func(extra string) string {
+		return `
+[[user]]
+name = "zero"
+root = true
+
+[[remote]]
+project = "p"
+name    = "hub"
+url     = "http://127.0.0.1:1/repos/p.git"
+` + extra
+	}
+
+	f, err := ParseFile([]byte(base("")))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if f.Remotes[0].OnReceive {
+		t.Fatal("缺省应为 false")
+	}
+
+	f, err = ParseFile([]byte(base("auto_sync = true\non_receive = true\n")))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if !f.Remotes[0].OnReceive || !f.Remotes[0].AutoSync {
+		t.Fatalf("应解析为 true: %+v", f.Remotes[0])
+	}
+
+	if _, err := ParseFile([]byte(base("on_receive = true\n"))); err == nil {
+		t.Fatal("on_receive 缺少 auto_sync 时应报错")
+	}
+
+	// 拼错的字段必须被拒绝，不能静默当成没写
+	if _, err := ParseFile([]byte(base("auto_sync = true\non_recieve = true\n"))); err == nil {
+		t.Fatal("拼错的字段必须被拒绝")
+	}
+}

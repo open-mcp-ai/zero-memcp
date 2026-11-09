@@ -72,7 +72,10 @@ func (s *Server) syncOnce(project string, rm config.Remote) {
 	key := project + "@" + rm.Name
 	root := s.rootCaller()
 
-	repo, err := s.projects.Get(project)
+	// 配置声明过的 auto_sync 项目，同步时允许自动建库（Ensure）。
+	// 否则一个新节点必须先手动写一条无意义的记忆才能开始同步，
+	// 这让「新节点入网自动拉取全量记忆」彻底失效。
+	repo, err := s.projects.Ensure(project)
 	if err != nil {
 		s.recordSyncErr(key, err.Error())
 		return

@@ -221,6 +221,8 @@ type Server struct {
 	// 通知不另存一份消息日志：树的 SHA 变化本身就是事件。
 	// 关注关系是派生态，丢了最多重读一次，不写进不可变历史。
 	treeWatch *TreeWatchHub
+	// fanouts 记录因收到推送而触发的扇出批次及其目标状态。
+	fanouts *fanoutHub
 
 	// remotes 是 [[remote]] 的当前快照，随 reload 原子替换。
 	remotes atomic.Pointer[[]config.Remote]
@@ -397,6 +399,7 @@ func New(cfg Config) (*Server, error) {
 
 		listens:   FromConfig(listenBlocks(cfgFile)),
 		treeWatch: newTreeWatchHub(),
+		fanouts:   newFanoutHub(),
 		resources: newResourceHub(),
 		done:      make(chan struct{}),
 		// 默认视为「没有维护循环」：New 之后没 Start 就 Close 的路径
@@ -2019,6 +2022,11 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		syncLines := s.syncStatusLines(c)
 		if len(syncLines) > 0 {
 			text += "\nsync:\n  " + strings.Join(syncLines, "\n  ")
+		}
+		if s.fanouts != nil && c.Mount.Empty() {
+			if fanLines := s.fanouts.describeLines(); len(fanLines) > 0 {
+				text += "\n" + strings.Join(fanLines, "\n")
+			}
 		}
 
 		return TermResult{

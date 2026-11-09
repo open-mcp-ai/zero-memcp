@@ -120,6 +120,9 @@ func (s *Server) catchUpSemantic(reason string) {
 	s.semantic.mu.RUnlock()
 	if emb == nil {
 		chain, err := embed.OpenChain(s.semanticChainConfig())
+		if err == nil {
+			chain.OnTransition(func(m string) { s.logf("%s", m) })
+		}
 		if err != nil {
 			// 仍然不可用：记下原因，等下个周期。这不是错误噪音，
 			// 是「欠着没补」的唯一可见痕迹。

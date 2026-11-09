@@ -114,6 +114,9 @@ func (s *Server) initSemantic() {
 	// 重新载入整个模型——延迟从毫秒变秒级；而且反复
 	// InitializeEnvironment/DestroyEnvironment 在并发下不可靠。
 	emb, err := embed.OpenChain(s.semanticChainConfig())
+	if err == nil {
+		emb.OnTransition(func(m string) { s.logf("%s", m) })
+	}
 	if err != nil {
 		// 启动时全链不可用不再意味着「语义功能死刑」：
 		// 维护协程会周期性重试 OpenChain，嵌入服务恢复后自动补算。

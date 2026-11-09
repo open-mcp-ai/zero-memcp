@@ -54,6 +54,16 @@ type Chain struct {
 	providers []namedEmbedder
 	dim       int
 	name      string
+	// onTransition 在 active 后端发生切换时被调用（降级 / 全部失败 / 恢复）。
+	//
+	// 为什么需要它：降级记录写在 note 里、能从 status 看到，但**降级发生
+	// 的那一刻日志里什么都没有**。排查时看到的是「服务一直在用备用后端」，
+	// 却不知道它是几点切的、切的原因是什么。Chain 在 embed 包，不认识
+	// 服务的 logger，所以由调用方注入一个回调。
+	//
+	// 只在切换时调用，不是每次失败都调——真正的迁移才是值得记的事件，
+	// 每周期刷一行会把恢复日志淹掉。
+	onTransition func(msg string)
 
 	// active 是当前生效的后端下标（atomic，热路径读）。
 	active atomic.Int32
@@ -230,6 +240,19 @@ func (c *Chain) Note() (string, time.Time, bool) {
 // Degraded 报告当前是否不在链首（即正在使用备用后端）。
 func (c *Chain) Degraded() bool { return c.active.Load() != 0 }
 
+// transition 把一次后端切换交给调用方的日志回调。
+//
+// 回调是可选的：Chain 单独使用（测试、嵌入方只要能力不要日志）时
+// 保持安静，不给它强加一个 logger。
+func (c *Chain) transition(msg string) {
+	if c.onTransition != nil {
+		c.onTransition(msg)
+	}
+}
+
+// OnTransition 注入切换回调。必须在 Chain 开始被并发使用之前调用。
+func (c *Chain) OnTransition(fn func(string)) { c.onTransition = fn }
+
 // markRecovered 在链首成功时清掉历史错误。
 //
 // 不清的后果不是"多显示一行日志"，而是让人永远无法确认系统到底恢没恢复：
@@ -274,10 +297,9 @@ func (c *Chain) Embed(text string) ([]float32, error) {
 		if err == nil {
 			if i != start {
 				c.active.Store(int32(i))
-				c.note.Store(chainNote{
-					msg: fmt.Sprintf("degraded to %s: %v", ps[i].label, lastErr),
-					at:  time.Now(),
-				})
+				msg := fmt.Sprintf("degraded to %s: %v", ps[i].label, lastErr)
+				c.note.Store(chainNote{msg: msg, at: time.Now()})
+				c.transition("semantic: " + msg)
 			}
 			// 链首成功 = 完全健康，清掉历史错误。
 			c.markRecovered(i == 0)
@@ -286,8 +308,10 @@ func (c *Chain) Embed(text string) ([]float32, error) {
 		lastErr = err
 	}
 	// 链尾也失败了：重置到链首，让下次请求重试最优后端
+	msg := fmt.Sprintf("all providers failed: %v", lastErr)
 	c.active.Store(0)
-	c.note.Store(chainNote{msg: fmt.Sprintf("all providers failed: %v", lastErr), at: time.Now()})
+	c.note.Store(chainNote{msg: msg, at: time.Now()})
+	c.transition("semantic: " + msg)
 	return nil, fmt.Errorf("%w: %v", ErrAllProvidersDown, lastErr)
 }
 
@@ -307,10 +331,9 @@ func (c *Chain) EmbedBatch(texts []string) ([][]float32, error) {
 		if err == nil {
 			if i != start {
 				c.active.Store(int32(i))
-				c.note.Store(chainNote{
-					msg: fmt.Sprintf("degraded to %s: %v", ps[i].label, lastErr),
-					at:  time.Now(),
-				})
+				msg := fmt.Sprintf("degraded to %s: %v", ps[i].label, lastErr)
+				c.note.Store(chainNote{msg: msg, at: time.Now()})
+				c.transition("semantic: " + msg)
 			}
 			c.markRecovered(i == 0)
 			return vs, nil

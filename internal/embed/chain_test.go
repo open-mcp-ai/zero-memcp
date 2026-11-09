@@ -206,3 +206,91 @@ func TestChainDegradedReportsTrueWhenNotAtHead(t *testing.T) {
 		t.Fatalf("当前后端应为 fallback，实际 %q", got)
 	}
 }
+
+// 后端切换必须有日志留痕：降级与恢复都要，而且各一次。
+//
+// 之前降级只写进 note（能从 status 看到），日志里一行都没有。于是排查
+// 时看到的是「服务一直在用备用后端」，不知道它几点切的、为什么切——
+// 而恢复那一行是有的，两边不对称，正好是最需要线索的一半缺失。
+func TestChainLogsTransitionBothWays(t *testing.T) {
+	head := &fakeProvider{label: "head", dim: 4}
+	backup := &fakeProvider{label: "backup", dim: 4}
+	ch := newTestChain(head, backup)
+
+	var logs []string
+	ch.OnTransition(func(m string) { logs = append(logs, m) })
+
+	// 正常：链首可用，不该有任何切换日志
+	if _, err := ch.Embed("a"); err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 0 {
+		t.Fatalf("链首健康时不应产生切换日志，得到 %v", logs)
+	}
+
+	// 链首倒下：必须记一条，且指明落到哪个后端
+	head.down = true
+	if _, err := ch.Embed("b"); err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("降级应产生恰好 1 条日志，得到 %v", logs)
+	}
+	if !strings.Contains(logs[0], "degraded to backup") {
+		t.Fatalf("降级日志应指明目标后端，得到 %q", logs[0])
+	}
+
+	// 仍在备用后端上：不刷屏
+	if _, err := ch.Embed("c"); err != nil {
+		t.Fatal(err)
+	}
+	if len(logs) != 1 {
+		t.Fatalf("持续降级不应重复刷日志，得到 %v", logs)
+	}
+
+	// 链不会自己重试链首：恢复由维护循环的 HealthCheck 负责（server 侧
+	// 会在那里打 recovered 日志）。这里验证职责边界没走样。
+	head.down = false
+	if ch.Degraded() {
+		// 还没探测时仍在备用后端上——这是预期，不是缺陷
+		if _, err := ch.Embed("d"); err != nil {
+			t.Fatal(err)
+		}
+		if !ch.Degraded() {
+			t.Fatal("未经 HealthCheck 就自行回到链首，说明恢复路径跑了两套")
+		}
+	}
+	if recovered, _ := ch.HealthCheck(); !recovered {
+		t.Fatal("HealthCheck 应探测到链首恢复")
+	}
+	if _, err := ch.Embed("e"); err != nil {
+		t.Fatal(err)
+	}
+	if ch.Degraded() {
+		t.Fatalf("链首恢复后 Degraded 应为 false")
+	}
+	if msg, _, ok := ch.Note(); ok && strings.Contains(msg, "degraded to") {
+		t.Fatalf("链首成功后不应残留降级记录: %q", msg)
+	}
+}
+
+// 全部后端都挂时必须留痕，并指认这是「全挂」而不是普通降级。
+func TestChainLogsAllProvidersDown(t *testing.T) {
+	head := &fakeProvider{label: "head", dim: 4, down: true}
+	backup := &fakeProvider{label: "backup", dim: 4, down: true}
+	ch := newTestChain(head, backup)
+
+	var logs []string
+	ch.OnTransition(func(m string) { logs = append(logs, m) })
+
+	if _, err := ch.Embed("x"); err == nil {
+		t.Fatal("全部后端都挂时应返回错误")
+	}
+	if len(logs) == 0 {
+		t.Fatal("全挂必须留痕，否则日志里看不出后端已经全没了")
+	}
+	joined := strings.Join(logs, "\n")
+	if !strings.Contains(joined, "all providers failed") {
+		t.Fatalf("应记明「全部失败」，得到 %v", logs)
+	}
+}

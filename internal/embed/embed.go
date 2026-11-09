@@ -199,16 +199,3 @@ func (e *LocalONNX) Embed(text string) ([]float32, error) {
 	}
 	return vec, nil
 }
-
-// Dot 是两个已归一化向量的相似度（内积 = 余弦）。
-func Dot(a, b []float32) float32 {
-	var s float32
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	for i := 0; i < n; i++ {
-		s += a[i] * b[i]
-	}
-	return s
-}

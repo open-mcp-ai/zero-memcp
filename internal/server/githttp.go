@@ -90,7 +90,15 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 	} else {
 		// 分支级可见性无法在这里表达（git 协议按 ref 粒度），
 		// 所以这里只检查「这个项目整体是否对该凭证可见」。
-		if !s.projectVisible(caller, project) {
+		//
+		// 推送方向不套这道门：projectVisible 是**读**门，要求「能读该
+		// 项目的每一条分支」。推送只需要「能写它要推的那几条」，而那几条
+		// 已经由 ReceivePack 的 per-ref 回调逐条裁决了。把读门套在推送上
+		// 还有两个坏处：
+		//   1. 刚由 Ensure 建出来的空仓库没有分支，这道门会退回拿服务端
+		//      默认分支（zero）去问，把只挂载了 main 的凭证直接判死；
+		//   2. 一张「只写不读」的凭证本来就能推，套上读门反而拦掉它。
+		if !receiveDir && !s.projectVisible(caller, project) {
 			http.Error(w, fmt.Sprintf("project %q is outside this credential's visible scope", project), http.StatusForbidden)
 			return
 		}
@@ -366,7 +374,29 @@ func (s *Server) gitPushAllowedRepo(c Caller, project string, repo *gitstore.Rep
 	}
 	refs, _ := repo.Refs("refs/heads/")
 	if len(refs) == 0 {
-		return s.allowed(c, project, s.defaultBranch, configBitWrite)
+		// 空仓库：没有任何已有分支可以拿来问。
+		//
+		// 不能拿 s.defaultBranch 去问——那是**服务端**的默认分支（zero），
+		// 与这张凭证被授权写哪些分支无关。一张只挂载了 main/main.record
+		// 的凭证，向空仓库推 main 是完全正当的，却会因为「它不能写 zero」
+		// 被判 403。实测踩到过：自举时 spoke 全量推不上去，报
+		// "credential lacks write permission"。
+		//
+		// 正确的门槛是「这个项目下至少有一条它算写的分支」，逐条问挂载表
+		// 里列出的分支即可；具体哪条分支允许落，由 ReceivePack 的
+		// per-ref allowRef 回调逐条裁决，能力不会因此放大。
+		if s.allowed(c, project, s.defaultBranch, configBitWrite) {
+			return true
+		}
+		for _, branch := range c.Mount.BranchesOf(project) {
+			if branch == "" || branch == "*" {
+				continue
+			}
+			if s.allowed(c, project, branch, configBitWrite) {
+				return true
+			}
+		}
+		return c.Mount.Empty() && s.allowed(c, project, s.defaultBranch, configBitWrite)
 	}
 	for _, ref := range refs {
 		branch := strings.TrimPrefix(ref, "refs/heads/")

@@ -444,3 +444,81 @@ mode  = "rwx------"
 		t.Fatalf("内容不一致: %q", string(data))
 	}
 }
+
+// 凭证只挂载了 main（没有挂载服务端的 defaultBranch=zero），
+// 向空仓库推 main 必须成功。
+//
+// 这是 403 踩坑的直接回归：预检拿 defaultBranch 去问这张凭证，
+// 发现它不能写 zero 就直接 403，无视了凭证挂载表里明写着 main。
+func TestGitHTTPPushEmptyProjectScopedToken(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dataDir := t.TempDir()
+	cfg := fmt.Sprintf(`
+[server]
+data = %q
+
+[[user]]
+name = "zero"
+root = true
+
+[[listen]]
+addr  = "127.0.0.1:0"
+allow = ["*", "git-upload-pack", "git-receive-pack"]
+
+[[project]]
+name  = "daily"
+owner = "zero"
+mode  = "rwx------"
+`, dataDir)
+	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := New(Config{
+		DataDir:     dataDir,
+		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
+		EnforceAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = srv.Start() }()
+	defer srv.Close()
+	addr := waitForServerAddr(t, srv)
+
+	// 凭证只被允许写 daily@main
+	tok := mintRestricted(t, dataDir, auth.Claims{
+		Sub:  "zero",
+		Name: "writer",
+		Cap:  "rwx",
+		Mount: []auth.MountPoint{
+			{Project: "daily", Branch: "main", Cap: "rwx"},
+		},
+	})
+
+	remoteURL := fmt.Sprintf("http://zero:%s@%s/repos/daily.git", tok, addr)
+
+	seedDir := filepath.Join(t.TempDir(), "seed")
+	runGit(t, "", "init", "-q", "-b", "main", seedDir)
+	runGit(t, seedDir, "config", "user.email", "t@example.com")
+	runGit(t, seedDir, "config", "user.name", "t")
+	if err := osWrite(filepath.Join(seedDir, "b.md"), "只推 main\n"); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, seedDir, "add", "-A")
+	runGit(t, seedDir, "commit", "-q", "-m", "seed")
+	runGit(t, seedDir, "remote", "add", "origin", remoteURL)
+	runGit(t, seedDir, "push", "-q", "origin", "main")
+
+	workDir := filepath.Join(t.TempDir(), "pull")
+	runGit(t, t.TempDir(), "clone", "-q", "-b", "main", remoteURL, workDir)
+	data, err := os.ReadFile(filepath.Join(workDir, "b.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(string(data)) != "只推 main" {
+		t.Fatalf("内容不一致: %q", string(data))
+	}
+}

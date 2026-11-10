@@ -225,10 +225,6 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 	dim := emb.Dim()
 
 	// 收集待索引的块。只取 thought 分支，只取可读的普通内容块。
-	type job struct {
-		id   string
-		text string
-	}
 	var jobs []job
 	for _, t := range s.snapshotTrees() {
 		for _, b := range t.Indexable() {
@@ -305,13 +301,28 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 		}
 		vs, berr := emb.EmbedBatch(batchIn)
 		if berr != nil {
-			// 整批失败：降级链已经换过后端还失败，标记全部失败。
-			// 已复用的旧向量不受影响，索引仍可用（只是少了这几片）。
-			failed += len(batch)
-			s.logf("semantic: batch %d-%d failed: %v", i, end, berr)
-			continue
+			// 一整批失败不再等于整批报废。
+			//
+			// 实测的故障形态：后端对整批返回 413「input length exceeds
+			// the context length」，于是同批另外十几条一起被计成失败，
+			// 而它们单独送进去全部正常。真正的病根是「批」这个粒度：
+			// 请求总量超过了后端的上下文。
+			//
+			// 更糟的是下一轮增量重建会重试，同样的批再次整体失败，形成
+			// 「一批内容永远进不了索引」的稳态，而 status 只报数字。
+			//
+			// 所以整批失败后二分重试：先试一半，坏的那半继续二分，直到
+			// 定位到真的嵌不进的那一片。全批都是好的时候只需 2 次请求，
+			// 而不是逐条 16 次。
+			s.logf("semantic: batch %d-%d failed (%v); isolating by halves", i, end, berr)
+			vs = s.embedIsolate(emb, batch, &failed)
 		}
 		for k, v := range vs {
+			if v == nil {
+				// 逐条兜底里失败的那几条：failed 已经在上面记过，
+				// 这里不能把空向量塞进索引（那不是「零向量」而是没有）。
+				continue
+			}
 			if err := ix.Add(batch[k].id, v); err != nil {
 				failed++
 				continue
@@ -624,4 +635,103 @@ func (s *Server) fileSemanticProviders() []config.SemanticProvider {
 func fingerprint(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:])
+}
+
+// job 是一条待嵌入的切片。
+//
+// 提到包级是为了让二分隔离（embedIsolate）能接收整批——
+// 它原本是 buildSemanticIndex 里的局部类型。
+type job struct {
+	id   string
+	text string
+}
+
+// maxEmbedChars 是送进嵌入模型前允许的最大字符数。
+//
+// bge-m3 的上下文是 8192 token；中日韩字符大致一个 token 一个字，
+// 标点与数字会多一些。取 6000 是留够余量后的安全线。
+//
+// 这个数字不需要精确——它不是分词器，只是「明显超长就先截断再试」
+// 的门槛。真正的长度判定由后端返回的 413 给出，这里只负责别让一条
+// 几万字的文档把整次重建卡在这个坑里反复重试。
+const maxEmbedChars = 6000
+
+// embedOneSlice 嵌入一片文本：先按原文，超长再截断重试。
+//
+// 返回 nil 向量表示这片确实嵌不进去（调用方记失败），语义上不等于
+// 「零向量」——零向量是一个合法结果，nil 不是。
+func (s *Server) embedOneSlice(emb embed.Embedder, text, id string) ([]float32, error) {
+	v, err := emb.Embed(text)
+	if err == nil && v != nil {
+		return v, nil
+	}
+	n := len([]rune(text))
+	if n <= maxEmbedChars {
+		if err == nil {
+			err = fmt.Errorf("backend returned an empty vector")
+		}
+		return nil, err
+	}
+	s.logf("semantic: slice %s is %d chars, over the embedding context; truncating to %d and retrying",
+		id, n, maxEmbedChars)
+	v2, err2 := emb.Embed(truncateRunes(text, maxEmbedChars))
+	if err2 != nil {
+		return nil, err2
+	}
+	if v2 == nil {
+		return nil, fmt.Errorf("backend returned an empty vector after truncation")
+	}
+	return v2, nil
+}
+
+// truncateRunes 按字符截断（不是字节），保证不切断 UTF-8 序列。
+//
+// 按字节截断会产生非法 UTF-8，而非法 UTF-8 在 JSON 编码时会被替换成
+// U+FFFD，送到后端就是一段看似正常、实则被悄悄改过的文本——错得
+// 无声无息。
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n])
+}
+
+// embedIsolate 在整批失败后二分重试，把能嵌的救回来。
+//
+// 返回长度与 jobs 等长的向量切片；嵌不进去的位置是 nil（调用方跳过并
+// 计失败）。为什么二分而不是逐条：整批失败最常见的原因是「请求总量
+// 超限」，此时绝大多数条目本身没问题，二分两三次就能把好的一半整体
+// 送进去；逐条重试会把 16 条好内容变成 16 次往返。
+func (s *Server) embedIsolate(emb embed.Embedder, jobs []job, failed *int) [][]float32 {
+	out := make([][]float32, len(jobs))
+	if len(jobs) == 0 {
+		return out
+	}
+	texts := make([]string, len(jobs))
+	for k := range jobs {
+		texts[k] = jobs[k].text
+	}
+	vs, err := emb.EmbedBatch(texts)
+	if err == nil {
+		copy(out, vs)
+		return out
+	}
+	if len(jobs) == 1 {
+		// 到单片了还失败：可能是这一片真的超长，先截断再试一次。
+		v, e := s.embedOneSlice(emb, jobs[0].text, jobs[0].id)
+		if e != nil {
+			*failed++
+			s.logf("semantic: slice %s cannot be embedded: %v", jobs[0].id, e)
+			return out
+		}
+		out[0] = v
+		return out
+	}
+	half := len(jobs) / 2
+	left := s.embedIsolate(emb, jobs[:half], failed)
+	right := s.embedIsolate(emb, jobs[half:], failed)
+	copy(out, left)
+	copy(out[half:], right)
+	return out
 }

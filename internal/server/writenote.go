@@ -85,7 +85,14 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 
 	// 写入目标必须同时满足三件事：挂载表可见、有写权限、配置里声明过。
 	// 取「全局第一个项目」是错的——那张凭证可能根本看不见它。
-	targetProject, resolvedBranch, pol, err := s.resolveWriteTarget(c, defaultBranch, explicit)
+	//
+	// 入口已经解析出明确分支时必须把它一并交给 resolveWriteTarget：
+	// 那个函数会拿「默认分支」去做可写校验，而分身边界凭证的默认分支
+	// 恰好是只读的 main。早先这里只传了剥掉 @branch 的项目名，于是同一
+	// 次写入先在第 77 行用 chat 校验通过，紧接着在 resolveWriteTarget
+	// 里用 main 再校验一次而失败——报错是 missing w permission，看起来
+	// 像凭证配错，实际是分支信息在传递中丢了。
+	targetProject, resolvedBranch, pol, err := s.resolveWriteTarget(c, defaultBranch, explicit, explicitBranch)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -359,11 +366,18 @@ func (s *Server) policyOf(project string) (manifest.Policy, bool) {
 // explicit 非空时必须命中它：指定了目标却写到别处，等于悄悄改主意。
 // 没有权限就拒绝，绝不回落到另一个仓库——那会让「我明明写这个仓库，
 // 结果写进了那个」变成一次无从察觉的事故。
-func (s *Server) resolveWriteTarget(c Caller, defaultBranch, explicit string) (string, string, manifest.Policy, error) {
+func (s *Server) resolveWriteTarget(c Caller, defaultBranch, explicit string, preferredBranch ...string) (string, string, manifest.Policy, error) {
+	pref := ""
+	if len(preferredBranch) > 0 && preferredBranch[0] != "" {
+		pref = preferredBranch[0]
+	}
 	if explicit == "" {
 		p, br, pol, err := s.writeTarget(c, defaultBranch)
 		if err != nil {
 			return "", "", manifest.Policy{}, err
+		}
+		if pref != "" {
+			br = pref
 		}
 		return p, br, pol, nil
 	}
@@ -395,7 +409,9 @@ func (s *Server) resolveWriteTarget(c Caller, defaultBranch, explicit string) (s
 		return "", "", manifest.Policy{}, fmt.Errorf("target %q is not a declared project", explicit)
 	}
 	branch := defaultBranch
-	if mountBranch != "" {
+	if pref != "" {
+		branch = pref
+	} else if mountBranch != "" {
 		branch = mountBranch
 	} else if wb := c.Mount.WritableBranch(project); wb != "" {
 		// 挂载表定义了对该项目的可写分支时优先落入，

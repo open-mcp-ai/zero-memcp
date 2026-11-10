@@ -59,9 +59,21 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 	//    这个字之差是一整轮跑偏的排查）；推送可以建库，但只限
 	//    配置里声明过的项目或无限制的 root，否则任何人推一个名字就能
 	//    在服务端造出一个空仓库。
+	//
+	// 推送方向要放行**两个**请求，不只一个：
+	//
+	//   GET  /info/refs?service=git-receive-pack   探测（git 先发这个）
+	//   POST /git-receive-pack                     真正推送
+	//
+	// 只放行后者的话，客户端在探测那步就拿到 404，永远走不到推送——
+	// 症状是「向空项目推第一次」直接失败并报「仓库不存在」，而配置里
+	// 明明声明了这个项目。实测踩到过：修了 Ensure 仍然推不上去。
+	receiveDir := action == "git-receive-pack" ||
+		(action == "info/refs" && r.URL.Query().Get("service") == "git-receive-pack")
+
 	repo, getErr := s.projects.Get(project)
 	if getErr != nil {
-		if action != "git-receive-pack" {
+		if !receiveDir {
 			http.Error(w, fmt.Sprintf("project %q has no repository yet", project), http.StatusNotFound)
 			return
 		}
@@ -110,7 +122,7 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 			_, _ = w.Write(body)
 
 		case "git-receive-pack":
-			if !s.gitPushAllowed(caller, project) {
+			if !s.gitPushAllowedRepo(caller, project, repo) {
 				http.Error(w, "git-receive-pack is not enabled on this port, or the credential lacks write permission", http.StatusForbidden)
 				return
 			}
@@ -178,7 +190,7 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		if !s.gitPushAllowed(caller, project) {
+		if !s.gitPushAllowedRepo(caller, project, repo) {
 			http.Error(w, "git-receive-pack is not enabled on this port, or the credential lacks write permission", http.StatusForbidden)
 			return
 		}
@@ -348,9 +360,8 @@ func parseGitPathFull(p string) (project, action string, err error) {
 
 // gitPushAllowed 检查凭证侧：该项目下至少有一条它能写的分支。
 // 端口侧的门槛在 portPolicy 里，两处都要过。
-func (s *Server) gitPushAllowed(c Caller, project string) bool {
-	repo, err := s.projects.Get(project)
-	if err != nil {
+func (s *Server) gitPushAllowedRepo(c Caller, project string, repo *gitstore.Repo) bool {
+	if repo == nil {
 		return false
 	}
 	refs, _ := repo.Refs("refs/heads/")

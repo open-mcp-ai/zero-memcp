@@ -125,7 +125,16 @@ func (r *Repo) advertise(defaultBranch string, keep func(ref string) bool, servi
 		}
 	}
 
+	// 空仓库规范：没有任何 ref 可广播时，Git 要求服务端发一行全 0 的
+	// capabilities^{} 伪 ref，后面带 capability 声明。
+	//
+	// 不发这一行（直接 flush 结束）的后果：客户端在 receive-pack 握手时
+	// 拿不到服务端 capabilities，以为不支持 report-status。等服务端解包
+	// 成功、回送 "unpack ok / ok refs/heads/main" 时，客户端把它当作协议
+	// 异常，报「无法推送一些引用」——而服务端明明已经收下了。症状是
+	// 新节点永远推不上第一条分支，且服务端日志干净。
 	if first {
+		buf.Write(PktLine(fmt.Sprintf("%s capabilities^{}\x00%s\n", zeroOID, caps)))
 		buf.Write(PktFlush())
 		return buf.Bytes(), nil
 	}

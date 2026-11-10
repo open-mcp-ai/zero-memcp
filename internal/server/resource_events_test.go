@@ -183,23 +183,45 @@ func TestListenHandshakeAndEvent(t *testing.T) {
 		Identity: c.Identity, Session: c.Session, Endpoint: srv.cfg.Endpoint,
 	})
 
-	// 3. 收到 resources/updated
-	ev := probe.nextFrame(t, 3*time.Second)
-	if got := ev["method"]; got != "notifications/resources/updated" {
-		t.Fatalf("应收到 resources/updated，实际 %v", got)
+	// 3. 收到带本次会话标识的 resources/updated
+	//
+	// 广播点从 commit 挪到写入之后，同一场景里会先到一条「写入」事件
+	// （origin.session 为空）。所以这里不能"读一帧就断言"，要读到
+	// 那条带 sess-A 的为止。
+	// 逐帧读，直到读到带 sess-A 的那条。
+	// 不能用「起 goroutine + 超时」的读法：超时后那个 goroutine 还挂在
+	// 同一个 Reader 上，会把后面到达的帧吞掉，表现为永远等不到。
+	var ev map[string]any
+	for i := 0; i < 8 && ev == nil; i++ {
+		f := probe.nextFrame(t, 3*time.Second)
+		if f["method"] != "notifications/resources/updated" {
+			continue
+		}
+		pr, _ := f["params"].(map[string]any)
+		if pr == nil {
+			continue
+		}
+		meta, _ := pr["_meta"].(map[string]any)
+		if meta == nil {
+			continue
+		}
+		if o, _ := meta["memcp/origin"].(map[string]any); o != nil && o["session"] == "sess-A" {
+			ev = f
+		}
+	}
+	if ev == nil {
+		t.Fatalf("没等到 origin.session=sess-A 的事件")
 	}
 	params, _ := ev["params"].(map[string]any)
 	if params["uri"] != "memcp://daily/zero" {
 		t.Fatalf("uri 不符: %v", params["uri"])
 	}
-	meta, _ := params["_meta"].(map[string]any)
-	origin, _ := meta["memcp/origin"].(map[string]any)
-	if origin["session"] != "sess-A" {
-		t.Fatalf("origin.session 应为 sess-A，实际 %v", origin["session"])
+	if meta, _ := params["_meta"].(map[string]any); meta != nil {
+		if o, _ := meta["memcp/origin"].(map[string]any); o != nil && o["identity"] == "" {
+			t.Fatalf("origin.identity 不应为空")
+		}
 	}
-	if origin["identity"] == "" {
-		t.Fatal("origin.identity 不该为空")
-	}
+
 }
 
 // TestListenRejectsOutOfScope 锁定订阅时的权限校验：
@@ -268,7 +290,6 @@ func TestInitializeDeclaresModernProtocol(t *testing.T) {
 	}
 }
 
-
 // TestTreeURIRoundTripWithSlashInProject 锁定项目名含斜杠时的 URI 编解码。
 //
 // 这个 bug 极其难发现：treeURI 与 parseTreeURI 用同一套逻辑，两边错得
@@ -320,5 +341,43 @@ func TestSubscriptionMatchesRealProjectURI(t *testing.T) {
 	}
 	if !subMatches([]string{treeURI("BlackEggAI/zero", "main.record", "")}, branchURI) {
 		t.Fatal("精确匹配应成立")
+	}
+}
+
+// frameWithin 在超时窗口内尝试读一帧；超时返回 ok=false 而不是测试失败。
+// 用于「排空已有事件」这类不关心内容的场景。
+func (p *listenProbe) frameWithin(timeout time.Duration) (map[string]any, bool) {
+	type res struct {
+		msg map[string]any
+		err error
+	}
+	ch := make(chan res, 1)
+	go func() {
+		var data string
+		for {
+			line, err := p.reader.ReadString('\n')
+			if err != nil {
+				ch <- res{err: err}
+				return
+			}
+			line = strings.TrimRight(line, "\r\n")
+			if line == "" {
+				if data == "" {
+					continue
+				}
+				var m map[string]any
+				ch <- res{msg: m}
+				return
+			}
+			if after, okay := strings.CutPrefix(line, "data:"); okay {
+				data += strings.TrimSpace(after)
+			}
+		}
+	}()
+	select {
+	case r := <-ch:
+		return r.msg, r.err == nil && r.msg != nil
+	case <-time.After(timeout):
+		return nil, false
 	}
 }

@@ -197,9 +197,27 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 		path = treePrefix + "/" + path
 	}
 
+	// 记下写入前的头，供事件携带——「写入发生在哪个版本之上」。
+	prevHead, _ := repo.Resolve(writeBranch)
+
 	if err := repo.Write(writeBranch, path, []byte(content), gitstore.ModeContent); err != nil {
 		return "", "", "", err
 	}
+
+	// 写入即通知：commit 是底层折叠动作，不是语义事件。
+	//
+	// 早先广播只挂在 commit 上，于是「外部往 inbox 写一条，等它自己折叠」
+	// 这条最常见的用法根本不触发唤醒——数据进了脏层，索引也更新了，
+	// 但订阅者收不到任何东西。让调用方为了叫醒别人而多调一次 commit，
+	// 等于把内部机制泄漏成外部契约。
+	//
+	// 语义从「树被折叠了」改成「树被写了」。commit 留空：脏层没有新版本号，
+	// 取差量的正确方式是按路径读，而不是 since <commit>。
+	s.publishTreeChange(targetProject, writeBranch, "", prevHead, "", EventOrigin{
+		Identity: c.Identity,
+		Session:  c.Session,
+		Endpoint: s.cfg.Endpoint,
+	})
 
 	addr = targetProject + "/" + path
 	s.dedup.Store(dedupKey, path)

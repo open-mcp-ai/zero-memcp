@@ -1,5 +1,7 @@
 package server
 
+import "strings"
+
 // 分支头水位：记录本进程上一次看到的各分支 HEAD。
 //
 // 它存在的唯一理由是发现**外部提交**：另一台机器 push 上来、
@@ -57,4 +59,42 @@ func (s *Server) rememberTreeHeads() {
 		}
 		return true
 	})
+}
+
+// splitTreeHeadKey 是 treeHeadKey 的逆运算。
+//
+// 键里用 \x00 当分隔符，因为项目名本身含斜杠（BlackEggAI/zero），
+// 用斜杠或冒号都会和项目名、分支名撞上。
+func splitTreeHeadKey(key string) (project, branch string, ok bool) {
+	i := strings.IndexByte(key, 0)
+	if i <= 0 || i == len(key)-1 {
+		return "", "", false
+	}
+	return key[:i], key[i+1:], true
+}
+
+// publishExternalTreeChanges 把「外部推进」的分支变化广播给订阅者。
+//
+// 与 MCP 写入路径的 publishTreeChange 分工相同：那边 origin 是真实身份，
+// 这边只能是 external——外部推进（另一台机器 push、人手 git commit、
+// 第三方 bot 直接推仓库）没有可信的身份信息，标成 external 是诚实的做法。
+// 客户端据此决定要不要唤醒自己；宁可多醒一次，也不假装知道是谁写的。
+func (s *Server) publishExternalTreeChanges(current map[string]branchHead) {
+	for key, head := range current {
+		prev := ""
+		if val, ok := s.lastCommits.Load(key); ok {
+			prev = val.(string)
+		}
+		if prev == head.Commit {
+			continue
+		}
+		proj, branch, ok := splitTreeHeadKey(key)
+		if !ok {
+			continue
+		}
+		s.publishTreeChange(proj, branch, "", prev, head.Commit, EventOrigin{
+			Identity: "external",
+			Endpoint: s.cfg.Endpoint,
+		})
+	}
 }

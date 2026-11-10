@@ -205,6 +205,7 @@ func (s *Server) checkExternalUpdates() {
 	}
 	if changed {
 		s.logf("branch head movement detected; rebuilding the index and broadcasting tree changes")
+		s.publishExternalTreeChanges(current)
 		_ = s.Reload()
 	}
 }

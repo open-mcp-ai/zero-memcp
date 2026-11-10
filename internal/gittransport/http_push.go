@@ -17,7 +17,19 @@ import (
 
 // maxAdvertisement 限制一次 ref 广告的读取量。
 // 一个错误的地址（比如把人家的 HTML 页面当仓库）不该把内存读穿。
+// maxAdvertisement 是 ref 广告的上限。一条广告是一行一个分支，
+// 8MB 足够放下几万个分支，超出说明对端不是在说 git 协议。
 const maxAdvertisement = 8 << 20
+
+// maxPackResponse 是 packfile 响应的上限。
+//
+// 这里曾是 maxAdvertisement，于是「取一个大于 8MB 的仓库」永远失败：
+// 响应被 LimitReader 静默截断，下游按 pkt-line 解析时读到半个分片，
+// 报 "read pack chunk: unexpected EOF"——一个完全指错方向的错误，
+// 看起来像对端断线，实际是本端自己截的。
+//
+// 用与接收端一致的上限，并且超限时明确报错，不再静默截断。
+const maxPackResponse = 512 << 20
 
 // PushHTTP 通过 smart HTTP 推送一个分支。
 //

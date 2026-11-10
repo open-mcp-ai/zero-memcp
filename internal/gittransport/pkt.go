@@ -220,8 +220,8 @@ func readSidebandPack(r *bufio.Reader) ([]byte, error) {
 			// 没有通道字节：某些实现直接发裸 pack 数据。
 			pack = append(pack, line...)
 		}
-		if len(pack) > maxAdvertisement {
-			return nil, fmt.Errorf("pack exceeds the %d byte limit", maxAdvertisement)
+		if len(pack) > maxPackResponse {
+			return nil, fmt.Errorf("pack exceeds the %d byte limit", maxPackResponse)
 		}
 	}
 	if len(pack) == 0 {

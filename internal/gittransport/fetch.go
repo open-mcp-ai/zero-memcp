@@ -108,7 +108,8 @@ func readPackPayload(r *bufio.Reader) ([]byte, error) {
 		return nil, fmt.Errorf("read pack: %w", err)
 	}
 	if string(head[:]) == "PACK" {
-		rest, err := io.ReadAll(io.LimitReader(r, maxAdvertisement))
+		// 这里是 pack 本体，不是 ref 广告：用 pack 的上限。
+		rest, err := io.ReadAll(io.LimitReader(r, maxPackResponse))
 		if err != nil {
 			return nil, fmt.Errorf("read pack: %w", err)
 		}
@@ -149,8 +150,8 @@ func readFramedPack(r io.Reader) ([]byte, error) {
 		default:
 			pack = append(pack, line...)
 		}
-		if len(pack) > maxAdvertisement {
-			return nil, fmt.Errorf("pack exceeds the %d byte limit", maxAdvertisement)
+		if len(pack) > maxPackResponse {
+			return nil, fmt.Errorf("pack exceeds the %d byte limit", maxPackResponse)
 		}
 	}
 	if len(pack) == 0 {
@@ -339,7 +340,17 @@ func postService(ctx context.Context, client *http.Client, base, user, token, se
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 		return nil, fmt.Errorf("remote returned %s: %s", resp.Status, strings.TrimSpace(string(snippet)))
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, maxAdvertisement))
+	// packfile 响应可以远大于 ref 广告（取决于仓库体积），所以这里不能
+	// 沿用广告的 8MB 上限。超限时明确报错而不是截断：截断只会让上半层的
+	// pkt-line 解析器报 "unexpected EOF"，把「本端自己切了」误导成「对端断了」。
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxPackResponse+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s response: %w", service, err)
+	}
+	if int64(len(data)) > maxPackResponse {
+		return nil, fmt.Errorf("%s response exceeds the %d byte limit", service, int64(maxPackResponse))
+	}
+	return data, nil
 }
 
 // v0PackHTTP 发送 v0 的 want/have 请求并取回 pack。

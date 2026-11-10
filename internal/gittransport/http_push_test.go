@@ -1,8 +1,11 @@
 package gittransport
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -179,9 +182,9 @@ var _ = url.Parse
 // 加密覆盖网内」（WireGuard / EasyTier / Tailscale 之类）。
 //
 // 两件事必须同时成立：
-//   1. 不带该参数时，非回环地址依然被拒（公网与陌生内网都不放过）。
-//   2. 带该参数时放行，但规范化后的 URL 里不能残留 insecure 查询参数——
-//      它只是本端的许可标记，不该出现在实际请求路径上。
+//  1. 不带该参数时，非回环地址依然被拒（公网与陌生内网都不放过）。
+//  2. 带该参数时放行，但规范化后的 URL 里不能残留 insecure 查询参数——
+//     它只是本端的许可标记，不该出现在实际请求路径上。
 func TestHTTPPushInsecureFlagAllowsPlaintextToRemoteHost(t *testing.T) {
 	if _, err := parseHTTPRemote("http://10.10.10.12:1729/repos/x/y.git"); err == nil {
 		t.Fatal("不带 ?insecure=1 时应拒绝向非回环主机明文发送凭证")
@@ -206,5 +209,37 @@ func TestParseHTTPRemoteLoopbackNeedsNoFlag(t *testing.T) {
 	}
 	if got != "http://127.0.0.1:1729/repos/x/y.git" {
 		t.Fatalf("回环地址规范化结果不对: %q", got)
+	}
+}
+
+// 大于 8MB 的 packfile 必须能取回。
+//
+// 回归的是一个把「ref 广告上限」当成「pack 上限」的错误：广告是几行文本，
+// 8MB 绰绰有余；pack 的大小取决于仓库体积，20~30MB 的仓库很常见。上限用错
+// 直接的后果是响应被 LimitReader 静默截断，下游按 pkt-line 读到半个分片，
+// 报 "read pack chunk: unexpected EOF"——把「本端自己切了」伪装成「对端断了」。
+func TestFetchReadsPackLargerThanAdvertisementLimit(t *testing.T) {
+	// pkt-line 单帧上限约 64KB，要测 >8MB 必须拼多个分片（side-band channel=1）。
+	chunkPayload := bytes.Repeat([]byte("z"), 32*1024)
+	// 4 字节十六进制长度 + 1 字节通道标识 (0x01) + 载荷
+	lineLen := 4 + 1 + len(chunkPayload)
+	chunk := make([]byte, lineLen)
+	copy(chunk[:4], fmt.Sprintf("%04x", lineLen))
+	chunk[4] = 1 // sideband data channel
+	copy(chunk[5:], chunkPayload)
+
+	var buf bytes.Buffer
+	// 300 个 32KB 分片 = ~9.6MB，明确跨过 8MB 原门槛
+	for i := 0; i < 300; i++ {
+		buf.Write(chunk)
+	}
+	buf.WriteString("0000") // flush
+
+	pack, err := readFramedPack(bufio.NewReader(&buf))
+	if err != nil {
+		t.Fatalf("大于 8MB 的 pack 应能读回: %v", err)
+	}
+	if len(pack) != 300*len(chunkPayload) {
+		t.Fatalf("读回字节数不对: got %d want %d", len(pack), 300*len(chunkPayload))
 	}
 }

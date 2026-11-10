@@ -98,6 +98,11 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 		writeBranch = explicitBranch
 	} else if resolvedBranch != "" {
 		writeBranch = resolvedBranch
+	} else if b := c.Mount.WritableBranch(targetProject); b != "" {
+		// 凭证是「读主干 + 写隔离分支」（main:r + chat:rw）时，
+		// 配置默认分支 main 恰好只读：不补这一层，写入永远被拒，
+		// 而报错是 missing w permission，看起来像凭证配错。
+		writeBranch = b
 	}
 	if implicitKind {
 		// 落点决定类型：项目声明的第一个 kind 就是它的默认语义。
@@ -392,6 +397,10 @@ func (s *Server) resolveWriteTarget(c Caller, defaultBranch, explicit string) (s
 	branch := defaultBranch
 	if mountBranch != "" {
 		branch = mountBranch
+	} else if wb := c.Mount.WritableBranch(project); wb != "" {
+		// 挂载表定义了对该项目的可写分支时优先落入，
+		// 避免「main:r + chat:rw」被配置默认分支 main 抢占而报只读错误。
+		branch = wb
 	} else if !c.Mount.Empty() {
 		branch = c.Mount.DefaultBranch()
 	}

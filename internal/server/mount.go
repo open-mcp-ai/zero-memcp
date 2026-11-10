@@ -100,6 +100,32 @@ func (m *Mount) DefaultBranch() string {
 	return m.defaultBranch
 }
 
+// WritableBranch 返回这张表里对 project 明确可写的第一个分支。
+//
+// 存在意义：当凭证是「读主干 + 写隔离分支」（main:r + chat:rw）时，
+// 配置的默认分支（main）恰好是只读的那条。若写入落点直接取默认分支，
+// 一张完全合法的凭证就永远写不进去，而报错说的是「missing w permission」
+// ——听起来像凭证配错了，实际是落点选错了分支。
+//
+// "*" 不是真实分支名，不返回。
+func (m *Mount) WritableBranch(project string) string {
+	if m == nil {
+		return ""
+	}
+	for _, e := range m.entries {
+		if e.project != project {
+			continue
+		}
+		if e.branch == "" || e.branch == "*" {
+			continue
+		}
+		if strings.ContainsRune(e.cap, 'w') {
+			return e.branch
+		}
+	}
+	return ""
+}
+
 // BranchesOf 列出这张挂载表里某个项目被授权的分支。
 //
 // "*" 展开成具体分支由调用方决定（它需要知道分支是否真的存在）；

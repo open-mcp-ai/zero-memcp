@@ -171,10 +171,26 @@ func parseHTTPRemote(raw string) (string, error) {
 	if u.Host == "" || strings.Trim(u.Path, "/") == "" {
 		return "", fmt.Errorf("HTTP remote is missing a host or repository path: %s", redactURL(raw))
 	}
-	// token 只能走 TLS。明文 HTTP 只允许回环地址（本机测试/自托管代理）。
-	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) {
-		return "", fmt.Errorf("refusing to send credentials over plain HTTP (%s); use https:// or SSH", u.Hostname())
+	// token 默认只能走 TLS。
+	//
+	// 明文 HTTP 的两个例外：
+	// 1. 回环地址（127.0.0.1 / ::1 / localhost）：本地测试与自托管同机代理。
+	// 2. 显式带有 ?insecure=1 查询参数的 URL：明确在局域网 / WireGuard /
+	//    EasyTier 等加密覆盖网内运行的私有端点。
+	//
+	// 为什么要求显式声明：在公共 WiFi 等不受控网络下，纯私网 IP（192.168.x）
+	// 也可能被嗅探。写配置的人必须在 URL 尾部显式声明 ?insecure=1，
+	// 把「这是安全网格」的承诺钉在配置里。公网 IP/域名带此参数也允许，
+	// 但由写配置的人承担明文泄漏风险（责任边界清晰）。
+	//
+	// 规范化输出时把该 query 参数剥离，不污染实际发往对端的 HTTP 请求路径。
+	insecure := u.Query().Get("insecure") == "1"
+	if u.Scheme == "http" && !isLoopbackHost(u.Hostname()) && !insecure {
+		return "", fmt.Errorf("refusing to send credentials over plain HTTP (%s); use https:// or SSH (or append ?insecure=1 for mesh networks)", u.Hostname())
 	}
+	q := u.Query()
+	q.Del("insecure")
+	u.RawQuery = q.Encode()
 	return strings.TrimSuffix(u.String(), "/"), nil
 }
 

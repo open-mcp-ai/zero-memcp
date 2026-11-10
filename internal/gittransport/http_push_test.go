@@ -174,3 +174,37 @@ func gitRemoteOutput(t *testing.T, repoDir string, args ...string) string {
 }
 
 var _ = url.Parse
+
+// ?insecure=1 是明文 HTTP 的显式放行：写配置的人以此声明「这条链路在
+// 加密覆盖网内」（WireGuard / EasyTier / Tailscale 之类）。
+//
+// 两件事必须同时成立：
+//   1. 不带该参数时，非回环地址依然被拒（公网与陌生内网都不放过）。
+//   2. 带该参数时放行，但规范化后的 URL 里不能残留 insecure 查询参数——
+//      它只是本端的许可标记，不该出现在实际请求路径上。
+func TestHTTPPushInsecureFlagAllowsPlaintextToRemoteHost(t *testing.T) {
+	if _, err := parseHTTPRemote("http://10.10.10.12:1729/repos/x/y.git"); err == nil {
+		t.Fatal("不带 ?insecure=1 时应拒绝向非回环主机明文发送凭证")
+	}
+	got, err := parseHTTPRemote("http://10.10.10.12:1729/repos/x/y.git?insecure=1")
+	if err != nil {
+		t.Fatalf("带 ?insecure=1 时应放行: %v", err)
+	}
+	if strings.Contains(got, "insecure") {
+		t.Fatalf("规范化后不应残留 insecure 参数: %s", got)
+	}
+	if want := "http://10.10.10.12:1729/repos/x/y.git"; got != want {
+		t.Fatalf("规范化结果应为 %q，得到 %q", want, got)
+	}
+}
+
+// 回环地址天然放行，不需要任何标记——本机测试与自托管同机代理都靠它。
+func TestParseHTTPRemoteLoopbackNeedsNoFlag(t *testing.T) {
+	got, err := parseHTTPRemote("http://127.0.0.1:1729/repos/x/y.git")
+	if err != nil {
+		t.Fatalf("回环地址不应需要 insecure 标记: %v", err)
+	}
+	if got != "http://127.0.0.1:1729/repos/x/y.git" {
+		t.Fatalf("回环地址规范化结果不对: %q", got)
+	}
+}

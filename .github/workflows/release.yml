@@ -1,0 +1,103 @@
+# zero-memcp 发版工作流。
+#
+# 纯 Go 偏好：CGO_ENABLED=0，全平台在一台 runner 上并发交叉编译。
+# 编译产物为静态单二进制，并同时生成 .gz 压缩版供 wrapper 快速拉取。
+#
+# 触发：push 以 'v' 开头的 tag（如 v0.1.0）。
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - os: darwin
+            arch: arm64
+            ext: ''
+          - os: darwin
+            arch: amd64
+            ext: ''
+          - os: linux
+            arch: amd64
+            ext: ''
+          - os: linux
+            arch: arm64
+            ext: ''
+          - os: windows
+            arch: amd64
+            ext: '.exe'
+          - os: windows
+            arch: arm64
+            ext: '.exe'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          check-latest: true
+
+      - name: 编译
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          OUT="zero-memcp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${TAG}" \
+            -o "dist/${OUT}" \
+            ./cmd/zero-memcp
+
+      - name: 压缩 (.gz)
+        run: |
+          OUT="zero-memcp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
+          gzip -c -9 "dist/${OUT}" > "dist/${OUT}.gz"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/*
+          retention-days: 1
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 下载所有产物
+        uses: actions/download-artifact@v4
+        with:
+          path: all-dist
+          merge-multiple: true
+
+      - name: 生成 SHA256SUMS
+        run: |
+          cd all-dist
+          sha256sum zero-memcp-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: 发布 GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" all-dist/* \
+            --title "zero-memcp $TAG" \
+            --generate-notes \
+            --draft=false \
+            --prerelease=false

@@ -26,6 +26,9 @@ func main() {
 			return
 		case "serve":
 			args = args[1:]
+		case "daemon":
+			runDaemon(args[1:])
+			return
 		}
 	}
 	os.Exit(runServe(args))
@@ -41,6 +44,11 @@ Start the server:
   zero-memcp serve -data DIR [-config FILE] [-listen ADDR] [-endpoint NAME]
                      [-branch NAME] [-weights FILE]
   zero-memcp -data DIR ...   (legacy form, identical to serve)
+
+Run it in the background:
+  zero-memcp daemon start  [-config FILE]   detach and write <data>/daemon.pid
+  zero-memcp daemon status                  pid alive? /health reachable?
+  zero-memcp daemon stop                    SIGTERM the detached instance
 
   On first start it generates the signing key (system/jwt.key) and an initial
   WebUI password. The password is printed once to stderr and must be changed

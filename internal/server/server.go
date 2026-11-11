@@ -1192,72 +1192,16 @@ func (s *Server) dispatchMCP(ctx context.Context, method string, params json.Raw
 		}, nil
 
 	case "tools/list":
-		// 只暴露 term。
+		// 只暴露 term，声明来自 termTool()。
 		//
 		// 本服务实现 termcp 协议：单工具 term({cmd})，动词在命令空间里分发。
+		// 逐个暴露动词等于给每个动词开一个口子，工具表变长、每轮都进提示词，
+		// 而能力一点没多。
 		//
-		// termcp 协议的约定是「一个入口，一行命令」：recall / read / put
-		// 都是 term 的动词，不是独立的工具。逐个暴露等于给每个动词开一个
-		// 口子，工具表变长、每轮都出现在提示词里，而能力一点没多。
-		//
-		// 声明面等于能力面：tools/list 里看得见 term，就只能调 term。
-		//
-		// 插件自己不走这条路——它有专门的 /identity 和 /recall 路由。
-		return map[string]any{
-			"tools": []map[string]any{
-				{
-					"name": "term",
-					"description": "termcp protocol entry point (implemented by this service). Accepts one line of DSL:\n" +
-						"  recall <text> [--scope T] semantic search (returns addresses and excerpts)\n" +
-						"  read <addr> [<addr>...]  read full text; accepts multiple addresses\n" +
-						"  grep <regex>             search full text with surrounding lines (better than recall for symbols, numbers, and names)\n" +
-						"  log [N]                  show dates and summaries of the most recent N entries (default 5)\n" +
-						"  ls [date]                list entries for a date\n" +
-						"  put [<tree>] -- $TEXT    write content to a memory tree (pass content through vars/args, not in the DSL)\n" +
-						"  put <tree> --ref <addr>  append a reference to existing memory in a tree\n" +
-						"  trees <project>[@<branch>]  view the tree directory\n" +
-						"  remind [<tree>]          watch a tree and receive notifications when it changes\n" +
-						"  since <tree> <commit>    retrieve tree changes since a commit\n" +
-						"  status                   index size\n" +
-						"  help [<verb>]            show usage for a verb; an empty command shows the overview\n" +
-						"This is your persistent memory: a successful put is stored locally and remains available after a restart.\n" +
-						"When to use each: ask \"what did I think about X?\" -> recall;\n" +
-						"search for exact strings (IP, port, QQ number, function name) -> grep;\n" +
-						"ask \"what was I working on recently?\" -> log.\n" +
-						"If the first word is the name of a downstream MCP, pass the rest through unchanged.",
-					"inputSchema": map[string]any{
-						"type": "object",
-						"properties": map[string]any{
-							"cmd": map[string]any{
-								"type":        "string",
-								"description": "DSL command line, e.g. 'recall napcat' or 'put -- $TEXT'. Pass content in vars/args and reference it with $NAME / $1; a reference must occupy a whole word.",
-							},
-							"args": map[string]any{
-								"type":        "array",
-								"items":       map[string]any{"type": "string"},
-								"description": "Positional arguments referenced as $1, $2, etc. in cmd. A reference must occupy a whole word. Values are not escaped or concatenated; pass content here instead of embedding it in cmd.",
-							},
-							"vars": map[string]any{
-								"type":                 "object",
-								"additionalProperties": map[string]any{"type": "string"},
-								"description":          "Named arguments referenced as $NAME in cmd. The same rule as args applies: a reference must occupy a whole word, and every supplied value must be referenced.",
-							},
-							"content": map[string]any{
-								"type":        "boolean",
-								"default":     true,
-								"description": "Whether to return a text projection for agents. Set to false for programmatic consumers.",
-							},
-							"structured_content": map[string]any{
-								"type":        "boolean",
-								"default":     false,
-								"description": "Whether to return a structured projection for programs. Combine with content:false to return only JSON.",
-							},
-						},
-						"required": []string{"cmd"},
-					},
-				},
-			},
-		}, nil
+		// schema 本身由 internal/server/mcp_tool.go 用 termcp 的 mcp.Tool 声明，
+		// 不再手写 map：协议层（字段名、required 的位置、default 的写法）
+		// 归 termcp，这里只回答"有哪些工具"。
+		return map[string]any{"tools": []any{termTool()}}, nil
 
 	case "tools/call":
 		var call struct {

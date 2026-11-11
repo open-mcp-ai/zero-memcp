@@ -71,25 +71,6 @@ help --all    show all details
 // helpVerb 返回单个动词的详细说明。
 func helpVerb(verb string) (string, bool) {
 	switch verb {
-	case "put":
-		return strings.TrimSpace(`
-put [<tree>] $TEXT
-ref <tree> <addr>
-
-Store content in a memory tree. If no target is given, the service chooses a default destination based on the stream declaration in SKILL.md;
-when a tree path is specified, content is written as a new entry in that subtree.
-
-Pass text separately from cmd through Termcp vars / args:
-  cmd:  put notes/todo $TEXT
-  vars: {"TEXT":"content can include spaces, newlines, and --"}
-
-Reference mode does not copy content:
-  cmd: ref notes/todo $1
-  args: ["memories/2026-08-03/123456-local.md"]
-
-The address returned by put is a stable file reference. Writes enter the single-writer dirty layer and are immediately searchable; policy or commit folds them into history.
-`), true
-
 	case "ref":
 		return strings.TrimSpace(`
 ref <tree> <addr>
@@ -522,6 +503,17 @@ users
 List users declared in the config and an access-control summary (root only).
 `), true
 
+	}
+
+	// 没有专门页面的动词，用动词声明里的 Usage + Detail 组装。
+	//
+	// 这是把「帮助文本」从这份文件搬回动词表的过渡层：搬完之后这个 switch
+	// 会空掉，最终由 termcp 的渲染器接手（见 issue: expose the help renderer）。
+	for _, op := range zeroGrammar.Ops() {
+		if op.Name != verb || op.Detail == "" {
+			continue
+		}
+		return strings.TrimSpace(op.Usage + "\n\n" + op.Detail), true
 	}
 	return "", false
 }

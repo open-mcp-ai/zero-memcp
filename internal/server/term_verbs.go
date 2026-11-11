@@ -33,6 +33,20 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		PayloadType:    term.PayloadVar,
 		Flags:          []string{"session"},
 		Usage:          "put [<tree>] [--session <id>] $TEXT",
+		// Detail 是 help put 的正文。它住在动词声明里而不是 help.go：
+		// 一个动词的用法和它的解释分开写，改一处忘一处是迟早的事。
+		Detail: `Store content in a memory tree. If no target is given, the service chooses a default destination based on the stream declaration in SKILL.md;
+when a tree path is specified, content is written as a new entry in that subtree.
+
+Pass text separately from cmd through Termcp vars / args:
+  cmd:  put notes/todo $TEXT
+  vars: {"TEXT":"content can include spaces, newlines, and --"}
+
+Reference mode does not copy content:
+  cmd: ref notes/todo $1
+  args: ["memories/2026-08-03/123456-local.md"]
+
+The address returned by put is a stable file reference. Writes enter the single-writer dirty layer and are immediately searchable; policy or commit folds them into history.`,
 	},
 	{
 		Name:   "ref",
@@ -248,9 +262,9 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Usage: "modified <project>",
 	},
 	{
-		Name:   "added",
-		Kind:   term.KindFlags,
-		Usage:  "added <project>",
+		Name:  "added",
+		Kind:  term.KindFlags,
+		Usage: "added <project>",
 	},
 
 	// ── 系统与权限 ──

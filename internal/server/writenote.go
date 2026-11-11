@@ -212,8 +212,10 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// 等于把内部机制泄漏成外部契约。
 	//
 	// 语义从「树被折叠了」改成「树被写了」。commit 留空：脏层没有新版本号，
+	// path 必须带上：客户端据此知道「这一次写的是哪个文件」。早先传空，
+	// 订阅方只能 ls 一遍猜最新一条，猜错就反复处理同一条旧输入。
 	// 取差量的正确方式是按路径读，而不是 since <commit>。
-	s.publishTreeChange(targetProject, writeBranch, "", prevHead, "", EventOrigin{
+	s.publishTreeChange(targetProject, writeBranch, path, prevHead, "", EventOrigin{
 		Identity: c.Identity,
 		Session:  c.Session,
 		Endpoint: s.cfg.Endpoint,

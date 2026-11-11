@@ -27,6 +27,7 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 	// 而引用写入没有正文，一个 Op 装不下两种形态。
 	{
 		Name:           "put",
+		Detail:         detail_put,
 		Kind:           term.KindPayload,
 		Target:         true,
 		TargetOptional: true,
@@ -35,31 +36,21 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Usage:          "put [<tree>] [--session <id>] $TEXT",
 		// Detail 是 help put 的正文。它住在动词声明里而不是 help.go：
 		// 一个动词的用法和它的解释分开写，改一处忘一处是迟早的事。
-		Detail: `Store content in a memory tree. If no target is given, the service chooses a default destination based on the stream declaration in SKILL.md;
-when a tree path is specified, content is written as a new entry in that subtree.
-
-Pass text separately from cmd through Termcp vars / args:
-  cmd:  put notes/todo $TEXT
-  vars: {"TEXT":"content can include spaces, newlines, and --"}
-
-Reference mode does not copy content:
-  cmd: ref notes/todo $1
-  args: ["memories/2026-08-03/123456-local.md"]
-
-The address returned by put is a stable file reference. Writes enter the single-writer dirty layer and are immediately searchable; policy or commit folds them into history.`,
 	},
 	{
 		Name:   "ref",
+		Detail: detail_ref,
 		Kind:   term.KindFlags,
 		Target: true,
 		Flags:  []string{"session"},
 		Usage:  "ref <tree> <addr>",
 	},
 	{
-		Name:  "recall",
-		Kind:  term.KindFlags,
-		Flags: []string{"scope", "bare", "all"},
-		Usage: "recall <query> [--scope <tree>] [--bare]",
+		Name:   "recall",
+		Detail: detail_recall,
+		Kind:   term.KindFlags,
+		Flags:  []string{"scope", "bare", "all"},
+		Usage:  "recall <query> [--scope <tree>] [--bare]",
 	},
 	{
 		Name:  "srecall",
@@ -68,89 +59,104 @@ The address returned by put is a stable file reference. Writes enter the single-
 		Usage: "srecall <query> [--scope <tree>]",
 	},
 	{
-		Name:  "read",
-		Kind:  term.KindFlags,
-		Usage: "read <addr> [<addr>...]",
+		Name:   "read",
+		Detail: detail_read,
+		Kind:   term.KindFlags,
+		Usage:  "read <addr> [<addr>...]",
 	},
 	{
-		Name:  "grep",
-		Kind:  term.KindFlags,
-		Flags: []string{"scope", "all", "bare"},
-		Usage: "grep <pattern> [--scope <tree>]",
+		Name:   "grep",
+		Detail: detail_grep,
+		Kind:   term.KindFlags,
+		Flags:  []string{"scope", "all", "bare"},
+		Usage:  "grep <pattern> [--scope <tree>]",
 	},
 	{
-		Name:  "log",
-		Kind:  term.KindFlags,
-		Usage: "log [N]",
+		Name:   "log",
+		Detail: detail_log,
+		Kind:   term.KindFlags,
+		Usage:  "log [N]",
 	},
 	{
-		Name:  "ls",
-		Kind:  term.KindFlags,
-		Flags: []string{"all", "scope"},
-		Usage: "ls [date] [--scope <tree>]",
+		Name:   "ls",
+		Detail: detail_ls,
+		Kind:   term.KindFlags,
+		Flags:  []string{"all", "scope"},
+		Usage:  "ls [date] [--scope <tree>]",
 	},
 	{
-		Name:  "trees",
-		Kind:  term.KindFlags,
-		Usage: "trees <project>[@<branch>]",
+		Name:   "trees",
+		Detail: detail_trees,
+		Kind:   term.KindFlags,
+		Usage:  "trees <project>[@<branch>]",
 	},
 	{
-		Name:  "remind",
-		Kind:  term.KindFlags,
-		Usage: "remind [<tree>]",
+		Name:   "remind",
+		Detail: detail_remind,
+		Kind:   term.KindFlags,
+		Usage:  "remind [<tree>]",
 	},
 	{
-		Name:  "since",
-		Kind:  term.KindFlags,
-		Usage: "since <tree> <commit|empty>",
+		Name:   "since",
+		Detail: detail_since,
+		Kind:   term.KindFlags,
+		Usage:  "since <tree> <commit|empty>",
 	},
 	{
-		Name:  "status",
-		Kind:  term.KindFlags,
-		Usage: "status",
+		Name:   "status",
+		Detail: detail_status,
+		Kind:   term.KindFlags,
+		Usage:  "status",
 	},
 
 	// ── 维护与分支操作 ──
 	{
-		Name:  "commit",
-		Kind:  term.KindFlags,
-		Flags: []string{"m"},
-		Usage: "commit [<project>[@<branch>]] [-m msg]",
+		Name:   "commit",
+		Detail: detail_commit,
+		Kind:   term.KindFlags,
+		Flags:  []string{"m"},
+		Usage:  "commit [<project>[@<branch>]] [-m msg]",
 	},
 	{
-		Name:  "diff",
-		Kind:  term.KindFlags,
-		Flags: []string{"raw", "to"},
-		Usage: "diff <p>@<br> [-> <p>@<br>]",
+		Name:   "diff",
+		Detail: detail_diff,
+		Kind:   term.KindFlags,
+		Flags:  []string{"raw", "to"},
+		Usage:  "diff <p>@<br> [-> <p>@<br>]",
 	},
 	{
-		Name:  "branch",
-		Kind:  term.KindFlags,
-		Usage: "branch [<project> [<new> [from <src>]]] ",
+		Name:   "branch",
+		Detail: detail_branch,
+		Kind:   term.KindFlags,
+		Usage:  "branch [<project> [<new> [from <src>]]] ",
 	},
 	{
 		Name:      "tag",
+		Detail:    detail_tag,
 		Kind:      term.KindFlags,
 		Flags:     []string{"d"},
 		Valueless: []string{"d"},
 		Usage:     "tag [-d] <project> [<name> [<ref>]]",
 	},
 	{
-		Name:  "cp",
-		Kind:  term.KindFlags,
-		Flags: []string{"to"},
-		Usage: "cp <src> -> <dst>",
+		Name:   "cp",
+		Detail: detail_cp,
+		Kind:   term.KindFlags,
+		Flags:  []string{"to"},
+		Usage:  "cp <src> -> <dst>",
 	},
 	{
-		Name:  "mv",
-		Kind:  term.KindFlags,
-		Flags: []string{"to"},
-		Usage: "mv <src> -> <dst>",
+		Name:   "mv",
+		Detail: detail_cp,
+		Kind:   term.KindFlags,
+		Flags:  []string{"to"},
+		Usage:  "mv <src> -> <dst>",
 	},
 	{
-		Name:  "delete",
-		Kind:  term.KindFlags,
-		Usage: "delete <p>@<br>/<path>...",
+		Name:   "delete",
+		Detail: detail_delete,
+		Kind:   term.KindFlags,
+		Usage:  "delete <p>@<br>/<path>...",
 	},
 	{
 		Name:  "deleted",
@@ -158,32 +164,38 @@ The address returned by put is a stable file reference. Writes enter the single-
 		Usage: "deleted <project>",
 	},
 	{
-		Name:  "archive",
-		Kind:  term.KindFlags,
-		Usage: "archive <p>@<br>",
+		Name:   "archive",
+		Detail: detail_archive,
+		Kind:   term.KindFlags,
+		Usage:  "archive <p>@<br>",
 	},
 	{
-		Name:  "reset",
-		Kind:  term.KindFlags,
-		Usage: "reset <p>@<br> from <src>",
+		Name:   "reset",
+		Detail: detail_reset,
+		Kind:   term.KindFlags,
+		Usage:  "reset <p>@<br> from <src>",
 	},
 	{
-		Name:  "lock",
-		Kind:  term.KindFlags,
-		Usage: "lock <p>@<br>",
+		Name:   "lock",
+		Detail: detail_lock,
+		Kind:   term.KindFlags,
+		Usage:  "lock <p>@<br>",
 	},
 	{
-		Name:  "unlock",
-		Kind:  term.KindFlags,
-		Usage: "unlock <p>@<br>",
+		Name:   "unlock",
+		Detail: detail_lock,
+		Kind:   term.KindFlags,
+		Usage:  "unlock <p>@<br>",
 	},
 	{
-		Name:  "chmod",
-		Kind:  term.KindFlags,
-		Usage: "chmod <p>@<br>/<path> <mode>",
+		Name:   "chmod",
+		Detail: detail_chmod,
+		Kind:   term.KindFlags,
+		Usage:  "chmod <p>@<br>/<path> <mode>",
 	},
 	{
 		Name:        "write",
+		Detail:      detail_write,
 		Kind:        term.KindPayload,
 		Target:      true,
 		PayloadType: term.PayloadVar,
@@ -192,9 +204,10 @@ The address returned by put is a stable file reference. Writes enter the single-
 
 	// ── 同步与远端 ──
 	{
-		Name:  "remote",
-		Kind:  term.KindFlags,
-		Usage: "remote [<project>]",
+		Name:   "remote",
+		Detail: detail_remote,
+		Kind:   term.KindFlags,
+		Usage:  "remote [<project>]",
 	},
 	// remote-key / remote-secret 是复合动词：子命令 list/delete 不带正文，
 	// 只有 put 带，且 put 还需要一个位置参数 <name>。
@@ -205,6 +218,7 @@ The address returned by put is a stable file reference. Writes enter the single-
 	// normalizeTermInput 双向转换。
 	{
 		Name:           "remote-key",
+		Detail:         detail_remote_key,
 		Kind:           term.KindPayload,
 		Target:         true,
 		TargetOptional: true,
@@ -214,6 +228,7 @@ The address returned by put is a stable file reference. Writes enter the single-
 	},
 	{
 		Name:           "remote-secret",
+		Detail:         detail_remote_secret,
 		Kind:           term.KindPayload,
 		Target:         true,
 		TargetOptional: true,
@@ -222,19 +237,22 @@ The address returned by put is a stable file reference. Writes enter the single-
 		Usage:          "remote-secret list | put --name <name> $TOKEN | delete <name>",
 	},
 	{
-		Name:  "fetch",
-		Kind:  term.KindFlags,
-		Usage: "fetch <project> [<remote>]",
+		Name:   "fetch",
+		Detail: detail_remote,
+		Kind:   term.KindFlags,
+		Usage:  "fetch <project> [<remote>]",
 	},
 	{
-		Name:  "push",
-		Kind:  term.KindFlags,
-		Usage: "push <project> [<remote>] <branch>",
+		Name:   "push",
+		Detail: detail_remote,
+		Kind:   term.KindFlags,
+		Usage:  "push <project> [<remote>] <branch>",
 	},
 	{
-		Name:  "sync",
-		Kind:  term.KindFlags,
-		Usage: "sync <project> [<remote>]",
+		Name:   "sync",
+		Detail: detail_remote,
+		Kind:   term.KindFlags,
+		Usage:  "sync <project> [<remote>]",
 	},
 	{
 		Name:  "conflict",
@@ -242,9 +260,10 @@ The address returned by put is a stable file reference. Writes enter the single-
 		Usage: "conflict [list|clear <id>]",
 	},
 	{
-		Name:  "merge",
-		Kind:  term.KindFlags,
-		Usage: "merge <project> <branch> from <remote>",
+		Name:   "merge",
+		Detail: detail_remote,
+		Kind:   term.KindFlags,
+		Usage:  "merge <project> <branch> from <remote>",
 	},
 	{
 		Name:  "merged",
@@ -269,24 +288,28 @@ The address returned by put is a stable file reference. Writes enter the single-
 
 	// ── 系统与权限 ──
 	{
-		Name:  "help",
-		Kind:  term.KindFlags,
-		Usage: "help [<verb>]",
+		Name:   "help",
+		Detail: detail_help,
+		Kind:   term.KindFlags,
+		Usage:  "help [<verb>]",
 	},
 	{
-		Name:  "whoami",
-		Kind:  term.KindFlags,
-		Usage: "whoami",
+		Name:   "whoami",
+		Detail: detail_whoami,
+		Kind:   term.KindFlags,
+		Usage:  "whoami",
 	},
 	{
-		Name:  "users",
-		Kind:  term.KindFlags,
-		Usage: "users",
+		Name:   "users",
+		Detail: detail_users,
+		Kind:   term.KindFlags,
+		Usage:  "users",
 	},
 	{
-		Name:  "reload",
-		Kind:  term.KindFlags,
-		Usage: "reload",
+		Name:   "reload",
+		Detail: detail_reload,
+		Kind:   term.KindFlags,
+		Usage:  "reload",
 	},
 	{
 		Name:  "rule",
@@ -294,9 +317,10 @@ The address returned by put is a stable file reference. Writes enter the single-
 		Usage: "rule [<project>]",
 	},
 	{
-		Name:  "config",
-		Kind:  term.KindFlags,
-		Usage: "config",
+		Name:   "config",
+		Detail: detail_config,
+		Kind:   term.KindFlags,
+		Usage:  "config",
 	},
 	{
 		Name:  "content",

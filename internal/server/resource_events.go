@@ -139,8 +139,8 @@ func (h *resourceHub) add(caller Caller, watches []string) *subscription {
 	defer h.mu.Unlock()
 	h.nextID++
 	sub := &subscription{
-		id:     "sub:" + strconv.Itoa(h.nextID),
-		caller: caller,
+		id:      "sub:" + strconv.Itoa(h.nextID),
+		caller:  caller,
 		watches: watches,
 		// 缓冲要够吞下突发：一次批量提交可能连着推多条。
 		ch:     make(chan resourceEvent, 32),
@@ -208,7 +208,7 @@ func subMatches(watches []string, evURI string) bool {
 func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, id any, params json.RawMessage, c Caller) {
 	var req struct {
 		Notifications struct {
-			ResourcesListChanged bool     `json:"resourcesListChanged"`
+			ResourcesListChanged  bool     `json:"resourcesListChanged"`
 			ResourceSubscriptions []string `json:"resourceSubscriptions"`
 		} `json:"notifications"`
 	}
@@ -277,7 +277,7 @@ func (s *Server) serveSubscription(w http.ResponseWriter, r *http.Request, id an
 		"method":  "notifications/subscriptions/acknowledged",
 		"params": map[string]any{
 			"notifications": map[string]any{
-				"resourcesListChanged":   false,
+				"resourcesListChanged":  false,
 				"resourceSubscriptions": watches,
 			},
 		},

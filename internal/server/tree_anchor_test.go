@@ -2,9 +2,9 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
-	"errors"
 	"path/filepath"
 	"strings"
 	"testing"

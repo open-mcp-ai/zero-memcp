@@ -94,7 +94,7 @@ func TestReadReinforcesRecall(t *testing.T) {
 		t.Fatalf("分片文件没生成 %s: %v", shardPath, err)
 	}
 	var w struct {
-		Version int             `json:"version"`
+		Version int `json:"version"`
 		Entries map[string]struct {
 			Hits int   `json:"hits"`
 			Last int64 `json:"last"`

@@ -6,11 +6,11 @@
 package server
 
 import (
-	"github.com/open-mcp-ai/termcp/term"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/open-mcp-ai/termcp/term"
 	"io"
 	"net"
 	"net/http"
@@ -226,7 +226,6 @@ type Server struct {
 
 	// remotes 是 [[remote]] 的当前快照，随 reload 原子替换。
 	remotes atomic.Pointer[[]config.Remote]
-
 
 	// policies 缓存每个项目的写入策略（从 100755 的 SKILL.md 解析而来）。
 	policies sync.Map // project -> manifest.Policy
@@ -1079,12 +1078,12 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-		// subscriptions/listen 是长请求：响应不是一条 JSON 而是一个事件流，
-		// 必须在 dispatchMCP 之前分流（后者只会编码一个对象）。
-		if req.Method == "subscriptions/listen" {
-			s.serveSubscription(w, r, req.ID, req.Params, caller)
-			return
-		}
+	// subscriptions/listen 是长请求：响应不是一条 JSON 而是一个事件流，
+	// 必须在 dispatchMCP 之前分流（后者只会编码一个对象）。
+	if req.Method == "subscriptions/listen" {
+		s.serveSubscription(w, r, req.ID, req.Params, caller)
+		return
+	}
 
 	result, err := s.dispatchMCP(r.Context(), req.Method, req.Params, caller)
 	w.Header().Set("Content-Type", "application/json")

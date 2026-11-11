@@ -184,7 +184,7 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 			// 会话标识由客户端声明，只用于事件溯源，不参与鉴权。
 			// 它不在凭证里：会话是易变的，凭证是长期身份。
 			Session: sess,
-			Gated:    claims.Gated,
+			Gated:   claims.Gated,
 		}, nil
 	}
 

@@ -71,8 +71,17 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 	if err := repo.Write(branch, path, []byte(content), gitstore.ModeContent); err != nil {
 		return "", err
 	}
-	if err := s.Reload(); err != nil {
-		return "", fmt.Errorf("written, but failed to rebuild index: %w", err)
+	// 只刷新这一条分支，不整库重建。
+	//
+	// 这里曾经是无条件 s.Reload()：写一个 25 字节的规则文件，实测
+	// 181.5 秒才返回（"written …; index rebuilt"）。调用方看到的是
+	// 一次近三分钟的挂起，重试之后更像"没有写权限"。而写入路径的
+	// 全部价值就在于立刻生效。
+	//
+	// 规则文件改动会同时改变「谁能看见什么」（SKILL.md 的 inject），
+	// 所以必须重建索引；但只需要重建它所在的那条分支。
+	if err := s.refreshBranch(proj, branch); err != nil {
+		return "", fmt.Errorf("written, but failed to refresh the index: %w", err)
 	}
-	return fmt.Sprintf("written to %s@%s/%s (%d bytes); index rebuilt", proj, branch, path, len(content)), nil
+	return fmt.Sprintf("written to %s@%s/%s (%d bytes); index refreshed", proj, branch, path, len(content)), nil
 }

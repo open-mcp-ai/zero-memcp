@@ -87,6 +87,9 @@ func (s *Server) aclPut(body string, c Caller) (TermResult, error) {
 		return TermResult{}, errors.New("usage: acl put <user> <project>[@<branch>] <perm> [--note <text>]")
 	}
 	user := args[0]
+	if err := s.validateIdentity(user); err != nil {
+		return TermResult{}, err
+	}
 	target := args[1]
 
 	rule := acl.Rule{User: user, Note: note}
@@ -94,9 +97,6 @@ func (s *Server) aclPut(body string, c Caller) (TermResult, error) {
 	// admin 形式：acl put <user> * --admin
 	admin := strings.Contains(body, "--admin") || target == "*"
 	if admin {
-		if _, ok := s.cfgIndex().User(user); !ok {
-			return TermResult{}, fmt.Errorf("user %q is not declared in [[user]] of the config", user)
-		}
 		rule.Project = "*"
 		rule.Admin = true
 		if len(args) >= 3 && !strings.HasPrefix(args[2], "--") {
@@ -124,9 +124,6 @@ func (s *Server) aclPut(body string, c Caller) (TermResult, error) {
 	rule.Branch = branch
 	rule.Perm = perm
 
-	if _, ok := s.cfgIndex().User(user); !ok {
-		return TermResult{}, fmt.Errorf("user %q is not declared in [[user]] of the config", user)
-	}
 	if branch != "" && branch != "*" {
 		if err := auth.ValidateBranchName(branch); err != nil {
 			return TermResult{}, err
@@ -234,4 +231,23 @@ func (s *Server) aclRulesForUI() []acl.Rule {
 	})
 	_ = gitstore.DefaultBranch
 	return rules
+}
+
+// validateIdentity 确认这个身份真的存在（有一张签发给它的凭证记录）。
+//
+// 为什么要校验：ACL 规则写错一个身份名，表现是「配了但永远不生效」——
+// 没有报错、没有日志，只有下一次权限判定时静默不匹配。这类故障排查起来
+// 比崩溃贵得多，所以入口就拦住。
+func (s *Server) validateIdentity(name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return errors.New("identity is required (use the credential name, e.g. zero or zero-dev)")
+	}
+	recs, _ := auth.LoadTokenRecords(s.dataDir)
+	for _, rec := range recs {
+		if rec.Name == name {
+			return nil
+		}
+	}
+	return fmt.Errorf("no credential named %q exists on this instance; ACL rules are keyed by credential identity (claims.name), not by user", name)
 }

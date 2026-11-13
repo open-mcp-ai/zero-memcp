@@ -39,7 +39,12 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 	}
 	// 服务端授权表：命中即权威（含「凭证没挂这条分支」的情形）
 	if s.aclActive() {
-		if granted, ok := s.acl.Lookup(c.User, project, branch); ok {
+		// 主体是**凭证身份**（claims.name），不是用户。
+		//
+		// 为什么：zero 和 zero-dev 两张凭证的 sub 都是 zero（同一个主人），
+		// 但它们的权限必须不同——按 user 记规则，等于把两个分身的权限
+		// 搅成同一份，「dev 只读、主体可写」这类要求无从表达。
+		if granted, ok := s.acl.Lookup(c.Identity, project, branch); ok {
 			bit := capBit(perm)
 			if !hasCap(c.Cap, bit) {
 				return false
@@ -171,7 +176,7 @@ func (s *Server) requireRootGlobal(c Caller, bit rune) error {
 	// MCP 配置实例，只能靠 SSH 上机器改文件。把管理权做成一条可撤销
 	// 的授权记录，既保住了「收窄的凭证不能自己提权」，又不必为了
 	// 一次配置动作去重签一张全权凭证。
-	if s.aclActive() && s.acl.IsAdmin(c.User) {
+	if s.aclActive() && s.acl.IsAdmin(c.Identity) {
 		return nil
 	}
 	if !c.Mount.Empty() {

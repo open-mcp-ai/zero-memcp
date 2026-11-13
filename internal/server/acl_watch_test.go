@@ -52,8 +52,9 @@ func TestAllowedUsesACLBeyondMounts(t *testing.T) {
 	s := &Server{acl: store, defaultBranch: "main", projects: NewProjectStore(t.TempDir())}
 	// 凭证只挂了 main.dev，没有 main.shared
 	c := Caller{
-		User:  "zero-dev",
-		Cap:   "rwx",
+		User:     "zero", // 与主体同一用户：ACL 按身份区分，不按用户
+		Identity: "zero-dev",
+		Cap:      "rwx",
 		Mount: NewMount([]auth.MountPoint{{Project: "BlackEggAI/zero", At: "/", Branch: "main.dev", Cap: "rwx"}}, "main"),
 	}
 
@@ -77,7 +78,7 @@ func TestACLCannotExceedCredentialCap(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := &Server{acl: store, defaultBranch: "main", projects: NewProjectStore(t.TempDir())}
-	c := Caller{User: "zero-dev", Cap: "r", Mount: NewMount(nil, "main")}
+	c := Caller{User: "zero", Identity: "zero-dev", Cap: "r", Mount: NewMount(nil, "main")}
 
 	if s.allowed(c, "p", "b", configBitWrite) {
 		t.Fatal("凭证 cap 只有 r 时，ACL 的 rwx 不该放行写")

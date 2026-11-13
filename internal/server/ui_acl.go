@@ -64,13 +64,11 @@ func (s *Server) uiACLPut(w http.ResponseWriter, r *http.Request) {
 	if rule.Branch == "*" {
 		rule.Branch = ""
 	}
-	// 用户必须已声明：让一条指向不存在用户的规则进来，等于埋一个
-	// 「配置看着生效、实际永远不匹配」的坑。
-	if s.cfgIndex() != nil && rule.User != "" {
-		if _, ok := s.cfgIndex().User(rule.User); !ok {
-			http.Error(w, "user "+rule.User+" is not declared in [[user]] of the config", http.StatusBadRequest)
-			return
-		}
+	// 身份必须存在（有一张签发给它的凭证记录）：指向不存在身份的规则
+	// 表现是「配了但永远不生效」，没有报错、没有日志。
+	if err := s.validateIdentity(rule.User); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
 	}
 	if !rule.Admin && rule.Project != "" && s.cfgIndex() != nil && !s.cfgIndex().Declared(rule.Project) {
 		http.Error(w, "project "+rule.Project+" is not declared in the config", http.StatusBadRequest)

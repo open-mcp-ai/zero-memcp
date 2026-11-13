@@ -20,7 +20,7 @@ func (s *Server) branchVisible(c Caller, project, branch string) bool {
 		return true
 	}
 	if s.aclActive() {
-		_, ok := s.acl.Lookup(c.User, project, branch)
+		_, ok := s.acl.Lookup(c.Identity, project, branch)
 		return ok
 	}
 	return false
@@ -35,5 +35,5 @@ func (s *Server) adminAllowed(c Caller) bool {
 	if s.rootUnrestricted(c) {
 		return true
 	}
-	return s.aclActive() && s.acl.IsAdmin(c.User)
+	return s.aclActive() && s.acl.IsAdmin(c.Identity)
 }

@@ -2529,6 +2529,13 @@ func (s *Server) requireBranchWide(rest string, c Caller) error {
 		proj = addr
 		br = ""
 	}
+	// 凭证里根本没挂这条分支，但服务端授权表给了它——那它就没有子树可拆，
+	// 整条分支都是它被授予的范围。不补这一条，ACL 开出来的共享分支
+	// 能读能写，却做不了 write（write 走的是这条整分支检查），
+	// 报错还说「被子树收窄」，与实际原因完全无关。
+	if !c.Mount.BranchWide(proj, br) && s.branchVisible(c, proj, br) {
+		return nil
+	}
 	if !c.Mount.BranchWide(proj, br) {
 		return fmt.Errorf("%s@%s is mounted with a path subtree (%q); this operation acts on the whole branch and is not available to this credential",
 			proj, br, c.Mount.rootOf(proj, br))

@@ -183,7 +183,7 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 				allowedTips[sha] = true
 			}
 		}
-		body, err := repo.UploadPackResponseFiltered(in, func(sha string) bool { return allowedTips[sha] })
+		req, err := repo.ParseUploadPackRequest(in, func(sha string) bool { return allowedTips[sha] })
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -191,7 +191,14 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/x-git-upload-pack-result")
 		w.Header().Set("Cache-Control", "no-cache")
 		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write(body)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		if err := repo.WriteUploadPack(w, req); err != nil {
+			// 一旦开始写字节就只能截断，不能再改状态码——这是 HTTP 流式的代价。
+			// 截断会让客户端抛 unpack-error，而不是静默当成成功。
+			return
+		}
 
 	case "git-receive-pack":
 		if r.Method != http.MethodPost {

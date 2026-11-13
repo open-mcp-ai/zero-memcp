@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -85,6 +86,25 @@ type semanticState struct {
 	// building 为真表示后台正在建索引。此时 srecall 回落到 BM25，
 	// 而不是阻塞等——检索是热路径，不能让人等几十秒。
 	building bool
+
+	// quarantine 记录「确定嵌不进去」的切片与它的退避状态。
+	//
+	// 为什么必须有它：后台追平每 30 秒跑一次，判据是「指纹不在 prints 里
+	// 就算新增」。一条永远返回 413 的切片因此每轮都会被重新送进去，
+	// 连带它所在的那一批都被二分隔离——实测这会让维护环每 30 秒重算
+	// 一次全量，CPU 长期 100%，而且日志每轮刷同样的错误。
+	// 失败不是不能有，失败必须有代价上限。
+	quarantine map[string]quarantineEntry
+}
+
+// quarantineEntry 是一条失败切片的退避状态。
+//
+// nextTry 之前不再尝试；failures 决定退避长度（指数，封顶 2 小时）。
+// 不设上限的话，一条真正碎的切片会让日志和 CPU 永久背账。
+type quarantineEntry struct {
+	failures int
+	nextTry  time.Time
+	lastErr  string
 }
 
 // semanticModelName 写进 manifest：换模型必须换这个名字，
@@ -265,7 +285,29 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 	var reused int    // 指纹没变直接复用的
 	start := time.Now()
 
+	// 隔离检查：退避期内的切片直接跳过，不参与本轮。
+	//
+	// 判据只看「时间到没到」，不看重试次数——退避长度本身已经由
+	// 次数算出来了。跳过的切片不会进 prints，所以它仍被算作「欠着」，
+	// 时间一到就会自动重试：既不会永久放弃，也不会每轮都撞。
+	now := time.Now()
+	s.semantic.mu.RLock()
+	quar := s.semantic.quarantine
+	var skipped int
 	for _, j := range jobs {
+		if e, ok := quar[j.id]; ok && e.nextTry.After(now) {
+			skipped++
+		}
+	}
+	s.semantic.mu.RUnlock()
+	if skipped > 0 {
+		s.logf("semantic: %d slice(s) in backoff, skipped this round", skipped)
+	}
+
+	for _, j := range jobs {
+		if e, ok := quar[j.id]; ok && e.nextTry.After(now) {
+			continue
+		}
 		fp := fingerprint(j.text)
 		if old, had := cachedPrints[j.id]; had && old == fp && cached != nil && cached.Has(j.id) {
 			// 内容没变：把旧向量原样搬进新索引，零推理开销。
@@ -322,6 +364,7 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 			if v == nil {
 				// 逐条兜底里失败的那几条：failed 已经在上面记过，
 				// 这里不能把空向量塞进索引（那不是「零向量」而是没有）。
+				s.noteSemanticFailure(batch[k].id, "embedding failed")
 				continue
 			}
 			if err := ix.Add(batch[k].id, v); err != nil {
@@ -652,37 +695,133 @@ type job struct {
 // bge-m3 的上下文是 8192 token；中日韩字符大致一个 token 一个字，
 // 标点与数字会多一些。取 6000 是留够余量后的安全线。
 //
-// 这个数字不需要精确——它不是分词器，只是「明显超长就先截断再试」
-// 的门槛。真正的长度判定由后端返回的 413 给出，这里只负责别让一条
-// 几万字的文档把整次重建卡在这个坑里反复重试。
+// 这个数字不需要精确——它不是分词器，只是「明显超长就切块」的门槛。
+// 真正的长度判定由后端返回的 413 给出。
 const maxEmbedChars = 6000
 
-// embedOneSlice 嵌入一片文本：先按原文，超长再截断重试。
+// embedChunkChars 是长文档切块的块大小。
 //
-// 返回 nil 向量表示这片确实嵌不进去（调用方记失败），语义上不等于
-// 「零向量」——零向量是一个合法结果，nil 不是。
+// 为什么要切而不是截断：截断只保留开头，一篇几万字的记录后半段
+// 永远进不了向量——「写了但搜不到」，而且没有任何报错。
+// 切块后每块单独嵌入、取均值再归一化，得到的是整篇的语义中心。
+//
+// 1500 是折中的产物：小块更贴近局部语义，但块数多、请求多；
+// 大块接近上限反而容易在后端触发上下文超限。取 1500 时，
+// 6000 字的文档是 4 块，一次批量请求就能送完。
+const embedChunkChars = 1500
+
+// embedOneSlice 嵌入一片文本：短文档直嵌，长文档切块后取语义中心。
+//
+// 返回 nil 向量表示这片确实嵌不进去（调用方记失败并进退避队列），
+// 语义上不等于「零向量」——零向量是一个合法结果，nil 不是。
 func (s *Server) embedOneSlice(emb embed.Embedder, text, id string) ([]float32, error) {
-	v, err := emb.Embed(text)
-	if err == nil && v != nil {
-		return v, nil
-	}
-	n := len([]rune(text))
-	if n <= maxEmbedChars {
+	runes := []rune(text)
+	if len(runes) <= maxEmbedChars {
+		v, err := emb.Embed(text)
+		if err == nil && v != nil {
+			return v, nil
+		}
 		if err == nil {
 			err = fmt.Errorf("backend returned an empty vector")
 		}
+		// 短文档也可能因为后端上下文更小而超限：截半再试一次。
+		half := truncateRunes(text, len(runes)/2)
+		if half == text || half == "" {
+			return nil, err
+		}
+		s.logf("semantic: slice %s is %d chars and failed (%v); retrying with the first half", id, len(runes), err)
+		if v2, err2 := emb.Embed(half); err2 == nil && v2 != nil {
+			return v2, nil
+		}
 		return nil, err
 	}
-	s.logf("semantic: slice %s is %d chars, over the embedding context; truncating to %d and retrying",
-		id, n, maxEmbedChars)
-	v2, err2 := emb.Embed(truncateRunes(text, maxEmbedChars))
-	if err2 != nil {
-		return nil, err2
+
+	// 长文档：切块、逐块嵌入、取均值。
+	chunks := splitRunes(runes, embedChunkChars)
+	s.logf("semantic: slice %s is %d chars, over the embedding window; embedding %d chunks of %d and averaging",
+		id, len(runes), len(chunks), embedChunkChars)
+
+	vecs, err := emb.EmbedBatch(chunks)
+	if err != nil || len(vecs) != len(chunks) {
+		// 批量失败时逐块退让：只要还有块能嵌进去，就别丢掉整篇。
+		vecs = make([][]float32, len(chunks))
+		var firstErr error = err
+		ok := 0
+		for i, ch := range chunks {
+			v, verr := emb.Embed(ch)
+			if verr != nil || v == nil {
+				if firstErr == nil {
+					firstErr = verr
+				}
+				continue
+			}
+			vecs[i] = v
+			ok++
+		}
+		if ok == 0 {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("all %d chunks failed to embed", len(chunks))
+			}
+			return nil, firstErr
+		}
 	}
-	if v2 == nil {
-		return nil, fmt.Errorf("backend returned an empty vector after truncation")
+	return meanVector(vecs), nil
+}
+
+// splitRunes 把 rune 序列切成不超过 n 的连续块。
+func splitRunes(r []rune, n int) []string {
+	if n <= 0 {
+		n = 1
 	}
-	return v2, nil
+	var out []string
+	for start := 0; start < len(r); start += n {
+		end := start + n
+		if end > len(r) {
+			end = len(r)
+		}
+		out = append(out, string(r[start:end]))
+	}
+	return out
+}
+
+// meanVector 对多块向量取均值并做 L2 归一化。
+//
+// 归一化不能省：下游按余弦相似度打分，均值后的向量模长会小于 1，
+// 不归一会让长文档在同一个阈值下被系统性压低或抬高——
+// 排序结果取决于文档长短，而不是内容相关度。
+func meanVector(vecs [][]float32) []float32 {
+	var acc []float32
+	n := 0
+	for _, v := range vecs {
+		if v == nil {
+			continue
+		}
+		if acc == nil {
+			acc = make([]float32, len(v))
+		}
+		if len(v) != len(acc) {
+			continue
+		}
+		for i, x := range v {
+			acc[i] += x
+		}
+		n++
+	}
+	if acc == nil || n == 0 {
+		return nil
+	}
+	var sum float64
+	for i := range acc {
+		acc[i] /= float32(n)
+		sum += float64(acc[i] * acc[i])
+	}
+	if sum > 0 {
+		norm := float32(math.Sqrt(sum))
+		for i := range acc {
+			acc[i] /= norm
+		}
+	}
+	return acc
 }
 
 // truncateRunes 按字符截断（不是字节），保证不切断 UTF-8 序列。
@@ -723,7 +862,8 @@ func (s *Server) embedIsolate(emb embed.Embedder, jobs []job, failed *int) [][]f
 		v, e := s.embedOneSlice(emb, jobs[0].text, jobs[0].id)
 		if e != nil {
 			*failed++
-			s.logf("semantic: slice %s cannot be embedded: %v", jobs[0].id, e)
+			s.noteSemanticFailure(jobs[0].id, e.Error())
+			s.logf("semantic: slice %s cannot be embedded (backing off): %v", jobs[0].id, e)
 			return out
 		}
 		out[0] = v
@@ -735,4 +875,34 @@ func (s *Server) embedIsolate(emb embed.Embedder, jobs []job, failed *int) [][]f
 	copy(out, left)
 	copy(out[half:], right)
 	return out
+}
+
+// noteSemanticFailure 记一次嵌入失败，并算出下次允许重试的时间。
+//
+// 退避按 1m、5m、30m、2h 递增并封顶：第一次失败多半是后端抖动，
+// 一分钟后重试就够；一直失败说明这片内容本身有问题（超长、二进制、
+// 编码坏），那就别让它在每轮维护里反复撞——每撞一次都要二分隔离
+// 一整批，代价远大于它自己的价值。
+func (s *Server) noteSemanticFailure(id, reason string) {
+	const (
+		base = time.Minute
+		max  = 2 * time.Hour
+	)
+	s.semantic.mu.Lock()
+	defer s.semantic.mu.Unlock()
+	if s.semantic.quarantine == nil {
+		s.semantic.quarantine = map[string]quarantineEntry{}
+	}
+	e := s.semantic.quarantine[id]
+	e.failures++
+	e.lastErr = reason
+	back := base
+	for i := 1; i < e.failures && back < max; i++ {
+		back *= 5
+	}
+	if back > max {
+		back = max
+	}
+	e.nextTry = time.Now().Add(back)
+	s.semantic.quarantine[id] = e
 }

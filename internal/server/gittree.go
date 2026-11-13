@@ -15,6 +15,7 @@ func (s *Server) loadGitTrees(defaultBranch string) ([]*memory.Tree, error) {
 	if err != nil {
 		return nil, err
 	}
+	startupStage("reload: %d project(s): %v", len(projects), projects)
 
 	var trees []*memory.Tree
 	for _, proj := range projects {
@@ -55,10 +56,12 @@ func (s *Server) loadGitTrees(defaultBranch string) ([]*memory.Tree, error) {
 			if has == "" && repo.Pending(br) == 0 {
 				continue
 			}
+			startupStage("reload: scanning %s@%s (head %s)", proj, br, shortSHA(has))
 			t, err := s.scanGitProject(repo, proj, br)
 			if err != nil {
 				return nil, fmt.Errorf("scan %s/%s: %w", proj, br, err)
 			}
+			startupStage("reload: %s@%s has %d entries", proj, br, len(t.Blocks))
 			trees = append(trees, t)
 		}
 	}
@@ -71,6 +74,7 @@ func (s *Server) scanGitProject(repo *gitstore.Repo, project, defaultBranch stri
 	if err != nil {
 		return nil, err
 	}
+	startupStage("reload: %s@%s listed %d paths", project, defaultBranch, len(entries))
 
 	t := &memory.Tree{Project: project, Branch: defaultBranch}
 	for _, e := range entries {

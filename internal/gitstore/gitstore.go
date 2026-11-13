@@ -81,6 +81,7 @@ type Repo struct {
 	writerErr  error         // worker 累积的异步错误，下一次 barrier 返回并清空
 	writerDown chan struct{} // worker 退出后关闭，Close 等它
 	writerDead bool          // 队列已关，不再接受新投递
+
 }
 
 // FS 返回当前仓库使用的存储抽象。
@@ -1089,35 +1090,109 @@ func (r *Repo) Log(ref string, n int) ([]CommitInfo, error) {
 }
 
 // fileTimes 返回每个路径最后一次被改动的提交时间。
+//
+// 踩过的坑（2026-11-13，hub 起不来，CPU 100% 十分钟、端口永不监听）：
+// 旧实现是 `Log(ref, 0)` 取全部历史，然后**对每个 commit 都把整棵树
+// 展开成 path map**——复杂度 O(commits × files)。在 inbox 这种
+// 「一条消息一个 commit」的流水分支上是 2052 × 4520 ≈ 900 万次树项遍历，
+// 而且每次都要从 pack 里解压对象。启动时它在 Reload 里跑，`net.Listen`
+// 排在后面，症状就是「进程活着、内存涨、端口永远不开、日志一行没有」。
+//
+// 现在的做法：沿 first-parent 链走，用 diffTree 比较相邻两棵树。
+// diffTree 对相同子树按 SHA 短路，所以每个 commit 的开销等于**它实际
+// 改动的路径数量**而不是仓库总文件数；总复杂度 O(changes)。
+// 一旦所有现存路径都拿到了时间就提前结束，不需要走完整段历史。
 func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
-	commits, err := r.Log(ref, 0)
+	tip, err := r.commitOf(normalizeRef(ref))
 	if err != nil {
 		return nil, err
 	}
 	out := map[string]int64{}
-	seen := map[string]bool{}
-	// 从最新往旧走：第一次见到的路径就是它最后一次被改动
-	for _, ci := range commits {
-		typ, body, err := r.readObject(ci.SHA)
-		if err != nil || typ != "commit" {
-			continue
-		}
-		c := parseCommit(body)
-		if c.Tree == "" {
-			continue
-		}
-		flat := map[string]Entry{}
-		if err := r.loadTree(c.Tree, "", flat); err != nil {
-			continue
-		}
-		for p := range flat {
-			if !seen[p] {
-				seen[p] = true
-				out[p] = ci.When.Unix()
+	if tip.Tree == "" {
+		return out, nil
+	}
+
+	// 只需要给「现在还存在」的路径定时间。已删除的历史路径对调用方没用，
+	// 拿它们当提前结束条件会让循环退化成走完全部历史。
+	wanted := map[string]bool{}
+	if err := r.collectPaths(tip.Tree, "", wanted); err != nil {
+		return nil, err
+	}
+	if len(wanted) == 0 {
+		return out, nil
+	}
+
+	// 防御性上限：仓库再长也不该让启动无限期卡住。
+	// 走到上限时剩下的路径回退到零值（调用方会改用正文里的 at:/created:）。
+	const maxCommits = 200000
+
+	cur := tip
+	for i := 0; i < maxCommits; i++ {
+		parentTree := ""
+		var parent *commitObj
+		if len(cur.Parents) > 0 {
+			pc, perr := r.commitOf(cur.Parents[0])
+			if perr != nil {
+				return nil, perr
 			}
+			parent = &pc
+			parentTree = pc.Tree
 		}
+
+		var changes []Change
+		if err := r.diffTree(parentTree, cur.Tree, "", &changes); err != nil {
+			return nil, err
+		}
+		for _, ch := range changes {
+			if ch.Kind == "deleted" {
+				continue
+			}
+			if !wanted[ch.Path] {
+				continue
+			}
+			if _, ok := out[ch.Path]; ok {
+				continue
+			}
+			out[ch.Path] = cur.When.Unix()
+		}
+		if len(out) >= len(wanted) || parent == nil {
+			break
+		}
+		cur = *parent
 	}
 	return out, nil
+}
+
+// collectPaths 把一棵树里的全部文件路径收进 set，用于计算「还差哪些路径」。
+func (r *Repo) collectPaths(sha, prefix string, out map[string]bool) error {
+	if sha == "" {
+		return nil
+	}
+	typ, body, err := r.readObject(sha)
+	if err != nil {
+		return err
+	}
+	if typ != "tree" {
+		return fmt.Errorf("object %s is not a tree but %s", sha, typ)
+	}
+	items, err := parseTree(body)
+	if err != nil {
+		return err
+	}
+	for _, it := range items {
+		full := it.name
+		if prefix != "" {
+			full = prefix + "/" + it.name
+		}
+		if it.mode == "40000" {
+			if err := r.collectPaths(it.sha, full, out); err != nil {
+				return err
+			}
+			continue
+		}
+		out[full] = true
+	}
+	return nil
 }
 
 // Fork 从 from 分支复制出 to 分支（零字节：只写一个 ref）。

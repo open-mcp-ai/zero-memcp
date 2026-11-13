@@ -277,6 +277,16 @@ func (s *Server) getListener() net.Listener {
 }
 
 // New 构建并校验服务端。校验在启动前完成，不在运行中抛出。
+// startupStage 打印启动阶段的进度。
+//
+// 为什么需要它：启动失败时进程可能既不监听端口也不写任何一行日志，
+// 外面看到的是「进程活着、CPU 在烧、端口没开」——只能靠猜。
+// 每个可能耗时的阶段都报一行，卡在哪一步就一目了然。
+// 这条日志的代价是启动时多几行 stderr，收益是故障现场自带证据。
+func startupStage(format string, args ...any) {
+	fmt.Fprintf(os.Stderr, "zero-memcp: startup: "+format+"\n", args...)
+}
+
 func New(cfg Config) (*Server, error) {
 	// 配置是权限与网络参数的真相源。
 	// 优先读它，没有才 fallback 到 flag 和硬编码默认值。
@@ -326,10 +336,12 @@ func New(cfg Config) (*Server, error) {
 	// 谁先落盘谁说了算，而另一个进程拿着自己刚生成的密钥继续跑——
 	// 结果是同一个数据目录里存在两套互不相认的身份体系。
 	// 把锁放在任何读写 system/ 之前，才能保证「首次启动」只发生一次。
+	startupStage("acquiring instance lock in %s", cfg.DataDir)
 	startupLock, err := acquireInstanceLock(cfg.DataDir)
 	if err != nil {
 		return nil, err
 	}
+	startupStage("instance lock acquired")
 	startupOK := false
 	defer func() {
 		// 半途失败时释放锁；成功路径的所有权交给 *Server。
@@ -344,6 +356,7 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open weights state: %w", err)
 	}
+	startupStage("weights state loaded from %s", cfg.WeightsDir)
 
 	// 签名密钥必须落盘。每次启动重新生成会让所有已签发的 token
 	// 同时失效，而那种故障的表现是「所有设备一起 401」——
@@ -419,13 +432,16 @@ func New(cfg Config) (*Server, error) {
 		rems := cfgFile.Remotes
 		s.remotes.Store(&rems)
 	}
+	startupStage("building initial index (reading every branch of every project)")
 	if err := s.Reload(); err != nil {
 		return nil, fmt.Errorf("build initial index: %w", err)
 	}
+	startupStage("initial index ready")
 
 	// 语义向量侧与 BM25 平行异步启动。
 	// 缺失模型配置时静默跳过，不会阻碍服务正常启动。
 	s.initSemantic()
+	startupStage("semantic init returned")
 
 	if s.UIRoutesEnabled() {
 		if plain, created, berr := s.passwords.Bootstrap(os.Getenv("ZERO_MEMCP_UI_PASS")); berr != nil {
@@ -472,16 +488,24 @@ func (s *Server) Reload() error {
 
 	defaultBranch := s.defaultBranch
 
+	startupStage("reload: scanning repositories")
 	trees, err := s.loadGitTrees(defaultBranch)
 	if err != nil {
 		return err
 	}
+	blocks := 0
+	for _, t := range trees {
+		blocks += len(t.Blocks)
+	}
+	startupStage("reload: %d trees, %d blocks scanned", len(trees), blocks)
 
 	// 判重表要先于索引使用：重启后靠它记住「这条已经写过了」。
 	s.seedDedup(trees)
+	startupStage("reload: dedup table seeded")
 
 	idx := index.New()
 	for _, t := range trees {
+		startupStage("reload: indexing %s@%s (%d blocks)", t.Project, t.Branch, len(t.Blocks))
 		for _, b := range t.Indexable() {
 			data, err := s.readBlock(b)
 			if err != nil {
@@ -516,6 +540,7 @@ func (s *Server) Reload() error {
 	s.trees = trees
 	s.idx = idx
 	s.mu.Unlock()
+	startupStage("reload: index built")
 
 	// 更新观察水位：让下一次 checkExternalUpdates 有比对基准。
 	s.rememberTreeHeads()

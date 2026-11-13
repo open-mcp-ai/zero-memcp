@@ -55,7 +55,7 @@ func TestAllowedUsesACLBeyondMounts(t *testing.T) {
 		User:     "zero", // 与主体同一用户：ACL 按身份区分，不按用户
 		Identity: "zero-dev",
 		Cap:      "rwx",
-		Mount: NewMount([]auth.MountPoint{{Project: "BlackEggAI/zero", At: "/", Branch: "main.dev", Cap: "rwx"}}, "main"),
+		Mount:    NewMount([]auth.MountPoint{{Project: "BlackEggAI/zero", At: "/", Branch: "main.dev", Cap: "rwx"}}, "main"),
 	}
 
 	if !s.allowed(c, "BlackEggAI/zero", "main.shared", configBitWrite) {
@@ -146,4 +146,34 @@ func TestTreeWatchHubWithoutPathDoesNotTouchDisk(t *testing.T) {
 		t.Fatal("in-memory hub must not write a file")
 	}
 	_ = time.Now()
+}
+
+// ACL 授予的分支必须能被列举出来（log/ls 用的是虚拟路径，
+// 未挂载分支没有虚拟路径 —— 早先因此整个分支在列举里消失）。
+func TestVirtualPathFallsBackForACLBranches(t *testing.T) {
+	dir := t.TempDir()
+	store, _ := acl.Open(filepath.Join(dir, "acl.json"))
+	if _, err := store.Put(acl.Rule{User: "zero-dev", Project: "p", Branch: "main.shared", Perm: "rwx"}); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{acl: store, defaultBranch: "main", projects: NewProjectStore(t.TempDir())}
+	c := Caller{
+		User:     "zero",
+		Identity: "zero-dev",
+		Cap:      "rwx",
+		Mount:    NewMount([]auth.MountPoint{{Project: "p", At: "/", Branch: "main.dev", Cap: "rwx"}}, "main"),
+	}
+
+	// 挂载表内的分支：虚拟路径（chroot 视角）
+	if got := s.virtualPath(c, "p", "main.dev", "a/b.md"); got != "a/b.md" {
+		t.Fatalf("mounted branch virtual path = %q, want a/b.md", got)
+	}
+	// ACL 授予、未被挂载的分支：退回真实地址，而不是空串
+	if got := s.virtualPath(c, "p", "main.shared", "a/b.md"); got != "p@main.shared:a/b.md" {
+		t.Fatalf("acl branch virtual path = %q, want p@main.shared:a/b.md", got)
+	}
+	// 既没挂载也没授权：空串（调用方据此跳过）
+	if got := s.virtualPath(c, "p", "main.chat", "a/b.md"); got != "" {
+		t.Fatalf("unrelated branch virtual path = %q, want empty", got)
+	}
 }

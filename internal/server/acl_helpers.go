@@ -37,3 +37,22 @@ func (s *Server) adminAllowed(c Caller) bool {
 	}
 	return s.aclActive() && s.acl.IsAdmin(c.Identity)
 }
+
+// virtualPath 返回一条块对这张凭证的「可写出口地址」。
+//
+// 挂载表里的分支用虚拟路径（chroot 语义，看到的是自己的世界）；
+// 只被服务端授权表开出来的分支没有虚拟路径，退回真实地址
+// project@branch:path——它是空的判据不能是「这棵树不可见」。
+//
+// 踩过的坑：listings（log/ls）里写成 `if virt == "" { continue }`，
+// 于是 ACL 授予的分支在列举里彻底消失，而按地址直接读又能读到。
+// 那种「能读但列不出来」的表现会被误判成"权限没生效"。
+func (s *Server) virtualPath(c Caller, project, branch, path string) string {
+	if v := c.Mount.ToVirtual(project, branch, path); v != "" {
+		return v
+	}
+	if s.branchVisible(c, project, branch) {
+		return project + "@" + branch + ":" + path
+	}
+	return ""
+}

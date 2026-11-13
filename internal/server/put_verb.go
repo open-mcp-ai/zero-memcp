@@ -163,7 +163,7 @@ func (s *Server) putBody(target, body, session string, c Caller) (TermResult, er
 		return TermResult{}, err
 	}
 	commitSHA, _ := repo.Resolve(branch)
-	virtPath := c.Mount.ToVirtual(proj, branch, rel)
+	virtPath := s.virtualPath(c, proj, branch, rel)
 
 	text := "ok " + virtPath
 	if commitSHA != "" {

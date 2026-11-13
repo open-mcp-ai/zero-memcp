@@ -417,7 +417,7 @@ func New(cfg Config) (*Server, error) {
 		uiLimiter:     newUILoginLimiter(),
 		lock:          startupLock,
 
-		listens: FromConfig(listenBlocks(cfgFile)),
+		listens:   FromConfig(listenBlocks(cfgFile)),
 		fanouts:   newFanoutHub(),
 		resources: newResourceHub(),
 		done:      make(chan struct{}),
@@ -2067,17 +2067,21 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		return TermResult{Text: grepText, Empty: !grepFound}, nil
 
 	case "log":
-		// log [N]
+		// log [<project>[@<branch>][:<path>]] [N]
 		//
-		// 类似 git log：按时间倒序看最近 N 篇（缺省 5 篇）的日期、主题、摘要。
-		// 模型想了解"最近做了什么"时，不用去 ls 目录。
+		// 类似 git log：按时间倒序看最近 N 篇（缺省 5 篇）。
+		// 给了地址就只看那一棵——早先这个参数被整个忽略，
+		// log @main.chat 与 log @main.shared 返回同一批内容。
 		n := 5
-		if rest != "" {
-			if parsed, err := strconv.Atoi(strings.TrimPrefix(rest, "-")); err == nil && parsed > 0 {
+		scope := ""
+		for _, f := range strings.Fields(rest) {
+			if parsed, err := strconv.Atoi(strings.TrimPrefix(f, "-")); err == nil && parsed > 0 {
 				n = parsed
+				continue
 			}
+			scope = f
 		}
-		logText, logErr := s.execLog(n, c)
+		logText, logErr := s.execLog(n, scope, c)
 		if logErr != nil {
 			return TermResult{}, logErr
 		}
@@ -2305,7 +2309,7 @@ func (s *Server) execGrep(pattern, scope string, c Caller) (string, bool, error)
 }
 
 // execLog 按时间倒序看最近 N 篇的摘要。
-func (s *Server) execLog(n int, c Caller) (string, error) {
+func (s *Server) execLog(n int, scope string, c Caller) (string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -2315,6 +2319,14 @@ func (s *Server) execLog(n int, c Caller) (string, error) {
 			continue
 		}
 		for _, b := range tr.Blocks {
+			// scope 过滤：log <project>[@<branch>][:<path>] 只看那一棵。
+			//
+			// 早先这个参数被整个忽略，于是 log @main.chat 和
+			// log @main.shared 返回同一批内容——看起来像"分支被无视"，
+			// 实际是这个动词根本没有分支这个概念。
+			if scope != "" && !addrUnderScope(memory.MakeID(b.Project, b.Branch, b.Path), scope) {
+				continue
+			}
 			all = append(all, b)
 		}
 	}
@@ -2354,7 +2366,7 @@ func (s *Server) execLog(n int, c Caller) (string, error) {
 	for i, e := range entries {
 		b := e.b
 		t := time.Unix(e.t, 0).Format("2006-01-02 15:04:05")
-		virt := c.Mount.ToVirtual(b.Project, b.Branch, b.Path)
+		virt := s.virtualPath(c, b.Project, b.Branch, b.Path)
 		if virt == "" {
 			continue
 		}
@@ -2404,7 +2416,7 @@ func (s *Server) execLs(rest string, c Caller) (string, error) {
 		for _, b := range tr.Blocks {
 			// 用虚拟地址匹配，不用 b.Path：后者是树内路径，
 			// 两个仓库里同名的日期目录会被混在一起。
-			virt := c.Mount.ToVirtual(b.Project, b.Branch, b.Path)
+			virt := s.virtualPath(c, b.Project, b.Branch, b.Path)
 			if virt == "" {
 				continue
 			}
@@ -2421,8 +2433,8 @@ func (s *Server) execLs(rest string, c Caller) (string, error) {
 		return "no matching entries", nil
 	}
 	sort.Slice(matches, func(i, j int) bool {
-		return c.Mount.ToVirtual(matches[i].Project, matches[i].Branch, matches[i].Path) <
-			c.Mount.ToVirtual(matches[j].Project, matches[j].Branch, matches[j].Path)
+		return s.virtualPath(c, matches[i].Project, matches[i].Branch, matches[i].Path) <
+			s.virtualPath(c, matches[j].Project, matches[j].Branch, matches[j].Path)
 	})
 
 	// 输出上限。

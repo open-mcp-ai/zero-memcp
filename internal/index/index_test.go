@@ -91,3 +91,33 @@ func TestDeterministic(t *testing.T) {
 		}
 	}
 }
+
+// Remove 必须精确撤销：同一篇的词只减它自己那一次，别篇不受影响。
+func TestRemoveIsExact(t *testing.T) {
+	ix := New()
+	ix.Add("p@b:a.md", "alpha beta gamma")
+	ix.Add("p@b:b.md", "beta delta")
+	if ix.Docs() != 2 {
+		t.Fatalf("docs = %d, want 2", ix.Docs())
+	}
+
+	if !ix.Remove("p@b:a.md") {
+		t.Fatal("remove should报告删掉了")
+	}
+	if ix.Docs() != 1 {
+		t.Fatalf("docs = %d, want 1 after remove", ix.Docs())
+	}
+	// b.md 里的 beta 必须还在
+	hits := ix.Search("beta", 10, 0)
+	if len(hits) != 1 || hits[0].Addr != "p@b:b.md" {
+		t.Fatalf("beta should only hit b.md, got %+v", hits)
+	}
+	// a.md 独有的词应当彻底消失（不留下空 posting）
+	if hits := ix.Search("gamma", 10, 0); len(hits) != 0 {
+		t.Fatalf("gamma should be gone, got %+v", hits)
+	}
+	// 重复删除不报错
+	if ix.Remove("p@b:a.md") {
+		t.Fatal("second remove should be a no-op")
+	}
+}

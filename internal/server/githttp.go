@@ -234,9 +234,19 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		// 写入成功后触发重载与脉冲广播：外部推进的 ref 也是真写入，
+		// 写入成功后刷新内存状态：外部推进的 ref 也是真写入，
 		// 内存索引与锚定者必须立刻知道。
-		_ = s.Reload()
+		//
+		// 这里曾经是无条件 s.Reload()——重扫全部仓库、逐块读盘、
+		// 重建整个倒排索引。一次 push 就让服务几十秒不可用，
+		// 症状是「命令偶发不通，过一会儿自己好了」，日志里只有一行
+		// branch head movement detected。
+		//
+		// 现在只刷新**真的推进了的那几条分支**。判断用推送前后的头
+		// 快照：重推一个已存在的提交不会推进 ref，那就不必动内存。
+		for _, adv := range advancedRefs(before, projectHeads(repo)) {
+			s.refreshBranches(project, []string{adv.Branch}, "push")
+		}
 		s.checkExternalUpdates()
 
 		// 只把「真的推进了」的分支拿出去扇出。

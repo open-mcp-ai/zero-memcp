@@ -27,6 +27,14 @@ type Index struct {
 	docSize map[string]int
 	// docTime 块地址 → 修改时间（Unix 秒），0 表示未知
 	docTime map[string]int64
+	// docTokens 块地址 → 它贡献过的词序列，用于精确撤销。
+	//
+	// 为什么要留这份冗余：倒排表里存的是「词 → 文档」，删一篇要把它
+	// 出现过的每个词都减一。不记下这篇贡献过哪些词，就只能整库重建
+	// 或者按词反查全表——前者是秒级代价，后者是 O(词表)。
+	// 代价是每篇多存一份 token 切片；21k 篇约几十 MB，换来的是
+	// 「一条分支推进只重建那条分支」。
+	docTokens map[string][]Token
 	// totalDocs 块总数
 	totalDocs int
 }
@@ -34,10 +42,11 @@ type Index struct {
 // New 创建一个空索引。
 func New() *Index {
 	return &Index{
-		postings: make(map[Token]map[string]int),
-		docLen:   make(map[string]int),
-		docSize:  make(map[string]int),
-		docTime:  make(map[string]int64),
+		postings:  make(map[Token]map[string]int),
+		docLen:    make(map[string]int),
+		docSize:   make(map[string]int),
+		docTime:   make(map[string]int64),
+		docTokens: make(map[string][]Token),
 	}
 }
 
@@ -55,6 +64,7 @@ func (ix *Index) AddWithTime(addr string, text string, modTime int64) {
 	}
 	ix.docLen[addr] = len(tokens)
 	ix.docSize[addr] = len(text)
+	ix.docTokens[addr] = tokens
 	ix.totalDocs++
 
 	for _, tok := range tokens {
@@ -65,6 +75,45 @@ func (ix *Index) AddWithTime(addr string, text string, modTime int64) {
 		}
 		m[addr]++
 	}
+}
+
+// Remove 从索引里精确撤销一个块。
+//
+// 返回是否真的删掉了（不存在时返回 false，不报错——调用方通常在
+// 「把旧树换掉」的循环里调它，重复删除是正常的）。
+func (ix *Index) Remove(addr string) bool {
+	tokens, ok := ix.docTokens[addr]
+	if !ok {
+		// 没有 token 记录但可能有长度/时间记录（空正文的块）
+		if _, had := ix.docTime[addr]; had {
+			delete(ix.docTime, addr)
+			delete(ix.docLen, addr)
+			delete(ix.docSize, addr)
+			return true
+		}
+		return false
+	}
+	for _, tok := range tokens {
+		m, ok := ix.postings[tok]
+		if !ok {
+			continue
+		}
+		m[addr]--
+		if m[addr] <= 0 {
+			delete(m, addr)
+		}
+		if len(m) == 0 {
+			delete(ix.postings, tok)
+		}
+	}
+	delete(ix.docTokens, addr)
+	delete(ix.docLen, addr)
+	delete(ix.docSize, addr)
+	delete(ix.docTime, addr)
+	if ix.totalDocs > 0 {
+		ix.totalDocs--
+	}
+	return true
 }
 
 // Hit 是一条检索结果。

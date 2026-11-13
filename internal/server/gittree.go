@@ -236,3 +236,95 @@ func (s *Server) addBlockLocked(project string, repo *gitstore.Repo, branch, pat
 	})
 	tree.Sort()
 }
+
+// refreshBranch 只重建一条分支的内存树与索引条目。
+//
+// 为什么需要它：Reload() 重扫全部仓库、逐块读盘、重建整个倒排索引
+// （21k 块、数十秒）。而它被挂在每一次 git push 上——一次外部推进
+// 就让整个服务几十秒不可用，症状是「命令偶发不通，过一会儿自己好了」。
+//
+// 这里只做那条分支：扫它、换掉它的树、把它的 doc 从索引里精确撤销
+// 再重新加进去。别的分支一个字节都不动。
+//
+// 出错时返回错误，调用方应当退回 Reload()——安全的那条路永远留着。
+func (s *Server) refreshBranch(project, branch string) error {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return fmt.Errorf("open project %s: %w", project, err)
+	}
+	tree, err := s.scanGitProject(repo, project, branch)
+	if err != nil {
+		return fmt.Errorf("scan %s@%s: %w", project, branch, err)
+	}
+
+	// SKILL.md 的策略在扫描时已经解析过，这里只需要把可能变化的那份换上去。
+	for _, b := range tree.Blocks {
+		if b.Path == "SKILL.md" || strings.HasSuffix(b.Path, "/SKILL.md") {
+			if data, rerr := s.readBlock(b); rerr == nil {
+				s.policies.Store(tree.Project, manifest.Parse(tree.Project, data))
+			}
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.idx != nil {
+		// 先撤销旧分支的全部 doc，再按新树加回去。
+		for _, old := range s.trees {
+			if old.Project != project || old.Branch != branch {
+				continue
+			}
+			for _, b := range old.Indexable() {
+				s.idx.Remove(b.ID())
+			}
+		}
+		for _, b := range tree.Indexable() {
+			data, rerr := s.readBlock(b)
+			if rerr != nil {
+				continue
+			}
+			stamp := b.Time
+			if at := sliceAtTime(string(data), b.Path); at > 0 {
+				stamp = at
+			}
+			s.idx.AddWithTime(b.ID(), string(data), stamp)
+		}
+	}
+
+	replaced := false
+	for i, old := range s.trees {
+		if old.Project == project && old.Branch == branch {
+			s.trees[i] = tree
+			replaced = true
+			break
+		}
+	}
+	if !replaced {
+		s.trees = append(s.trees, tree)
+	}
+	return nil
+}
+
+// refreshBranches 批量刷新若干条分支，任一失败就整体退回全量 Reload。
+//
+// 退回是刻意的：增量刷新是优化，全量重建是正确性保底。增量出问题时
+// 宁可慢，也不能让索引与实际仓库不一致——那种不一致的表现是
+// 「写进去了但搜不到」，而它不会报任何错。
+func (s *Server) refreshBranches(project string, branches []string, reason string) {
+	if len(branches) == 0 {
+		return
+	}
+	for _, br := range branches {
+		if err := s.refreshBranch(project, br); err != nil {
+			s.logf("%s: incremental refresh of %s@%s failed (%v); falling back to full reload",
+				reason, project, br, err)
+			if rerr := s.Reload(); rerr != nil {
+				s.logf("%s: full reload also failed: %v", reason, rerr)
+			}
+			return
+		}
+	}
+	s.logf("%s: refreshed %d branch(es) of %s incrementally (%s)",
+		reason, len(branches), project, strings.Join(branches, ", "))
+}

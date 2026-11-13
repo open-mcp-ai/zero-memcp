@@ -204,9 +204,42 @@ func (s *Server) checkExternalUpdates() {
 		})
 	}
 	if changed {
-		s.logf("branch head movement detected; rebuilding the index and broadcasting tree changes")
+		s.logf("branch head movement detected; refreshing the affected branches")
 		s.publishExternalTreeChanges(current)
-		_ = s.Reload()
+
+		// 只刷新真的动过的那几条分支。
+		//
+		// 这里曾经无条件 Reload()：一条分支推进就重扫全部仓库、
+		// 重建整个倒排索引（21k 块、数十秒），期间整个服务不可用。
+		// 而外部推进是常态（另一台机器同步、agent 写入后 commit），
+		// 于是「偶发卡顿」变成了常态。
+		byProject := map[string][]string{}
+		for key, head := range current {
+			if val, ok := s.lastCommits.Load(key); ok && val.(string) == head.Commit {
+				continue
+			}
+			byProject[head.Project] = append(byProject[head.Project], head.Branch)
+		}
+		// 已删除的分支：它可能还有残留的树，交给全量重建处理。
+		removed := false
+		s.lastCommits.Range(func(k, _ any) bool {
+			if _, exists := current[k.(string)]; !exists {
+				removed = true
+				return false
+			}
+			return true
+		})
+		if removed {
+			s.logf("branch disappeared; falling back to a full reload")
+			if err := s.Reload(); err != nil {
+				s.logf("full reload failed: %v", err)
+			}
+			return
+		}
+		for project, branches := range byProject {
+			s.refreshBranches(project, branches, "external head movement")
+		}
+		s.rememberTreeHeads()
 	}
 }
 

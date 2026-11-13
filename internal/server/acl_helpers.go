@@ -51,6 +51,12 @@ func (s *Server) virtualPath(c Caller, project, branch, path string) string {
 	if v := c.Mount.ToVirtual(project, branch, path); v != "" {
 		return v
 	}
+	// 分支已挂载、但路径落在它的子树 root 之外：这是 chroot 的边界，
+	// 一律不可见。绝不能退回真实地址——那样子树分身就能列出
+	// 同分支兄弟子树的内容，隔离直接失效（实测会泄漏）。
+	if c.Mount.Visible(project, branch) {
+		return ""
+	}
 	if s.branchVisible(c, project, branch) {
 		return project + "@" + branch + ":" + path
 	}

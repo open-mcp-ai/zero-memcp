@@ -735,8 +735,12 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 	if len(removed) == 0 {
 		return "no files were deleted", nil
 	}
-	// 删除也得重算内存索引，否则被删的切片还能被 recall 搜到
-	if err := s.Reload(); err != nil {
+	// 删除也得重算内存索引，否则被删的切片还能被 recall 搜到。
+	//
+	// 但只重算受影响的那条分支：这里曾经是无条件 Reload()，
+	// 实测删一条 146 字节的消息要 129~135 秒才返回（删四条 = 近九分钟）。
+	// 清理动作本该是秒级的。
+	if err := s.refreshBranch(proj, branch); err != nil {
 		return "", err
 	}
 	return fmt.Sprintf("marked %d files for deletion (%s@%s; commit to apply):\n  %s",

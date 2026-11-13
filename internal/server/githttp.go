@@ -98,7 +98,8 @@ func (s *Server) handleGitHTTP(w http.ResponseWriter, r *http.Request) {
 		//   1. 刚由 Ensure 建出来的空仓库没有分支，这道门会退回拿服务端
 		//      默认分支（zero）去问，把只挂载了 main 的凭证直接判死；
 		//   2. 一张「只写不读」的凭证本来就能推，套上读门反而拦掉它。
-		if !receiveDir && !s.projectVisible(caller, project) {
+		allowPartial := r.URL.Query().Get("partial") == "1" || r.URL.Query().Get("single_branch") == "1"
+		if !receiveDir && !s.projectVisibleWithMode(caller, project, allowPartial) {
 			http.Error(w, fmt.Sprintf("project %q is outside this credential's visible scope", project), http.StatusForbidden)
 			return
 		}
@@ -291,10 +292,25 @@ func parseGitPath(p string) (project, action string, err error) {
 	return project, action, nil
 }
 
-// projectVisible 报告该凭证能否看到这个项目（任意分支可见即可）。
+// projectVisible 报告该凭证能否看到这个项目。
+//
+// 默认规则（整仓 clone 保守门）：必须能读每一条活跃分支，否则
+// fail-closed 拒掉。这是为了防止「只挂了开发分支的人 clone 整仓，
+// 客户端误以为自己拿到了全部历史、随后以缺失的历史为基准生成补丁」。
+//
+// 部分分支开关：当 URL 带 `?partial=1`（或 `?single_branch=1`）时，
+// 降级为「任意一条分支可读即可」——客户端明确知晓自己在做单分支
+// 或受限克隆，比如：
+//
+//	git clone --single-branch -b main.shared http://host/repos/p.git?partial=1
+//
+// 广告本身始终按凭证逐条过滤（AdvertiseRefsFiltered）：看不见的分支
+// 绝不出现在广告里，因此开关打开也不会泄漏不可读分支的内容。
 func (s *Server) projectVisible(c Caller, project string) bool {
-	// Smart Git advertises and serves the repository as a whole; it cannot enforce
-	// per-branch ACLs. Fail closed unless the caller may read every active branch.
+	return s.projectVisibleWithMode(c, project, false)
+}
+
+func (s *Server) projectVisibleWithMode(c Caller, project string, allowPartial bool) bool {
 	repo, err := s.projects.Get(project)
 	if err != nil {
 		return false
@@ -307,13 +323,20 @@ func (s *Server) projectVisible(c Caller, project string) bool {
 		branch := s.defaultBranch
 		return s.allowed(c, project, branch, configBitRead)
 	}
+	anyOk := false
 	for _, ref := range refs {
 		branch := strings.TrimPrefix(ref, "refs/heads/")
-		if !s.allowed(c, project, branch, configBitRead) {
+		if branch == ref {
+			continue
+		}
+		can := s.allowed(c, project, branch, configBitRead)
+		if can {
+			anyOk = true
+		} else if !allowPartial {
 			return false
 		}
 	}
-	return true
+	return anyOk
 }
 
 func newGzipReader(r io.Reader) (io.ReadCloser, error) { return gzip.NewReader(r) }

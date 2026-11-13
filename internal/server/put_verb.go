@@ -162,6 +162,21 @@ func (s *Server) putBody(target, body, session string, c Caller) (TermResult, er
 	if err != nil {
 		return TermResult{}, err
 	}
+	// 屏障：等这一笔真的落进脏层，再决定回什么。
+	//
+	// 这里曾经直接回 ok——Write 只承诺「已投递」。实测出现过
+	// put 回 ok、路径也对，但文件在磁盘和 git 里都不存在，
+	// 随后 commit 回 "nothing pending" 的情况。丢写不报错是最贵的故障。
+	if err := repo.Barrier(); err != nil {
+		return TermResult{}, fmt.Errorf("write did not reach disk: %w", err)
+	}
+	// 回读校验：脏层能读到，才算真的在。
+	if _, rerr := repo.Read(branch, rel); rerr != nil {
+		return TermResult{}, fmt.Errorf(
+			"write reported success but %s@%s:%s cannot be read back (%v); treating it as failed",
+			proj, branch, rel, rerr)
+	}
+
 	commitSHA, _ := repo.Resolve(branch)
 	virtPath := s.virtualPath(c, proj, branch, rel)
 

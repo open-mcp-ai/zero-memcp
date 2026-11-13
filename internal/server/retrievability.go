@@ -43,7 +43,10 @@ func (s *Server) branchCandidates(repo *gitstore.Repo, path string, c Caller, pr
 		if br == ref {
 			continue // 不是 heads 下的（如 tags），跳过
 		}
-		if !c.Mount.Visible(proj, br) || !s.allowed(c, proj, br, configBitRead) {
+		// 可见性以「挂载表 或 服务端授权表」为准：ACL 开出来的分支
+		// 不在凭证里，但路径确实在那里能找到。只认挂载表的话，
+		// 「唯一命中就直给」这条便利用不上 ACL 分支。
+		if !s.branchVisible(c, proj, br) || !s.allowed(c, proj, br, configBitRead) {
 			continue
 		}
 		if _, rerr := repo.Read(br, path); rerr == nil {

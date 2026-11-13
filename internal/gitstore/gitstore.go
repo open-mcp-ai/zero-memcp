@@ -610,6 +610,16 @@ func (r *Repo) dirtyWorker() {
 	}
 }
 
+// Barrier 等待脏写入队列排空：返回时，此前投递的写入都已经落进脏层。
+//
+// 为什么需要它：Write 只承诺「已投递」（见其注释），而调用方往往要在
+// 回包里写「ok」。只投递就回 ok 的后果实测过——put 回了 ok、路径也对，
+// 但文件在磁盘和 git 里都不存在，commit 还说 "nothing pending"。
+// 一次静默丢写比一次报错贵得多：报错会被重试，丢写没人知道。
+func (r *Repo) Barrier() error {
+	return r.syncDirtyWriter()
+}
+
 func (r *Repo) syncDirtyWriter() error {
 	r.writerMu.Lock()
 	if r.writerDead {

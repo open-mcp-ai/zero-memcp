@@ -1754,13 +1754,19 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 				// 用户不知道「默认分支」是哪个，也不该知道——他手里只有路径。
 				// 唯一命中就直接给；多分支都有就列出来消歧；都没有才报 not found。
 				if strings.Contains(addr, "@") {
-					missing = append(missing, addr+"(not found)")
+					missing = append(missing, fmt.Sprintf("%s(not found on %s@%s)", addr, proj, br))
 					continue
 				}
 				cands := s.branchCandidates(repo, path, c, proj)
 				switch len(cands) {
 				case 0:
-					missing = append(missing, addr+"(not found)")
+					// 找过哪条分支必须写出来。
+					//
+					// 「not found」不说是哪条分支，就会被读成「记忆丢了」：
+					// 同一个文件 ls 里有、换个写法就 not found，而真相是
+					// 不带 @branch 的地址落到默认分支。默认分支是服务端的
+					// 概念，调用方手里只有路径，没义务知道它。
+					missing = append(missing, fmt.Sprintf("%s(not found on %s@%s)", addr, proj, br))
 					continue
 				case 1:
 					found, ferr := repo.Read(cands[0], path)

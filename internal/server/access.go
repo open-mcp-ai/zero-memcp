@@ -350,3 +350,20 @@ func (s *Server) grantAllows(c Caller, project, branch string, bit rune) bool {
 func gatedHas(gated string, bit rune) bool {
 	return strings.ContainsRune(gated, bit)
 }
+
+// namesDeclaredProject 报告 addr 是否直接以某个已声明的项目名开头。
+//
+// 判据要包含 "@"：写入目标常见的形态是 project@branch，
+// 它同样属于「调用方已经写明真实项目」，不该再被挂载表翻译一次。
+func (s *Server) namesDeclaredProject(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return false
+	}
+	for _, p := range s.declaredProjects() {
+		if addr == p || strings.HasPrefix(addr, p+"/") || strings.HasPrefix(addr, p+"@") {
+			return true
+		}
+	}
+	return false
+}

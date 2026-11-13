@@ -407,8 +407,15 @@ func (s *Server) resolveWriteTarget(c Caller, defaultBranch, explicit string, pr
 	//
 	// 必须优先走它：否则挂载表定义的虚拟根没有任何意义——
 	// 调用方看见的是虚拟路径，写的时候却被逼着知道真实项目全名。
+	// 但**只在 explicit 不是真实项目名时**才走它。
+	//
+	// 踩过的坑：显式写了 BlackEggAI/weft@main.record，挂载表里却有
+	// 多条根在 "/" 的挂载点，ToReal 按第一条命中返回，于是这次写入
+	// 被翻成了 BlackEggAI/zero@main.record——内容和地址都"成功"，
+	// 只是进错了仓库。反过来（虚拟路径 → 真实项目）是它的正当用途，
+	// 所以判定条件只能是「explicit 本身是不是已声明的项目」。
 	var mountBranch string
-	if !c.Mount.Empty() {
+	if !c.Mount.Empty() && !s.namesDeclaredProject(explicit) {
 		if realProj, realBranch, _, err := c.Mount.ToReal(explicit); err == nil && realProj != "" {
 			explicit = realProj
 			mountBranch = realBranch

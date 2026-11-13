@@ -1,7 +1,12 @@
 package server
 
 import (
+	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -49,10 +54,80 @@ type TreeWatch struct {
 type TreeWatchHub struct {
 	mu      sync.RWMutex
 	watches map[string][]TreeWatch
+	// path 非空时把整张表落盘。
+	//
+	// 为什么必须落盘：关注标记是「我关心这棵树」这个判断本身，属于身份，
+	// 不属于进程生命周期。纯内存的代价是每次重启后两个分身都「忘了自己在
+	// 关注共享分支」，而它们并不会自己重新 remind——于是对讲机静默失效，
+	// 症状是「消息发出去了但对面一直没醒」，没有任何报错。
+	//
+	// 空 path 表示不持久化（测试与单机临时实例）。
+	path string
 }
 
 func newTreeWatchHub() *TreeWatchHub {
 	return &TreeWatchHub{watches: make(map[string][]TreeWatch)}
+}
+
+// newPersistentTreeWatchHub 打开一份落盘的关注表。文件不存在视为空表。
+func newPersistentTreeWatchHub(path string) (*TreeWatchHub, error) {
+	h := &TreeWatchHub{watches: make(map[string][]TreeWatch), path: path}
+	raw, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return h, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return h, nil
+	}
+	var doc struct {
+		Watches map[string][]TreeWatch `json:"watches"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		// 读坏了不能拖垮启动：关注是派生态，丢一次最多重读一遍树。
+		// 但要出声——静默变空表会让「remind 明明做过」变成一次无从查起的谜。
+		return h, fmt.Errorf("parse %s: %w (starting with an empty watch table)", path, err)
+	}
+	if doc.Watches != nil {
+		h.watches = doc.Watches
+	}
+	return h, nil
+}
+
+// saveLocked 把当前表写回磁盘（调用方已持锁）。
+//
+// 写失败不回滚内存：关注丢了只是多读一次树，而把内存改回旧值会让
+// 调用方刚做完的 remind 看起来「成功了但没生效」。日志里出声即可。
+func (h *TreeWatchHub) saveLocked() {
+	if h.path == "" {
+		return
+	}
+	body, err := json.MarshalIndent(struct {
+		Watches map[string][]TreeWatch `json:"watches"`
+	}{Watches: h.watches}, "", "  ")
+	if err != nil {
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(h.path), 0o755); err != nil {
+		return
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(h.path), ".watches-*.tmp")
+	if err != nil {
+		return
+	}
+	name := tmp.Name()
+	defer os.Remove(name)
+	if _, err := tmp.Write(append(body, '\n')); err != nil {
+		tmp.Close()
+		return
+	}
+	_ = tmp.Sync()
+	if err := tmp.Close(); err != nil {
+		return
+	}
+	_ = os.Rename(name, h.path)
 }
 
 // Add 为某个身份增加或更新一条关注标记（同 project+branch+path 视为同一条）。
@@ -64,10 +139,12 @@ func (h *TreeWatchHub) Add(identity string, w TreeWatch) {
 		if cur.Project == w.Project && cur.Branch == w.Branch && cur.Path == w.Path {
 			// 重新锚定：把基线推到当前头。
 			list[i] = w
+			h.saveLocked()
 			return
 		}
 	}
 	h.watches[identity] = append(list, w)
+	h.saveLocked()
 }
 
 // List 返回该身份当前关注的树。
@@ -85,6 +162,7 @@ func (h *TreeWatchHub) Clear(identity string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.watches, identity)
+	h.saveLocked()
 }
 
 // watchStatus 是 status 动词里的一行关注报告。

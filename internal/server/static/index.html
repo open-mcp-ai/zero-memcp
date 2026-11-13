@@ -158,6 +158,26 @@
     </div>
   </div>
 
+  <div class="panel" style="margin-bottom:12px">
+    <div class="panel-head">Branch access (ACL) — takes effect immediately, no credential re-issue</div>
+    <div style="padding:9px 11px">
+      <p class="gate-hint" style="margin-top:0">This table is the authoritative answer to "which identity may touch which branch". It is stored in <code>system/acl.json</code>, so a credential never has to be re-signed when you add a shared branch. Rules for a specific branch win over the <code>*</code> row.</p>
+      <table id="acl"><tr><td class="muted">loading...</td></tr></table>
+      <div class="row-form">
+        <input id="acl-user" placeholder="identity (credential user, e.g. zero-dev)" style="width:230px">
+        <input id="acl-project" placeholder="project (e.g. BlackEggAI/zero)" style="width:240px">
+        <input id="acl-branch" placeholder="branch (empty/* = all branches)" style="width:220px">
+        <input id="acl-perm" placeholder="perm: rwx subset" style="width:150px">
+      </div>
+      <div class="row-form">
+        <input id="acl-note" placeholder="note (why this rule exists)" style="width:420px">
+        <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--muted)"><input id="acl-admin" type="checkbox" style="width:auto"> admin (instance-level verbs)</label>
+        <button onclick="aclPut()">Add / update</button>
+      </div>
+      <pre id="acl-out" style="white-space:pre-wrap;font-size:11px;color:var(--gold);margin-top:6px"></pre>
+    </div>
+  </div>
+
   <div class="panel">
     <div class="panel-head">Temporary write grants (activate / revoke)</div>
     <div style="padding:9px 11px">
@@ -357,6 +377,65 @@ async function loadAdmin(){
   await loadOverview();
   await loadTokens();
   await loadGrants();
+  await loadACL();
+}
+
+async function loadACL(){
+  try {
+    const res = await fetch("/ui/api/acl");
+    if(!res.ok){ $("acl").innerHTML = `<tr><td class="warn">failed to load ACL: ${await res.text()}</td></tr>`; return; }
+    const d = await res.json();
+    if(d.error){ $("acl").innerHTML = `<tr><td class="muted">${d.error}</td></tr>`; return; }
+    const rows = (d.rules||[]).map(r => {
+      const br = r.branch ? `<code>${r.branch}</code>` : '<span class="muted">* (all)</span>';
+      const adm = r.admin ? ' <span class="warn">admin</span>' : '';
+      const note = r.note ? `<span class="muted" style="margin-left:6px">${r.note}</span>` : '';
+      const brVal = r.branch || "";
+      return `<tr>
+        <td><code>${r.user}</code></td>
+        <td><code>${r.project}</code></td>
+        <td>${br}</td>
+        <td><code>${r.perm||"-"}${adm}</code></td>
+        <td>${note}</td>
+        <td><button class="btn-sm" onclick="aclRm('${r.user}','${r.project}','${brVal}')">Delete</button></td>
+      </tr>`;
+    }).join("");
+    $("acl").innerHTML = `<tr><th>identity</th><th>project</th><th>branch</th><th>perm</th><th>note</th><th></th></tr>`
+      + (rows || '<tr><td colspan="6" class="muted">(no rules yet — fill the row below and click "Add / update")</td></tr>');
+  } catch(e){
+    $("acl").innerHTML = `<tr><td class="warn">ACL load error: ${e.message}</td></tr>`;
+  }
+}
+
+async function aclPut(){
+  const user = $("acl-user").value.trim();
+  const proj = $("acl-project").value.trim();
+  const branch = $("acl-branch").value.trim();
+  const perm = $("acl-perm").value.trim();
+  const note = $("acl-note").value.trim();
+  const admin = $("acl-admin").checked;
+  if(!user){ alert("Enter an identity (user)"); return; }
+  if(!admin && (!proj || !perm)){ alert("Enter project and perm (or check admin)"); return; }
+  $("acl-out").textContent = "saving...";
+  const r = await fetch("/ui/api/acl/put", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({user, project: proj || "*", branch, perm, admin, note})
+  });
+  if(!r.ok){ $("acl-out").textContent = "failed: " + (await r.text()); return; }
+  $("acl-out").textContent = "saved ok";
+  setTimeout(() => { $("acl-out").textContent = ""; }, 2500);
+  $("acl-branch").value = ""; $("acl-perm").value = ""; $("acl-note").value = ""; $("acl-admin").checked = false;
+  await loadACL();
+}
+
+async function aclRm(user, project, branch){
+  if(!confirm(`Delete rule for ${user} on ${project}@${branch||"*"}?`)) return;
+  const r = await fetch("/ui/api/acl/rm", {
+    method:"POST", headers:{"Content-Type":"application/json"},
+    body: JSON.stringify({user, project, branch})
+  });
+  if(!r.ok){ alert("Delete failed: " + await r.text()); return; }
+  await loadACL();
 }
 
 async function loadOverview(){

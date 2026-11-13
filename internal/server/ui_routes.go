@@ -194,6 +194,12 @@ func (s *Server) handleUIAPI(w http.ResponseWriter, r *http.Request) {
 		s.uiGrantAdd(w, r)
 	case "grants/revoke":
 		s.uiGrantRevoke(w, r)
+	case "acl":
+		s.uiACLList(w, r)
+	case "acl/put":
+		s.uiACLPut(w, r)
+	case "acl/rm":
+		s.uiACLRm(w, r)
 	case "search":
 		s.uiSearch(w, r)
 	case "gc":

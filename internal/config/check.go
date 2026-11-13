@@ -19,7 +19,7 @@ import (
 // 为什么严格遵循这个顺序：POSIX 的「属主被否定就不看组位」虽然反直觉，
 // 但它排除了「一个人既是属主又在组里，结果到底算哪边」的所有歧义。
 // 每一层一旦匹配就确定结果，不往下一层漏。
-func Check(l *Lookup, user, project string, perm uint8) bool {
+func Check(l *Lookup, user, project, branch string, perm uint8) bool {
 	u, ok := l.User(user)
 	if !ok {
 		return false
@@ -40,7 +40,10 @@ func Check(l *Lookup, user, project string, perm uint8) bool {
 	}
 
 	// 显式 [[access]] 例外：给某人开小灶，比 mode 优先。
-	if granted, ok := l.AccessFor(user, project); ok {
+	//
+	// 分支级规则也在这里命中：精确分支优先于通配，所以
+	// 「项目通配只给 r」+「main.shared 给 rwx」能同时成立。
+	if granted, ok := l.AccessFor(user, project, branch); ok {
 		return hasPerm(granted, perm)
 	}
 
@@ -60,7 +63,7 @@ func Check(l *Lookup, user, project string, perm uint8) bool {
 }
 
 // Explain 给出拒绝理由，让错误信息能说清是谁被哪一条挡住了。
-func Explain(l *Lookup, user, project string, perm uint8) string {
+func Explain(l *Lookup, user, project, branch string, perm uint8) string {
 	u, ok := l.User(user)
 	if !ok {
 		return fmt.Sprintf("user %q does not exist", user)
@@ -72,11 +75,11 @@ func Explain(l *Lookup, user, project string, perm uint8) string {
 	if u.Root {
 		return "root"
 	}
-	if granted, ok := l.AccessFor(user, project); ok {
+	if granted, ok := l.AccessFor(user, project, branch); ok {
 		if hasPerm(granted, perm) {
 			return "explicit access grant allows this operation"
 		}
-		return fmt.Sprintf("explicit access grant only allows %s; missing %s", granted, permName(perm))
+		return fmt.Sprintf("explicit access grant for %s@%s only allows %s; missing %s", project, branch, granted, permName(perm))
 	}
 	switch {
 	case p.Owner != "" && p.Owner == user:
@@ -89,8 +92,8 @@ func Explain(l *Lookup, user, project string, perm uint8) string {
 					g, project, p.Perm.String(), permName(perm))
 			}
 		}
-		return fmt.Sprintf("user %s (project %s, owner %q, group %q, %s) lacks %s permission via other bits",
-			user, project, p.Owner, p.Group, p.Perm.String(), permName(perm))
+		return fmt.Sprintf("user %s (project %s, branch %s, owner %q, group %q, %s) lacks %s permission via other bits",
+			user, project, branch, p.Owner, p.Group, p.Perm.String(), permName(perm))
 	}
 }
 

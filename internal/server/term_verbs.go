@@ -317,6 +317,12 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Usage: "rule [<project>]",
 	},
 	{
+		Name:   "acl",
+		Detail: detail_acl,
+		Kind:   term.KindFlags,
+		Usage:  "acl list | acl put <user> <project>[@<branch>] <perm> | acl rm <user> <target>",
+	},
+	{
 		Name:   "config",
 		Detail: detail_config,
 		Kind:   term.KindFlags,

@@ -376,6 +376,35 @@ Pass content through vars/args as well:
 Example: write proj/notes@main/rules/01.md $TEXT
 `
 
+const detail_acl = `
+acl list
+acl put <user> <project>[@<branch>] <perm> [--note <text>]
+acl put <user> * --admin [--note <text>]
+acl rm <user> <project>[@<branch>]
+acl rm <user> *
+
+Grant or revoke branch-level permissions on the server side (admin only).
+
+This is the answer to "changing one permission should not require re-signing a
+credential". The rule lives in <data>/system/acl.json and takes effect on the
+next request: no reload, no restart, nothing to copy into any client.
+
+Branch-level rules take precedence over the wildcard, so "whole project read-only
+plus this one branch writable" is two rules and needs no ordering tricks.
+
+  acl put zero-dev BlackEggAI/zero@main.shared rwx
+      zero-dev may now read/write that branch even though its credential never
+      listed it. That is the whole point: the credential says who you are, this
+      table says what you may touch today.
+
+  acl put weft * --admin
+      lets that identity run administration verbs (config/reload/users/acl)
+      without handing it an unrestricted credential.
+
+  acl rm zero-dev BlackEggAI/zero@main.shared
+      revoke. Effective immediately.
+`
+
 const detail_config = `
 config show
 config path

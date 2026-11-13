@@ -223,9 +223,17 @@ type Remote struct {
 //
 // 它的用处是「给某个用户单独开某个项目的口子」，而不必为此改项目归属
 // 或者把人塞进组里。优先级高于 mode。
+//
+// Branch 把授权粒度从项目细化到分支：留空或 "*" 表示整条项目的所有分支，
+// 写了具体分支名就只对那条分支生效。
+//
+// 为什么需要它：mode 是项目级的，表达不了「看得见 main.dev、看不见
+// main.chat」。而这两个分身的隔离恰恰是分支级的——不细化到分支，
+// 就只能把隔离写进凭证的挂载表，于是每加一条共享分支都要重签一次凭证。
 type AccessRule struct {
 	User    string
 	Project string
+	Branch  string // 空或 "*" = 所有分支
 	Perm    string // rwx 的子集
 }
 
@@ -268,7 +276,7 @@ var knownKeys = map[string]map[string]bool{
 	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
 	"group":   {"name": true, "members": true},
 	"project": {"name": true, "owner": true, "group": true, "mode": true},
-	"access":  {"user": true, "project": true, "perm": true},
+	"access":  {"user": true, "project": true, "branch": true, "perm": true},
 	"listen":  {"addr": true, "allow": true, "require": true, "mount": true, "webui": true},
 	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true},
 }
@@ -636,6 +644,9 @@ func ParseFile(raw []byte) (*File, error) {
 		if a.Project, err = str(sec, "[[access]]", "project"); err != nil {
 			return nil, err
 		}
+		if a.Branch, err = str(sec, "[[access]]", "branch"); err != nil {
+			return nil, err
+		}
 		if a.Perm, err = str(sec, "[[access]]", "perm"); err != nil {
 			return nil, err
 		}
@@ -732,6 +743,13 @@ func (f *File) Validate() error {
 		if a.Perm == "" {
 			return fmt.Errorf("[[access]] #%d is missing perm", i+1)
 		}
+		// 分支名写错不会报错、只会静默不生效——那是最难查的一类故障。
+		// 通配 "*" 是合法值，代表「整条项目的所有分支」。
+		if b := strings.TrimSpace(a.Branch); b != "" && b != "*" {
+			if err := auth.ValidateBranchName(b); err != nil {
+				return fmt.Errorf("[[access]] #%d branch: %w", i+1, err)
+			}
+		}
 		for _, c := range a.Perm {
 			if !strings.ContainsRune("rwx", c) {
 				return fmt.Errorf("[[access]] #%d perm %q may only contain rwx", i+1, a.Perm)
@@ -801,7 +819,7 @@ type Lookup struct {
 	users    map[string]User
 	groups   map[string]Group
 	projects map[string]Project
-	access   map[string]map[string]string // user -> project -> 权限字母
+	access   []AccessRule // 按声明顺序；精确分支优先于通配
 }
 
 // Build 建立运行时索引。
@@ -810,7 +828,7 @@ func (f *File) Build() *Lookup {
 		users:    map[string]User{},
 		groups:   map[string]Group{},
 		projects: map[string]Project{},
-		access:   map[string]map[string]string{},
+		access:   []AccessRule{},
 	}
 	for _, u := range f.Users {
 		l.users[u.Name] = u
@@ -822,10 +840,7 @@ func (f *File) Build() *Lookup {
 		l.projects[p.Name] = p
 	}
 	for _, a := range f.Access {
-		if l.access[a.User] == nil {
-			l.access[a.User] = map[string]string{}
-		}
-		l.access[a.User][a.Project] = a.Perm
+		l.access = append(l.access, a)
 	}
 	return l
 }
@@ -889,11 +904,35 @@ func (l *Lookup) GroupsOf(user string) []string {
 	return out
 }
 
-// AccessFor 返回某用户对某项目的显式授权（可能为空）。
-func (l *Lookup) AccessFor(user, project string) (string, bool) {
-	if m, ok := l.access[user]; ok {
-		p, ok := m[project]
-		return p, ok
+// AccessFor 返回某用户对某项目**某分支**的显式授权（可能为空）。
+//
+// 匹配优先级：精确分支 > 通配（空或 "*"）。
+//
+// 为什么要定优先级而不是「最后一条生效」：通配规则是用来「整片开门」的，
+// 精确规则是用来「单个房间关门」的。如果按声明顺序胜出，一条写在后面的
+// 通配会把前面所有精确限制吃掉——那正是权限系统最不该有的隐械行为。
+// 反过来，精确规则永远能覆盖通配，意味着「先给一片、再挖个洞」这个最
+// 常见的授权写法不会被顺序意外打破。
+func (l *Lookup) AccessFor(user, project, branch string) (string, bool) {
+	branch = strings.TrimSpace(branch)
+	wildcard, hasWildcard := "", false
+	for _, a := range l.access {
+		if a.User != user || a.Project != project {
+			continue
+		}
+		ab := strings.TrimSpace(a.Branch)
+		if ab == "" || ab == "*" {
+			if !hasWildcard {
+				wildcard, hasWildcard = a.Perm, true
+			}
+			continue
+		}
+		if branch != "" && ab == branch {
+			return a.Perm, true
+		}
+	}
+	if hasWildcard {
+		return wildcard, true
 	}
 	return "", false
 }

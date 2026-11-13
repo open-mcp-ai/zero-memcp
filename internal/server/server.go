@@ -24,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/open-mcp-ai/zero-memcp/internal/acl"
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
@@ -221,6 +222,13 @@ type Server struct {
 	// 通知不另存一份消息日志：树的 SHA 变化本身就是事件。
 	// 关注关系是派生态，丢了最多重读一次，不写进不可变历史。
 	treeWatch *TreeWatchHub
+
+	// acl 是服务端的分支级授权表（<data>/system/acl.json）。
+	//
+	// 它是运行时数据，不是部署配置：改它不该要重启，更不该重签凭证。
+	// nil 表示没启用（例如测试或从命令行启动的单机模式），此时
+	// 权限判定退回凭证挂载表 + TOML 的老路子。
+	acl *acl.Store
 	// fanouts 记录因收到推送而触发的扇出批次及其目标状态。
 	fanouts *fanoutHub
 
@@ -409,8 +417,7 @@ func New(cfg Config) (*Server, error) {
 		uiLimiter:     newUILoginLimiter(),
 		lock:          startupLock,
 
-		listens:   FromConfig(listenBlocks(cfgFile)),
-		treeWatch: newTreeWatchHub(),
+		listens: FromConfig(listenBlocks(cfgFile)),
 		fanouts:   newFanoutHub(),
 		resources: newResourceHub(),
 		done:      make(chan struct{}),
@@ -424,6 +431,28 @@ func New(cfg Config) (*Server, error) {
 	}
 	if lookup != nil {
 		s.cfgLookup.Store(lookup)
+	}
+
+	// 关注表落盘：重启后两个分身仍记得自己关注哪条共享分支。
+	if hub, herr := newPersistentTreeWatchHub(filepath.Join(cfg.DataDir, "system", "watches.json")); herr != nil {
+		startupStage("watches: %v", herr)
+		s.logf("watches: %v", herr)
+		s.treeWatch = hub
+	} else {
+		s.treeWatch = hub
+	}
+
+	// 服务端授权表（<data>/system/acl.json）。
+	//
+	// 读不出来时不阻断启动，但必须出声：静默退回「只看挂载表」会让
+	// 权限表现和预期完全不同——本该能读的分支突然读不到，而日志里
+	// 一个字都没有，排查的人只会去怀疑凭证。
+	if store, aerr := acl.Open(filepath.Join(cfg.DataDir, "system", "acl.json")); aerr != nil {
+		startupStage("acl: %v (falling back to credential mounts only)", aerr)
+		s.logf("acl: %v — permission decisions fall back to credential mounts + TOML", aerr)
+	} else {
+		s.acl = store
+		startupStage("acl: %d rule(s)", len(store.Rules()))
 	}
 	// 会话表：改口令时清空全部会话，所以它必须能看到口令状态。
 	s.sessions = auth.NewSessionStore(12*time.Hour, s.passwords.MustChange)
@@ -1913,6 +1942,10 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// write <project>[@<branch>]/<path> -- <内容>
 		out, err := s.execWrite(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
+
+	case "acl":
+		// acl list | acl put <user> <project>[@<branch>] <perm> | acl rm <user> <target>
+		return s.execACL(rest, c)
 
 	case "config":
 		// config show | config path | config put <TOML>

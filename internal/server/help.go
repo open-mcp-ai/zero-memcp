@@ -84,7 +84,7 @@ func helpAll() string {
 	var b strings.Builder
 	b.WriteString(helpOverview())
 	b.WriteString("\n\n")
-	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "ref", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "merge", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "config", "reload", "whoami", "users", "help"} {
+	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "ref", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "merge", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "archive", "reset", "acl", "config", "reload", "whoami", "users", "help"} {
 		if d, ok := helpVerb(v); ok {
 			b.WriteString("\n-- " + v + " ")
 			b.WriteString(strings.Repeat("-", max(0, 60-len(v))))

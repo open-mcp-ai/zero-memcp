@@ -263,7 +263,7 @@ func TestCheckRootBypassesEverything(t *testing.T) {
 	l := permModel(t)
 	for _, p := range []string{"me", "public", "private"} {
 		for _, perm := range []uint8{auth.BitRead, auth.BitWrite, auth.BitExecute} {
-			if !Check(l, "owner", p, perm) {
+			if !Check(l, "owner", p, "*", perm) {
 				t.Fatalf("root 应对 %s 有全部权限", p)
 			}
 		}
@@ -274,25 +274,25 @@ func TestCheckOwnerGroupOther(t *testing.T) {
 	l := permModel(t)
 
 	// 属主：rwx
-	if !Check(l, "alice", "me", auth.BitWrite) {
+	if !Check(l, "alice", "me", "*", auth.BitWrite) {
 		t.Fatal("属主应可写")
 	}
 	// 同组：r-x，不能写
-	if !Check(l, "bob", "me", auth.BitRead) {
+	if !Check(l, "bob", "me", "*", auth.BitRead) {
 		t.Fatal("同组应可读")
 	}
-	if Check(l, "bob", "me", auth.BitWrite) {
+	if Check(l, "bob", "me", "*", auth.BitWrite) {
 		t.Fatal("同组不应可写")
 	}
 	// 其他位是 ---，陌生人读写都不行
-	if Check(l, "stranger", "me", auth.BitRead) {
+	if Check(l, "stranger", "me", "*", auth.BitRead) {
 		t.Fatal("其他位 --- 不应可读")
 	}
 	// 其他位是 r-x 的项目，陌生人可读不可写
-	if !Check(l, "stranger", "public", auth.BitRead) {
+	if !Check(l, "stranger", "public", "*", auth.BitRead) {
 		t.Fatal("public 其他人应可读")
 	}
-	if Check(l, "stranger", "public", auth.BitWrite) {
+	if Check(l, "stranger", "public", "*", auth.BitWrite) {
 		t.Fatal("public 其他人不应可写")
 	}
 }
@@ -302,11 +302,11 @@ func TestAccessOverridesMode(t *testing.T) {
 	l := permModel(t)
 
 	// private 的 other 位是 ---，但 stranger 被显式授了 r
-	if !Check(l, "stranger", "private", auth.BitRead) {
+	if !Check(l, "stranger", "private", "*", auth.BitRead) {
 		t.Fatal("显式授权应覆盖 mode")
 	}
 	// 但显式授权只写了 r，写仍然不行
-	if Check(l, "stranger", "private", auth.BitWrite) {
+	if Check(l, "stranger", "private", "*", auth.BitWrite) {
 		t.Fatal("显式授权只有 r，不该可写")
 	}
 }
@@ -314,7 +314,7 @@ func TestAccessOverridesMode(t *testing.T) {
 // 未在配置里声明的项目，任何人都不该能碰。
 func TestUnknownProjectDenied(t *testing.T) {
 	l := permModel(t)
-	if Check(l, "owner", "ghost", auth.BitRead) {
+	if Check(l, "owner", "ghost", "*", auth.BitRead) {
 		t.Fatal("未声明的项目连 root 也不该自动获得——root 是绕过位检查，不是绕过存在性")
 	}
 }
@@ -358,7 +358,7 @@ mode  = "rwx---r--"
 `).Build()
 
 	// alice 是属主，属主位是 rwx。即使组位是 --- 也不影响她。
-	if !Check(l, "alice", "p", auth.BitWrite) {
+	if !Check(l, "alice", "p", "*", auth.BitWrite) {
 		t.Fatal("属主应可写")
 	}
 }

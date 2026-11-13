@@ -94,17 +94,23 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 	if strings.Contains(addr, "@") {
 		proj, br, p, perr := s.parseBranchAddr(addr)
 		if perr == nil {
-			// 显式分支也必须先过挂载可见性，否则等于绕过 chroot
-			if !c.Mount.Visible(proj, br) {
+			// 显式分支必须先过可见性，否则等于绕过 chroot。
+			//
+			// 可见性有两处来源：凭证挂载表，和服务端授权表（acl.json）。
+			// 后者是「加一条共享分支不用重签凭证」的落点——凭证里没有
+			// 这条分支，但服务端表给了它，它就该能被寻址。
+			if !s.branchVisible(c, proj, br) {
 				return "", "", "", fmt.Errorf("project %s@%s is outside this credential's visible scope", proj, br)
 			}
-			// 路径收窄挂载（root 子树）：路径级可见性。
-			if !c.Mount.PathVisible(proj, br, p) {
+			// ACL 授予的分支不在挂载表里，没有 root 子树可校验，
+			// 整条分支可见。
+			if c.Mount.Visible(proj, br) && !c.Mount.PathVisible(proj, br, p) {
 				return "", "", "", fmt.Errorf("path %q is outside this mount's subtree (%s@%s:%s)", p, proj, br, c.Mount.rootOf(proj, br))
 			}
 			return proj, br, p, nil
 		}
 	}
+
 	if !c.Mount.Empty() {
 		proj, br, p, terr := c.Mount.ToReal(addr)
 		if terr != nil {

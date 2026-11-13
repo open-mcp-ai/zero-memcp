@@ -10,13 +10,20 @@ import (
 
 // allowed 判定这个调用者对某个项目能否做 perm。
 //
-// 两层，取交集，任一层拒绝即拒绝：
+// 三层，取交集，任一层拒绝即拒绝：
 //
-//  1. 凭证层（cap + mount）：这张 token 最远能干到哪
-//  2. 配置层（TOML mode/owner/group）：这个人一般被允许做什么
+//  1. 服务端授权表（acl.json）：这条分支对这个身份开没开
+//  2. 凭证层（cap + mount）：这张 token 最远能干到哪
+//  3. 配置层（TOML mode/owner/group）：这个人一般被允许做什么
 //
-// 凭证只能收窄，不能放宽——所以「改了配置不用重发 token」依然成立，
-// 而 root 又能为一次具体任务签一张更窄的凭证。
+// ACL 命中就不再走凭证挂载表，这是刻意的不对称：
+//
+// 挂载表写在 JWT 里，改它就得重签、重发、重启客户端。而「再加一条共享分支」
+// 是一次随时会发生的日常动作，不该触发换钥匙。所以一旦服务端表对
+// (身份, 项目, 分支) 有明确说法，就不再看挂载表——凭证退化成身份证明。
+//
+// 但 cap （能力位天花板）仍然生效：挂载表管「能看哪」，cap 管「能做什么」。
+// 一张只有 r 的凭证即使 ACL 给了 rwx，也写不进去。
 func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 	// 分支锁：锁住的分支只留「不受限的 root」。
 	//
@@ -29,6 +36,16 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 	// 而锁恰恰是为了拦住它们。判定标准是「这张凭证有没有被收窄」。
 	if !s.rootUnrestricted(c) && s.branchLocked(project, branch) {
 		return false
+	}
+	// 服务端授权表：命中即权威（含「凭证没挂这条分支」的情形）
+	if s.aclActive() {
+		if granted, ok := s.acl.Lookup(c.User, project, branch); ok {
+			bit := capBit(perm)
+			if !hasCap(c.Cap, bit) {
+				return false
+			}
+			return permLetterHas(granted, string(bit))
+		}
 	}
 	// 凭证层：项目必须在这张凭证的挂载表里
 	if !c.Mount.Visible(project, branch) {
@@ -71,10 +88,20 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 	if !s.cfgIndex().Declared(project) {
 		return c.Root
 	}
-	if !config.Check(s.cfgIndex(), c.User, project, perm) {
+	if !config.Check(s.cfgIndex(), c.User, project, branch, perm) {
 		return false
 	}
 	return true
+}
+
+// permLetterHas 把 perm 位映射到授权字母上。
+func permLetterHas(granted string, bit string) bool {
+	for _, r := range bit {
+		if !strings.ContainsRune(granted, r) {
+			return false
+		}
+	}
+	return bit != ""
 }
 
 // projectWritableFor 报告凭证是否至少能写该项目的一条已存在分支。
@@ -137,8 +164,18 @@ func (s *Server) requireRootGlobal(c Caller, bit rune) error {
 	if err := s.requireRootCap(c, bit); err != nil {
 		return err
 	}
+	// 第二条出口：ACL 里显式授予的 admin。
+	//
+	// 为什么需要它：老规则要求「挂载表为空」才能管实例，于是任何被
+	// 收窄过的凭证（也就是所有 agent 实际在用的那些）都永远无法通过
+	// MCP 配置实例，只能靠 SSH 上机器改文件。把管理权做成一条可撤销
+	// 的授权记录，既保住了「收窄的凭证不能自己提权」，又不必为了
+	// 一次配置动作去重签一张全权凭证。
+	if s.aclActive() && s.acl.IsAdmin(c.User) {
+		return nil
+	}
 	if !c.Mount.Empty() {
-		return fmt.Errorf("this is a restricted credential (mounts are limited); global administration verbs require an unrestricted credential")
+		return fmt.Errorf("this is a restricted credential (mounts are limited); global administration verbs require either an unrestricted credential or an admin grant in the ACL")
 	}
 	return nil
 }
@@ -172,7 +209,7 @@ func (s *Server) denyReason(c Caller, project, branch string, perm uint8) string
 	// 这一层只剩配置（TOML 的 mode/owner/group）。
 	// 早先这里还有一段「被角色挡住」的判定，逐请求切换身份的
 	// 机制删掉之后它就永远不可达了——留着只会让人以为还有角色。
-	return config.Explain(s.cfgIndex(), c.User, project, perm)
+	return config.Explain(s.cfgIndex(), c.User, project, branch, perm)
 }
 
 // rootUnrestricted 报告这是否是一张没有被收窄过的 root 凭证。

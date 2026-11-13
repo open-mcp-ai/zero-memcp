@@ -71,7 +71,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 			br, _, _ := strings.Cut(rest, "/")
 			if br != "" {
 				explicitBranch = br
-				if !c.Mount.Visible(proj, br) {
+				if !s.branchVisible(c, proj, br) {
 					return "", "", "", fmt.Errorf("project %s@%s is outside this credential's visible scope", proj, br)
 				}
 				if !s.allowed(c, proj, br, configBitWrite) {
@@ -281,7 +281,7 @@ func (s *Server) writeTarget(c Caller, defaultBranch string) (project, branch st
 		// 逐个挂载点试：项目可见 + 该分支可写，才算候选。
 		for _, p := range s.declaredProjects() {
 			for _, br := range c.Mount.BranchesOf(p) {
-				if !c.Mount.Visible(p, br) {
+				if !s.branchVisible(c, p, br) {
 					continue
 				}
 				if !s.allowed(c, p, br, configBitWrite) {
@@ -440,7 +440,9 @@ func (s *Server) resolveWriteTarget(c Caller, defaultBranch, explicit string, pr
 	} else if !c.Mount.Empty() {
 		branch = c.Mount.DefaultBranch()
 	}
-	if !c.Mount.Visible(project, branch) {
+	// 可见性以「挂载表 或 服务端授权表」为准：ACL 开出来的分支
+	// 不在凭证里，但它确实对这张凭证可见。
+	if !s.branchVisible(c, project, branch) {
 		return "", "", manifest.Policy{}, fmt.Errorf("project %q is outside this credential's visible scope", project)
 	}
 	if !s.allowed(c, project, branch, configBitWrite) {

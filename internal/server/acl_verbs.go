@@ -140,7 +140,7 @@ func (s *Server) aclPut(body string, c Caller) (TermResult, error) {
 		where += "@" + r.Branch
 	}
 	return TermResult{
-		Text: fmt.Sprintf("granted %s on %s to %s — effective immediately, no credential re-issue needed", r.Perm, where, r.User),
+		Text:       fmt.Sprintf("granted %s on %s to %s — effective immediately, no credential re-issue needed", r.Perm, where, r.User),
 		Structured: map[string]any{"ok": true, "rule": r},
 	}, nil
 }

@@ -58,7 +58,7 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 			proj = s.projectOfAddr(addr)
 			br = s.defaultBranch
 		}
-		if !c.Mount.Visible(proj, br) {
+		if !s.branchVisible(c, proj, br) {
 			return false
 		}
 		return s.allowed(c, proj, br, configBitRead)

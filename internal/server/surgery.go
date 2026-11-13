@@ -309,7 +309,7 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 	// 「这条是哪天的」这个不需要读内容就能知道的信息。
 	dstIsDir := dstPath == "" || strings.HasSuffix(dst, "/")
 
-	if !c.Mount.Visible(dstProj, dstBranch) {
+	if !s.branchVisible(c, dstProj, dstBranch) {
 		return "", fmt.Errorf("destination %s@%s is not in the mount table", dstProj, dstBranch)
 	}
 	if !s.allowed(c, dstProj, dstBranch, configBitWrite) {
@@ -672,7 +672,10 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 	if err != nil {
 		return "", err
 	}
-	if !c.Mount.Visible(proj, branch) {
+	// 可见性以「挂载表 或 服务端授权表」为准：ACL 开出来的分支
+	// 不在凭证里，但它确实对这张凭证可见（不加这一条，delete 会在
+	// 权限判定之前就被挂载表挡掉，报的还是"不在可见范围内"）。
+	if !s.branchVisible(c, proj, branch) {
 		return "", fmt.Errorf("%s@%s is outside this credential's visible scope", proj, branch)
 	}
 	if !s.allowed(c, proj, branch, configBitWrite) {

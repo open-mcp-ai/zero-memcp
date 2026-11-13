@@ -29,7 +29,7 @@ func TestSplitRunesCoversWholeDoc(t *testing.T) {
 // 压低或抬高，排序变成「按文档长度排」。
 func TestMeanVectorIsNormalised(t *testing.T) {
 	// 嵌入模型产出的向量本来就是单位向量；两个同样重要性的块模长相同。
-v := meanVector([][]float32{{1, 0, 0}, {0, 1, 0}, nil})
+	v := meanVector([][]float32{{1, 0, 0}, {0, 1, 0}, nil})
 	if v == nil {
 		t.Fatal("nil mean")
 	}

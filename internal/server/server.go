@@ -1620,7 +1620,7 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 				proj = s.projectOfAddr(addr)
 				br = s.defaultBranch
 			}
-			if !c.Mount.Visible(proj, br) {
+			if !s.branchVisible(c, proj, br) {
 				return false
 			}
 			return s.allowed(c, proj, br, configBitRead)
@@ -2121,7 +2121,7 @@ func (s *Server) Report(w io.Writer, c Caller) {
 	defer s.mu.RUnlock()
 
 	for _, t := range s.trees {
-		if !c.Mount.Visible(t.Project, t.Branch) {
+		if !s.branchVisible(c, t.Project, t.Branch) {
 			continue
 		}
 		fmt.Fprintf(w, "\n=== %s ===\n", t.Project)

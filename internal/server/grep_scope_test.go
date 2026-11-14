@@ -109,3 +109,70 @@ mode  = "rwx------"
 		t.Fatalf("输出里出现了 --scope，说明参数没被剥离: %s", out)
 	}
 }
+
+// 语义对齐 shell grep：默认大小写敏感，-i 才不敏感。
+// 模型直觉是 shell 给的，默认敏感让用户能精确搜「ADB」而不被「adb」淹没。
+func TestGrepCaseSensitivityMatchesShell(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := `
+[server]
+data = "` + dataDir + `"
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name  = "p"
+owner = "zero"
+mode  = "rwx------"
+`
+	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		DataDir:     dataDir,
+		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
+		Listen:      "127.0.0.1:0",
+		EnforceAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "t", Cap: "rwx"})
+
+	// 写入一条含大写与小写的内容
+	_, err = callMCP(t, srv, tok, "put p -- MixedCase AlphaBETA text")
+	if err != nil {
+		t.Fatalf("put failed: %v", err)
+	}
+	if err := srv.Reload(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. 默认敏感：精准匹配大写
+	out, err := callMCP(t, srv, tok, "grep AlphaBETA")
+	if err != nil || !strings.Contains(out, "MixedCase") {
+		t.Fatalf("case-sensitive match should hit: out=%q err=%v", out, err)
+	}
+
+	// 2. 默认敏感：大小写不符时不命中（Empty = true，返回 no matches）
+	out, err = callMCP(t, srv, tok, "grep alphabeta")
+	if err != nil || strings.Contains(out, "MixedCase") {
+		t.Fatalf("case-mismatched pattern without -i must not match: out=%q err=%v", out, err)
+	}
+
+	// 3. 显式 -i：大小写不符也命中
+	out, err = callMCP(t, srv, tok, "grep -i alphabeta")
+	if err != nil || !strings.Contains(out, "MixedCase") {
+		t.Fatalf("grep -i must hit regardless of case: out=%q err=%v", out, err)
+	}
+
+	// 4. -i 与 --scope 混用
+	out, err = callMCP(t, srv, tok, "grep -i alphabeta --scope p")
+	if err != nil || !strings.Contains(out, "MixedCase") {
+		t.Fatalf("grep -i with --scope must hit: out=%q err=%v", out, err)
+	}
+}

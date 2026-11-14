@@ -2048,7 +2048,7 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		}, nil
 
 	case "grep":
-		// grep <pattern> [--scope <tree>]
+		// grep [-i] <pattern> [--scope <tree>]
 		//
 		// 正则匹配全文，带上下文。
 		// 模型换 bash 的头号原因就是想搜精确串（比如 "254203716" 或 "BlackEgg"）
@@ -2059,14 +2059,29 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		//
 		// 未知选项必须报错：`grep -c . zero-agi` 早先会把 "-c" 编进正则，
 		// 最后返回 "no matches"——调用方据此得出「库里没有」，而事实只是参数错了。
+		// 大小写语义与 shell 的 grep 对齐：**默认敏感，-i 不敏感**。
+		//
+		// 早先这里无条件编成 (?i)（永远不敏感），于是 "ADB" 与 "adb"
+		// 分不开：想只找大写的那批命中，做不到。而调用方的直觉来自
+		// shell grep——默认敏感、加 -i 才不敏感。语义与直觉不一致时，
+		// 模型会写出 `grep -i x`，然后被当成未知 flag 拒掉，白跑一趟。
+		//
+		// 这里接受 -i / --ignore-case；其余未知选项仍然报错——
+		// `grep -c . zero-agi` 早先会被编进正则，最后返回 "no matches"，
+		// 调用方据此得出「库里没有」，而事实只是参数错了。
+		ignoreCase := false
+		if hasFlag(rest, "-i", "--ignore-case") {
+			ignoreCase = true
+			rest = stripFlags(rest, "-i", "--ignore-case")
+		}
 		if bad, ok := unknownFlag(rest); ok {
-			return TermResult{}, fmt.Errorf("grep: unknown flag %q (supported: --scope)", bad)
+			return TermResult{}, fmt.Errorf("grep: unknown flag %q (supported: --scope, -i)", bad)
 		}
 		pattern, scope := splitScope(rest)
 		if pattern == "" {
-			return TermResult{}, errors.New("grep syntax: grep <pattern> [--scope <tree>]")
+			return TermResult{}, errors.New("grep syntax: grep <pattern> [--scope <tree>] [-i]")
 		}
-		grepText, grepFound, grepErr := s.execGrep(pattern, scope, c)
+		grepText, grepFound, grepErr := s.execGrep(pattern, scope, c, ignoreCase)
 		if grepErr != nil {
 			return TermResult{}, grepErr
 		}
@@ -2238,8 +2253,17 @@ func (s *Server) weightCount(addr string) int {
 // 为什么要先剥参数再编译正则：早先整个 rest 直接当正则用，
 // 于是 `grep 1729 --scope daily` 会把 "--scope daily" 也编进模式里，
 // 结果是必然零命中——而报错文本是「无命中」，看上去像内容不存在。
-func (s *Server) execGrep(pattern, scope string, c Caller) (string, bool, error) {
-	re, err := regexp.Compile("(?i)" + pattern)
+func (s *Server) execGrep(pattern, scope string, c Caller, ignoreCase bool) (string, bool, error) {
+	// 默认大小写敏感（与 shell grep 一致）；-i 时加 (?i)。
+	//
+	// 为什么不再无条件 (?i)：那等于所有检索都不区分大小写，
+	// 用户想「只找大写 ADB」时无从表达。语义对齐 shell 之后，
+	// 加不加 -i 就是一次显式选择。
+	expr := pattern
+	if ignoreCase {
+		expr = "(?i)" + expr
+	}
+	re, err := regexp.Compile(expr)
 	if err != nil {
 		return "", false, fmt.Errorf("invalid regular expression: %w", err)
 	}

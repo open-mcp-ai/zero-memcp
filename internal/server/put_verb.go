@@ -480,6 +480,39 @@ func splitScope(rest string) (query, scope string) {
 // 把 "-c" 编进正则、把 "zero-agi" 当搜索词，最后返回 "no matches"——
 // 调用方会得出「库里没有」这个错误结论，而事实是参数写错了。
 // 静默比报错危险得多：报错会停下来，静默会接着往下推。
+// hasFlag 报告 rest 里是否包含某个选项。
+func hasFlag(rest string, flags ...string) bool {
+	for _, f := range strings.Fields(rest) {
+		for _, want := range flags {
+			if f == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stripFlags 从 rest 里剥掉给定的选项（完整 token 匹配）。
+func stripFlags(rest string, flags ...string) string {
+	drop := map[string]bool{}
+	for _, f := range flags {
+		drop[f] = true
+	}
+	var keep []string
+	for _, f := range strings.Fields(rest) {
+		if !drop[f] {
+			keep = append(keep, f)
+		}
+	}
+	return strings.Join(keep, " ")
+}
+
+// unknownFlag 找出 DSL 里被误当搜索词的选项。
+//
+// 为什么必须报错而不是忽略：`grep -c . zero-agi` 的真实后果是
+// 把 "-c" 编进正则、把 "zero-agi" 当搜索词，最后返回 "no matches"——
+// 调用方会得出「库里没有」这个错误结论，而事实是参数写错了。
+// 静默比报错危险得多：报错会停下来，静默会接着往下推。
 func unknownFlag(rest string) (string, bool) {
 	for _, f := range strings.Fields(rest) {
 		if !strings.HasPrefix(f, "-") {

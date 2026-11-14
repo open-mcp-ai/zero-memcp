@@ -15,7 +15,7 @@ func termTool() mcp.Tool {
 		mcp.WithDescription("termcp protocol entry point (implemented by this service). Accepts one line of DSL:\n"+
 			"  recall <text> [--scope T] semantic search (returns addresses and excerpts)\n"+
 			"  read <addr> [<addr>...]  read full text; accepts multiple addresses\n"+
-			"  grep [-i] <regex>        search full text with surrounding lines (case-sensitive by default, like shell grep; -i ignores case)\n"+
+			"  grep [-i] [-c] <regex>   search full text (case-sensitive like shell grep; -i ignores case, -c counts only)\n"+
 			"  log [N]                  show dates and summaries of the most recent N entries (default 5)\n"+
 			"  ls [date]                list entries for a date\n"+
 			"  put [<tree>] -- $TEXT    write content to a memory tree (pass content through vars/args, not in the DSL)\n"+

@@ -176,3 +176,68 @@ mode  = "rwx------"
 		t.Fatalf("grep -i with --scope must hit: out=%q err=%v", out, err)
 	}
 }
+
+// -c 只报数量：模型判断「有多少处」时不该被几十行上下文淹没。
+func TestGrepCount(t *testing.T) {
+	dataDir := t.TempDir()
+	cfg := `
+[server]
+data = "` + dataDir + `"
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name  = "p"
+owner = "zero"
+mode  = "rwx------"
+`
+	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		DataDir:     dataDir,
+		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
+		Listen:      "127.0.0.1:0",
+		EnforceAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "t", Cap: "rwx"})
+	if _, err := callMCPWithVars(t, srv, tok, "put p $TEXT",
+		map[string]string{"TEXT": "adbox 在这里\nadbox 又出现一次\n无关的一行"}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := srv.Reload(); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := callMCP(t, srv, tok, "grep -c adbox")
+	if err != nil {
+		t.Fatalf("grep -c: %v", err)
+	}
+	if !strings.Contains(out, "2 matching line(s)") || !strings.Contains(out, "1 block(s)") {
+		t.Fatalf("count output = %q, want '2 matching line(s) in 1 block(s)'", out)
+	}
+	// 计数模式不该吐上下文
+	if strings.Contains(out, " > ") {
+		t.Fatalf("count mode must not include context lines: %q", out)
+	}
+	// 无命中时仍然是 no matches + Empty
+	out, err = callMCP(t, srv, tok, "grep -c nosuchtoken")
+	if err != nil {
+		t.Fatalf("grep -c no match: %v", err)
+	}
+	if !strings.Contains(out, "no matches") {
+		t.Fatalf("no-match count = %q", out)
+	}
+	// -c 与 -i 同时用
+	out, err = callMCP(t, srv, tok, "grep -c -i ADBOX")
+	if err != nil || !strings.Contains(out, "2 matching line(s)") {
+		t.Fatalf("grep -c -i = %q err=%v", out, err)
+	}
+}

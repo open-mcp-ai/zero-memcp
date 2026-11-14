@@ -2074,14 +2074,24 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			ignoreCase = true
 			rest = stripFlags(rest, "-i", "--ignore-case")
 		}
+		// -c：只报数量，不返回上下文（与 shell grep -c 同义）。
+		//
+		// 为什么值得做一个真开关而不是容忍它：模型判断「这条记忆到底存在多少处」
+		// 时只需要数字，返回几十行上下文纯属浪费；而装作接受却不实现，
+		// 会让它以为拿到了计数。
+		countOnly := false
+		if hasFlag(rest, "-c", "--count") {
+			countOnly = true
+			rest = stripFlags(rest, "-c", "--count")
+		}
 		if bad, ok := unknownFlag(rest); ok {
-			return TermResult{}, fmt.Errorf("grep: unknown flag %q (supported: --scope, -i)", bad)
+			return TermResult{}, fmt.Errorf("grep: unknown flag %q (supported: --scope, -i, -c)", bad)
 		}
 		pattern, scope := splitScope(rest)
 		if pattern == "" {
-			return TermResult{}, errors.New("grep syntax: grep <pattern> [--scope <tree>] [-i]")
+			return TermResult{}, errors.New("grep syntax: grep [-i] [-c] <pattern> [--scope <tree>]")
 		}
-		grepText, grepFound, grepErr := s.execGrep(pattern, scope, c, ignoreCase)
+		grepText, grepFound, grepErr := s.execGrep(pattern, scope, c, ignoreCase, countOnly)
 		if grepErr != nil {
 			return TermResult{}, grepErr
 		}
@@ -2253,7 +2263,7 @@ func (s *Server) weightCount(addr string) int {
 // 为什么要先剥参数再编译正则：早先整个 rest 直接当正则用，
 // 于是 `grep 1729 --scope daily` 会把 "--scope daily" 也编进模式里，
 // 结果是必然零命中——而报错文本是「无命中」，看上去像内容不存在。
-func (s *Server) execGrep(pattern, scope string, c Caller, ignoreCase bool) (string, bool, error) {
+func (s *Server) execGrep(pattern, scope string, c Caller, ignoreCase, countOnly bool) (string, bool, error) {
 	// 默认大小写敏感（与 shell grep 一致）；-i 时加 (?i)。
 	//
 	// 为什么不再无条件 (?i)：那等于所有检索都不区分大小写，
@@ -2273,6 +2283,8 @@ func (s *Server) execGrep(pattern, scope string, c Caller, ignoreCase bool) (str
 
 	var sb strings.Builder
 	totalHits := 0
+	// 计数模式的统计口径：一行算一处，一块算一处（与 grep -c 的“行数”对齐）。
+	matchedLines, matchedBlocks := 0, 0
 	for _, tr := range s.trees {
 		// 只判挂载表会漏掉两层：凭证 cap 与 TOML 权限。
 		// grep 读的是正文，判据必须与 read 完全一致。
@@ -2296,6 +2308,15 @@ func (s *Server) execGrep(pattern, scope string, c Caller, ignoreCase bool) (str
 			blockHit := false
 			for i, line := range lines {
 				if re.MatchString(line) {
+					matchedLines++
+					if countOnly {
+						// 只计数：不拼上下文，命中一块就记一块。
+						if !blockHit {
+							blockHit = true
+							matchedBlocks++
+						}
+						continue
+					}
 					if !blockHit {
 						blockHit = true
 						sb.WriteString("-- " + c.Mount.ToVirtual(b.Project, b.Branch, b.Path) + " --\n")
@@ -2327,6 +2348,12 @@ func (s *Server) execGrep(pattern, scope string, c Caller, ignoreCase bool) (str
 				sb.WriteString("\n")
 			}
 		}
+	}
+	if countOnly {
+		if matchedLines == 0 {
+			return "no matches", false, nil
+		}
+		return fmt.Sprintf("%d matching line(s) in %d block(s)", matchedLines, matchedBlocks), true, nil
 	}
 	if totalHits == 0 {
 		// The bool is what a conditional branches on; the text is only a

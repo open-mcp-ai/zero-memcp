@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
@@ -366,4 +367,20 @@ func (s *Server) namesDeclaredProject(addr string) bool {
 		}
 	}
 	return false
+}
+
+// visibleBranches 列出这张凭证在某个项目里能读的分支（字典序，稳定输出）。
+func (s *Server) visibleBranches(c Caller, project string) []string {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, b := range repo.Branches() {
+		if s.branchVisible(c, project, b) && s.allowed(c, project, b, configBitRead) {
+			out = append(out, b)
+		}
+	}
+	sort.Strings(out)
+	return out
 }

@@ -45,3 +45,29 @@ func TestPutSpecColonSyntax(t *testing.T) {
 		}
 	}
 }
+
+// 不带 @ 的分支写法必须落到分支上，而不是在默认分支下建目录。
+// 实测现场：dev 写 put main.shared $TEXT → missing w permission；
+// put BlackEggAI/zero/main.shared/probe.md → 建出 probe.md/ 目录。
+func TestBranchPathFormsResolveToBranch(t *testing.T) {
+	srv, _ := setupMountServer(t)
+
+	for _, addr := range []string{
+		"blackegg/daily@zero/x.md", // 标准写法
+		"blackegg/daily/zero/x.md", // 项目/分支/路径
+	} {
+		proj, branch, path, err := srv.parseBranchAddr(addr)
+		if err != nil {
+			t.Fatalf("%s: %v", addr, err)
+		}
+		if proj != "blackegg/daily" || branch != "zero" || path != "x.md" {
+			t.Fatalf("%s → %s@%s:%s, want blackegg/daily@zero:x.md", addr, proj, branch, path)
+		}
+	}
+
+	// 分支名在多个项目里都存在时不猜：zero/x.md 到底是哪个 zero？
+	// 猜错的后果是写进另一个仓库，而且不报错。
+	if _, _, _, err := srv.parseBranchAddr("zero/x.md"); err == nil {
+		t.Fatal("ambiguous bare branch name must be refused, not guessed")
+	}
+}

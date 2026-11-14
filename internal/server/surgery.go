@@ -438,6 +438,14 @@ func (s *Server) parseBranchAddr(addr string) (project, branch, path string, err
 			branch = rest
 		}
 	} else {
+		// 先认「项目/分支/路径」与「分支/路径」这两种不带 @ 的写法。
+		//
+		// 为什么必须认：调用方手里往往只有路径（ls 里看到的就是这种东西），
+		// 而分支名恰好是第一段。不认它，main.shared/x.md 会被当成
+		// 默认分支下名为 main.shared 的目录，于是「文件明明在那儿却读不到」。
+		if pj, br, p, ok := s.splitBranchPath(addr); ok {
+			return pj, br, p, nil
+		}
 		// 没写分支：按已声明项目做最长前缀匹配，剩下的都是路径
 		pj, p, ok := memory.SplitAddrWithProjects(addr, s.declaredProjects())
 		if !ok {
@@ -949,4 +957,72 @@ func (s *Server) execChmod(rest string, c Caller, defaultBranch string) (string,
 		label = "plain content (not injected)"
 	}
 	return fmt.Sprintf("%s@%s/%s -> %s; commit to apply", proj, branch, path, label), nil
+}
+
+// splitBranchPath 把「<project>/<branch>[/<path>]」或「<branch>[/<path>]」
+// 解析成项目、分支、路径。分支必须是这个仓库里真实存在的分支。
+//
+// 只在没有 @ 的地址上用。判据是「这一段确实是分支名」，不是猜测：
+// 分支名取自仓库的 refs，不存在就返回 false，让调用方走原来的路径解析。
+// 这样 `put main.shared/x.md` 与 `put main.shared` 都落到分支上，
+// 而不是在默认分支下建一个叫 main.shared 的目录。
+//
+// 项目名本身可能带斜杠（blackegg/daily），所以不能按第一段切：
+// 先用「以项目名开头」做最长前缀匹配，剩下的第一段才是分支候选。
+func (s *Server) splitBranchPath(addr string) (project, branch, path string, ok bool) {
+	addr = strings.Trim(strings.TrimSpace(addr), "/")
+	if addr == "" {
+		return "", "", "", false
+	}
+	projects := s.declaredProjects()
+	sort.Slice(projects, func(i, j int) bool { return len(projects[i]) > len(projects[j]) })
+
+	hasBranch := func(pj, want string) bool {
+		repo, err := s.projects.Get(pj)
+		if err != nil {
+			return false
+		}
+		for _, b := range repo.Branches() {
+			if b == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// ① <project>/<branch>[/...]
+	for _, pj := range projects {
+		if addr != pj && !strings.HasPrefix(addr, pj+"/") {
+			continue
+		}
+		rest := strings.TrimPrefix(strings.TrimPrefix(addr, pj), "/")
+		if rest == "" {
+			continue
+		}
+		seg := strings.SplitN(rest, "/", 2)
+		if hasBranch(pj, seg[0]) {
+			p := ""
+			if len(seg) > 1 {
+				p = seg[1]
+			}
+			return pj, seg[0], p, true
+		}
+	}
+
+	// ② <branch>[/...]：分支名在项目之间唯一时才算数，否则不猜。
+	seg := strings.SplitN(addr, "/", 2)
+	var hits [][2]string
+	for _, pj := range projects {
+		if hasBranch(pj, seg[0]) {
+			hits = append(hits, [2]string{pj, seg[0]})
+		}
+	}
+	if len(hits) == 1 {
+		p := ""
+		if len(seg) > 1 {
+			p = seg[1]
+		}
+		return hits[0][0], hits[0][1], p, true
+	}
+	return "", "", "", false
 }

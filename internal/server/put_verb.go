@@ -106,6 +106,15 @@ func (s *Server) parsePutSpec(target string, c Caller) putSpec {
 		}
 	}
 
+	// 不带 @ 的分支写法：<project>/<branch>[/path] 或 <branch>[/path]。
+	//
+	// 必须在「已声明项目前缀」之前判：`BlackEggAI/zero/main.shared/x.md`
+	// 既像项目路径也像项目/分支/路径，后者才是调用方的意思。
+	// 判据是那一段真的是分支名（取自 refs），不是猜。
+	if proj, br, rest, ok := s.splitBranchPath(target); ok {
+		return putSpec{Explicit: proj + "@" + br, TreePath: strings.Trim(rest, "/")}
+	}
+
 	// 已声明项目前缀：proj[/path]
 	for _, p := range s.declaredProjects() {
 		if target == p {
@@ -348,6 +357,21 @@ func (s *Server) execTrees(rest string, c Caller) (TermResult, error) {
 		return TermResult{}, err
 	}
 	if !s.allowed(c, proj, branch, configBitRead) {
+		// 没写 @branch 且默认分支不可见时，别用「不在可见范围内」把人挡死：
+		// 列出这张凭证真正能看的几条分支，比一句拒绝有用得多。
+		// （实测：dev 执行 trees BlackEggAI/zero 报 outside visible scope，
+		//   而它明明能读 main / main.record / main.dev / main.shared。）
+		if !strings.Contains(addr, "@") {
+			if vis := s.visibleBranches(c, proj); len(vis) > 0 {
+				var sb strings.Builder
+				sb.WriteString("no branch specified and the default branch is not visible; visible branches of " + proj + ":\n")
+				for _, b := range vis {
+					fmt.Fprintf(&sb, "  %s@%s\n", proj, b)
+				}
+				sb.WriteString("retry as: trees " + proj + "@<branch>")
+				return TermResult{Text: sb.String()}, nil
+			}
+		}
 		return TermResult{}, fmt.Errorf("%s", s.denyReason(c, proj, branch, configBitRead))
 	}
 	repo, err := s.projects.Get(proj)

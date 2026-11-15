@@ -59,15 +59,22 @@ func TestIndexSnapshotRoundTrip(t *testing.T) {
 	}
 }
 
-// 快照必须能被证伪：仓库推进之后，旧快照**不许**被采用。
+// 快照之后分支推进了：必须采用快照**并**把差量补上。
 //
-// 这是这个优化的正确性底线。采用了过期快照的症状是
-// 「启动很快，但刚写的东西搜不到」，而且完全不报错。
-func TestIndexSnapshotRejectedWhenBranchMoved(t *testing.T) {
+// 正确性底线是「新写的东西必须搜得到」，而不是「必须拒绝快照」。
+//
+// 演进过程：早先的判据是「所有分支 head 必须与快照一致，否则整份弃用」。
+// 但这是活系统——后台每 30 秒折叠脏层、分身随时在写，11 条分支
+// 一步没动过的概率接近零。实测两次启动都是
+// 「main.dev moved since the snapshot; full rebuild」，快照一次没生效过。
+//
+// 现在改成应用差量：repo.Diff 是纯哈希比较（不读 blob），
+// 改动的那几个 path 只重算那几个。
+func TestIndexSnapshotAppliesDeltaWhenBranchMoved(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "test", Cap: "rwx"})
 
-	if _, err := callMCP(t, srv, tok, "write blackegg/me@fact:a.md -- first"); err != nil {
+	if _, err := callMCP(t, srv, tok, "write blackegg/me@fact:a.md -- zzz-before-snapshot"); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 	if _, err := callMCP(t, srv, tok, "commit blackegg/me@fact -m one"); err != nil {
@@ -77,7 +84,7 @@ func TestIndexSnapshotRejectedWhenBranchMoved(t *testing.T) {
 		t.Fatalf("save snapshot: %v", err)
 	}
 
-	// 分支推进。
+	// 分支推进：新增一个文件、改掉另一个。
 	if _, err := callMCP(t, srv, tok,
 		"write blackegg/me@fact:b.md -- zzz-after-snapshot-marker"); err != nil {
 		t.Fatalf("write b: %v", err)
@@ -86,9 +93,60 @@ func TestIndexSnapshotRejectedWhenBranchMoved(t *testing.T) {
 		t.Fatalf("commit two: %v", err)
 	}
 
-	if srv.tryLoadIndexSnapshot("zero") {
-		t.Fatal("分支已经推进，旧快照仍然被采用——" +
-			"症状会是「启动很快，但刚写的东西搜不到」，而且不报错")
+	if !srv.tryLoadIndexSnapshot("zero") {
+		t.Fatal("分支推进之后快照被整份弃用——活系统里这等于快照永不生效")
+	}
+
+	// 核心判据：快照之后新写的内容必须搜得到。
+	out, err := callMCP(t, srv, tok, "recall zzz-after-snapshot-marker --scope blackegg/me@fact")
+	if err != nil {
+		t.Fatalf("recall: %v", err)
+	}
+	if !contains(out, "after-snapshot") && !contains(out, "zzz-after-snapshot-marker") {
+		t.Fatalf("采用快照后新写的内容搜不到——这正是「启动很快但内容丢了」：%s", out)
+	}
+
+	// 快照之前就有的内容也必须在（差量不能把旧数据冲掉）。
+	out, err = callMCP(t, srv, tok, "recall zzz-before-snapshot --scope blackegg/me@fact")
+	if err != nil {
+		t.Fatalf("recall before: %v", err)
+	}
+	if !contains(out, "before-snapshot") {
+		t.Fatalf("应用差量把快照里的旧内容弄丢了：%s", out)
+	}
+}
+
+// 删除也要跟着差量走：快照之后被删的文件不能再搜到。
+func TestIndexSnapshotDeltaHandlesDeletion(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "test", Cap: "rwx"})
+
+	if _, err := callMCP(t, srv, tok, "write blackegg/me@fact:gone.md -- zzz-will-be-deleted"); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := callMCP(t, srv, tok, "commit blackegg/me@fact -m one"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	if err := srv.saveIndexSnapshot(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	if _, err := callMCP(t, srv, tok, "delete blackegg/me@fact:gone.md"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := callMCP(t, srv, tok, "commit blackegg/me@fact -m two"); err != nil {
+		t.Fatalf("commit two: %v", err)
+	}
+
+	if !srv.tryLoadIndexSnapshot("zero") {
+		t.Fatal("删除之后快照不该整份弃用")
+	}
+	out, err := callMCP(t, srv, tok, "grep zzz-will-be-deleted --scope blackegg/me@fact")
+	if err != nil {
+		t.Fatalf("grep: %v", err)
+	}
+	if contains(out, "zzz-will-be-deleted") {
+		t.Fatalf("差量没处理删除：快照之后删掉的内容还能搜到：%s", out)
 	}
 }
 

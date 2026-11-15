@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 	"github.com/open-mcp-ai/zero-memcp/internal/index"
 	"github.com/open-mcp-ai/zero-memcp/internal/manifest"
 	"github.com/open-mcp-ai/zero-memcp/internal/memory"
@@ -66,26 +67,38 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 		}
 	}
 
-	// 核对 head：变了的分支不能信快照里的那些 doc。
+	// 核对分支集合：比快照多出来的分支要整条补扫，少掉的要摘掉。
+	//
+	// 这里**不再**因为「head 变了」整份弃用。
+	//
+	// 踩过的坑：早先的判据是「所有分支的 head 必须与快照一致」。
+	// 但这是个活的系统——后台每 30 秒折叠一次脏层、语义索引每 30 秒
+	// 追平、分身随时在写。11 条分支全部一步没动过的概率接近零，
+	// 于是快照几乎永远被拒，一次都没生效过（实测两次启动都是
+	// 「main.dev moved since the snapshot; full rebuild」）。
+	//
+	// 正确做法是承认它会动，然后把差量补上：`git Diff` 是纯哈希比较，
+	// 不读任何 blob；改动的那几个 path 走已有的 refreshPath（O(1)）。
+	// 一条分支推进了几个文件，就只重算那几个。
 	current := map[string]string{}
+	treeByKey := map[string]*memory.Tree{}
 	for _, t := range trees {
 		repo, rerr := s.projects.Get(t.Project)
 		if rerr != nil {
 			continue
 		}
 		if sha, serr := repo.Resolve(t.Branch); serr == nil {
-			current[treeHeadKey(t.Project, t.Branch)] = sha
+			key := treeHeadKey(t.Project, t.Branch)
+			current[key] = sha
+			treeByKey[key] = t
 		}
 	}
-	if len(current) != len(hdr.Heads) {
-		startupStage("reload: snapshot has %d branch(es), current has %d; full rebuild",
-			len(hdr.Heads), len(current))
-		return false
-	}
-	for k, sha := range current {
-		if hdr.Heads[k] != sha {
-			startupStage("reload: %s moved since the snapshot; full rebuild", splitKeyForLog(k))
-			return false
+	for key := range hdr.Heads {
+		if _, ok := current[key]; !ok {
+			// 快照里有、现在没有：那条分支被归档/删除了。
+			// 树快照里也就不该再有它——restoreTreesFromSnapshot
+			// 已经会因此拒绝。走到这里说明树快照没有它，安全。
+			continue
 		}
 	}
 
@@ -100,17 +113,70 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 		return false
 	}
 
-	// 只保留仍然存在的 doc：快照与树之间如果出现「索引里有、树里没有」
-	// 的条目，说明两边对不上，与其猜不如整份弃用。
-	live := make(map[string]bool, 2048)
-	for _, t := range trees {
-		for _, b := range t.Indexable() {
-			live[b.ID()] = true
+	// 应用差量：把「快照之后每个分支改了什么」补进索引。
+	//
+	// 这是让快照真正可用的关键一步。不做这一步的话，只要有一个分支
+	// 动过，快照就永远被拒——而这是活系统，几乎每次都动。
+	//
+	// 差量用 repo.Diff：纯哈希比较，不读任何 blob。
+	// 改动的那几个 path 走 refreshPath（O(路径深度)）。
+	patched := 0
+	for key, curSHA := range current {
+		prevSHA, had := hdr.Heads[key]
+		if !had || prevSHA == curSHA {
+			continue
+		}
+		proj, br, ok := splitTreeHeadKey(key)
+		if !ok {
+			continue
+		}
+		repo, rerr := s.projects.Get(proj)
+		if rerr != nil {
+			continue
+		}
+		changes, derr := repo.Diff(prevSHA, curSHA)
+		if derr != nil {
+			// 差量算不出来（历史被重写、对象缺失）——这一条分支整条重建。
+			startupStage("reload: cannot diff %s (%v); rescanning that branch",
+				splitKeyForLog(key), derr)
+			if tree, terr := s.scanGitProject(repo, proj, br); terr == nil {
+				for i, t := range trees {
+					if t.Project == proj && t.Branch == br {
+						trees[i] = tree
+						break
+					}
+				}
+			}
+			continue
+		}
+		// 把树里这一条分支的 Blocks 同步成新状态，并更新索引。
+		for _, ch := range changes {
+			patched++
+			applyOneChange(trees, idx, repo, proj, br, ch)
 		}
 	}
-	if !indexSubsetOf(idx, live) {
-		startupStage("reload: snapshot references docs that no longer exist; full rebuild")
-		return false
+
+	// 快照里有、现在没有的分支：从索引里摘掉。
+	for key := range hdr.Heads {
+		if _, ok := current[key]; ok {
+			continue
+		}
+		proj, br, ok := splitTreeHeadKey(key)
+		if !ok {
+			continue
+		}
+		for _, t := range trees {
+			if t.Project != proj || t.Branch != br {
+				continue
+			}
+			for _, b := range t.Indexable() {
+				idx.Remove(b.ID())
+			}
+		}
+	}
+
+	if patched > 0 {
+		startupStage("reload: applied %d changed path(s) from diff", patched)
 	}
 
 	// SKILL.md 的策略必须从磁盘重新解析：它决定「谁能看见什么」，
@@ -310,3 +376,70 @@ func (s *Server) restoreTreesFromSnapshot(defaultBranch string) ([]*memory.Tree,
 }
 
 var errNoSnapshot = errors.New("no index snapshot")
+
+// applyOneChange 把一个 git 差量应用到内存树与索引上。
+//
+// 这是 refreshPath 的「启动期版本」：不取 s.mu（调用方还没发布 trees），
+// 直接改传入的树切片与索引。
+func applyOneChange(trees []*memory.Tree, idx *index.Index, repo *gitstore.Repo, proj, br string, ch gitstore.Change) {
+	var tree *memory.Tree
+	for _, t := range trees {
+		if t.Project == proj && t.Branch == br {
+			tree = t
+			break
+		}
+	}
+	if tree == nil {
+		return
+	}
+
+	id := memory.MakeID(proj, br, ch.Path)
+
+	if ch.Kind == "deleted" {
+		idx.Remove(id)
+		for i := range tree.Blocks {
+			if tree.Blocks[i].Path == ch.Path {
+				tree.Blocks = append(tree.Blocks[:i], tree.Blocks[i+1:]...)
+				break
+			}
+		}
+		return
+	}
+
+	// 新增或修改：取回新条目与内容，重新判定 Rule/Hidden。
+	entry, ok, serr := repo.Stat(br, ch.Path)
+	if serr != nil || !ok {
+		return
+	}
+	p, b := proj, br
+	path := ch.Path
+	read := func() ([]byte, error) { return repo.Read(b, path) }
+	blk := memory.Block{
+		Project: p, Branch: b, Path: path,
+		Size: entry.Size, Time: entry.Time, Hash: entry.Hash, Read: read,
+	}
+	data, rerr := read()
+	if rerr != nil {
+		return
+	}
+	_, rule, hidden := classifyContent(p, path, data, entry.Mode)
+	blk.Rule = rule
+	blk.Hidden = hidden
+
+	idx.Remove(id)
+	if !blk.Hidden {
+		stamp := entry.Time
+		if at := sliceAtTime(string(data), path); at > 0 {
+			stamp = at
+		}
+		idx.AddWithTime(id, string(data), stamp)
+	}
+
+	for i := range tree.Blocks {
+		if tree.Blocks[i].Path == path {
+			tree.Blocks[i] = blk
+			return
+		}
+	}
+	tree.Blocks = append(tree.Blocks, blk)
+}

@@ -1698,9 +1698,26 @@ type Change struct {
 // from 为空串表示「和空树比」，即列出 to 的全部文件——
 // 第一次扫某个脏流分支时就是这个用法。
 func (r *Repo) Diff(from, to string) ([]Change, error) {
+	// 两个参数可以是分支名，也可以是 40 位 commit SHA。
+	//
+	// 为什么要支持 SHA：启动时用快照恢复索引，需要比对「快照记录的
+	// 那个 commit」与「现在的 head」——前者只能是一个 SHA，它已经不是
+	// 任何分支的 head 了。早先直接传给 List(commitOf→Resolve)，
+	// 而 Resolve 会去 refs/heads/<40位十六进制> 找一个不存在的名字，
+	// 返回空 → 两边都当空树 → 差量恒为 0。
+	// 症状是「快照加载成功、差量应用 0 条、新写的内容搜不到」。
+	listAt := func(ref string) ([]Entry, error) {
+		if len(ref) == 40 {
+			if err := validSHA(ref); err == nil {
+				return r.listAtCommit(ref)
+			}
+		}
+		return r.List(ref)
+	}
+
 	oldEntries := map[string]Entry{}
 	if from != "" {
-		list, err := r.List(from)
+		list, err := listAt(from)
 		if err != nil {
 			return nil, fmt.Errorf("read %s: %w", from, err)
 		}
@@ -1709,7 +1726,7 @@ func (r *Repo) Diff(from, to string) ([]Change, error) {
 		}
 	}
 
-	newList, err := r.List(to)
+	newList, err := listAt(to)
 	if err != nil {
 		return nil, fmt.Errorf("read %s: %w", to, err)
 	}
@@ -1795,4 +1812,34 @@ func (r *Repo) PendingRefs() []string {
 	defer unlockDirty()
 	refs, _ := r.dirtyRefs()
 	return refs
+}
+
+// listAtCommit 列出一个具体 commit 的树（不进脏层）。
+//
+// 与 List 的区别：List 是「这条分支现在有什么」（含未折叠的脏层），
+// 这里问的是「那个 commit 当时有什么」——历史快照，不该被脏层污染。
+func (r *Repo) listAtCommit(sha string) ([]Entry, error) {
+	if err := validSHA(sha); err != nil {
+		return nil, err
+	}
+	typ, body, err := r.readObject(sha)
+	if err != nil {
+		return nil, err
+	}
+	if typ != "commit" {
+		return nil, fmt.Errorf("%s is not a commit but %s", sha, typ)
+	}
+	c := parseCommit(body)
+	out := map[string]Entry{}
+	if c.Tree != "" {
+		if err := r.loadTree(c.Tree, "", out); err != nil {
+			return nil, err
+		}
+	}
+	list := make([]Entry, 0, len(out))
+	for _, e := range out {
+		list = append(list, e)
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Path < list[j].Path })
+	return list, nil
 }

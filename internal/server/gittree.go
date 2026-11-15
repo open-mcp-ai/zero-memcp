@@ -277,59 +277,61 @@ func (s *Server) makeBlock(project, branch string, e gitstore.Entry, read func()
 		Read:    read,
 	}
 
-	// 以点开头的目录/文件（.legacy-archive、.githooks、.gitignore）
-	// 是归档与工具，不是正文：保留可读，但不进检索。
-	if memory.HiddenPath(e.Path) {
-		block.Hidden = true
-		return block
-	}
-
-	// 规则与索引的判定，优先看文件自己写的 frontmatter。
-	//
-	// 为什么不再用 Git 的可执行位：100755 在真实仓库里的含义是
-	// 「这是个可执行脚本」。用它当「规则」标记，后果是
-	// .githooks/pre-push 和一个 11KB 的 python 脚本被当成规则
-	// 注入系统提示，而真正的 SKILL.md（全是 100644）一个都没进。
-	// 文件自己写着 inject: every_turn —— 那才是作者的本意。
-	if strings.HasSuffix(e.Path, ".md") {
+	data, rerr := read()
+	if rerr == nil {
 		// 只读一次：判定要用，索引阶段也要用。
 		//
 		// 早先这里读一次判 frontmatter，索引阶段 readBlock 再读一次——
 		// 同一个文件读两遍。库里 24,000 块绝大多数是 .md，
-		// 启动时这一倍的白读直接摊在 110 秒的不可用窗口里。
-		// 读到的内容留在 Block.Body，索引阶段直接复用（见 readBlockBody）。
-		data, rerr := read()
-		if rerr == nil {
-			block.Body = data
-		}
-		if rerr == nil && hasFrontmatter(data) {
-			pol := manifest.Parse(project, data)
-			switch pol.Inject {
-			case "every_turn":
-				block.Rule = true
-			case "never":
-				block.Rule = false
-			default:
-				// 没声明 inject：说明作者只写了 write 策略，
-				// 这时仍按 Git 的可执行位判断，保持旧行为。
-				block.Rule = e.Mode == gitstore.ModeRule
-			}
-			if pol.Index == "none" {
-				block.Hidden = true
-			}
-		} else {
-			// 没有 frontmatter 的 Markdown：按老规矩看 mode 位
-			block.Rule = e.Mode == gitstore.ModeRule
-		}
-	} else {
+		// 启动时这一倍的白读直接摊在不可用窗口里。
+		block.Body = data
+	}
+	_, rule, hidden := classifyContent(project, e.Path, data, e.Mode)
+	block.Rule = rule
+	block.Hidden = hidden
+	return block
+}
+
+// classifyContent 判定一份内容是不是规则、要不要进检索。
+//
+// 抽成独立函数是因为有三条路径要做同一件事：全量扫描、单文件增量刷新、
+// 以及启动时应用 git 差量。三处各写一份判定，慢慢就会走偏——
+// 而走偏的症状是「规则不注入了」或「该搜的搜不到」，都不报错。
+//
+// 判据优先看文件自己写的 frontmatter，而不是 Git 的可执行位：
+// 100755 在真实仓库里的含义是「这是个可执行脚本」。用它当「规则」标记，
+// 后果是 .githooks/pre-push 和一个 11KB 的 python 脚本被当成规则
+// 注入系统提示，而真正的 SKILL.md（全是 100644）一个都没进。
+// 文件自己写着 inject: every_turn —— 那才是作者的本意。
+func classifyContent(project, path string, data []byte, mode gitstore.Mode) (pol manifest.Policy, rule, hidden bool) {
+	// 以点开头的目录/文件（.legacy-archive、.githooks、.gitignore）
+	// 是归档与工具，不是正文：保留可读，但不进检索。
+	if memory.HiddenPath(path) {
+		return pol, false, true
+	}
+
+	if !strings.HasSuffix(path, ".md") {
 		// 非 Markdown 一律不是规则。
 		// 可执行脚本再「可执行」也只是工具，不是给模型的指令。
-		block.Rule = false
-		if isExecutableScript(e.Path) {
-			block.Hidden = true
-		}
+		return pol, false, isExecutableScript(path)
 	}
-	return block
+
+	if data != nil && hasFrontmatter(data) {
+		pol = manifest.Parse(project, data)
+		switch pol.Inject {
+		case "every_turn":
+			rule = true
+		case "never":
+			rule = false
+		default:
+			// 没声明 inject：说明作者只写了 write 策略，
+			// 这时仍按 Git 的可执行位判断，保持旧行为。
+			rule = mode == gitstore.ModeRule
+		}
+		return pol, rule, pol.Index == "none"
+	}
+	// 没有 frontmatter 的 Markdown：按老规矩看 mode 位
+	return pol, mode == gitstore.ModeRule, false
 }
 
 // refreshPath 只更新一条分支上的一个文件：树里的 Block 和索引里的 doc。

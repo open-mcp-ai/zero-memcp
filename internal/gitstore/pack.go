@@ -225,19 +225,28 @@ func (r *Repo) readPacked(sha string) (string, []byte, error) {
 		return r.readAt(idx, off, 0)
 	}
 
-	// 找不到时强制失效再试一次。
+	// 找不到时的自愈：**只在指纹真的变了**才重载一次。
 	//
-	// 外部 git gc / repack 不通知我们，缓存里的索引可能已过期。
-	// 让它自愈一次，比让调用方看到「不在任何 pack 里」有用得多——
-	// 那个报错完全指不到缓存，运维只会以为对象真的丢了。
-	r.InvalidatePackCache()
-	if idxs2, err2 := r.loadPacks(); err2 == nil {
-		for _, idx := range idxs2 {
-			off, ok := idx.find(raw)
-			if !ok {
-				continue
+	// 外部 git gc / repack 不通知我们，缓存的索引可能已过期，
+	// 所以值得给一次重试。但重试必须有前提——
+	//
+	// 踩过的坑：早先无条件「失效 + 重载 + 再找一次」。当对象本来
+	// 就不在任何 pack 里时（所在仓库从没 repack 过，对象全是散装），
+	// 每次未命中都会重新解析整个 .idx 文件。inbox 分支 4,583 个路径
+	// 因此从 3.6 秒涨到 103.7 秒——一次「更稳妥」的改动把一个
+	// 2.4 秒的启动阶段变成了两分钟。
+	//
+	// 判据：先比指纹。指纹没变说明缓存就是当前磁盘的样子，
+	// 再解析一遍结果必然一样，纯属白烧 CPU。
+	if r.packFingerprintChanged() {
+		if idxs2, err2 := r.loadPacks(); err2 == nil {
+			for _, idx := range idxs2 {
+				off, ok := idx.find(raw)
+				if !ok {
+					continue
+				}
+				return r.readAt(idx, off, 0)
 			}
-			return r.readAt(idx, off, 0)
 		}
 	}
 	return "", nil, fmt.Errorf("object %s is neither loose nor in any pack", sha)
@@ -590,4 +599,19 @@ func (r *Repo) InvalidatePackCache() {
 	packCacheMu.Lock()
 	delete(packCache, r.Path)
 	packCacheMu.Unlock()
+}
+
+// packFingerprintChanged 判断 pack 目录是否与缓存里记录的不一致。
+//
+// 只比对指纹，不解析任何 .idx——它要在「对象没找到」这条常被
+// 误触发的路径上保持廉价。指纹没变就说明缓存就是磁盘当前的样子，
+// 再解析一遍结果必然相同。
+func (r *Repo) packFingerprintChanged() bool {
+	packCacheMu.RLock()
+	cur, ok := packCache[r.Path]
+	packCacheMu.RUnlock()
+	if !ok {
+		return true // 没缓存过，值得读一次
+	}
+	return r.packFingerprint(filepath.Join(r.Path, "objects", "pack")) != cur.fingerprint
 }

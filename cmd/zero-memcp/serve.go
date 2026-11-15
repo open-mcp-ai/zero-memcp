@@ -120,6 +120,8 @@ func runServe(args []string) int {
 		cfg.Listen = *listen
 	}
 
+	// 尽早打启动时钟：冷启动的分段耗时从这里开始算。
+	server.StartStartupClock()
 	srv, err := server.New(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "zero-memcp: %v\n", err)

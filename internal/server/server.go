@@ -292,8 +292,21 @@ func (s *Server) getListener() net.Listener {
 // 每个可能耗时的阶段都报一行，卡在哪一步就一目了然。
 // 这条日志的代价是启动时多几行 stderr，收益是故障现场自带证据。
 func startupStage(format string, args ...any) {
+	// 带累计耗时：冷启动那几十秒必须能拆开看，否则「启动慢」只能靠猜。
+	// 修性能的第一条规矩是先量，而启动路径最缺的就是分段数字。
+	if !startupClock.IsZero() {
+		fmt.Fprintf(os.Stderr, "zero-memcp: startup: [+%.1fs] "+format+"\n",
+			append([]any{time.Since(startupClock).Seconds()}, args...)...)
+		return
+	}
 	fmt.Fprintf(os.Stderr, "zero-memcp: startup: "+format+"\n", args...)
 }
+
+// startupClock 是本次启动的起点，给 startupStage 算相对耗时用。
+var startupClock time.Time
+
+// StartStartupClock 标记启动开始（main 里尽早调用）。
+func StartStartupClock() { startupClock = time.Now() }
 
 func New(cfg Config) (*Server, error) {
 	// 配置是权限与网络参数的真相源。
@@ -533,10 +546,15 @@ func (s *Server) Reload() error {
 	startupStage("reload: dedup table seeded")
 
 	idx := index.New()
+	// 分段计时：readBlock（读盘/缓存）与 AddWithTime（分词）是两件
+	// 完全不同的事，混在一起看就只知道「慢」而不知道慢在哪。
+	var readNS, tokenizeNS time.Duration
 	for _, t := range trees {
 		startupStage("reload: indexing %s@%s (%d blocks)", t.Project, t.Branch, len(t.Blocks))
 		for _, b := range t.Indexable() {
+			tr0 := time.Now()
 			data, err := s.readBlock(b)
+			readNS += time.Since(tr0)
 			if err != nil {
 				return fmt.Errorf("read %s: %w", b.Addr(), err)
 			}
@@ -549,7 +567,9 @@ func (s *Server) Reload() error {
 			if at := sliceAtTime(string(data), b.Path); at > 0 {
 				stamp = at
 			}
+			tt0 := time.Now()
 			idx.AddWithTime(b.ID(), string(data), stamp)
+			tokenizeNS += time.Since(tt0)
 
 			// SKILL.md 永远解析策略，不看 b.Rule。
 			//
@@ -583,7 +603,8 @@ func (s *Server) Reload() error {
 	s.trees = trees
 	s.idx = idx
 	s.mu.Unlock()
-	startupStage("reload: index built")
+	startupStage("reload: index built (read %.1fs, tokenize %.1fs)",
+		readNS.Seconds(), tokenizeNS.Seconds())
 
 	// 更新观察水位：让下一次 checkExternalUpdates 有比对基准。
 	s.rememberTreeHeads()

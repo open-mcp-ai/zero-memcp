@@ -71,16 +71,16 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 	if err := repo.Write(branch, path, []byte(content), gitstore.ModeContent); err != nil {
 		return "", err
 	}
-	// 只刷新这一条分支，不整库重建。
+	// 只刷新这一个文件，不重扫整条分支。
 	//
-	// 这里曾经是无条件 s.Reload()：写一个 25 字节的规则文件，实测
-	// 181.5 秒才返回（"written …; index rebuilt"）。调用方看到的是
-	// 一次近三分钟的挂起，重试之后更像"没有写权限"。而写入路径的
-	// 全部价值就在于立刻生效。
+	// 演进过程：无条件 s.Reload()（写 25 字节要 181.5 秒）
+	//   → refreshBranch（只刷一条分支，但在 main.chat 这种 5233 文件的
+	//     分支上仍要 19 秒，因为整条分支被重读重分词）
+	//   → refreshPath（只动这一个 path，O(路径深度)）。
 	//
-	// 规则文件改动会同时改变「谁能看见什么」（SKILL.md 的 inject），
-	// 所以必须重建索引；但只需要重建它所在的那条分支。
-	if err := s.refreshBranch(proj, branch); err != nil {
+	// 语义没变：都是让索引反映当前磁盘状态。变的是工作量的量级——
+	// 前两者都随分支规模增长，后者不随。
+	if err := s.refreshPath(proj, branch, path, true); err != nil {
 		return "", fmt.Errorf("written, but failed to refresh the index: %w", err)
 	}
 	return fmt.Sprintf("written to %s@%s/%s (%d bytes); index refreshed", proj, branch, path, len(content)), nil

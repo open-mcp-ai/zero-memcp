@@ -743,13 +743,22 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 	if len(removed) == 0 {
 		return "no files were deleted", nil
 	}
-	// 删除也得重算内存索引，否则被删的切片还能被 recall 搜到。
+	// 删除也得同步内存索引，否则被删的切片还能被 recall 搜到。
 	//
-	// 但只重算受影响的那条分支：这里曾经是无条件 Reload()，
-	// 实测删一条 146 字节的消息要 129~135 秒才返回（删四条 = 近九分钟）。
-	// 清理动作本该是秒级的。
-	if err := s.refreshBranch(proj, branch); err != nil {
-		return "", err
+	// 演进：无条件 Reload()（删一条 146 字节要 129~135 秒）
+	//   → refreshBranch（只刷这条分支，但 main.chat 上仍要 18 秒）
+	//   → 逐个 refreshPath（只动被删的那些 path）。
+	//
+	// 删几个文件就只动几个 doc。清理动作本该是秒级的。
+	for _, p := range removed {
+		if err := s.refreshPath(proj, branch, p, false); err != nil {
+			// 增量失败不能静默：退回整分支刷新，保证索引一定是对的。
+			// 慢一点好过「删了但还搜得到」。
+			if rerr := s.refreshBranch(proj, branch); rerr != nil {
+				return "", rerr
+			}
+			break
+		}
 	}
 	return fmt.Sprintf("marked %d files for deletion (%s@%s; commit to apply):\n  %s",
 		len(removed), proj, branch, strings.Join(removed, "\n  ")), nil

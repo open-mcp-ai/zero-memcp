@@ -512,6 +512,72 @@ func (r *Repo) Read(ref, path string) ([]byte, error) {
 	return body, nil
 }
 
+// Stat 取单个路径的条目（路径、mode、大小、blob hash），不遍历整棵树。
+//
+// 为什么需要它：`List(ref)` 会展开整条分支（main.chat 有 5233 个路径），
+// 而 write / delete 只需要知道「这一个文件现在长什么样」。
+// 一次 write 为此走一遍全分支，实测 19 秒——规模越大越慢。
+//
+// findInTree 的复杂度是 O(路径深度)，与分支大小无关，这才是这里要的。
+// 找不到时返回 (Entry{}, false, nil)：文件不存在不是错误。
+func (r *Repo) Stat(ref, path string) (Entry, bool, error) {
+	if err := r.syncDirtyWriter(); err != nil {
+		return Entry{}, false, fmt.Errorf("process dirty write queue: %w", err)
+	}
+	normRef := normalizeRef(ref)
+	dir, name := splitDirName(path)
+
+	e := Entry{Path: strings.Trim(path, "/")}
+
+	// ① 脏层优先：刚写入还没提交的文件也必须能 stat 到。
+	unlockDirty := r.rlockDirty()
+	n, err := r.loadDirtyNode(normRef, dir)
+	if err != nil {
+		unlockDirty()
+		return Entry{}, false, err
+	}
+	if n != nil {
+		if gone := n.del[name]; gone {
+			unlockDirty()
+			return Entry{}, false, nil
+		}
+		if it, ok := n.set[name]; ok && it.Mode != "40000" {
+			unlockDirty()
+			e.Mode = it.Mode
+			e.Hash = it.SHA
+			if typ, body, rerr := r.readObject(it.SHA); rerr == nil && typ == "blob" {
+				e.Size = int64(len(body))
+			}
+			e.Time = r.objectTime(it.SHA)
+			return e, true, nil
+		}
+	}
+	unlockDirty()
+
+	// ② 干净层
+	c, err := r.commitOf(normRef)
+	if err != nil {
+		return Entry{}, false, err
+	}
+	if c.Tree == "" {
+		return Entry{}, false, nil
+	}
+	sha, err := r.findInTree(c.Tree, "", e.Path)
+	if err != nil {
+		return Entry{}, false, err
+	}
+	if sha == "" {
+		return Entry{}, false, nil
+	}
+	e.Hash = sha
+	if typ, body, rerr := r.readObject(sha); rerr == nil && typ == "blob" {
+		e.Size = int64(len(body))
+	}
+	e.Time = r.objectTime(sha)
+	e.Mode = ModeContent
+	return e, true, nil
+}
+
 // splitDirName 把树内路径拆成 (目录, 名字)。根目录返回 ""。
 func splitDirName(path string) (string, string) {
 	path = strings.Trim(path, "/")

@@ -77,68 +77,17 @@ func (s *Server) scanGitProject(repo *gitstore.Repo, project, defaultBranch stri
 	startupStage("reload: %s@%s listed %d paths", project, defaultBranch, len(entries))
 
 	t := &memory.Tree{Project: project, Branch: defaultBranch}
+	seen := make(map[string]struct{}, len(entries))
 	for _, e := range entries {
 		path := e.Path
 		r := repo
 		read := func() ([]byte, error) {
 			return r.Read(defaultBranch, path)
 		}
-
-		block := memory.Block{
-			Project: project,
-			Branch:  defaultBranch,
-			Path:    path,
-			Size:    e.Size,
-			Time:    e.Time,
-			Read:    read,
-		}
-
-		// 以点开头的目录/文件（.legacy-archive、.githooks、.gitignore）
-		// 是归档与工具，不是正文：保留可读，但不进检索。
-		if memory.HiddenPath(path) {
-			block.Hidden = true
-			t.Blocks = append(t.Blocks, block)
-			continue
-		}
-
-		// 规则与索引的判定，优先看文件自己写的 frontmatter。
-		//
-		// 为什么不再用 Git 的可执行位：100755 在真实仓库里的含义是
-		// 「这是个可执行脚本」。用它当「规则」标记，后果是
-		// .githooks/pre-push 和一个 11KB 的 python 脚本被当成规则
-		// 注入系统提示，而真正的 SKILL.md（全是 100644）一个都没进。
-		// 文件自己写着 inject: every_turn —— 那才是作者的本意。
-		if strings.HasSuffix(path, ".md") {
-			if data, rerr := read(); rerr == nil && hasFrontmatter(data) {
-				pol := manifest.Parse(project, data)
-				switch pol.Inject {
-				case "every_turn":
-					block.Rule = true
-				case "never":
-					block.Rule = false
-				default:
-					// 没声明 inject：说明作者只写了 write 策略，
-					// 这时仍按 Git 的可执行位判断，保持旧行为。
-					block.Rule = e.Mode == gitstore.ModeRule
-				}
-				if pol.Index == "none" {
-					block.Hidden = true
-				}
-			} else {
-				// 没有 frontmatter 的 Markdown：按老规矩看 mode 位
-				block.Rule = e.Mode == gitstore.ModeRule
-			}
-		} else {
-			// 非 Markdown 一律不是规则。
-			// 可执行脚本再「可执行」也只是工具，不是给模型的指令。
-			block.Rule = false
-			if isExecutableScript(path) {
-				block.Hidden = true
-			}
-		}
-
-		t.Blocks = append(t.Blocks, block)
+		seen[path] = struct{}{}
+		t.Blocks = append(t.Blocks, s.makeBlock(project, defaultBranch, e, read))
 	}
+	_ = seen
 	// 规则目录的兄弟文件也是规则。
 	//
 	// 判据来自 SKILL.md 自己写的那句「按文件名顺序读就是全文」——
@@ -235,6 +184,167 @@ func (s *Server) addBlockLocked(project string, repo *gitstore.Repo, branch, pat
 		Read:    read,
 	})
 	tree.Sort()
+}
+
+// makeBlock 把一个 git 条目变成内存块，并就地判出 Rule / Hidden。
+//
+// 抽出来是为了 `write` / `delete` 能只更新一个 path——
+// 早先它们调 refreshBranch，整条分支 5233 个文件全部重读重分词，
+// 一次 write 要 19 秒。而它们真正改变的只有一个文件。
+func (s *Server) makeBlock(project, branch string, e gitstore.Entry, read func() ([]byte, error)) memory.Block {
+	block := memory.Block{
+		Project: project,
+		Branch:  branch,
+		Path:    e.Path,
+		Size:    e.Size,
+		Time:    e.Time,
+		Read:    read,
+	}
+
+	// 以点开头的目录/文件（.legacy-archive、.githooks、.gitignore）
+	// 是归档与工具，不是正文：保留可读，但不进检索。
+	if memory.HiddenPath(e.Path) {
+		block.Hidden = true
+		return block
+	}
+
+	// 规则与索引的判定，优先看文件自己写的 frontmatter。
+	//
+	// 为什么不再用 Git 的可执行位：100755 在真实仓库里的含义是
+	// 「这是个可执行脚本」。用它当「规则」标记，后果是
+	// .githooks/pre-push 和一个 11KB 的 python 脚本被当成规则
+	// 注入系统提示，而真正的 SKILL.md（全是 100644）一个都没进。
+	// 文件自己写着 inject: every_turn —— 那才是作者的本意。
+	if strings.HasSuffix(e.Path, ".md") {
+		if data, rerr := read(); rerr == nil && hasFrontmatter(data) {
+			pol := manifest.Parse(project, data)
+			switch pol.Inject {
+			case "every_turn":
+				block.Rule = true
+			case "never":
+				block.Rule = false
+			default:
+				// 没声明 inject：说明作者只写了 write 策略，
+				// 这时仍按 Git 的可执行位判断，保持旧行为。
+				block.Rule = e.Mode == gitstore.ModeRule
+			}
+			if pol.Index == "none" {
+				block.Hidden = true
+			}
+		} else {
+			// 没有 frontmatter 的 Markdown：按老规矩看 mode 位
+			block.Rule = e.Mode == gitstore.ModeRule
+		}
+	} else {
+		// 非 Markdown 一律不是规则。
+		// 可执行脚本再「可执行」也只是工具，不是给模型的指令。
+		block.Rule = false
+		if isExecutableScript(e.Path) {
+			block.Hidden = true
+		}
+	}
+	return block
+}
+
+// refreshPath 只更新一条分支上的一个文件：树里的 Block 和索引里的 doc。
+//
+// 为什么需要它：write / delete 早先调 refreshBranch —— 那条路会把整条
+// 分支重扫一遍（List 全部路径、每个 .md 读两次、全部重新分词）。
+// main.chat 有 5233 个文件，一次 write 实测 19 秒、一次 delete 18 秒，
+// 而它们真正改变的是一个文件。规模越大越慢，正是「越用越卡」的来源。
+//
+// 语义与 refreshBranch 等价：那边是「撤销整分支 → 全量加回去」，
+// 净效果就是让索引反映当前磁盘状态。这里对单个 path 做同一件事。
+//
+// exists=false 表示这个文件已经从树里消失（delete）。
+func (s *Server) refreshPath(project, branch, path string, exists bool) error {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return fmt.Errorf("open project %s: %w", project, err)
+	}
+
+	id := memory.MakeID(project, branch, path)
+
+	// 先把新块算出来（读盘在锁外：不能在持锁时做 I/O）。
+	var (
+		block memory.Block
+		text  string
+		stamp int64
+	)
+	if exists {
+		// Stat 只走路径深度（O(dirs)），不展开整条分支。
+		entry, found, serr := repo.Stat(branch, path)
+		if serr != nil {
+			return fmt.Errorf("stat %s@%s:%s: %w", project, branch, path, serr)
+		}
+		if !found {
+			exists = false
+		} else {
+			r := repo
+			read := func() ([]byte, error) { return r.Read(branch, path) }
+			block = s.makeBlock(project, branch, entry, read)
+			if data, rerr := read(); rerr == nil {
+				text = string(data)
+				stamp = entry.Time
+				if at := sliceAtTime(text, path); at > 0 {
+					stamp = at
+				}
+			}
+		}
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// ① 索引：先撤销这个 id 的旧条目（可能是内容变了，也可能是文件没了）。
+	if s.idx != nil {
+		s.idx.Remove(id)
+		if exists && !block.Hidden && text != "" {
+			s.idx.AddWithTime(id, text, stamp)
+		}
+	}
+
+	// ② 树：替换或移除对应 Block。
+	var tree *memory.Tree
+	for _, t := range s.trees {
+		if t.Project == project && t.Branch == branch {
+			tree = t
+			break
+		}
+	}
+	if tree == nil {
+		if !exists {
+			return nil
+		}
+		tree = &memory.Tree{Project: project, Branch: branch}
+		s.trees = append(s.trees, tree)
+	}
+
+	replaced := false
+	for i := range tree.Blocks {
+		if tree.Blocks[i].Path != path {
+			continue
+		}
+		if exists {
+			tree.Blocks[i] = block
+		} else {
+			tree.Blocks = append(tree.Blocks[:i], tree.Blocks[i+1:]...)
+		}
+		replaced = true
+		break
+	}
+	if !replaced && exists {
+		tree.Blocks = append(tree.Blocks, block)
+		tree.Sort()
+	}
+
+	// ③ SKILL.md 变了要重解析策略：它决定「谁能看见什么」。
+	if exists && (path == "SKILL.md" || strings.HasSuffix(path, "/SKILL.md")) {
+		if data, rerr := block.Read(); rerr == nil {
+			s.policies.Store(project, manifest.Parse(project, data))
+		}
+	}
+	return nil
 }
 
 // refreshBranch 只重建一条分支的内存树与索引条目。

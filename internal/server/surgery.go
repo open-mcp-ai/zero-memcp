@@ -145,7 +145,23 @@ func (s *Server) listBranches(project string, c Caller) string {
 				continue
 			}
 			sha, _ := repo.Resolve(name)
-			n, _ := repo.List(name)
+			// 条目数从内存树取，不再 repo.List 每条分支。
+			//
+			// 早先这里对每条分支 List 一遍：7 条分支 × 5000+ 文件
+			// = 一次 `branch` 实测 6.7 秒。而它只是在数文件个数。
+			// 内存树与磁盘同步（Reload / refreshBranch / refreshPath /
+			// put 都会立即更新），是同一份数据。
+			//
+			// 索引里没有这条分支（刚 fork、还没建树）时才退回真扫。
+			n := s.indexedPaths(p, name)
+			if n == nil {
+				if entries, lerr := repo.List(name); lerr == nil {
+					n = make([]string, len(entries))
+					for i, e := range entries {
+						n[i] = e.Path
+					}
+				}
+			}
 			when := ""
 			if logs, err := repo.Log(name, 1); err == nil && len(logs) > 0 {
 				when = logs[0].When.Format("2006-01-02 15:04")

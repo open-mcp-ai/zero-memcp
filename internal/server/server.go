@@ -565,6 +565,20 @@ func (s *Server) Reload() error {
 		}
 	}
 
+	// 索引建完，Block.Body 这个「扫描期缓存」就该扔掉。
+	//
+	// 它只在「扫描 → 索引」这段窗口里有价值（省掉一次重复读盘）。
+	// 留着它的代价是整库正文常驻内存——24,000 块 × 平均几 KB，
+	// 而真正需要正文的时候走 Read() 就行，那是按需的。
+	//
+	// 丢掉之后 Block 仍是值类型、仍可安全读取；readBlock 见 Body 为空
+	// 会退回 Read()，行为完全一致。
+	for _, t := range trees {
+		for i := range t.Blocks {
+			t.Blocks[i].Body = nil
+		}
+	}
+
 	s.mu.Lock()
 	s.trees = trees
 	s.idx = idx

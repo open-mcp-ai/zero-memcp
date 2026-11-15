@@ -14,6 +14,14 @@ import (
 // 这是全服务唯一的内容读取入口。块自己带着 Read 钩子，
 // 所以它来自哪个仓库、哪个分支、哪条路径，上层都不需要知道。
 func (s *Server) readBlock(b memory.Block) ([]byte, error) {
+	// Body 是扫描时顺手读到的正文缓存：命中就不必再读盘。
+	//
+	// 这一条把启动时的读盘量砍掉一半——扫描判 frontmatter 已经读过
+	// .md，索引阶段原本又读一遍，同一份文件两次。
+	// Body 为空是安全的：退回 Read()，结果一样。
+	if b.Body != nil {
+		return b.Body, nil
+	}
 	if b.Read == nil {
 		return nil, errors.New("block has no read method bound")
 	}

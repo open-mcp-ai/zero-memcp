@@ -247,7 +247,17 @@ func (s *Server) makeBlock(project, branch string, e gitstore.Entry, read func()
 	// 注入系统提示，而真正的 SKILL.md（全是 100644）一个都没进。
 	// 文件自己写着 inject: every_turn —— 那才是作者的本意。
 	if strings.HasSuffix(e.Path, ".md") {
-		if data, rerr := read(); rerr == nil && hasFrontmatter(data) {
+		// 只读一次：判定要用，索引阶段也要用。
+		//
+		// 早先这里读一次判 frontmatter，索引阶段 readBlock 再读一次——
+		// 同一个文件读两遍。库里 24,000 块绝大多数是 .md，
+		// 启动时这一倍的白读直接摊在 110 秒的不可用窗口里。
+		// 读到的内容留在 Block.Body，索引阶段直接复用（见 readBlockBody）。
+		data, rerr := read()
+		if rerr == nil {
+			block.Body = data
+		}
+		if rerr == nil && hasFrontmatter(data) {
 			pol := manifest.Parse(project, data)
 			switch pol.Inject {
 			case "every_turn":
@@ -357,6 +367,7 @@ func (s *Server) refreshPath(project, branch, path string, exists bool) error {
 			continue
 		}
 		if exists {
+			block.Body = nil // 只在这一轮有用，不留给长期树
 			tree.Blocks[i] = block
 		} else {
 			tree.Blocks = append(tree.Blocks[:i], tree.Blocks[i+1:]...)
@@ -365,6 +376,7 @@ func (s *Server) refreshPath(project, branch, path string, exists bool) error {
 		break
 	}
 	if !replaced && exists {
+		block.Body = nil
 		tree.Blocks = append(tree.Blocks, block)
 		tree.Sort()
 	}
@@ -431,6 +443,11 @@ func (s *Server) refreshBranch(project, branch string) error {
 			}
 			s.idx.AddWithTime(b.ID(), string(data), stamp)
 		}
+	}
+	// 索引建完就扔掉扫描期缓存：留着等于整分支正文常驻内存。
+	// （见 Reload 里的同一段说明。）
+	for i := range tree.Blocks {
+		tree.Blocks[i].Body = nil
 	}
 
 	replaced := false

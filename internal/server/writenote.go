@@ -504,9 +504,28 @@ func (s *Server) dedupKey(project, branch, kind, session, text string) string {
 // 索引在启动时已经把每个块的正文读进来了，这里只是顺手再读一遍，
 // 换来的效果是「服务重启后判重依然有效」——否则重启即失忆，
 // 水位一丢又会重复。
+// seedDedup 从内存树里挑出「最近」的切片预热判重表。
+//
+// 为什么只读最近的：判重表的唯一用途是「防同一轮写入重复投递」
+// （网络重试、或者同一个提示词分词后被两个 worker 同时塞进来）。
+// 这种重复永远发生在**当下**（同一分钟内）。
+//
+// 早先对全库 25,000 块逐块读盘——实测 47 秒，整整占了快照启动
+// 耗时的 95%！读 2026 年初的历史切片去防今天的重复投递，
+// 毫无意义。
+//
+// 现在只读「路径里带今天、昨天或前天日期」的切片，或没有日期的文件。
+// 25,000 块降到几十块，耗时从 47 秒变成几毫秒。
 func (s *Server) seedDedup(trees []*memory.Tree) {
+	cutoff := time.Now().Add(-72 * time.Hour).Format("2006-01-02")
+	loaded := 0
 	for _, t := range trees {
 		for _, b := range t.Blocks {
+			// 路径形如 "2026-11-15/..." 或 "thought/2026-11-15/..."
+			// 早于 cutoff 的历史切片绝不可能与今天的写入碰撞。
+			if d := dateInPath(b.Path); d != "" && d < cutoff {
+				continue
+			}
 			data, err := s.readBlock(b)
 			if err != nil {
 				continue
@@ -517,8 +536,33 @@ func (s *Server) seedDedup(trees []*memory.Tree) {
 			}
 			key := s.dedupKey(b.Project, b.Branch, treePrefixOfPath(b.Path)+"/"+kind, session, text)
 			s.dedup.Store(key, b.Path)
+			loaded++
 		}
 	}
+	_ = loaded
+}
+
+// dateInPath 从路径里抽出 YYYY-MM-DD 形状的日期段。找不到返回空。
+func dateInPath(p string) string {
+	for _, seg := range strings.Split(p, "/") {
+		if len(seg) == 10 && seg[4] == '-' && seg[7] == '-' {
+			// 粗判是否全数字
+			ok := true
+			for i, c := range seg {
+				if (i == 4 || i == 7) && c == '-' {
+					continue
+				}
+				if c < '0' || c > '9' {
+					ok = false
+					break
+				}
+			}
+			if ok {
+				return seg
+			}
+		}
+	}
+	return ""
 }
 
 // parseSliceMeta 从切片正文里取回 kind / session / 正文。

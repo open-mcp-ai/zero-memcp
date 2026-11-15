@@ -2,7 +2,9 @@ package server
 
 import (
 	"fmt"
+	"runtime"
 	"strings"
+	"sync"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 	"github.com/open-mcp-ai/zero-memcp/internal/manifest"
@@ -77,17 +79,7 @@ func (s *Server) scanGitProject(repo *gitstore.Repo, project, defaultBranch stri
 	startupStage("reload: %s@%s listed %d paths", project, defaultBranch, len(entries))
 
 	t := &memory.Tree{Project: project, Branch: defaultBranch}
-	seen := make(map[string]struct{}, len(entries))
-	for _, e := range entries {
-		path := e.Path
-		r := repo
-		read := func() ([]byte, error) {
-			return r.Read(defaultBranch, path)
-		}
-		seen[path] = struct{}{}
-		t.Blocks = append(t.Blocks, s.makeBlock(project, defaultBranch, e, read))
-	}
-	_ = seen
+	t.Blocks = s.makeBlocksParallel(repo, project, defaultBranch, entries)
 	// 规则目录的兄弟文件也是规则。
 	//
 	// 判据来自 SKILL.md 自己写的那句「按文件名顺序读就是全文」——
@@ -214,6 +206,59 @@ func (s *Server) indexedPaths(project, branch string) []string {
 		return out
 	}
 	return nil
+}
+
+// makeBlocksParallel 并行把一批 git 条目变成内存块。
+//
+// 为什么必须并行：每个 .md 都要读出来判 frontmatter，而读的是 zlib
+// 解压 + pack 里找对象——纯 I/O + CPU，彼此完全独立。串行跑在
+// 25,000 个文件上实测 65 秒，全部摊在发版那段不可用的窗口里。
+//
+// 分段的实测数字（v19）：扫描 65.2s、索引 7.7s（其中读盘 0.0s）。
+// 也就是说**慢的是扫描，不是分词**——所以并行化加在这里，
+// 而不是加在 AddWithTime 上。
+//
+// 顺序必须保持不变：Blocks 的顺序影响树的 Sort 稳定性与日志可读性，
+// 也让「同样的输入产出同样的树」这件事成立（对拍测试依赖它）。
+func (s *Server) makeBlocksParallel(repo *gitstore.Repo, project, branch string, entries []gitstore.Entry) []memory.Block {
+	out := make([]memory.Block, len(entries))
+	if len(entries) == 0 {
+		return out
+	}
+
+	// 并发度：扫描是 I/O 密集（读 pack 里的对象），给足并发。
+	// 上限 16 是为了不让机械盘/网络盘出现抖动反而更慢。
+	workers := runtime.NumCPU() * 4
+	if workers > 16 {
+		workers = 16
+	}
+	if workers > len(entries) {
+		workers = len(entries)
+	}
+
+	var wg sync.WaitGroup
+	idx := make(chan int)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range idx {
+				e := entries[i]
+				path := e.Path
+				r := repo
+				read := func() ([]byte, error) {
+					return r.Read(branch, path)
+				}
+				out[i] = s.makeBlock(project, branch, e, read)
+			}
+		}()
+	}
+	for i := range entries {
+		idx <- i
+	}
+	close(idx)
+	wg.Wait()
+	return out
 }
 
 // makeBlock 把一个 git 条目变成内存块，并就地判出 Rule / Hidden。

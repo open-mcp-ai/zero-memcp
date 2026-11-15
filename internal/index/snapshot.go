@@ -27,8 +27,19 @@ import (
 // 换句话说：快照是**优化**，全量重建仍是正确性保底。
 // 这条边界必须守住——否则会出现「启动很快，但搜不到刚写的东西」。
 const (
-	snapshotMagic   = "zmidx1"
-	snapshotVersion = 1
+	snapshotMagic = "zmidx1"
+	// snapshotVersion 是快照格式版本。**字段增删必须递增它。**
+	//
+	// 递增的理由：树快照里存的是「扫描的判定结果」。如果新增了一个
+	// 参与判定的字段（比如 v2 的 Layer），而旧快照里那个字段是零值，
+	// 那么「命中快照」反而会带来错误结论——症状是「启动很快，但
+	// 新功能对历史数据完全不生效」，而且不报错。
+	//
+	// 版本不符时 tryLoadIndexSnapshot 会拒绝快照、退回全量扫描。
+	// 代价是一次慢启动，换来的是「新判据一定作用在全部数据上」。
+	//
+	// v2: BlockSnapshot 增加 Layer（内容自己声明的认知层）
+	snapshotVersion = 2
 )
 
 // SnapshotHeader 是快照的元信息，与倒排表分开存放。
@@ -267,6 +278,7 @@ type BlockSnapshot struct {
 	Rule   bool
 	Hidden bool
 	Hash   string
+	Layer  string
 }
 
 // SaveTrees 把树快照写到 dir 下的独立文件。

@@ -3,6 +3,7 @@ package server
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -269,5 +270,83 @@ func TestIndexSnapshotSaveIsFast(t *testing.T) {
 	}
 	if el := time.Since(t0); el > 5*time.Second {
 		t.Fatalf("存快照耗时 %v，太慢（它跑在后台维护循环上）", el)
+	}
+}
+
+// 快照必须保住 Layer，否则新判据对历史数据完全失效且不报错。
+//
+// 这是 2026-11-16 的真实事故：改完 isSemanticBlock 之后部署，
+// 语义维护日志仍然是 `delta: 16167 reusable, 0 need embed`——
+// 候选集根本没变大。原因是 BlockSnapshot 里没有 Layer 字段，
+// 从快照恢复的块 Layer 全是空串，判据依旧失效。
+//
+// 症状的形状很坏：**启动很快（命中快照）、日志全绿（0 error）、
+// 功能完全不生效**。这正是我们今晚反复踩的那种「绿得不对」。
+func TestSnapshotPreservesLayer(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "test", Cap: "rwx"})
+
+	// 一条落在日期根目录、但自己声明了 layer: thought 的内容
+	addr := "blackegg/me@fact:2026-11-16/declared.md"
+	body := "---\nlayer: thought\nsession: s1\n---\n# Reasoning\n\nthis should be indexed\n"
+	if _, err := callMCPVars(t, srv, tok, addr, body); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if _, err := callMCP(t, srv, tok, "commit blackegg/me@fact -m one"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	// 存快照前：Layer 必须是 thought
+	var wantLayer string
+	func() {
+		srv.mu.RLock()
+		defer srv.mu.RUnlock()
+		for _, tr := range srv.trees {
+			for _, b := range tr.Blocks {
+				if strings.HasSuffix(b.Path, "declared.md") {
+					wantLayer = b.Layer
+				}
+			}
+		}
+	}()
+	if wantLayer != "thought" {
+		t.Fatalf("扫描期没解析出 Layer：got %q，want thought", wantLayer)
+	}
+
+	if err := srv.saveIndexSnapshot(); err != nil {
+		t.Fatalf("save snapshot: %v", err)
+	}
+
+	// 清空内存后从快照恢复
+	srv.mu.Lock()
+	srv.trees = nil
+	srv.idx = nil
+	srv.mu.Unlock()
+
+	if !srv.tryLoadIndexSnapshot("zero") {
+		t.Fatal("快照没能命中——这条测试测不到恢复路径")
+	}
+
+	// 恢复之后 Layer 必须还在，否则 isSemanticBlock 对这条永远返回 false
+	var gotLayer string
+	var semantic bool
+	func() {
+		srv.mu.RLock()
+		defer srv.mu.RUnlock()
+		for _, tr := range srv.trees {
+			for _, b := range tr.Blocks {
+				if strings.HasSuffix(b.Path, "declared.md") {
+					gotLayer = b.Layer
+					semantic = isSemanticBlock(b)
+				}
+			}
+		}
+	}()
+	if gotLayer != "thought" {
+		t.Fatalf("快照恢复丢了 Layer：got %q，want thought——"+
+			"症状是「启动很快、日志全绿、新判据对历史数据完全不生效」", gotLayer)
+	}
+	if !semantic {
+		t.Fatal("恢复后 isSemanticBlock 返回 false——日期根目录 + layer: thought 必须参与索引")
 	}
 }

@@ -253,6 +253,7 @@ func (s *Server) saveIndexSnapshot() error {
 			bs[i] = index.BlockSnapshot{
 				Path: b.Path, Size: b.Size, Time: b.Time,
 				Rule: b.Rule, Hidden: b.Hidden, Hash: b.Hash,
+				Layer: b.Layer,
 			}
 		}
 		treeSnaps = append(treeSnaps, index.TreeSnapshot{
@@ -378,6 +379,7 @@ func (s *Server) restoreTreesFromSnapshot(defaultBranch string) ([]*memory.Tree,
 				Rule:    bs.Rule,
 				Hidden:  bs.Hidden,
 				Hash:    bs.Hash,
+				Layer:   bs.Layer,
 				Read:    func() ([]byte, error) { return repo.Read(br, path) },
 			}
 		}

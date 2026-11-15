@@ -56,7 +56,12 @@ func (s *Server) maintain(done chan struct{}) {
 
 	states := &sync.Map{} // project -> *repoState
 	now := time.Now()
-	var lastSnapAt time.Time // 上次落索引快照的时刻
+	// 首次快照要早：启动后 60 秒就存一份。
+	//
+	// 为什么不等 10 分钟：刚发完版的人往往还要再发一次（修问题），
+	// 而那时候如果没有快照，就又要吃一遍全量重建。60 秒足够让
+	// 启动后的第一次写入落定，又足够短到「下一次重启就受益」。
+	var lastSnapAt = time.Now().Add(9 * time.Minute)
 
 	for {
 		select {
@@ -131,11 +136,14 @@ func (s *Server) maintain(done chan struct{}) {
 
 			// 定期把索引快照落盘：下次启动就不必重扫重分词。
 			//
-			// 间隔取 2 分钟而不是每轮：快照有几十 MB，写它本身就是
-			// 一次不小的 I/O，而它的价值只体现在「下次启动」。
-			// 两分钟意味着「最多丢两分钟的索引变化」——那些变化在
-			// 下次启动时会被 head 比对发现，然后走增量重建补上。
-			if s.indexSnapshotDue(lastSnapAt, 2*time.Minute) {
+			// 间隔 10 分钟：快照压缩后仍有几十 MB，写它是一次实打实的
+			// I/O，而它的价值只体现在「下次启动」。10 分钟意味着
+			// 「最多丢 10 分钟的索引变化」——那些变化在下次启动时
+			// 会被 head 比对发现，然后走全量重建补上。
+			//
+			// 真正的时机是**退出时**（Close 里那一次）：正常发版
+			// 就是「先停旧进程再起新的」，所以那一次才是主路径。
+			if s.indexSnapshotDue(lastSnapAt, 10*time.Minute) {
 				if err := s.saveIndexSnapshot(); err != nil {
 					s.logf("index snapshot save failed: %v", err)
 				}

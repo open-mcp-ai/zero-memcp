@@ -1,6 +1,7 @@
 package index
 
 import (
+	"compress/gzip"
 	"encoding/gob"
 	"fmt"
 	"os"
@@ -157,8 +158,13 @@ func LoadSnapshotHeader(dir string) (*SnapshotHeader, error) {
 		return nil, err
 	}
 	defer f.Close()
+	zr, zerr := gzip.NewReader(f)
+	if zerr != nil {
+		return nil, fmt.Errorf("snapshot header is not gzip: %w", zerr)
+	}
+	defer zr.Close()
 	var h SnapshotHeader
-	if err := gob.NewDecoder(f).Decode(&h); err != nil {
+	if err := gob.NewDecoder(zr).Decode(&h); err != nil {
 		return nil, fmt.Errorf("decode snapshot header: %w", err)
 	}
 	if h.Magic != snapshotMagic {
@@ -177,20 +183,38 @@ func LoadSnapshotData(dir string) (*SnapshotData, error) {
 		return nil, err
 	}
 	defer f.Close()
+	zr, zerr := gzip.NewReader(f)
+	if zerr != nil {
+		return nil, fmt.Errorf("snapshot data is not gzip: %w", zerr)
+	}
+	defer zr.Close()
 	var d SnapshotData
-	if err := gob.NewDecoder(f).Decode(&d); err != nil {
+	if err := gob.NewDecoder(zr).Decode(&d); err != nil {
 		return nil, fmt.Errorf("decode snapshot data: %w", err)
 	}
 	return &d, nil
 }
 
+// writeGobAtomic 原子写一份 gob，并做 gzip 压缩。
+//
+// 为什么要压缩：倒排表里同一个块地址（project@branch:path）会在
+// 它出现过的每个词下面重复一次。实测 25,000 篇解压前 660 MB，
+// 这种高度重复的字符串压缩比通常十几倍——不压就是每次退出写 660MB。
+// 压缩的 CPU 代价远小于磁盘 I/O。
 func writeGobAtomic(path string, v any) error {
 	tmp := path + ".tmp"
 	f, err := os.Create(tmp)
 	if err != nil {
 		return err
 	}
-	if err := gob.NewEncoder(f).Encode(v); err != nil {
+	zw, _ := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	if err := gob.NewEncoder(zw).Encode(v); err != nil {
+		zw.Close()
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := zw.Close(); err != nil {
 		f.Close()
 		os.Remove(tmp)
 		return err
@@ -260,8 +284,13 @@ func LoadTrees(dir string) ([]TreeSnapshot, error) {
 		return nil, err
 	}
 	defer f.Close()
+	zr, zerr := gzip.NewReader(f)
+	if zerr != nil {
+		return nil, fmt.Errorf("tree snapshot is not gzip: %w", zerr)
+	}
+	defer zr.Close()
 	var ts []TreeSnapshot
-	if err := gob.NewDecoder(f).Decode(&ts); err != nil {
+	if err := gob.NewDecoder(zr).Decode(&ts); err != nil {
 		return nil, fmt.Errorf("decode tree snapshot: %w", err)
 	}
 	return ts, nil

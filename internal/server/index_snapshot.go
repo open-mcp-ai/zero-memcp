@@ -162,17 +162,40 @@ func (s *Server) saveIndexSnapshot() error {
 	if dir == "" || os.Getenv("ZERO_MEMCP_NO_INDEX_SNAPSHOT") != "" {
 		return nil
 	}
+	// 整段导出必须持读写锁。
+	//
+	// 踩过的坑：早先只在取 ix 指针时持锁，然后锁外 Export()。
+	// 而写入路径是在 s.mu.Lock() 里调 idx.AddWithTime 的——
+	// 于是「后台存快照」与「用户写入」同时动同一张 map，
+	// 进程直接 fatal error: concurrent map iteration and map write。
+	// 那不是 error，是 runtime 直接杀进程，没有任何 recover 机会。
 	s.mu.RLock()
+	if s.idx == nil {
+		s.mu.RUnlock()
+		return nil
+	}
 	ix := s.idx
 	heads := make(map[string]string, 16)
 	trees := make([]string, 0, 16)
 	for _, t := range s.trees {
 		trees = append(trees, treeHeadKey(t.Project, t.Branch))
 	}
-	s.mu.RUnlock()
-	if ix == nil {
-		return nil
+	data := ix.Export()
+	docs, terms := ix.Docs(), ix.Terms()
+	treeSnaps := make([]index.TreeSnapshot, 0, len(s.trees))
+	for _, t := range s.trees {
+		bs := make([]index.BlockSnapshot, len(t.Blocks))
+		for i, b := range t.Blocks {
+			bs[i] = index.BlockSnapshot{
+				Path: b.Path, Size: b.Size, Time: b.Time,
+				Rule: b.Rule, Hidden: b.Hidden, Hash: b.Hash,
+			}
+		}
+		treeSnaps = append(treeSnaps, index.TreeSnapshot{
+			Project: t.Project, Branch: t.Branch, Blocks: bs,
+		})
 	}
+	s.mu.RUnlock()
 
 	// heads 从仓库读，不从内存猜：内存里的 head 是「上次刷新时」的，
 	// 而快照必须精确记录「这份索引对应哪个 commit」。
@@ -191,32 +214,17 @@ func (s *Server) saveIndexSnapshot() error {
 	}
 
 	// 树快照：把每个 Block 的判定结果存下来，下次启动就不必再扫一遍。
-	s.mu.RLock()
-	treeSnaps := make([]index.TreeSnapshot, 0, len(s.trees))
-	for _, t := range s.trees {
-		bs := make([]index.BlockSnapshot, len(t.Blocks))
-		for i, b := range t.Blocks {
-			bs[i] = index.BlockSnapshot{
-				Path: b.Path, Size: b.Size, Time: b.Time,
-				Rule: b.Rule, Hidden: b.Hidden, Hash: b.Hash,
-			}
-		}
-		treeSnaps = append(treeSnaps, index.TreeSnapshot{
-			Project: t.Project, Branch: t.Branch, Blocks: bs,
-		})
-	}
-	s.mu.RUnlock()
 	if err := index.SaveTrees(dir, treeSnaps); err != nil {
 		return err
 	}
 
-	hdr := &index.SnapshotHeader{Heads: heads, Docs: ix.Docs(), Terms: ix.Terms(), TreeFile: "index-trees.gob"}
-	if err := index.SaveSnapshot(dir, hdr, ix.Export()); err != nil {
+	hdr := &index.SnapshotHeader{Heads: heads, Docs: docs, Terms: terms, TreeFile: "index-trees.gob"}
+	if err := index.SaveSnapshot(dir, hdr, data); err != nil {
 		return err
 	}
 	if st, err := os.Stat(filepath.Join(dir, "index-data.gob")); err == nil {
 		s.logf("index snapshot saved: %d docs, %d terms, %.1f MB",
-			ix.Docs(), ix.Terms(), float64(st.Size())/(1<<20))
+			docs, terms, float64(st.Size())/(1<<20))
 	}
 	return nil
 }

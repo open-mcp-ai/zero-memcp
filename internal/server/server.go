@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -531,6 +532,24 @@ func (s *Server) Reload() error {
 	defaultBranch := s.defaultBranch
 
 	startupStage("reload: scanning repositories")
+
+	// 快速路径：先试索引快照。
+	//
+	// 冷启动实测 33 秒（扫描 23s + 分词 9s），而这两件事的结果是确定的：
+	// 同一份仓库内容分出来就是同一份倒排表。每次发版都重算，等于让
+	// 用户为「我们换了二进制」付 33 秒不可用。
+	//
+	// 快照的边界必须守住：
+	//   - 头部对不上（格式变了 / 写了一半）→ 整份丢弃，全量重建
+	//   - 某个分支 head 变了 → 只重建那一条（走已有的增量路径）
+	//   - 全部一致 → 直接用
+	// 快照是优化，全量重建仍是正确性保底。
+	if s.tryLoadIndexSnapshot(defaultBranch) {
+		startupStage("reload: loaded index from snapshot")
+		s.rememberTreeHeads()
+		return nil
+	}
+
 	trees, err := s.loadGitTrees(defaultBranch)
 	if err != nil {
 		return err
@@ -761,6 +780,14 @@ func (p *portPolicy) allows(name string) bool {
 // Close 停止全部监听器。
 func (s *Server) Close() error {
 	s.doneOnce.Do(func() { close(s.done) })
+	// 退出前把索引快照落盘。正常发版（停旧进程 → 启新进程）就靠它
+	// 把「下次启动 33 秒」变成「下次启动读一个文件」。
+	//
+	// 放在最前面：后面的步骤会关维护循环和仓库，那时索引可能
+	// 已经在拆，来不及做完一次 40MB 的写。
+	if err := s.saveIndexSnapshot(); err != nil {
+		s.logf("index snapshot save on shutdown failed: %v", err)
+	}
 	// 停语义索引的后台追平：它会读仓库，必须在关仓库之前停。
 	s.stopSemanticMaintainer()
 	// 停后台同步：它会 fetch/push，必须在关仓库之前停。
@@ -2347,10 +2374,12 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 	}
 	s.mu.RUnlock()
 
-	var sb strings.Builder
-	totalHits := 0
-	// 计数模式的统计口径：一行算一处，一块算一处（与 grep -c 的“行数”对齐）。
-	matchedLines, matchedBlocks := 0, 0
+	// 收集候选块（顺序 = 快照顺序，输出必须可复现）。
+	type cand struct {
+		block memory.Block
+		virt  string
+	}
+	var cands []cand
 	for _, tr := range snaps {
 		// 只判挂载表会漏掉两层：凭证 cap 与 TOML 权限。
 		// grep 读的是正文，判据必须与 read 完全一致。
@@ -2366,54 +2395,105 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 			if !matchAnyScope(b.ID(), scopes) {
 				continue
 			}
-			data, err := s.readBlock(b)
-			if err != nil {
-				continue
-			}
-			lines := strings.Split(string(data), "\n")
-			blockHit := false
-			for i, line := range lines {
-				if re.MatchString(line) {
-					matchedLines++
-					if countOnly {
-						// 只计数：不拼上下文，命中一块就记一块。
-						if !blockHit {
-							blockHit = true
-							matchedBlocks++
-						}
+			cands = append(cands, cand{block: b, virt: c.Mount.ToVirtual(b.Project, b.Branch, b.Path)})
+		}
+	}
+
+	// 并行读盘 + 匹配。
+	//
+	// 为什么要并行：grep 不带 --scope 时要读全库 25,000 个块的正文，
+	// 实测 1.3 秒。这不是「实现不好」，是本质工作量——但它是 25,000 个
+	// 彼此独立的读+正则匹配，串行做完全没必要。分词和读盘本来就是
+	// 这台机器上最该吃满多核的两件事。
+	//
+	// 输出顺序必须与串行版一致：结果按 cands 下标写回，排版仍按原顺序
+	// 走。否则同一个库搜两次给两种顺序，调用方会以为内容变了。
+	type blockHit struct {
+		// hits 只保存命中块的行（0-based）。没命中的块整份丢弃，
+		// 所以内存占用与命中数成正比，不与库大小成正比。
+		lines []int
+		// kept 是命中块的正文按行切好的结果——排版阶段直接用它，
+		// 不再回头读第二次盘。
+		kept []string
+	}
+	hits := make([]blockHit, len(cands))
+	{
+		workers := runtime.NumCPU() * 4
+		if workers > 32 {
+			workers = 32
+		}
+		if workers > len(cands) {
+			workers = len(cands)
+		}
+		var wg sync.WaitGroup
+		idx := make(chan int)
+		for w := 0; w < workers; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range idx {
+					data, rerr := s.readBlock(cands[i].block)
+					if rerr != nil {
 						continue
 					}
-					if !blockHit {
-						blockHit = true
-						sb.WriteString("-- " + c.Mount.ToVirtual(b.Project, b.Branch, b.Path) + " --\n")
-					}
-					// 打印上下文：命中行前一行 + 命中行 + 后一行
-					start := i - 1
-					if start < 0 {
-						start = 0
-					}
-					end := i + 2
-					if end > len(lines) {
-						end = len(lines)
-					}
-					for j := start; j < end; j++ {
-						prefix := "   "
-						if j == i {
-							prefix = " > "
+					lines := strings.Split(string(data), "\n")
+					for ln, line := range lines {
+						if re.MatchString(line) {
+							hits[i].lines = append(hits[i].lines, ln)
 						}
-						sb.WriteString(fmt.Sprintf("%4d%s%s\n", j+1, prefix, lines[j]))
 					}
-					totalHits++
-					if totalHits >= 30 {
-						sb.WriteString("\n[truncated: too many matches; showing the first 30]\n")
-						return sb.String(), true, nil
+					if len(hits[i].lines) > 0 {
+						hits[i].kept = lines
 					}
 				}
+			}()
+		}
+		for i := range cands {
+			idx <- i
+		}
+		close(idx)
+		wg.Wait()
+	}
+
+	var sb strings.Builder
+	totalHits := 0
+	// 计数模式的统计口径：一行算一处，一块算一处（与 grep -c 的“行数”对齐）。
+	matchedLines, matchedBlocks := 0, 0
+	for i, cd := range cands {
+		h := hits[i]
+		if len(h.lines) == 0 {
+			continue
+		}
+		matchedLines += len(h.lines)
+		matchedBlocks++
+		if countOnly {
+			continue
+		}
+		lines := h.kept
+		sb.WriteString("-- " + cd.virt + " --\n")
+		for _, ln := range h.lines {
+			start := ln - 1
+			if start < 0 {
+				start = 0
 			}
-			if blockHit {
-				sb.WriteString("\n")
+			end := ln + 2
+			if end > len(lines) {
+				end = len(lines)
+			}
+			for j := start; j < end; j++ {
+				prefix := "   "
+				if j == ln {
+					prefix = " > "
+				}
+				sb.WriteString(fmt.Sprintf("%4d%s%s\n", j+1, prefix, lines[j]))
+			}
+			totalHits++
+			if totalHits >= 30 {
+				sb.WriteString("\n[truncated: too many matches; showing the first 30]\n")
+				return sb.String(), true, nil
 			}
 		}
+		sb.WriteString("\n")
 	}
 	if countOnly {
 		if matchedLines == 0 {

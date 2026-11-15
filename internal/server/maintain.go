@@ -56,6 +56,7 @@ func (s *Server) maintain(done chan struct{}) {
 
 	states := &sync.Map{} // project -> *repoState
 	now := time.Now()
+	var lastSnapAt time.Time // 上次落索引快照的时刻
 
 	for {
 		select {
@@ -127,8 +128,29 @@ func (s *Server) maintain(done chan struct{}) {
 			}
 
 			s.checkExternalUpdates()
+
+			// 定期把索引快照落盘：下次启动就不必重扫重分词。
+			//
+			// 间隔取 2 分钟而不是每轮：快照有几十 MB，写它本身就是
+			// 一次不小的 I/O，而它的价值只体现在「下次启动」。
+			// 两分钟意味着「最多丢两分钟的索引变化」——那些变化在
+			// 下次启动时会被 head 比对发现，然后走增量重建补上。
+			if s.indexSnapshotDue(lastSnapAt, 2*time.Minute) {
+				if err := s.saveIndexSnapshot(); err != nil {
+					s.logf("index snapshot save failed: %v", err)
+				}
+				lastSnapAt = time.Now()
+			}
 		}
 	}
+}
+
+// indexSnapshotDue 判断是否该落一份新快照。
+func (s *Server) indexSnapshotDue(last time.Time, every time.Duration) bool {
+	if s.indexSnapshotDir() == "" {
+		return false
+	}
+	return time.Since(last) >= every
 }
 
 // shortestTick 取一个合适的检查周期：不超过 1 秒，也不超过最短提交间隔的一半。

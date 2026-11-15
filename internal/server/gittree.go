@@ -289,6 +289,12 @@ func (s *Server) makeBlock(project, branch string, e gitstore.Entry, read func()
 	_, rule, hidden := classifyContent(project, e.Path, data, e.Mode)
 	block.Rule = rule
 	block.Hidden = hidden
+	// 顺手把「内容自己声明的层」解析出来。
+	// 这里 content 已经在手上，多解析一个字段是零成本的；
+	// 放到索引阶段去做就要多读一次盘。
+	if rerr == nil {
+		block.Layer = memory.DeclaredLayer(string(data))
+	}
 	return block
 }
 

@@ -61,6 +61,61 @@ func isSemanticContent(path string) bool {
 	return false
 }
 
+// semanticLayers 是「内容自己声明的层」里，允许进语义索引的那些。
+//
+// 和路径白名单是**两个入口、同一个结果**：路径对了算进，
+// 内容自己写明是这几层之一也算进。
+var semanticLayers = map[string]bool{
+	"thought": true,
+	"record":  true,
+	"review":  true,
+	"fact":    true,
+}
+
+// isSemanticBlock 判断一个块该不该参与语义索引。
+//
+// 两条入口，满足任一即可：
+//
+//  1. **路径**在前缀白名单里（thought/ record/ review/ fact/）——主路径
+//  2. **内容自己声明了** layer: thought|record|review|fact —— 历史数据补票
+//
+// # 为什么第 2 条不能省
+//
+// 2026-11-16 实测：`docs 28187 / semantic 16167`，差 12,020 篇。
+// 缺的全是历史思维链和对话——它们躺在日期根目录（`2026-11-15/xxx.md`），
+// 而当时只认路径前缀，于是这些块**一个向量都没算过**。
+//
+// 症状极难查：数据在、能 grep、能 read，就是语义搜不到。
+// 看起来像「没落盘」，实际是「落了但索引瞎了」——
+// 这两件事对用户是完全不同的说法（前者是数据丢了，后者是数据还在）。
+//
+// 「写错路径」是**已经发生过的事实**，不是可能发生的事。
+// 所以这不是提前加的防护，是补一个已经漏掉的口子。
+//
+// 排除项优先：me/（每轮注入的规则，不靠检索）和点开头的隐藏内容
+// 一律不进，哪怕正文里声明了 layer。
+func isSemanticBlock(b memory.Block) bool {
+	if b.Hidden || memory.HiddenPath(b.Path) {
+		return false
+	}
+	// me/ 装的是每轮注入系统提示的规则，靠注入不靠检索。
+	// 把它放进向量库只会让 recall 里全是规则条文，挤掉真正的内容。
+	if strings.HasPrefix(b.Path, "me/") || strings.Contains(b.Path, "/me/") {
+		return false
+	}
+	if isSemanticContent(b.Path) {
+		return true
+	}
+	layer := b.Layer
+	// 如果扫描阶段没填 Layer 但 Body 已经带在身上（比如测试造的数据、
+	// 或某些直接构造 Block 的快路径），顺手代为解析一次。
+	// 这不引入读盘：Body 已经在内存里。
+	if layer == "" && len(b.Body) > 0 {
+		layer = memory.DeclaredLayer(string(b.Body))
+	}
+	return semanticLayers[layer]
+}
+
 // semanticMinScore 是向量命中的最低余弦相似度。
 //
 // 0.35 的依据是实测分布：无关内容 0.19~0.30，跨语言正解 0.45，
@@ -262,7 +317,7 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 			// 按**路径**决定是否进语义索引（isSemanticContent），
 			// 不再看分支名。分支可以是任何名字（main、main/record、
 			// task-1729），只要内容在 thought/ 或 record/ 下就参与。
-			if !isSemanticContent(b.Path) {
+			if !isSemanticBlock(b) {
 				continue
 			}
 			data, rerr := s.readBlock(b)

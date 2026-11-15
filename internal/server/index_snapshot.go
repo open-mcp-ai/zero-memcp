@@ -259,6 +259,19 @@ func (s *Server) saveIndexSnapshot() error {
 			Project: t.Project, Branch: t.Branch, Blocks: bs,
 		})
 	}
+	// 在持锁的同一窗口里把倒排表复制出来。
+	//
+	// 这是修一个真实的 race（2026-11-16，-race 抓到）：
+	// 早先这里只复制了 trees，然后锁外直接调 ix.WriteBinary。
+	// 而 WriteBinary 要遍历 ix.docLen / ix.postings / ix.docTokens，
+	// 与此同时并发写入在跑 refreshPath → ix.AddWithTime 改写同样的 map。
+	// 后果是 runtime 直接 fatal error: concurrent map iteration and map write
+	// ——不是 error，是杀进程，没有 recover 机会。
+	//
+	// 为什么不用「整段 WriteBinary 持 RLock」：写盘要 gzip 几十 MB、
+	// 做 fsync，持锁期间所有写入都被卡住。快照是后台任务，不该阻塞前台。
+	// 复制只遍历 map 取值，微秒级。
+	snap := ix.TakeSnapshot()
 	s.mu.RUnlock()
 
 	// heads 从仓库读，不从内存猜：内存里的 head 是「上次刷新时」的，
@@ -285,7 +298,8 @@ func (s *Server) saveIndexSnapshot() error {
 	hdr := &index.SnapshotHeader{Heads: heads, Docs: docs, Terms: terms, TreeFile: "index-trees.gob"}
 	// 先写倒排表（紧凑格式），再写头部——头部的存在等于「这份快照可用」。
 	// 顺序反了的话，进程在两步之间被杀会留下「头部说有、数据却没有」。
-	if err := ix.WriteBinary(index.SnapshotPath(dir)); err != nil {
+	// 锁外写盘：用的是刚才复制出来的 snap，不碰 *Index。
+	if err := index.WriteSnapshot(snap, index.SnapshotPath(dir)); err != nil {
 		return err
 	}
 	if err := index.SaveSnapshot(dir, hdr, nil); err != nil {

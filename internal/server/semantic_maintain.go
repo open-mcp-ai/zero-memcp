@@ -264,7 +264,7 @@ func (s *Server) semanticDelta(cached *vecindex.Index, prints map[string]string)
 	skippedByHash := 0
 	for _, t := range s.snapshotTrees() {
 		for _, b := range t.Indexable() {
-			if !isSemanticContent(b.Path) {
+			if !isSemanticBlock(b) {
 				continue
 			}
 			id := b.ID()

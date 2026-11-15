@@ -301,3 +301,148 @@ func ReadBinary(path string) (*Index, error) {
 func SnapshotPath(dir string) string {
 	return filepath.Join(dir, "index-data.bin")
 }
+
+// Snapshot 复制一份索引的只读切片数据，用于在锁外安全写盘。
+//
+// 为什么必须复制：直接传 *Index 给 WriteBinary，写盘期间
+// （几十毫秒到几秒，视数据量和 I/O）如果持有 RLock，写入就会被卡住；
+// 如果不持锁，并发写入触发 map 迭代写，runtime 直接杀进程。
+// 复制只遍历 map 取值，耗时是微秒量级，在持 RLock 的瞬间完成。
+type Snapshot struct {
+	Addrs    []string
+	Terms    []string
+	DocLen   []int
+	DocSize  []int
+	DocTime  []int64
+	Postings [][]PostingEntry
+	Tokens   [][]int
+}
+
+type PostingEntry struct {
+	AddrIdx int
+	TF      int
+}
+
+// TakeSnapshot 在调用方持读锁的极短窗口里复制只读结构。
+func (ix *Index) TakeSnapshot() *Snapshot {
+	s := &Snapshot{
+		Addrs:   make([]string, 0, len(ix.docLen)),
+		Terms:   make([]string, 0, len(ix.postings)),
+		DocLen:  make([]int, 0, len(ix.docLen)),
+		DocSize: make([]int, 0, len(ix.docSize)),
+		DocTime: make([]int64, 0, len(ix.docTime)),
+	}
+	addrIdx := make(map[string]int, len(ix.docLen))
+	for a := range ix.docLen {
+		addrIdx[a] = len(s.Addrs)
+		s.Addrs = append(s.Addrs, a)
+		s.DocLen = append(s.DocLen, ix.docLen[a])
+		s.DocSize = append(s.DocSize, ix.docSize[a])
+		s.DocTime = append(s.DocTime, ix.docTime[a])
+	}
+
+	termIdx := make(map[string]int, len(ix.postings))
+	for t := range ix.postings {
+		termIdx[string(t)] = len(s.Terms)
+		s.Terms = append(s.Terms, string(t))
+	}
+
+	s.Postings = make([][]PostingEntry, len(s.Terms))
+	for i, t := range s.Terms {
+		docs := ix.postings[Token(t)]
+		entries := make([]PostingEntry, 0, len(docs))
+		for a, tf := range docs {
+			if idx, ok := addrIdx[a]; ok {
+				entries = append(entries, PostingEntry{AddrIdx: idx, TF: tf})
+			}
+		}
+		s.Postings[i] = entries
+	}
+
+	s.Tokens = make([][]int, len(s.Addrs))
+	for i, a := range s.Addrs {
+		toks := ix.docTokens[a]
+		indices := make([]int, 0, len(toks))
+		for _, tk := range toks {
+			if ti, ok := termIdx[string(tk)]; ok {
+				indices = append(indices, ti)
+			}
+		}
+		s.Tokens[i] = indices
+	}
+	return s
+}
+
+// WriteSnapshot 把快照写盘（纯 I/O，不碰 *Index，无需持任何锁）。
+func WriteSnapshot(s *Snapshot, path string) (err error) {
+	tmp := path + ".tmp"
+	f, cerr := os.Create(tmp)
+	if cerr != nil {
+		return cerr
+	}
+	defer func() {
+		if err != nil {
+			f.Close()
+			os.Remove(tmp)
+		}
+	}()
+
+	zw, _ := gzip.NewWriterLevel(f, gzip.BestSpeed)
+	bw := &binWriter{w: bufio.NewWriterSize(zw, 1<<20)}
+	if _, err = bw.w.WriteString(binMagic); err != nil {
+		return err
+	}
+
+	// ① 地址表
+	bw.uvarint(uint64(len(s.Addrs)))
+	for _, a := range s.Addrs {
+		bw.str(a)
+	}
+
+	// ② 词表
+	bw.uvarint(uint64(len(s.Terms)))
+	for _, t := range s.Terms {
+		bw.str(t)
+	}
+
+	// ③ 文档元数据
+	for i := range s.Addrs {
+		bw.uvarint(uint64(s.DocLen[i]))
+		bw.uvarint(uint64(s.DocSize[i]))
+		bw.svarint(s.DocTime[i])
+	}
+
+	// ④ 倒排
+	for _, entries := range s.Postings {
+		bw.uvarint(uint64(len(entries)))
+		for _, e := range entries {
+			bw.uvarint(uint64(e.AddrIdx))
+			bw.uvarint(uint64(e.TF))
+		}
+	}
+
+	// ⑤ 每篇贡献的词
+	for _, toks := range s.Tokens {
+		bw.uvarint(uint64(len(toks)))
+		for _, ti := range toks {
+			bw.uvarint(uint64(ti))
+		}
+	}
+
+	if bw.err != nil {
+		return bw.err
+	}
+	if err = bw.w.Flush(); err != nil {
+		return err
+	}
+	if err = zw.Close(); err != nil {
+		return err
+	}
+	if err = f.Sync(); err != nil {
+		return err
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}

@@ -56,12 +56,17 @@ func (s *Server) maintain(done chan struct{}) {
 
 	states := &sync.Map{} // project -> *repoState
 	now := time.Now()
-	// 首次快照要早：启动后 60 秒就存一份。
+	// 首次快照要早：启动后 60 秒就存一份，之后每 10 分钟。
 	//
-	// 为什么不等 10 分钟：刚发完版的人往往还要再发一次（修问题），
-	// 而那时候如果没有快照，就又要吃一遍全量重建。60 秒足够让
-	// 启动后的第一次写入落定，又足够短到「下一次重启就受益」。
-	var lastSnapAt = time.Now().Add(9 * time.Minute)
+	// 为什么首次要这么急：Windows 上用 `taskkill /F` 停进程是硬杀，
+	// Close() 根本不会执行——「退出前存快照」那条路在真实发版流程里
+	// **不存在**。所以后台定时是唯一路径，它必须尽早跑一次，
+	// 否则「下次重启就受益」永远等不到。
+	//
+	// 为什么之后放宽到 10 分钟：写快照是实打实的 I/O（压缩后几十 MB），
+	// 而它的价值只体现在「下次启动」。
+	var lastSnapAt = time.Now()
+	snapDone := false
 
 	for {
 		select {
@@ -143,9 +148,15 @@ func (s *Server) maintain(done chan struct{}) {
 			//
 			// 真正的时机是**退出时**（Close 里那一次）：正常发版
 			// 就是「先停旧进程再起新的」，所以那一次才是主路径。
-			if s.indexSnapshotDue(lastSnapAt, 10*time.Minute) {
+			snapEvery := 10 * time.Minute
+			if !snapDone {
+				snapEvery = 60 * time.Second
+			}
+			if s.indexSnapshotDue(lastSnapAt, snapEvery) {
 				if err := s.saveIndexSnapshot(); err != nil {
 					s.logf("index snapshot save failed: %v", err)
+				} else {
+					snapDone = true
 				}
 				lastSnapAt = time.Now()
 			}

@@ -89,12 +89,11 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 		}
 	}
 
-	data, err := index.LoadSnapshotData(dir)
+	idx, err := index.ReadBinary(index.SnapshotPath(dir))
 	if err != nil {
 		startupStage("reload: snapshot data unreadable (%v); full rebuild", err)
 		return false
 	}
-	idx := index.Import(data)
 	if idx.Docs() != hdr.Docs {
 		startupStage("reload: snapshot doc count mismatch (%d vs %d); full rebuild",
 			idx.Docs(), hdr.Docs)
@@ -180,7 +179,6 @@ func (s *Server) saveIndexSnapshot() error {
 	for _, t := range s.trees {
 		trees = append(trees, treeHeadKey(t.Project, t.Branch))
 	}
-	data := ix.Export()
 	docs, terms := ix.Docs(), ix.Terms()
 	treeSnaps := make([]index.TreeSnapshot, 0, len(s.trees))
 	for _, t := range s.trees {
@@ -219,10 +217,15 @@ func (s *Server) saveIndexSnapshot() error {
 	}
 
 	hdr := &index.SnapshotHeader{Heads: heads, Docs: docs, Terms: terms, TreeFile: "index-trees.gob"}
-	if err := index.SaveSnapshot(dir, hdr, data); err != nil {
+	// 先写倒排表（紧凑格式），再写头部——头部的存在等于「这份快照可用」。
+	// 顺序反了的话，进程在两步之间被杀会留下「头部说有、数据却没有」。
+	if err := ix.WriteBinary(index.SnapshotPath(dir)); err != nil {
 		return err
 	}
-	if st, err := os.Stat(filepath.Join(dir, "index-data.gob")); err == nil {
+	if err := index.SaveSnapshot(dir, hdr, nil); err != nil {
+		return err
+	}
+	if st, err := os.Stat(index.SnapshotPath(dir)); err == nil {
 		s.logf("index snapshot saved: %d docs, %d terms, %.1f MB",
 			docs, terms, float64(st.Size())/(1<<20))
 	}

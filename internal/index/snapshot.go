@@ -145,8 +145,12 @@ func SaveSnapshot(dir string, hdr *SnapshotHeader, data *SnapshotData) error {
 	if err := writeGobAtomic(hdrPath, hdr); err != nil {
 		return fmt.Errorf("write snapshot header: %w", err)
 	}
-	if err := writeGobAtomic(dataPath, data); err != nil {
-		return fmt.Errorf("write snapshot data: %w", err)
+	// data 为 nil 表示倒排表由 WriteBinary 单独写（紧凑格式）。
+	// 早先这里无条件写 gob，传 nil 直接 panic：gob 不能编码 nil 指针。
+	if data != nil {
+		if err := writeGobAtomic(dataPath, data); err != nil {
+			return fmt.Errorf("write snapshot data: %w", err)
+		}
 	}
 	return nil
 }

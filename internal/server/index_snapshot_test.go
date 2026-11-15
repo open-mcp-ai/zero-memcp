@@ -37,7 +37,7 @@ func TestIndexSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("save snapshot: %v", err)
 	}
 	// 快照文件必须真的落盘（不然下面的加载是在测空气）。
-	for _, name := range []string{"index-head.gob", "index-data.gob"} {
+	for _, name := range []string{"index-head.gob", "index-data.bin"} {
 		p := filepath.Join(dataDir, "system", "indexsnap", name)
 		if _, serr := os.Stat(p); serr != nil {
 			t.Fatalf("快照文件 %s 没写出来：%v", name, serr)
@@ -108,7 +108,7 @@ func TestIndexSnapshotRejectedWhenCorrupt(t *testing.T) {
 	}
 
 	// 把数据文件写坏（模拟「进程在写快照时被杀掉」）。
-	p := filepath.Join(dataDir, "system", "indexsnap", "index-data.gob")
+	p := filepath.Join(dataDir, "system", "indexsnap", "index-data.bin")
 	if err := os.WriteFile(p, []byte("not a gob at all"), 0o644); err != nil {
 		t.Fatalf("corrupt: %v", err)
 	}

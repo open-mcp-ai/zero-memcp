@@ -1625,13 +1625,13 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			}
 			return s.allowed(c, proj, br, configBitRead)
 		}
-		query, scope := splitScope(rest)
-		scopeMatch := func(addr string) bool {
-			if scope == "" {
-				return true
-			}
-			return addrUnderScope(addr, scope)
-		}
+		// --scope 支持分层写法：`--scope A||B||C` 表示「任一命中即可」。
+		//
+		// 这条以前根本没有：splitScope 拿到 scope 却没人用，`--scope`
+		// 里的词被当成搜索词一起送进索引。症状是「召回结果莫名其妙」，
+		// 而不是报错——静默走偏比报错贵得多。
+		query, scopes := splitScopes(rest)
+		scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
 		hits := s.idx.SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
 			return allowedHit(addr) && scopeMatch(addr)
 		})
@@ -1663,9 +1663,20 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		}
 		s.mu.RUnlock()
 		if len(hits) == 0 {
+			text := "no matches"
+			// 带 scope 却没命中时，多跑一次不带 scope 的判定：
+			// 「这个范围外有」比「记忆里没有」有用得多——前者说明
+			// 换个范围就找得到，后者会让人以为要重新写一遍。
+			if len(scopes) > 0 {
+				outside := s.idx.SearchCovered(query, 1, 0, recallMinCoverage, s.weightCount, allowedHit)
+				if len(outside) > 0 {
+					text = fmt.Sprintf("no matches under scope %s, but the same query matches %s elsewhere in your visible range",
+						strings.Join(scopes, "||"), s.projectOfAddr(outside[0].Addr))
+				}
+			}
 			return TermResult{
-				Text:       "no matches",
-				Structured: map[string]any{"hits": []any{}, "count": 0},
+				Text:       text,
+				Structured: map[string]any{"hits": []any{}, "count": 0, "scopes": scopes},
 				Empty:      true,
 			}, nil
 		}
@@ -2087,11 +2098,11 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		if bad, ok := unknownFlag(rest); ok {
 			return TermResult{}, fmt.Errorf("grep: unknown flag %q (supported: --scope, -i, -c)", bad)
 		}
-		pattern, scope := splitScope(rest)
+		pattern, scopes := splitScopes(rest)
 		if pattern == "" {
 			return TermResult{}, errors.New("grep syntax: grep [-i] [-c] <pattern> [--scope <tree>]")
 		}
-		grepText, grepFound, grepErr := s.execGrep(pattern, scope, c, ignoreCase, countOnly)
+		grepText, grepFound, grepErr := s.execGrep(pattern, scopes, c, ignoreCase, countOnly)
 		if grepErr != nil {
 			return TermResult{}, grepErr
 		}
@@ -2263,7 +2274,7 @@ func (s *Server) weightCount(addr string) int {
 // 为什么要先剥参数再编译正则：早先整个 rest 直接当正则用，
 // 于是 `grep 1729 --scope daily` 会把 "--scope daily" 也编进模式里，
 // 结果是必然零命中——而报错文本是「无命中」，看上去像内容不存在。
-func (s *Server) execGrep(pattern, scope string, c Caller, ignoreCase, countOnly bool) (string, bool, error) {
+func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase, countOnly bool) (string, bool, error) {
 	// 默认大小写敏感（与 shell grep 一致）；-i 时加 (?i)。
 	//
 	// 为什么不再无条件 (?i)：那等于所有检索都不区分大小写，
@@ -2317,7 +2328,7 @@ func (s *Server) execGrep(pattern, scope string, c Caller, ignoreCase, countOnly
 			}
 			// 范围收窄：把块拼回索引地址形状，复用与 recall 同一套判定，
 			// 避免两处各写一份前缀匹配而慢慢走偏。
-			if scope != "" && !addrUnderScope(b.ID(), scope) {
+			if !matchAnyScope(b.ID(), scopes) {
 				continue
 			}
 			data, err := s.readBlock(b)
@@ -2473,17 +2484,12 @@ func (s *Server) execLs(rest string, c Caller) (string, error) {
 	if bad, ok := unknownFlag(rest); ok {
 		return "", fmt.Errorf("ls: unknown flag %q (supported: --scope)", bad)
 	}
-	day, scope := splitScope(rest)
+	day, scopes := splitScopes(rest)
 	if i := strings.Index(day, " "); i >= 0 {
 		// 剩余参数多于一个（如两个日期）——不猜，直接报。
 		return "", fmt.Errorf("ls: expected one date, got %q", day)
 	}
-	var scopeMatch func(addr string) bool
-	if scope == "" {
-		scopeMatch = func(string) bool { return true }
-	} else {
-		scopeMatch = func(addr string) bool { return addrUnderScope(addr, scope) }
-	}
+	scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
 
 	var matches []memory.Block
 	for _, tr := range s.trees {

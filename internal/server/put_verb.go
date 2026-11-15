@@ -472,6 +472,25 @@ func (s *Server) parseTreeAddress(addr string, c Caller) (project, branch, treeP
 // 默认不限制范围：调用方知道的树路径未必完整，强制写全会让
 // 「随口问一句」变成查参数。需要收窄时显式给。
 func splitScope(rest string) (query, scope string) {
+	q, scopes := splitScopes(rest)
+	if len(scopes) == 0 {
+		return q, ""
+	}
+	return q, scopes[0]
+}
+
+// splitScopes 解析 `--scope A` 以及 `--scope A||B||C`（分层召回）。
+//
+// 为什么要支持 `||`：扩展的分层召回一直发的是
+// `recall $Q --scope main||main.record||main.dev`，而服务端只认单个
+// scope——`||` 在 DSL 里是语句分隔符，于是整条命令被拆成
+// 「recall ... --scope main」+「main.record」+「main.dev」，
+// 后两段是非法指令。症状是分层召回 100% 失败、且失败被静默吞掉：
+// 调用方看到的是「没有命中」，于是以为记忆里真的没有。
+//
+// 这里在**语句切分之前**就把 `||` 认成 scope 分隔符，所以
+// `a||b||c` 不会被当成三条语句。
+func splitScopes(rest string) (query string, scopes []string) {
 	query = strings.TrimSpace(rest)
 	for {
 		i := strings.Index(query, "--scope")
@@ -480,14 +499,40 @@ func splitScope(rest string) (query, scope string) {
 		}
 		before := strings.TrimSpace(query[:i])
 		after := strings.TrimSpace(query[i+len("--scope"):])
-		fields := strings.Fields(after)
-		if len(fields) == 0 {
-			return before, scope
+		if after == "" {
+			query = before
+			break
 		}
-		scope = strings.Trim(fields[0], "/")
-		query = strings.TrimSpace(before + " " + strings.Join(fields[1:], " "))
+		// 取到第一个空白为止：scope 里不会有空格，但可能有 ||。
+		field := after
+		rest := ""
+		if j := strings.IndexAny(after, " \t\n"); j >= 0 {
+			field, rest = after[:j], strings.TrimSpace(after[j:])
+		}
+		// 逗号是折叠后的形状（protectLayeredScope 干的），竖线是原始写法。
+		for _, part := range strings.FieldsFunc(field, func(r rune) bool { return r == ',' || r == '|' }) {
+			part = strings.Trim(strings.TrimSpace(part), "/")
+			if part != "" {
+				scopes = append(scopes, part)
+			}
+		}
+		query = strings.TrimSpace(before + " " + rest)
 	}
-	return query, scope
+	return query, scopes
+}
+
+// matchAnyScope 判断地址是否落在任一 scope 内。
+// 空 scopes 表示不限制（与「没有 --scope」等价）。
+func matchAnyScope(addr string, scopes []string) bool {
+	if len(scopes) == 0 {
+		return true
+	}
+	for _, sc := range scopes {
+		if addrUnderScope(addr, sc) {
+			return true
+		}
+	}
+	return false
 }
 
 // unknownFlag 找出 DSL 里被误当搜索词的选项。

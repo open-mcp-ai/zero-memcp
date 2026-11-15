@@ -62,7 +62,55 @@ func normalizeTermInput(cmd string, vars map[string]string, args []string) (stri
 		return "", term.Subst{}, err
 	}
 
-	return injectMissingTarget(cmd), sub, nil
+	return injectMissingTarget(protectLayeredScope(cmd)), sub, nil
+}
+
+// protectLayeredScope 把 `--scope A||B||C` 折叠成 `--scope A,B,C`。
+//
+// 为什么必须在解析**之前**做：`||` 在 DSL 里是语句分隔符。
+// `recall foo --scope main||main.record` 会被当成
+// 「recall foo --scope main」+「main.record」两条语句，第二段是非法指令。
+//
+// 而扩展的分层召回一直发的就是这个形状——症状不是报错，是
+// **分层召回 100% 失败且被静默吞掉**：调用方看到「没有命中」，
+// 于是以为记忆里真的没有。这类「功能坏了但看不出坏」比慢和报错都贵。
+//
+// 折叠成逗号是为了让 scope 里不含任何 DSL 元字符；splitScopes
+// 两样都认，所以调用方写 `||` 或 `,` 都行。
+func protectLayeredScope(cmd string) string {
+	if !strings.Contains(cmd, "--scope") {
+		return cmd
+	}
+	var out strings.Builder
+	rest := cmd
+	for {
+		i := strings.Index(rest, "--scope")
+		if i < 0 {
+			out.WriteString(rest)
+			break
+		}
+		out.WriteString(rest[:i])
+		out.WriteString("--scope")
+		after := rest[i+len("--scope"):]
+
+		// scope 值：跳过前导空白后，取到第一个空白（或行尾）为止。
+		j := 0
+		for j < len(after) && (after[j] == ' ' || after[j] == '\t') {
+			j++
+		}
+		out.WriteString(after[:j])
+		val := after[j:]
+		end := len(val)
+		for k := 0; k < len(val); k++ {
+			if val[k] == ' ' || val[k] == '\t' || val[k] == '\n' || val[k] == ';' {
+				end = k
+				break
+			}
+		}
+		out.WriteString(strings.ReplaceAll(val[:end], "||", ","))
+		rest = val[end:]
+	}
+	return out.String()
 }
 
 // validateReferences 检查 payload 动词的行内引用都在 vars/args 里有值。

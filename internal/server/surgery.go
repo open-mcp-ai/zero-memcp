@@ -80,8 +80,12 @@ func (s *Server) execBranch(rest string, c Caller, defaultBranch string) (string
 	if err := repo.Fork(src, newBranch); err != nil {
 		return "", err
 	}
-	if err := s.Reload(); err != nil {
-		return "", err
+	// fork 只是复制了一个 ref，只刷新新分支，不重载整库。
+	if err := s.refreshBranch(project, newBranch); err != nil {
+		// 增量失败退回全量重建（保底）
+		if rerr := s.Reload(); rerr != nil {
+			return "", rerr
+		}
 	}
 	return fmt.Sprintf("created branch %s@%s from %s@%s (%s)", project, src, project, newBranch, sha[:8]), nil
 }
@@ -385,8 +389,20 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 		moved = append(moved, fmt.Sprintf("  %s@%s/%s -> %s@%s/%s", srcProj, srcBranch, srcPath, dstProj, dstBranch, target))
 	}
 
-	if err := s.Reload(); err != nil {
-		return "", err
+	// 跨分支操作只触碰源和目标分支，不需要整库 Reload。
+	touchedBranches := map[string]bool{}
+	for _, raw := range srcs {
+		_, sb, _, _ := s.parseBranchAddr(raw)
+		if sb != "" { touchedBranches[sb] = true }
+	}
+	touchedBranches[dstBranch] = true
+	for br := range touchedBranches {
+		if err := s.refreshBranch(dstProj, br); err != nil {
+			if rerr := s.Reload(); rerr != nil {
+				return "", rerr
+			}
+			break
+		}
 	}
 	verb := "copy"
 	if isMove {
@@ -848,9 +864,14 @@ func (s *Server) execArchive(rest string, c Caller) (string, error) {
 	if err := repo.ArchiveRef(branch); err != nil {
 		return "", err
 	}
-	if err := s.Reload(); err != nil {
-		return "", err
+	// 归档改变了「哪些分支存在」，索引里要把源分支摘掉、把归档分支加上。
+	// 只动这两条，不重载整库。
+	if err := s.refreshBranch(proj, dstBranch); err != nil {
+		if rerr := s.Reload(); rerr != nil {
+			return "", rerr
+		}
 	}
+	s.dropBranch(proj, branch)
 	return fmt.Sprintf("archived %s@%s -> %s@%s (%s); source ref moved to refs/archived/%s",
 		proj, branch, proj, dstBranch, shortSHA(sha), branch), nil
 }
@@ -918,8 +939,11 @@ func (s *Server) execReset(rest string, c Caller) (string, error) {
 	if err := repo.Fork(srcBranch, dstBranch); err != nil {
 		return "", err
 	}
-	if err := s.Reload(); err != nil {
-		return "", err
+	// reset 只改了 dstBranch 的内容，只刷新它。
+	if err := s.refreshBranch(dstProj, dstBranch); err != nil {
+		if rerr := s.Reload(); rerr != nil {
+			return "", rerr
+		}
 	}
 	msg := fmt.Sprintf("reset %s@%s -> %s@%s (%s)", dstProj, dstBranch, srcProj, srcBranch, shortSHA(srcSHA))
 	if oldSHA != "" {
@@ -974,8 +998,12 @@ func (s *Server) execChmod(rest string, c Caller, defaultBranch string) (string,
 	if err := repo.Write(branch, path, body, mode); err != nil {
 		return "", err
 	}
-	if err := s.Reload(); err != nil {
-		return "", fmt.Errorf("mode changed, but failed to rebuild index: %w", err)
+	// 改 mode 只改变这一个文件的 Rule/Hidden 属性，走 refreshPath 即可。
+	// 早先无条件 Reload()：改一个文件的执行位要扫整库 24,000 块。
+	if err := s.refreshPath(proj, branch, path, true); err != nil {
+		if rerr := s.refreshBranch(proj, branch); rerr != nil {
+			return "", fmt.Errorf("mode changed, but failed to rebuild index: %w", rerr)
+		}
 	}
 	label := "rule (injected every turn)"
 	if mode == gitstore.ModeContent {

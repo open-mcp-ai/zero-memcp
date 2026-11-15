@@ -191,11 +191,16 @@ func (s *Server) catchUpSemantic(reason string) {
 	}
 	s.semantic.mu.RUnlock()
 
-	if delta := s.semanticDelta(cached, prints); delta.needsEmbed == 0 && delta.removed == 0 && cached != nil {
+	delta := s.semanticDelta(cached, prints)
+	if delta.needsEmbed == 0 && delta.removed == 0 && cached != nil {
 		// 无事可做。上次有错误的话清掉。
 		s.semantic.mu.Lock()
 		s.semantic.err = ""
 		s.semantic.mu.Unlock()
+		// 记一行：全靠 blob hash 短路的块数。没有这行，就无法判断
+		// 「这次没读盘」是真的没读，还是恰好数据小。
+		s.logf("semantic: delta: %d reusable (%d skipped without reading), %d need embed, %d removed",
+			delta.reusable, delta.skippedByHash, delta.needsEmbed, delta.removed)
 		return
 	}
 
@@ -225,17 +230,69 @@ type semanticDeltaStats struct {
 	needsEmbed int // 指纹变了或新增，需要推理
 	reusable   int // 指纹没变，可直接复用
 	removed    int // 索引里有、树里已经没有
+	// skippedByHash 是靠 blob hash 短路、完全没有读盘的块数。
+	// 它是这个优化的唯一可观测证据——没有它就无法知道优化是否生效。
+	skippedByHash int
 }
 
 // semanticDelta 只做比对，不推理。
+//
+// 关键优化：内容没变就不读盘。
+//
+// 早先这里对每一条可索引的块都 readBlock + semanticText + sha256，
+// 只为回答「变没变」。24,000 块 × 每 30 秒一次 = 持续的全库读盘，
+// 而且它和用户的读写抢同一份磁盘。
+//
+// 现在先用 Block.Hash（git blob hash，写的时候就有）判：
+// hash 与上一轮记下的一致，就跳过读盘。只有 hash 变了或缺失时才读。
+//
+// 为什么不直接把 prints 换成 blob hash：
+// prints 是 vecindex 落盘格式的一部分，换坐标系会让存量指纹全部失效、
+// 触发一次 14,000 条的全量重算。这里走的是「旁路加速」——
+// 用 blobHashPrints 记住「这个 id 上一轮的 blob hash 是多少」，
+// 它对不上才去算真指纹。指纹语义完全不变。
 func (s *Server) semanticDelta(cached *vecindex.Index, prints map[string]string) semanticDeltaStats {
 	var st semanticDeltaStats
 	seen := make(map[string]bool, len(prints)+64)
+	// 本轮观察到的 blob hash，用来更新旁路表。
+	observed := make(map[string]string, len(prints)+64)
+
+	s.semantic.mu.RLock()
+	prevHashes := s.semantic.blobHashes
+	s.semantic.mu.RUnlock()
+
+	skippedByHash := 0
 	for _, t := range s.snapshotTrees() {
 		for _, b := range t.Indexable() {
 			if !isSemanticContent(b.Path) {
 				continue
 			}
+			id := b.ID()
+
+			// 旁路：blob hash 与上一轮相同 → 内容一定没变 → 不必读盘。
+			//
+			// 判据只需要三件事同时成立，缺一不可：
+			//   1. 这个块有 blob hash（脏层也有，写的时候就算过）
+			//   2. 与上一轮记下的 hash 相同
+			//   3. 指纹表里有它，且当前缓存里确实有这条向量
+			//
+			// 第 3 条不能省：否则「上次嵌入失败」的块会被当成
+			// 「没变、可复用」，而它根本没有向量——症状是
+			// 「语义搜不到这条，但 status 显示一切正常」。
+			if b.Hash != "" {
+				if prev, ok := prevHashes[id]; ok && prev == b.Hash {
+					if _, hadPrint := prints[id]; hadPrint && cached != nil && cached.Has(id) {
+						seen[id] = true
+						observed[id] = b.Hash
+						st.reusable++
+						skippedByHash++
+						continue
+					}
+				}
+			}
+
+			// 走到这里必须读盘。读到的结果决定 needsEmbed 还是 reusable。
+
 			data, err := s.readBlock(b)
 			if err != nil {
 				continue
@@ -244,8 +301,10 @@ func (s *Server) semanticDelta(cached *vecindex.Index, prints map[string]string)
 			if text == "" {
 				continue
 			}
-			id := b.ID()
 			seen[id] = true
+			if b.Hash != "" {
+				observed[id] = b.Hash
+			}
 			if old, ok := prints[id]; ok && old == fingerprint(text) && cached != nil && cached.Has(id) {
 				st.reusable++
 			} else {
@@ -258,5 +317,11 @@ func (s *Server) semanticDelta(cached *vecindex.Index, prints map[string]string)
 			st.removed++
 		}
 	}
+
+	s.semantic.mu.Lock()
+	s.semantic.blobHashes = observed
+	s.semantic.mu.Unlock()
+
+	st.skippedByHash = skippedByHash
 	return st
 }

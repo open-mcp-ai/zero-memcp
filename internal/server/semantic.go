@@ -83,6 +83,16 @@ type semanticState struct {
 	// 避免反复从磁盘读 manifest。
 	prints map[string]string
 
+	// blobHashes 是「id -> 上一轮看到的 git blob hash」。
+	//
+	// 旁路加速用，不参与落盘：它只回答「这个块的内容能不能确定
+	// 没变」。对得上就不必 readBlock + sha256——后台每 30 秒一次
+	// 的全库读盘就是这么省下来的。
+	//
+	// 值缺失是安全的：缺失只会让那一块退回读盘算指纹（慢一点，
+	// 但答案一样）。
+	blobHashes map[string]string
+
 	// building 为真表示后台正在建索引。此时 srecall 回落到 BM25，
 	// 而不是阻塞等——检索是热路径，不能让人等几十秒。
 	building bool

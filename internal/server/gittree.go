@@ -166,11 +166,20 @@ func (s *Server) addBlockLocked(project string, repo *gitstore.Repo, branch, pat
 		s.trees = append(s.trees, tree)
 	}
 
+	// blob hash 必须一起更新：后台语义追平靠它判断「内容变没变」，
+	// 不更新的话那个块会被永久当成「已嵌入、没变化」——
+	// 症状是「写了新内容，语义搜索还是旧向量」。
+	var hash string
+	if e, ok, serr := repo.Stat(branch, path); serr == nil && ok {
+		hash = e.Hash
+	}
+
 	// 同路径覆盖（同一毫秒内重写同一文件时不会产生重复条目）
 	for i := range tree.Blocks {
 		if tree.Blocks[i].Path == path {
 			tree.Blocks[i].Size = size
 			tree.Blocks[i].Time = mtime
+			tree.Blocks[i].Hash = hash
 			return
 		}
 	}
@@ -181,6 +190,7 @@ func (s *Server) addBlockLocked(project string, repo *gitstore.Repo, branch, pat
 		Path:    path,
 		Size:    size,
 		Time:    mtime,
+		Hash:    hash,
 		Read:    read,
 	})
 	tree.Sort()
@@ -218,6 +228,7 @@ func (s *Server) makeBlock(project, branch string, e gitstore.Entry, read func()
 		Path:    e.Path,
 		Size:    e.Size,
 		Time:    e.Time,
+		Hash:    e.Hash, // 免读盘判断内容变没变，见 Block.Hash
 		Read:    read,
 	}
 
@@ -457,4 +468,36 @@ func (s *Server) refreshBranches(project string, branches []string, reason strin
 	}
 	s.logf("%s: refreshed %d branch(es) of %s incrementally (%s)",
 		reason, len(branches), project, strings.Join(branches, ", "))
+}
+
+// dropBranch 从内存树与索引里摘掉一条分支（分支被归档/删除时用）。
+//
+// 为什么不能只 refreshBranch：归档之后源分支在 refs 里已经不存在，
+// 而索引里它的 doc 还在——症状是「归档了但还能 recall 到」。
+func (s *Server) dropBranch(project, branch string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, t := range s.trees {
+		if t.Project != project || t.Branch != branch {
+			continue
+		}
+		if s.idx != nil {
+			for _, b := range t.Indexable() {
+				s.idx.Remove(b.ID())
+			}
+		}
+		s.trees = append(s.trees[:i], s.trees[i+1:]...)
+		return
+	}
+}
+
+// allIndexableBlocks 返回全库可索引块的副本（测试与诊断用）。
+func (s *Server) allIndexableBlocks() []memory.Block {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []memory.Block
+	for _, t := range s.trees {
+		out = append(out, t.Indexable()...)
+	}
+	return out
 }

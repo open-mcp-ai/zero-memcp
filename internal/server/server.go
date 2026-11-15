@@ -2278,20 +2278,40 @@ func (s *Server) execGrep(pattern, scope string, c Caller, ignoreCase, countOnly
 		return "", false, fmt.Errorf("invalid regular expression: %w", err)
 	}
 
+	// 只持锁复制一份块列表，然后**在锁外**读盘。
+	//
+	// 早先这里是 defer RUnlock() 包住整个扫描：main.chat 有 5233 个文件，
+	// 一次 grep 要 1.4 秒，这 1.4 秒里所有写操作都被挡在锁外。
+	// 症状是「搜一次，写入卡一下」——而 grep 是模型最常用的动作。
+	//
+	// 必须真的复制一份 Blocks 切片，不能只拷 []*Tree：
+	// refreshPath 会原地改写 tree.Blocks（替换元素、增删），
+	// 只拿指针读就是数据竞争。Block 本身是值类型，切片复制后
+	// 每个元素（含 Read 闭包）都是稳定的。
+	type treeSnap struct {
+		project, branch string
+		blocks          []memory.Block
+	}
 	s.mu.RLock()
-	defer s.mu.RUnlock()
+	snaps := make([]treeSnap, 0, len(s.trees))
+	for _, tr := range s.trees {
+		blocks := make([]memory.Block, len(tr.Blocks))
+		copy(blocks, tr.Blocks)
+		snaps = append(snaps, treeSnap{project: tr.Project, branch: tr.Branch, blocks: blocks})
+	}
+	s.mu.RUnlock()
 
 	var sb strings.Builder
 	totalHits := 0
 	// 计数模式的统计口径：一行算一处，一块算一处（与 grep -c 的“行数”对齐）。
 	matchedLines, matchedBlocks := 0, 0
-	for _, tr := range s.trees {
+	for _, tr := range snaps {
 		// 只判挂载表会漏掉两层：凭证 cap 与 TOML 权限。
 		// grep 读的是正文，判据必须与 read 完全一致。
-		if !s.allowed(c, tr.Project, tr.Branch, configBitRead) {
+		if !s.allowed(c, tr.project, tr.branch, configBitRead) {
 			continue
 		}
-		for _, b := range tr.Blocks {
+		for _, b := range tr.blocks {
 			if b.Hidden {
 				continue
 			}

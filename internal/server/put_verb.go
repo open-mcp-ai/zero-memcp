@@ -374,20 +374,36 @@ func (s *Server) execTrees(rest string, c Caller) (TermResult, error) {
 		}
 		return TermResult{}, fmt.Errorf("%s", s.denyReason(c, proj, branch, configBitRead))
 	}
-	repo, err := s.projects.Get(proj)
-	if err != nil {
-		return TermResult{}, err
-	}
-	entries, err := repo.List(branch)
-	if err != nil {
-		return TermResult{}, err
+	// 目录从内存树里取，不再 repo.List 一遍。
+	//
+	// repo.List 会展开整条分支（main.chat = 5233 个路径，实测 751ms），
+	// 而这里只要目录名。内存树本来就是索引在用的那份，是同步过的：
+	// put 走 addBlockLocked、write/delete 走 refreshPath、push 走
+	// refreshBranch，都会立即更新它。
+	//
+	// 代价是「列出目录」依赖索引已加载；这在服务起来后恒成立
+	// （Reload 在 Listen 之前跑完），和 ls 用的是同一份数据。
+	paths := s.indexedPaths(proj, branch)
+	if paths == nil {
+		// 索引里没有这条分支（刚声明还没写过）：退回真扫一次。
+		repo, err := s.projects.Get(proj)
+		if err != nil {
+			return TermResult{}, err
+		}
+		entries, err := repo.List(branch)
+		if err != nil {
+			return TermResult{}, err
+		}
+		paths = make([]string, 0, len(entries))
+		for _, e := range entries {
+			paths = append(paths, e.Path)
+		}
 	}
 
 	seen := map[string]bool{}
 	var dirs []string
 	prefix = strings.Trim(prefix, "/")
-	for _, e := range entries {
-		p := e.Path
+	for _, p := range paths {
 		if prefix != "" {
 			if !strings.HasPrefix(p, prefix+"/") {
 				continue

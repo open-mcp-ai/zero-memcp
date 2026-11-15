@@ -186,6 +186,26 @@ func (s *Server) addBlockLocked(project string, repo *gitstore.Repo, branch, pat
 	tree.Sort()
 }
 
+// indexedPaths 返回内存树里某条分支的全部路径（副本）。
+//
+// 用于「只要路径」的场景（如 trees 列目录）。索引里没有这条分支时
+// 返回 nil，调用方据此退回真扫一次仓库。
+func (s *Server) indexedPaths(project, branch string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, t := range s.trees {
+		if t.Project != project || t.Branch != branch {
+			continue
+		}
+		out := make([]string, len(t.Blocks))
+		for i, b := range t.Blocks {
+			out[i] = b.Path
+		}
+		return out
+	}
+	return nil
+}
+
 // makeBlock 把一个 git 条目变成内存块，并就地判出 Rule / Hidden。
 //
 // 抽出来是为了 `write` / `delete` 能只更新一个 path——

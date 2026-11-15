@@ -137,12 +137,24 @@ func TestSemanticSelfHealsAfterOutage(t *testing.T) {
 
 	// 等一两个巡检周期：索引不该变多（服务不可用）
 	time.Sleep(500 * time.Millisecond)
-	if n := srv.semantic.idx.Len(); n != 2 {
-		t.Fatalf("服务不可用期间索引不应增长，实际 %d", n)
+	// 必须在锁内读：后台 catchUpSemantic 会并发替换 s.semantic.idx，
+	// 裸读是数据竞争（-race 会抓到，而且抓到的位置看起来像业务代码）。
+	srv.semantic.mu.RLock()
+	nDuringOutage := 0
+	if srv.semantic.idx != nil {
+		nDuringOutage = srv.semantic.idx.Len()
+	}
+	srv.semantic.mu.RUnlock()
+	if nDuringOutage != 2 {
+		t.Fatalf("服务不可用期间索引不应增长，实际 %d", nDuringOutage)
 	}
 
 	// ③ 服务恢复，等巡检自动补算
 	flaky.SetDown(false)
+	// 6 秒是够的——只要退避逻辑没把「后端不可用」当成「这片内容有问题」。
+	// 早先这里必须放宽到 20 秒才能偶发通过，根因是 noteSemanticFailure
+	// 给每条都记了 1 分钟退避；修好之后恢复原来的严格值。
+	// 这个数字本身就是那个 bug 的探针：退避一旦退回来，这里立刻红。
 	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
 		srv.semantic.mu.RLock()

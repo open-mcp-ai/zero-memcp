@@ -353,6 +353,18 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 			batchIn[k] = j.text
 		}
 		vs, berr := emb.EmbedBatch(batchIn)
+		if berr != nil && transientEmbedError(berr.Error()) {
+			// 后端整体不可用：整轮放弃，不做二分隔离。
+			//
+			// 为什么不能继续二分：二分会把「后端连不上」逐条判成
+			// 「这一片有问题」。一个 8,826 片的库会因此发出上万次
+			// 注定失败的请求，每次都要等超时——一轮维护能跑十几分钟，
+			// 而且把这些片全打进 quarantine。
+			//
+			// 正确做法是把这一轮当作「没跑过」：不记失败、不动退避，
+			// 下一轮（几十秒后）再试。后端恢复后自然就补上了。
+			return fmt.Errorf("embedding backend unavailable, aborting this round: %w", berr)
+		}
 		if berr != nil {
 			// 一整批失败不再等于整批报废。
 			//
@@ -887,19 +899,63 @@ func (s *Server) embedIsolate(emb embed.Embedder, jobs []job, failed *int) [][]f
 	return out
 }
 
+// transientEmbedError 判断一次嵌入失败是「环境不可用」还是「这片内容有问题」。
+//
+// 这个区分是关键。早先一律按「这片有问题」退避，于是：
+//   - 3060 断网 30 秒
+//   - 二分隔离把整批的每一条都判成「单独送进去也失败」
+//   - 每条各记一次失败，退避 1 分钟；下一轮再失败，退避 5 分钟
+//   - 几轮之后 30 分钟、2 小时
+//
+// 结果是「服务早就恢复了，但索引要等两小时才补」，
+// 而 status 只报数字，没人看得出是被退避卡住的。
+//
+// 环境不可用时**不该**退避：它跟这片内容无关，下一轮就该重试。
+func transientEmbedError(reason string) bool {
+	r := strings.ToLower(reason)
+	for _, sig := range []string{
+		"all providers failed",   // 整条降级链都连不上
+		"connection refused",     // 后端没起来
+		"no such host",           // DNS 解析不了
+		"service unavailable",    // 503
+		"timeout",                // 超时（含 context deadline exceeded）
+		"deadline exceeded",
+		"connection reset",
+		"broken pipe",
+		"eof",                    // 对端提前关闭
+	} {
+		if strings.Contains(r, sig) {
+			return true
+		}
+	}
+	return false
+}
+
 // noteSemanticFailure 记一次嵌入失败，并算出下次允许重试的时间。
 //
 // 退避按 1m、5m、30m、2h 递增并封顶：第一次失败多半是后端抖动，
 // 一分钟后重试就够；一直失败说明这片内容本身有问题（超长、二进制、
 // 编码坏），那就别让它在每轮维护里反复撞——每撞一次都要二分隔离
 // 一整批，代价远大于它自己的价值。
+//
+// 但「环境不可用」不走退避，见 transientEmbedError 的说明。
 func (s *Server) noteSemanticFailure(id, reason string) {
+	s.semantic.mu.Lock()
+	defer s.semantic.mu.Unlock()
+
+	// 环境不可用：不计入退避，也不污染 quarantine 的失败计数。
+	// 清掉这一条的退避状态，下一轮立刻重试。
+	if transientEmbedError(reason) {
+		if _, ok := s.semantic.quarantine[id]; ok {
+			delete(s.semantic.quarantine, id)
+		}
+		return
+	}
+
 	const (
 		base = time.Minute
 		max  = 2 * time.Hour
 	)
-	s.semantic.mu.Lock()
-	defer s.semantic.mu.Unlock()
 	if s.semantic.quarantine == nil {
 		s.semantic.quarantine = map[string]quarantineEntry{}
 	}

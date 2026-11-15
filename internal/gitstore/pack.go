@@ -33,7 +33,13 @@ type packIdx struct {
 }
 
 var (
-	packCacheMu sync.Mutex
+	// packCacheMu 保护 packCache。
+	//
+	// 必须是 RWMutex：这是**每一次对象读取**都要经过的路径。
+	// 早先用的是 Mutex，于是并发读盘被串行化了——并行扫描的 worker
+	// 全在这一把锁上排队，多核机器跑出串行的速度。
+	// 读多写极少（只有重扫 pack 目录时才写），正是 RWMutex 的形态。
+	packCacheMu sync.RWMutex
 	// packCache 的键是仓库路径，值是缓存条目。
 	//
 	// 光用路径做键是不够的：仓库目录会被外部进程改写。
@@ -81,11 +87,27 @@ func (r *Repo) loadPacks() ([]*packIdx, error) {
 	packDir := filepath.Join(r.Path, "objects", "pack")
 
 	// 指纹在锁外算：ReadDir 可能不便宜，而包目录通常不变。
+	//
+	// 注意：指纹**必须每次都算**。早先试过「指纹 5 秒内不重算」，
+	// 结果新写出的 pack 在那个窗口里不可见，报错是
+	// 「object ... is neither loose nor in any pack」——
+	// 一个性能优化直接变成了正确性 bug，而且报错完全指不到缓存。
+	// 省下来的那点 ReadDir 不值得这个风险。
 	fingerprint := r.packFingerprint(packDir)
+
+	// 命中就走共享锁：绝大多数读都是「缓存有效」，不该排队。
+	packCacheMu.RLock()
+	if e, ok := packCache[r.Path]; ok && e.fingerprint == fingerprint {
+		idxs := e.idxs
+		packCacheMu.RUnlock()
+		return idxs, nil
+	}
+	packCacheMu.RUnlock()
 
 	packCacheMu.Lock()
 	defer packCacheMu.Unlock()
 
+	// 双检：等锁期间别的 goroutine 可能已经重建好。
 	if e, ok := packCache[r.Path]; ok && e.fingerprint == fingerprint {
 		return e.idxs, nil
 	}
@@ -201,6 +223,22 @@ func (r *Repo) readPacked(sha string) (string, []byte, error) {
 			continue
 		}
 		return r.readAt(idx, off, 0)
+	}
+
+	// 找不到时强制失效再试一次。
+	//
+	// 外部 git gc / repack 不通知我们，缓存里的索引可能已过期。
+	// 让它自愈一次，比让调用方看到「不在任何 pack 里」有用得多——
+	// 那个报错完全指不到缓存，运维只会以为对象真的丢了。
+	r.InvalidatePackCache()
+	if idxs2, err2 := r.loadPacks(); err2 == nil {
+		for _, idx := range idxs2 {
+			off, ok := idx.find(raw)
+			if !ok {
+				continue
+			}
+			return r.readAt(idx, off, 0)
+		}
 	}
 	return "", nil, fmt.Errorf("object %s is neither loose nor in any pack", sha)
 }

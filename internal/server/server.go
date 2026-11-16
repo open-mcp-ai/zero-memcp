@@ -1723,18 +1723,36 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		for i, h := range hits {
 			snips[i] = s.snippet(h.Addr, query, 240)
 		}
+		// 「范围外有」的判定也必须在锁内做完。
+		//
+		// 2026-11-16 线上事故：这一句原本写在 s.mu.RUnlock() 之后，
+		// SearchCovered 遍历 idx.docLen / idx.postings 的同时，
+		// 并发写入在 refreshPath → AddWithTime 改同一批 map，于是
+		//
+		//     fatal error: concurrent map iteration and map write
+		//
+		// 这不是 error，是 runtime 直接杀进程——hub 整个挂了，没有 recover。
+		// 而这条路径只在「带 scope 且一条都没命中」时才走，所以它躲了很久：
+		// 直到 dev 的 agent 开始大量做带 scope 的 recall 且频繁落空才被撞出来。
+		//
+		// Index 自身没有互斥（并发保护在 Server.mu 这一层），
+		// 所以**每一次碰 idx 都必须在锁内**——这是纪律，而纪律会漏。
+		// 真正的解法见 docs：把索引读路径改成不可变快照 + atomic.Pointer。
+		var outsideAddr string
+		if len(hits) == 0 && len(scopes) > 0 {
+			if outside := s.idx.SearchCovered(query, 1, 0, recallMinCoverage, s.weightCount, allowedHit); len(outside) > 0 {
+				outsideAddr = outside[0].Addr
+			}
+		}
 		s.mu.RUnlock()
 		if len(hits) == 0 {
 			text := "no matches"
 			// 带 scope 却没命中时，多跑一次不带 scope 的判定：
 			// 「这个范围外有」比「记忆里没有」有用得多——前者说明
 			// 换个范围就找得到，后者会让人以为要重新写一遍。
-			if len(scopes) > 0 {
-				outside := s.idx.SearchCovered(query, 1, 0, recallMinCoverage, s.weightCount, allowedHit)
-				if len(outside) > 0 {
-					text = fmt.Sprintf("no matches under scope %s, but the same query matches %s elsewhere in your visible range",
-						strings.Join(scopes, "||"), s.projectOfAddr(outside[0].Addr))
-				}
+			if outsideAddr != "" {
+				text = fmt.Sprintf("no matches under scope %s, but the same query matches %s elsewhere in your visible range",
+					strings.Join(scopes, "||"), s.projectOfAddr(outsideAddr))
 			}
 			return TermResult{
 				Text:       text,

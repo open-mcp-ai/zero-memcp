@@ -14,10 +14,10 @@ func testTrees(srv *Server) []*memory.Tree { return srv.treeList() }
 // 测试里改块（例如替换 b.Read 计数）必须走这条路：已发布的树不可修改。
 func mutateTrees(t *testing.T, srv *Server, fn func(trees []*memory.Tree)) {
 	t.Helper()
-	release, err := srv.acquireTreeWrite()
-	if err != nil {
-		t.Fatalf("acquireTreeWrite: %v", err)
-	}
+	// 测试要改整份树列表，所以把所有分支的令牌都拿一遍容易死锁；
+	// 这里用一个专用的「全库」令牌：测试是单线程改完再发布，
+	// 不需要与生产写者真并发。
+	release := srv.testGlobalWriteTok()
 	defer release()
 
 	cur := srv.treeList()

@@ -143,7 +143,7 @@ func (s *Server) addBlockLocked(project string, repo *gitstore.Repo, branch, pat
 	if idx == nil {
 		return
 	}
-	release, err := s.acquireTreeWrite()
+	release, err := s.acquireBranchWrite(project, branch)
 	if err != nil {
 		return
 	}
@@ -397,7 +397,7 @@ func (s *Server) refreshPath(project, branch, path string, exists bool) error {
 		}
 	}
 
-	release, lerr := s.acquireTreeWrite()
+	release, lerr := s.acquireBranchWrite(project, branch)
 	if lerr != nil {
 		return lerr
 	}
@@ -487,7 +487,7 @@ func (s *Server) refreshBranch(project, branch string) error {
 		}
 	}
 
-	release, lerr := s.acquireTreeWrite()
+	release, lerr := s.acquireBranchWrite(project, branch)
 	if lerr != nil {
 		return lerr
 	}
@@ -560,7 +560,7 @@ func (s *Server) refreshBranches(project string, branches []string, reason strin
 // 为什么不能只 refreshBranch：归档之后源分支在 refs 里已经不存在，
 // 而索引里它的 doc 还在——症状是「归档了但还能 recall 到」。
 func (s *Server) dropBranch(project, branch string) {
-	release, err := s.acquireTreeWrite()
+	release, err := s.acquireBranchWrite(project, branch)
 	if err != nil {
 		return
 	}

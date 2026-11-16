@@ -146,10 +146,12 @@ type Server struct {
 	// 现在：读路径一次 Load 拿到底，写路径取 treeTok 令牌后
 	// 造新快照再 Store。Index 自身也已无锁（见 internal/index）。
 	treesPtr atomic.Pointer[treeSet]
-	// treeTok 串行化记忆库写者（重建分支索引 + 换树）。
-	// treeTokOnce 保证它被懒创建——零值 Server 也能安全取用。
-	treeTok     chan struct{}
-	treeTokOnce sync.Once
+	// branchToks 按 (project@branch) 分段串行化记忆库写者。
+	//
+	// 早先这里是全库唯一的一把令牌。那把令牌让「写一条记忆」必须排队
+	// 等「任何其他分支的索引重建」——正是「容纳更多 agent」的反面。
+	// 分段后不同分支完全并行；同分支排队，因为它们改的是同一棵树。
+	branchToks sync.Map // "project@branch" -> chan struct{}
 
 	// clock 告诉客户端「记忆库有更新」。
 	//

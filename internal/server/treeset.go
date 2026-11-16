@@ -46,21 +46,28 @@ func (s *Server) idxNow() *index.Index {
 	return nil
 }
 
-// treeTokOf 返回写令牌 channel（懒创建）。
+// branchTok 返回某条分支的写令牌（懒创建，每分支一把）。
 //
-// 必须懒创建：Server 有零值构造的路径（测试、以及 New 之前的早期装配），
-// 直接对 nil channel 做 select 会永久阻塞——症状是所有写入卡满 60 秒
-// 然后超时失败，看起来像「索引重建慢」，实际是令牌根本不存在。
-func (s *Server) treeTokOf() chan struct{} {
-	s.treeTokOnce.Do(func() {
-		s.treeTok = make(chan struct{}, 1)
-	})
-	return s.treeTok
+// 为什么按分支分段而不是全局一把：写一条记忆只需要重建它所在的那条
+// 分支的索引。全局令牌会让「agent A 写一条」等「agent B 重建一个
+// 五千篇的分支」——那几秒里所有 agent 都写不进去。
+// 分段后：不同分支完全并行，同分支排队（这是正确的，它们要改同一棵树）。
+//
+// 必须懒创建：Server 有零值构造路径（测试、早期装配），
+// nil channel 上的 select 永久阻塞——症状是写入卡满 60 秒再超时。
+func (s *Server) branchTok(project, branch string) chan struct{} {
+	key := project + "@" + branch
+	if v, ok := s.branchToks.Load(key); ok {
+		return v.(chan struct{})
+	}
+	tok := make(chan struct{}, 1)
+	v, _ := s.branchToks.LoadOrStore(key, tok)
+	return v.(chan struct{})
 }
 
-// acquireTreeWrite 取写令牌。返回的 release 必须调用。
-func (s *Server) acquireTreeWrite() (func(), error) {
-	tok := s.treeTokOf()
+// acquireBranchWrite 取某条分支的写令牌。返回的 release 必须调用。
+func (s *Server) acquireBranchWrite(project, branch string) (func(), error) {
+	tok := s.branchTok(project, branch)
 	select {
 	case tok <- struct{}{}:
 		return func() { <-tok }, nil
@@ -72,9 +79,11 @@ func (s *Server) acquireTreeWrite() (func(), error) {
 	case tok <- struct{}{}:
 		return func() { <-tok }, nil
 	case <-t.C:
-		return nil, fmt.Errorf("记忆库写令牌等待超时（%v）：有写者卡在重建索引上", treeWriteTimeout)
+		return nil, fmt.Errorf("%s@%s: 分支写令牌等待超时（%v）：有写者卡在重建这条分支的索引上",
+			project, branch, treeWriteTimeout)
 	}
 }
+
 
 // publishTrees 用新的树列表替换当前快照（必须在持写令牌时调用）。
 func (s *Server) publishTrees(trees []*memory.Tree, idx *index.Index) {
@@ -104,4 +113,11 @@ func findTree(trees []*memory.Tree, project, branch string) int {
 		}
 	}
 	return -1
+}
+
+// testGlobalWriteTok 是测试专用的全库写令牌。
+func (s *Server) testGlobalWriteTok() func() {
+	tok := s.branchTok("_test", "_global")
+	tok <- struct{}{}
+	return func() { <-tok }
 }

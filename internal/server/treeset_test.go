@@ -28,3 +28,13 @@ func mutateTrees(t *testing.T, srv *Server, fn func(trees []*memory.Tree)) {
 	fn(next)
 	srv.publishTrees(next, srv.idxNow())
 }
+
+// semQuar 读一条退避记录（测试专用）。
+func semQuar(s *Server, id string) quarantineEntry {
+	v, ok := s.semantic.quarantine.Load(id)
+	if !ok {
+		return quarantineEntry{}
+	}
+	e, _ := v.(quarantineEntry)
+	return e
+}

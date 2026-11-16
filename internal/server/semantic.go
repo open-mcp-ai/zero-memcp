@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
@@ -123,43 +124,71 @@ func isSemanticBlock(b memory.Block) bool {
 // 又不至于把跨语言的正确答案筛掉——那是这个功能存在的理由。
 const semanticMinScore = 0.35
 
-// semanticState 是向量侧的运行状态。
-type semanticState struct {
-	mu    sync.RWMutex
-	ready bool
-	idx   *vecindex.Index
-	// emb 是常驻推理会话。模型 449MB，每条查询重新加载会把
-	// 延迟从毫秒推到秒级，而且反复 InitializeEnvironment /
-	// DestroyEnvironment 在并发下不可靠。
-	emb embed.Embedder
-	err string // 构建失败的原因，供 status 报告
-	// prints 是当前 idx 的内容指纹表（id -> fingerprint(text)）。
-	// 与 idx 同生共死：每次替换 idx 时一起换。后台追平用它做增量比对，
-	// 避免反复从磁盘读 manifest。
+// semanticSnapshot 是 (idx, prints) 的原子快照。
+//
+// 它们必须同生共死：每次替换 idx 时一起换，读者 Load 一次就拿到
+// 匹配的一对，不会读到「索引是新的、指纹还是旧的」导致增量判定全部失效。
+type semanticSnapshot struct {
+	idx    *vecindex.Index
 	prints map[string]string
+}
 
-	// blobHashes 是「id -> 上一轮看到的 git blob hash」。
-	//
-	// 旁路加速用，不参与落盘：它只回答「这个块的内容能不能确定
-	// 没变」。对得上就不必 readBlock + sha256——后台每 30 秒一次
-	// 的全库读盘就是这么省下来的。
-	//
-	// 值缺失是安全的：缺失只会让那一块退回读盘算指纹（慢一点，
-	// 但答案一样）。
-	blobHashes map[string]string
+// semanticState 是向量侧的运行状态。
+//
+// # 为什么没有锁
+//
+// 拆成三个维度的无锁原语：
+//   - active：(idx, prints) 的原子快照，整体替换；
+//   - emb / err：atomic.Pointer；
+//   - quarantine / blobHashes：sync.Map，每个 id 互相独立；
+//   - building：atomic.Bool（CAS 去重）。
+//
+// 读者（srecall 热路径）全程只做 Load，永不阻塞后台构建；
+// 后台构建（几十秒网络推理）在锁外跑完，最后一次 Store 换上去。
+type semanticState struct {
+	emb        atomic.Pointer[embedHolder]
+	active     atomic.Pointer[semanticSnapshot]
+	err        atomic.Pointer[string]
+	building   atomic.Bool
+	quarantine sync.Map // id -> quarantineEntry
+	blobHashes sync.Map // id -> git blob hash
+}
 
-	// building 为真表示后台正在建索引。此时 srecall 回落到 BM25，
-	// 而不是阻塞等——检索是热路径，不能让人等几十秒。
-	building bool
+type embedHolder struct{ emb embed.Embedder }
 
-	// quarantine 记录「确定嵌不进去」的切片与它的退避状态。
-	//
-	// 为什么必须有它：后台追平每 30 秒跑一次，判据是「指纹不在 prints 里
-	// 就算新增」。一条永远返回 413 的切片因此每轮都会被重新送进去，
-	// 连带它所在的那一批都被二分隔离——实测这会让维护环每 30 秒重算
-	// 一次全量，CPU 长期 100%，而且日志每轮刷同样的错误。
-	// 失败不是不能有，失败必须有代价上限。
-	quarantine map[string]quarantineEntry
+func (st *semanticState) getEmb() embed.Embedder {
+	if h := st.emb.Load(); h != nil {
+		return h.emb
+	}
+	return nil
+}
+
+func (st *semanticState) setEmb(emb embed.Embedder) {
+	st.emb.Store(&embedHolder{emb: emb})
+}
+
+func (st *semanticState) getActive() *semanticSnapshot {
+	return st.active.Load()
+}
+
+func (st *semanticState) setActive(idx *vecindex.Index, prints map[string]string) {
+	st.active.Store(&semanticSnapshot{idx: idx, prints: prints})
+}
+
+func (st *semanticState) getErr() string {
+	if p := st.err.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+func (st *semanticState) setErr(err string) {
+	st.err.Store(&err)
+}
+
+func (st *semanticState) isReady() bool {
+	snap := st.getActive()
+	return snap != nil && snap.idx != nil && st.getEmb() != nil
 }
 
 // quarantineEntry 是一条失败切片的退避状态。
@@ -207,16 +236,12 @@ func (s *Server) initSemantic() {
 		// 启动时全链不可用不再意味着「语义功能死刑」：
 		// 维护协程会周期性重试 OpenChain，嵌入服务恢复后自动补算。
 		// 这正是「写入时 Ollama 没开，开了之后自动追平」的实现路径。
-		s.semantic.mu.Lock()
-		s.semantic.err = fmt.Sprintf("open embedder: %v", err)
-		s.semantic.mu.Unlock()
-		s.logf("semantic: %s — will retry in background", s.semantic.err)
+		s.semantic.setErr(fmt.Sprintf("open embedder: %v", err))
+		s.logf("semantic: %s — will retry in background", s.semantic.getErr())
 		s.startSemanticMaintainer(s.cfg.Semantic.MaintainInterval)
 		return
 	}
-	s.semantic.mu.Lock()
-	s.semantic.emb = emb
-	s.semantic.mu.Unlock()
+	s.semantic.setEmb(emb)
 	s.logf("semantic: embedder ready (dim=%d, model=%s, providers=%v, active=%s)",
 		emb.Dim(), emb.Name(), emb.Providers(), emb.ActiveLabel())
 
@@ -236,11 +261,7 @@ func (s *Server) initSemantic() {
 				cached = ix
 				// 先挂上去：即使接下来要增量补算，检索也已可用，
 				// 不必让 srecall 回落到 BM25 等增量跑完。
-				s.semantic.mu.Lock()
-				s.semantic.idx = ix
-				s.semantic.prints = prints
-				s.semantic.ready = true
-				s.semantic.mu.Unlock()
+				s.semantic.setActive(ix, prints)
 				s.logf("semantic: loaded %d vectors from cache (%d prints)", ix.Len(), len(prints))
 			}
 		}
@@ -302,9 +323,7 @@ func (s *Server) semanticHeads() map[string]string {
 // 复用常驻 embedder，不自己 Open：模型 449MB，建完索引后它还要
 // 继续服务查询，不能在这里 Close 掉。
 func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cached *vecindex.Index, cachedPrints map[string]string) error {
-	s.semantic.mu.RLock()
-	emb := s.semantic.emb
-	s.semantic.mu.RUnlock()
+	emb := s.semantic.getEmb()
 	if emb == nil {
 		return fmt.Errorf("embedder not initialized")
 	}
@@ -356,22 +375,24 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 	// 次数算出来了。跳过的切片不会进 prints，所以它仍被算作「欠着」，
 	// 时间一到就会自动重试：既不会永久放弃，也不会每轮都撞。
 	now := time.Now()
-	s.semantic.mu.RLock()
-	quar := s.semantic.quarantine
 	var skipped int
 	for _, j := range jobs {
-		if e, ok := quar[j.id]; ok && e.nextTry.After(now) {
-			skipped++
+		if v, ok := s.semantic.quarantine.Load(j.id); ok {
+			e := v.(quarantineEntry)
+			if e.nextTry.After(now) {
+				skipped++
+			}
 		}
 	}
-	s.semantic.mu.RUnlock()
 	if skipped > 0 {
 		s.logf("semantic: %d slice(s) in backoff, skipped this round", skipped)
 	}
 
 	for _, j := range jobs {
-		if e, ok := quar[j.id]; ok && e.nextTry.After(now) {
-			continue
+		if v, ok := s.semantic.quarantine.Load(j.id); ok {
+			if e, _ := v.(quarantineEntry); e.nextTry.After(now) {
+				continue
+			}
 		}
 		fp := fingerprint(j.text)
 		if old, had := cachedPrints[j.id]; had && old == fp && cached != nil && cached.Has(j.id) {
@@ -464,11 +485,7 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 		}
 	}
 
-	s.semantic.mu.Lock()
-	s.semantic.idx = ix
-	s.semantic.prints = prints
-	s.semantic.ready = true
-	s.semantic.mu.Unlock()
+	s.semantic.setActive(ix, prints)
 
 	s.logf("semantic: ready with %d vectors (%d reused, %d failed) in %.1fs",
 		ix.Len(), reused, failed, time.Since(start).Seconds())
@@ -499,14 +516,12 @@ func semanticText(raw string) string {
 
 // semanticSearch 在向量索引上查一次。返回空表示未启用或未就绪。
 func (s *Server) semanticSearch(query string) []vecindex.Hit {
-	s.semantic.mu.RLock()
-	ix := s.semantic.idx
-	emb := s.semantic.emb
-	ready := s.semantic.ready
-	s.semantic.mu.RUnlock()
-	if !ready || ix == nil || emb == nil {
+	snap := s.semantic.getActive()
+	emb := s.semantic.getEmb()
+	if snap == nil || snap.idx == nil || emb == nil {
 		return nil
 	}
+	ix := snap.idx
 
 	qv, err := emb.Embed(query)
 	if err != nil {
@@ -631,12 +646,9 @@ func (s *Server) addrToVirtualFor(id string) string {
 
 // semanticStatus 给 status 动词报告向量侧状态。
 func (s *Server) semanticStatus() string {
-	s.semantic.mu.RLock()
-	defer s.semantic.mu.RUnlock()
-	// 后端详情（降级链的当前生效应是排查「为什么召回变慢/变差」
-	// 的第一入口）：不依赖锁，Chain 自己是并发安全的。
+	snap := s.semantic.getActive()
 	var backend string
-	if emb := s.semantic.emb; emb != nil {
+	if emb := s.semantic.getEmb(); emb != nil {
 		if ch, ok := emb.(*embed.Chain); ok {
 			backend = " via " + ch.ActiveLabel()
 			// 只在「当前确实在用备用后端」时报降级原因。
@@ -656,12 +668,12 @@ func (s *Server) semanticStatus() string {
 		}
 	}
 	switch {
-	case s.semantic.building:
+	case s.semantic.building.Load():
 		return "building" + backend
-	case s.semantic.ready && s.semantic.idx != nil:
-		return fmt.Sprintf("ready (%d vectors)%s", s.semantic.idx.Len(), backend)
-	case s.semantic.err != "":
-		return "unavailable: " + s.semantic.err
+	case snap != nil && snap.idx != nil:
+		return fmt.Sprintf("ready (%d vectors)%s", snap.idx.Len(), backend)
+	case s.semantic.getErr() != "":
+		return "unavailable: " + s.semantic.getErr()
 	default:
 		return "not initialized"
 	}
@@ -993,15 +1005,8 @@ func transientEmbedError(reason string) bool {
 //
 // 但「环境不可用」不走退避，见 transientEmbedError 的说明。
 func (s *Server) noteSemanticFailure(id, reason string) {
-	s.semantic.mu.Lock()
-	defer s.semantic.mu.Unlock()
-
-	// 环境不可用：不计入退避，也不污染 quarantine 的失败计数。
-	// 清掉这一条的退避状态，下一轮立刻重试。
 	if transientEmbedError(reason) {
-		if _, ok := s.semantic.quarantine[id]; ok {
-			delete(s.semantic.quarantine, id)
-		}
+		s.semantic.quarantine.Delete(id)
 		return
 	}
 
@@ -1009,10 +1014,10 @@ func (s *Server) noteSemanticFailure(id, reason string) {
 		base = time.Minute
 		max  = 2 * time.Hour
 	)
-	if s.semantic.quarantine == nil {
-		s.semantic.quarantine = map[string]quarantineEntry{}
+	var e quarantineEntry
+	if v, ok := s.semantic.quarantine.Load(id); ok {
+		e = v.(quarantineEntry)
 	}
-	e := s.semantic.quarantine[id]
 	e.failures++
 	e.lastErr = reason
 	back := base
@@ -1023,5 +1028,5 @@ func (s *Server) noteSemanticFailure(id, reason string) {
 		back = max
 	}
 	e.nextTry = time.Now().Add(back)
-	s.semantic.quarantine[id] = e
+	s.semantic.quarantine.Store(id, e)
 }

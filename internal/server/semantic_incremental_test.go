@@ -115,8 +115,8 @@ func TestSemanticIncremental(t *testing.T) {
 	if calls := embedCalls.Load(); calls != 1 {
 		t.Fatalf("无改动二次启动推理次数应为 1（仅 probe，0 块），实际 %d", calls)
 	}
-	if s2.semantic.idx.Len() != 3 {
-		t.Fatalf("复用后向量总数应为 3，实际 %d", s2.semantic.idx.Len())
+	if s2.semantic.getActive().idx.Len() != 3 {
+		t.Fatalf("复用后向量总数应为 3，实际 %d", s2.semantic.getActive().idx.Len())
 	}
 	s2.Close()
 
@@ -152,12 +152,10 @@ func TestSemanticIncremental(t *testing.T) {
 	// 这里等追平真正完成（embedCalls 达到 3 = 1 probe + 2 块）。
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		s3.semantic.mu.RLock()
 		n := 0
-		if s3.semantic.idx != nil {
-			n = s3.semantic.idx.Len()
+		if snap := s3.semantic.getActive(); snap != nil && snap.idx != nil {
+			n = snap.idx.Len()
 		}
-		s3.semantic.mu.RUnlock()
 		if n >= 4 && embedCalls.Load() >= 3 {
 			break
 		}
@@ -167,12 +165,10 @@ func TestSemanticIncremental(t *testing.T) {
 	if calls := embedCalls.Load(); calls != 3 {
 		t.Fatalf("部分改动推理次数应为 3（1 probe + 2 块），实际 %d", calls)
 	}
-	s3.semantic.mu.RLock()
 	n := 0
-	if s3.semantic.idx != nil {
-		n = s3.semantic.idx.Len()
+	if snap := s3.semantic.getActive(); snap != nil && snap.idx != nil {
+		n = snap.idx.Len()
 	}
-	s3.semantic.mu.RUnlock()
 	if n != 4 {
 		t.Fatalf("增量后向量总数应为 4，实际 %d", n)
 	}
@@ -183,10 +179,8 @@ func waitForSemanticReady(t *testing.T, s *Server) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		s.semantic.mu.RLock()
-		ready := s.semantic.ready
-		building := s.semantic.building
-		s.semantic.mu.RUnlock()
+		ready := s.semantic.isReady()
+		building := s.semantic.building.Load()
 		if ready && !building {
 			return
 		}

@@ -51,7 +51,7 @@ func TestSemanticFailureBackoffGrows(t *testing.T) {
 	var prev time.Duration
 	for i := 0; i < 6; i++ {
 		s.noteSemanticFailure("x.md", "boom")
-		e := s.semantic.quarantine["x.md"]
+		e := semQuar(s, "x.md")
 		wait := time.Until(e.nextTry)
 		// 到达封顶后各次等待相同，留 1 秒容差避免把「封顶」判成「退步」。
 		if i > 0 && wait < prev-1*time.Second {
@@ -62,7 +62,7 @@ func TestSemanticFailureBackoffGrows(t *testing.T) {
 		}
 		prev = wait
 	}
-	if s.semantic.quarantine["x.md"].failures != 6 {
+	if semQuar(s, "x.md").failures != 6 {
 		t.Errorf("failure counter not tracked")
 	}
 }

@@ -110,9 +110,7 @@ func TestSemanticLongDocDoesNotFailItsBatch(t *testing.T) {
 	s1.initSemantic()
 	waitForSemanticReady(t, s1)
 
-	s1.semantic.mu.RLock()
-	got := s1.semantic.idx.Len()
-	s1.semantic.mu.RUnlock()
+	got := s1.semantic.getActive().idx.Len()
 	s1.Close()
 
 	// 三条都得进索引：长文档被截断后成功，邻居不受牵连。

@@ -14,7 +14,8 @@ package embed
 import (
 	"fmt"
 	"math"
-	"sync"
+	"sync/atomic"
+	"time"
 
 	ort "github.com/yalue/onnxruntime_go"
 )
@@ -39,18 +40,27 @@ const MaxTokens = 512
 // 平台上——Mac 的 .dylib 编不出 Linux 二进制，容器化和交叉编译
 // 都被它卡住。它退居「零外部进程」的兜底位，主力让给 HTTP 后端。
 type LocalONNX struct {
-	mu   sync.Mutex
-	sess *ort.DynamicAdvancedSession
+	// sess 用 atomic.Pointer：Close 会在运行中把它置空，而 Embed 可能正在跑。
+	// 用原子指针 + Swap 让「取到会话」与「销毁会话」不打架，
+	// 也不会出现 Close 后 Embed 还在用一个已销毁的会话。
+	sess atomic.Pointer[ort.DynamicAdvancedSession]
 	tok  *BertTokenizer
-	dim  int // 模型输出维度，首次推理时实测写入
+	dim  int // 构造时确定，之后只读
+	// run 是一槽 channel 令牌，串行化推理。
+	//
+	// 为什么还得串行：ONNX session 本身不是并发安全的，这是库的约束，
+	// 不是我们可以选择的地方。区别在于用什么原语表达这个约束：
+	// 用 Mutex 的话，一次卡死的推理会让所有后来者永久阻塞且无法退出；
+	// 用令牌 + 超时，最坏结果是「这一次报错」。
+	run chan struct{}
 }
 
-// Dim 返回模型输出维度。首次调用会跑一次空推理实测。
-func (e *LocalONNX) Dim() int {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	return e.dim
-}
+// embedRunTimeout 是等推理令牌的上界。推理本身可能耗时数十秒，
+// 所以这里给的余量比普通写令牌大，但仍然有上界。
+const embedRunTimeout = 2 * time.Minute
+
+// Dim 返回模型输出维度（构造时已确定，只读）。
+func (e *LocalONNX) Dim() int { return e.dim }
 
 // Config 描述去哪找三样东西：动态库、模型、词表。
 type Config struct {
@@ -97,14 +107,23 @@ func OpenLocal(cfg Config) (*LocalONNX, error) {
 		return nil, fmt.Errorf("model output dim is dynamic (%v); cannot determine vector size", outDims)
 	}
 	_ = ins
-	return &LocalONNX{sess: sess, tok: tok, dim: dim}, nil
+	e := &LocalONNX{tok: tok, dim: dim, run: make(chan struct{}, 1)}
+	e.sess.Store(sess)
+	return e, nil
 }
 
 // Close 释放会话与运行时。
+//
+// 先拿推理令牌再销毁：否则可能把一个正在被 Run 使用的会话销毁掉。
 func (e *LocalONNX) Close() error {
-	if e.sess != nil {
-		e.sess.Destroy()
-		e.sess = nil
+	select {
+	case e.run <- struct{}{}:
+	case <-time.After(embedRunTimeout):
+		return fmt.Errorf("onnx: 等推理结束超时，会话未释放")
+	}
+	defer func() { <-e.run }()
+	if sess := e.sess.Swap(nil); sess != nil {
+		sess.Destroy()
 	}
 	ort.DestroyEnvironment()
 	return nil
@@ -138,8 +157,17 @@ func (e *LocalONNX) EmbedBatch(texts []string) ([][]float32, error) {
 func (e *LocalONNX) Embed(text string) ([]float32, error) {
 	ids, mask, types := e.tok.Encode(text)
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	sess := e.sess.Load()
+	if sess == nil {
+		return nil, fmt.Errorf("onnx: 会话已关闭")
+	}
+
+	select {
+	case e.run <- struct{}{}:
+	case <-time.After(embedRunTimeout):
+		return nil, fmt.Errorf("onnx: 等推理令牌超时（%v）", embedRunTimeout)
+	}
+	defer func() { <-e.run }()
 
 	shape := ort.NewShape(1, int64(MaxTokens))
 	inIDs, err := ort.NewTensor(shape, ids)
@@ -165,7 +193,7 @@ func (e *LocalONNX) Embed(text string) ([]float32, error) {
 	}
 	defer out.Destroy()
 
-	if err := e.sess.Run([]ort.Value{inIDs, inMask, inTypes}, []ort.Value{out}); err != nil {
+	if err := sess.Run([]ort.Value{inIDs, inMask, inTypes}, []ort.Value{out}); err != nil {
 		return nil, err
 	}
 

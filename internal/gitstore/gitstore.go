@@ -64,19 +64,24 @@ type Repo struct {
 	// Path 是仓库目录（通常以 .git 结尾）。
 	Path string
 
-	// fs 与 locker 抽象底层存储与并发锁。
-	// 默认使用本地磁盘与进程内锁，但可由外部注入替换。
-	fs     FS
-	locker Locker
-
-	// mu 保护仓库实例自身的字段。
-	mu sync.Mutex
+	// fsBox / lockerBox 是懒初始化的原子槽。
+	//
+	// 原来用 mu 保护「为 nil 就赋值」——那是典型的「检查并置位」，
+	// 靠人保证多条 return 路径配平锁。CompareAndSwap 把检查与置位
+	// 合成一次原子操作，对错当场可判。
+	fsBox     atomic.Pointer[fsHolder]
+	lockerBox atomic.Pointer[lockerHolder]
 
 	// writer 是单线程脏层写者。Write/Delete 只把任务投递进队列就返回；
 	// Read/List/Commit 会排一个 barrier，保证此前已接受的任务先处理完。
 	writerOnce sync.Once
 	writerCh   chan dirtyTask
-	writerMu   sync.Mutex // 串行化入队与关闭；barrier 必须排在先前写入之后
+	// writerTok 是一槽 channel 令牌，串行化「入队 / 关闭 / barrier」这三种动作。
+	// barrier 必须排在先前写入之后，这个顺序由令牌保证。
+	//
+	// 为什么不用 Mutex：下面三个函数每一个都有 3~5 条 return 路径，
+	// 每条都必须记得 unlock。令牌配 defer 只有一条路径需要写对。
+	writerTokPtr atomic.Pointer[chan struct{}]
 	writerSize atomic.Int64
 	writerErr  error         // worker 累积的异步错误，下一次 barrier 返回并清空
 	writerDown chan struct{} // worker 退出后关闭，Close 等它
@@ -84,29 +89,66 @@ type Repo struct {
 
 }
 
+type fsHolder struct{ fs FS }
+type lockerHolder struct{ locker Locker }
+
+// writerTok 返回写者令牌（懒创建）。零值 Repo 也能用。
+func (r *Repo) writerTok() chan struct{} {
+	if p := r.writerTokPtr.Load(); p != nil {
+		return *p
+	}
+	ch := make(chan struct{}, 1)
+	if r.writerTokPtr.CompareAndSwap(nil, &ch) {
+		return ch
+	}
+	return *r.writerTokPtr.Load()
+}
+
+// lockWriter 取写者令牌，返回释放函数。超时后返回错误而不是无限等待。
+func (r *Repo) lockWriter(what string) (func(), error) {
+	ch := r.writerTok()
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	default:
+	}
+	t := time.NewTimer(30 * time.Second)
+	defer t.Stop()
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-t.C:
+		return nil, fmt.Errorf("%s: 等写者令牌超时（30s），有写者卡在落盘上", what)
+	}
+}
+
 // FS 返回当前仓库使用的存储抽象。
 func (r *Repo) FS() FS {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.fs == nil {
-		r.fs = DefaultFS()
+	if h := r.fsBox.Load(); h != nil {
+		return h.fs
 	}
-	return r.fs
+	h := &fsHolder{fs: DefaultFS()}
+	if r.fsBox.CompareAndSwap(nil, h) {
+		return h.fs
+	}
+	return r.fsBox.Load().fs
 }
 
 // Locker 返回当前仓库使用的锁管理器。
 func (r *Repo) Locker() Locker {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.locker == nil {
-		r.locker = newLocalLocker()
+	if h := r.lockerBox.Load(); h != nil {
+		return h.locker
 	}
-	return r.locker
+	h := &lockerHolder{locker: newLocalLocker()}
+	if r.lockerBox.CompareAndSwap(nil, h) {
+		return h.locker
+	}
+	return r.lockerBox.Load().locker
 }
 
 func (r *Repo) rlockDirty() func() { return r.Locker().RLockDirty() }
 func (r *Repo) lockDirty() func()  { return r.Locker().LockDirty() }
-func (r *Repo) lockNode(ref, dir string) func() {
+func (r *Repo) lockNode(ref, dir string) (func(), error) {
 	return r.Locker().LockNode(ref, dir)
 }
 
@@ -144,7 +186,13 @@ func OpenWith(path string, storage FS, locker Locker) (*Repo, error) {
 			return nil, fmt.Errorf("%s is not a bare repository (missing %s)", abs, want)
 		}
 	}
-	r := &Repo{Path: abs, fs: storage, locker: locker}
+	r := &Repo{Path: abs}
+	if storage != nil {
+		r.fsBox.Store(&fsHolder{fs: storage})
+	}
+	if locker != nil {
+		r.lockerBox.Store(&lockerHolder{locker: locker})
+	}
 	// 脏层本身就是持久层，重启后直接生效；这里只清掉孤儿脏层
 	// （所属分支已不存在）并统计还有多少改动等着折叠。
 	// 失败不影响打开：脏层文件读不出来最多让那个目录退回干净层。
@@ -687,10 +735,13 @@ func (r *Repo) Barrier() error {
 }
 
 func (r *Repo) syncDirtyWriter() error {
-	r.writerMu.Lock()
+	release, err := r.lockWriter("barrier")
+	if err != nil {
+		return err
+	}
 	if r.writerDead {
 		down := r.writerDown
-		r.writerMu.Unlock()
+		release()
 		if down != nil {
 			<-down
 		}
@@ -701,7 +752,7 @@ func (r *Repo) syncDirtyWriter() error {
 	r.initDirtyWriter()
 	ch := make(chan error, 1)
 	r.writerCh <- dirtyTask{done: ch}
-	r.writerMu.Unlock()
+	release()
 	return <-ch
 }
 
@@ -711,10 +762,13 @@ func (r *Repo) syncDirtyWriter() error {
 // 与某条分支的提交排队无关；它要做的只是「队列关闸、存量刷完、
 // goroutine 退出」。幂等：重复调用与「从未写过」都安全。
 func (r *Repo) Close() error {
-	r.writerMu.Lock()
+	release, lerr := r.lockWriter("close")
+	if lerr != nil {
+		return lerr
+	}
 	if r.writerDead {
 		down := r.writerDown
-		r.writerMu.Unlock()
+		release()
 		if down != nil {
 			<-down
 		}
@@ -722,12 +776,12 @@ func (r *Repo) Close() error {
 	}
 	r.writerDead = true
 	if r.writerCh == nil {
-		r.writerMu.Unlock()
+		release()
 		return nil
 	}
 	down := r.writerDown
 	close(r.writerCh)
-	r.writerMu.Unlock()
+	release()
 	<-down
 	// worker 已退出，不会再改 writerErr；返回关闭前尚未被 barrier
 	// 观察到的最后一个异步写盘错误。
@@ -755,25 +809,25 @@ func (r *Repo) Write(ref, path string, data []byte, mode Mode) error {
 	cp := make([]byte, len(data))
 	copy(cp, data)
 
-	r.writerMu.Lock()
+	release, lerr := r.lockWriter("enqueue-write")
+	if lerr != nil {
+		return lerr
+	}
+	defer release()
 	if r.writerDead {
-		r.writerMu.Unlock()
 		return fmt.Errorf("repository %s is closed; refusing new writes", filepath.Base(r.Path))
 	}
 	r.initDirtyWriter()
 	queuedSize := r.writerSize.Load()
 	if len(r.writerCh) >= dirtyQueueCapacity || queuedSize+size > dirtyQueueMaxBytes {
-		r.writerMu.Unlock()
 		return fmt.Errorf("dirty write queue is full (%d pending / %d bytes); refusing new writes, retry later", len(r.writerCh), queuedSize)
 	}
 	r.writerSize.Add(size)
 	select {
 	case r.writerCh <- dirtyTask{op: 'W', ref: ref, path: path, data: cp, mode: mode, size: size}:
-		r.writerMu.Unlock()
 		return nil
 	default:
 		r.writerSize.Add(-size)
-		r.writerMu.Unlock()
 		return fmt.Errorf("dirty write queue is full; refusing new writes, retry later")
 	}
 }
@@ -790,7 +844,10 @@ func (r *Repo) applyDirtyWrite(ref, path string, data []byte, mode Mode) error {
 	unlockDirty := r.rlockDirty()
 	defer unlockDirty()
 
-	unlock := r.lockDirtyFile(normRef, dir)
+	unlock, lerr := r.lockDirtyFile(normRef, dir)
+	if lerr != nil {
+		return lerr
+	}
 	defer unlock()
 
 	n, err := r.loadDirtyNode(normRef, dir)
@@ -820,7 +877,10 @@ func (r *Repo) applyDirtyDelete(ref, path string) error {
 	unlockDirty := r.rlockDirty()
 	defer unlockDirty()
 
-	unlock := r.lockDirtyFile(normRef, dir)
+	unlock, lerr := r.lockDirtyFile(normRef, dir)
+	if lerr != nil {
+		return lerr
+	}
 	defer unlock()
 
 	n, err := r.loadDirtyNode(normRef, dir)
@@ -1485,22 +1545,22 @@ func (r *Repo) Delete(ref, path string) error {
 	if err := validPath(path); err != nil {
 		return err
 	}
-	r.writerMu.Lock()
+	release, lerr := r.lockWriter("enqueue-delete")
+	if lerr != nil {
+		return lerr
+	}
+	defer release()
 	if r.writerDead {
-		r.writerMu.Unlock()
 		return fmt.Errorf("repository %s is closed; refusing delete: %s", filepath.Base(r.Path), path)
 	}
 	r.initDirtyWriter()
 	if len(r.writerCh) >= dirtyQueueCapacity {
-		r.writerMu.Unlock()
 		return fmt.Errorf("dirty write queue is full; refusing delete: %s", path)
 	}
 	select {
 	case r.writerCh <- dirtyTask{op: 'D', ref: ref, path: path}:
-		r.writerMu.Unlock()
 		return nil
 	default:
-		r.writerMu.Unlock()
 		return fmt.Errorf("dirty write queue is full; refusing delete: %s", path)
 	}
 }

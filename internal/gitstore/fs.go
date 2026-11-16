@@ -205,8 +205,9 @@ func (osFS) Open(path string) (ReaderAtCloser, error) {
 //  2. 脏层全局读写锁：改脏 RLock，折叠 Commit 全局独占 Lock；
 //  3. 分支提交令牌：同一分支只能有一个提交在进行，带超时。
 type Locker interface {
-	// LockNode 获取某分支某脏目录的文件级锁。
-	LockNode(ref, dir string) (unlock func())
+	// LockNode 获取某分支某脏目录的文件级令牌。
+	// 返回错误表示等令牌超时——有持有者卡在磁盘 I/O 上。
+	LockNode(ref, dir string) (unlock func(), err error)
 
 	// RLockDirty 获取脏层全局读锁（写入与只读覆盖）。
 	RLockDirty() (unlock func())
@@ -221,7 +222,11 @@ type Locker interface {
 // localLocker 是基于内存 sync.RWMutex 与 sync.Map 的原生单进程锁实现。
 type localLocker struct {
 	dirtyMu   sync.RWMutex
-	nodeLocks sync.Map // normRef+"\x00"+dir -> *sync.Mutex
+	// nodeLocks 的值是一槽 channel 令牌，不是 *sync.Mutex。
+	//
+	// 差别在等待的上界：Mutex 的 Lock() 没有超时，持有者卡在磁盘 I/O
+	// 时后来者永久阻塞；令牌用 select + 计时器，超时明确报错。
+	nodeLocks sync.Map // normRef+"\x00"+dir -> chan struct{}
 	commitTok sync.Map // normRef -> chan struct{} (cap 1)
 }
 
@@ -229,12 +234,25 @@ func newLocalLocker() *localLocker {
 	return &localLocker{}
 }
 
-func (l *localLocker) LockNode(ref, dir string) func() {
+func (l *localLocker) LockNode(ref, dir string) (func(), error) {
 	key := normalizeRef(ref) + "\x00" + dir
-	v, _ := l.nodeLocks.LoadOrStore(key, &sync.Mutex{})
-	mu := v.(*sync.Mutex)
-	mu.Lock()
-	return mu.Unlock
+	v, _ := l.nodeLocks.LoadOrStore(key, make(chan struct{}, 1))
+	ch := v.(chan struct{})
+
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	default:
+	}
+	// 慢路径给一个明确的上界，而不是无限期等下去。
+	t := time.NewTimer(30 * time.Second)
+	defer t.Stop()
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-t.C:
+		return nil, fmt.Errorf("node lock %q: 等令牌超时（30s），有持有者卡在磁盘 I/O 上", key)
+	}
 }
 
 func (l *localLocker) RLockDirty() func() {

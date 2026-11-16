@@ -313,8 +313,8 @@ func (r *Repo) dirtyRefs() ([]string, error) {
 	return out, nil
 }
 
-// lockDirtyFile 取得某个脏目录的文件锁。
-func (r *Repo) lockDirtyFile(ref, dir string) func() {
+// lockDirtyFile 取得某个脏目录的文件级令牌。
+func (r *Repo) lockDirtyFile(ref, dir string) (func(), error) {
 	return r.Locker().LockNode(ref, dir)
 }
 

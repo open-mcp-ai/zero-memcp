@@ -74,7 +74,7 @@ type spyLocker struct {
 	commitTokens  atomic.Int64
 }
 
-func (s *spyLocker) LockNode(ref, dir string) func() {
+func (s *spyLocker) LockNode(ref, dir string) (func(), error) {
 	s.lockNodeCalls.Add(1)
 	return s.Locker.LockNode(ref, dir)
 }

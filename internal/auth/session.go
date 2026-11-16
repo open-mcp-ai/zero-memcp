@@ -18,9 +18,11 @@ import (
 // 才做得到的事。MCP 那边用 JWT 是因为凭证本来就该是「发出去的纸」，
 // 管理面恰恰相反。
 type SessionStore struct {
-	mu sync.Mutex
 	// sessions 的键是 cookie 里的随机串，值是过期时间。
-	sessions map[string]time.Time
+	//
+	// 用 sync.Map：每个 key 相互独立，没有跨 key 的不变量，
+	// 每次操作只碰一个会话。session 数在个位数量级，Range 遍历也很便宜。
+	sessions sync.Map
 	// ttl 是单次登录的最长有效期。
 	ttl time.Duration
 	// pending 表示当前口令还是引导口令：此时只允许访问改密接口。
@@ -33,9 +35,8 @@ func NewSessionStore(ttl time.Duration, pending func() bool) *SessionStore {
 		ttl = 12 * time.Hour
 	}
 	return &SessionStore{
-		sessions: map[string]time.Time{},
-		ttl:      ttl,
-		pending:  pending,
+		ttl:     ttl,
+		pending: pending,
 	}
 }
 
@@ -46,9 +47,7 @@ func (s *SessionStore) Create() (string, error) {
 		return "", err
 	}
 	tok := base64.RawURLEncoding.EncodeToString(raw)
-	s.mu.Lock()
-	s.sessions[tok] = time.Now().Add(s.ttl)
-	s.mu.Unlock()
+	s.sessions.Store(tok, time.Now().Add(s.ttl))
 	return tok, nil
 }
 
@@ -57,14 +56,13 @@ func (s *SessionStore) Valid(tok string) bool {
 	if tok == "" {
 		return false
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	exp, ok := s.sessions[tok]
+	v, ok := s.sessions.Load(tok)
 	if !ok {
 		return false
 	}
+	exp, _ := v.(time.Time)
 	if time.Now().After(exp) {
-		delete(s.sessions, tok)
+		s.sessions.Delete(tok)
 		return false
 	}
 	return true
@@ -72,9 +70,7 @@ func (s *SessionStore) Valid(tok string) bool {
 
 // Drop 让一个会话立刻失效（退出登录）。
 func (s *SessionStore) Drop(tok string) {
-	s.mu.Lock()
-	delete(s.sessions, tok)
-	s.mu.Unlock()
+	s.sessions.Delete(tok)
 }
 
 // DropAll 清空全部会话。
@@ -82,16 +78,20 @@ func (s *SessionStore) Drop(tok string) {
 // 改口令、改权限、改密钥之后必须调它：会话是「刚才验过身份」的凭据，
 // 而身份相关的事实变了以后，那个「刚才」就不再成立。
 func (s *SessionStore) DropAll() {
-	s.mu.Lock()
-	s.sessions = map[string]time.Time{}
-	s.mu.Unlock()
+	s.sessions.Range(func(k, _ any) bool {
+		s.sessions.Delete(k)
+		return true
+	})
 }
 
 // Count 返回当前有效会话数（含已过期但尚未清理的，仅用于展示）。
 func (s *SessionStore) Count() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.sessions)
+	n := 0
+	s.sessions.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
 }
 
 // TTL 返回会话有效期。

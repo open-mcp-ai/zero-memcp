@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 )
 
 // 这一层读 packfile。
@@ -39,7 +40,12 @@ var (
 	// 早先用的是 Mutex，于是并发读盘被串行化了——并行扫描的 worker
 	// 全在这一把锁上排队，多核机器跑出串行的速度。
 	// 读多写极少（只有重扫 pack 目录时才写），正是 RWMutex 的形态。
-	packCacheMu sync.RWMutex
+	// packBuildTok 串行化「重建 pack 缓存」这一件重活。
+	//
+	// 用一槽 channel 而不是 Mutex：重建期间要 ReadDir + 逐个 parseIdx，
+	// 都是磁盘 I/O；Mutex 会让等待者无限期挂着，令牌带超时。
+	// 注意**命中缓存不碰这把它**——热路径只做一次 sync.Map.Load。
+	packBuildTok = make(chan struct{}, 1)
 	// packCache 的键是仓库路径，值是缓存条目。
 	//
 	// 光用路径做键是不够的：仓库目录会被外部进程改写。
@@ -48,7 +54,10 @@ var (
 	// 报错是「不在松散库也不在任何 pack 里」，看不出是缓存问题。
 	// 所以缓存条目带一个指纹（pack 目录的文件名 + 大小 + mtime），
 	// 每轮先比指纹，不一致就重新读。
-	packCache = map[string]packCacheEntry{} // 仓库路径 -> 缓存条目
+	// packCache 的条目是不可变值，用 sync.Map 原子发布：
+	// 重建时造新条目再 Store，读者 Load 到的永远是完整的一份，
+	// 不需要任何锁，也不会读到「指纹已更新、索引还是旧的」的中间态。
+	packCache sync.Map // 仓库路径 -> packCacheEntry
 )
 
 type packCacheEntry struct {
@@ -95,27 +104,30 @@ func (r *Repo) loadPacks() ([]*packIdx, error) {
 	// 省下来的那点 ReadDir 不值得这个风险。
 	fingerprint := r.packFingerprint(packDir)
 
-	// 命中就走共享锁：绝大多数读都是「缓存有效」，不该排队。
-	packCacheMu.RLock()
-	if e, ok := packCache[r.Path]; ok && e.fingerprint == fingerprint {
-		idxs := e.idxs
-		packCacheMu.RUnlock()
-		return idxs, nil
+	// 快路径：命中缓存直接返回，全程不取任何令牌。
+	if v, ok := packCache.Load(r.Path); ok {
+		if e, ok := v.(packCacheEntry); ok && e.fingerprint == fingerprint {
+			return e.idxs, nil
+		}
 	}
-	packCacheMu.RUnlock()
 
-	packCacheMu.Lock()
-	defer packCacheMu.Unlock()
+	release, lerr := acquirePackBuild()
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer release()
 
-	// 双检：等锁期间别的 goroutine 可能已经重建好。
-	if e, ok := packCache[r.Path]; ok && e.fingerprint == fingerprint {
-		return e.idxs, nil
+	// 双检：等令牌期间别的 goroutine 可能已经重建好。
+	if v, ok := packCache.Load(r.Path); ok {
+		if e, ok := v.(packCacheEntry); ok && e.fingerprint == fingerprint {
+			return e.idxs, nil
+		}
 	}
 
 	entries, err := r.FS().ReadDir(packDir)
 	if err != nil {
 		if isNotExist(err) {
-			packCache[r.Path] = packCacheEntry{fingerprint: fingerprint}
+			packCache.Store(r.Path, packCacheEntry{fingerprint: fingerprint})
 			return nil, nil
 		}
 		return nil, err
@@ -126,15 +138,33 @@ func (r *Repo) loadPacks() ([]*packIdx, error) {
 		if filepath.Ext(e.Name()) != ".idx" {
 			continue
 		}
-		idx, err := r.parseIdx(filepath.Join(packDir, e.Name()))
-		if err != nil {
-			// 一个坏索引不该让整个仓库读不了：跳过它，剩下的照读。
+		idx, perr := r.parseIdx(filepath.Join(packDir, e.Name()))
+		if perr != nil {
+			// 跳过坏 idx 而不是整体失败：git gc 可能与解析并发，
+			// 一个正在被替换的 pack 不该让整个仓库读不出来。
 			continue
 		}
 		idxs = append(idxs, idx)
 	}
-	packCache[r.Path] = packCacheEntry{idxs: idxs, fingerprint: fingerprint}
+	packCache.Store(r.Path, packCacheEntry{fingerprint: fingerprint, idxs: idxs})
 	return idxs, nil
+}
+
+// acquirePackBuild 取重建 pack 缓存的令牌。
+func acquirePackBuild() (func(), error) {
+	select {
+	case packBuildTok <- struct{}{}:
+		return func() { <-packBuildTok }, nil
+	default:
+	}
+	t := time.NewTimer(30 * time.Second)
+	defer t.Stop()
+	select {
+	case packBuildTok <- struct{}{}:
+		return func() { <-packBuildTok }, nil
+	case <-t.C:
+		return nil, fmt.Errorf("pack cache rebuild: 等令牌超时（30s）")
+	}
 }
 
 func (r *Repo) parseIdx(path string) (*packIdx, error) {
@@ -596,9 +626,7 @@ func hexVal(c byte) (byte, bool) {
 
 // InvalidatePackCache 在仓库新增了 pack 之后清掉缓存。
 func (r *Repo) InvalidatePackCache() {
-	packCacheMu.Lock()
-	delete(packCache, r.Path)
-	packCacheMu.Unlock()
+	packCache.Delete(r.Path)
 }
 
 // packFingerprintChanged 判断 pack 目录是否与缓存里记录的不一致。
@@ -607,11 +635,10 @@ func (r *Repo) InvalidatePackCache() {
 // 误触发的路径上保持廉价。指纹没变就说明缓存就是磁盘当前的样子，
 // 再解析一遍结果必然相同。
 func (r *Repo) packFingerprintChanged() bool {
-	packCacheMu.RLock()
-	cur, ok := packCache[r.Path]
-	packCacheMu.RUnlock()
+	v, ok := packCache.Load(r.Path)
 	if !ok {
 		return true // 没缓存过，值得读一次
 	}
+	cur, _ := v.(packCacheEntry)
 	return r.packFingerprint(filepath.Join(r.Path, "objects", "pack")) != cur.fingerprint
 }

@@ -139,8 +139,7 @@ func TestChmodPromotesContentToRule(t *testing.T) {
 		t.Fatal(err)
 	}
 	found := false
-	srv.mu.RLock()
-	for _, tr := range srv.trees {
+	for _, tr := range testTrees(srv) {
 		if tr.Project != "blackegg/me" || tr.Branch != "zero" {
 			continue
 		}
@@ -150,7 +149,6 @@ func TestChmodPromotesContentToRule(t *testing.T) {
 			}
 		}
 	}
-	srv.mu.RUnlock()
 	if found {
 		t.Fatal("write 写出来的块不该是可注入规则")
 	}
@@ -168,9 +166,8 @@ func TestChmodPromotesContentToRule(t *testing.T) {
 	if err != nil || string(body) != "不许说谎" {
 		t.Fatalf("chmod 不该改动正文: %v %q", err, string(body))
 	}
-	srv.mu.RLock()
 	found = false
-	for _, tr := range srv.trees {
+	for _, tr := range testTrees(srv) {
 		if tr.Project != "blackegg/me" || tr.Branch != "zero" {
 			continue
 		}
@@ -180,7 +177,6 @@ func TestChmodPromotesContentToRule(t *testing.T) {
 			}
 		}
 	}
-	srv.mu.RUnlock()
 	if !found {
 		t.Fatal("chmod rule 之后应成为可注入规则")
 	}
@@ -192,9 +188,8 @@ func TestChmodPromotesContentToRule(t *testing.T) {
 	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m back"); err != nil {
 		t.Fatal(err)
 	}
-	srv.mu.RLock()
 	found = false
-	for _, tr := range srv.trees {
+	for _, tr := range testTrees(srv) {
 		if tr.Project != "blackegg/me" || tr.Branch != "zero" {
 			continue
 		}
@@ -204,7 +199,6 @@ func TestChmodPromotesContentToRule(t *testing.T) {
 			}
 		}
 	}
-	srv.mu.RUnlock()
 	if found {
 		t.Fatal("chmod content 之后不该再注入")
 	}

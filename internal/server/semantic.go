@@ -606,7 +606,7 @@ func (s *Server) companionRecord(thoughtID string) (string, string) {
 
 // semanticTime 查一条切片的正文时间，优先索引表，回退 commit 时间。
 func (s *Server) semanticTime(id string) int64 {
-	if t := s.idx.DocTime(id); t != 0 {
+	if t := s.idxNow().DocTime(id); t != 0 {
 		return t
 	}
 	return 0
@@ -669,10 +669,8 @@ func (s *Server) semanticStatus() string {
 
 // snapshotTrees 取当前树的快照（调用方已持有锁时不要用）。
 func (s *Server) snapshotTrees() []*memory.Tree {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*memory.Tree, len(s.trees))
-	copy(out, s.trees)
+	out := make([]*memory.Tree, len(s.treeList()))
+	copy(out, s.treeList())
 	return out
 }
 

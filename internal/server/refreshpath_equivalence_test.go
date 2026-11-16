@@ -72,9 +72,8 @@ func TestRefreshPathMatchesFullRebuild(t *testing.T) {
 	//     （索引是倒排表，外部只能通过检索观察它）
 	snapshot := func(t *testing.T) string {
 		t.Helper()
-		srv.mu.RLock()
 		var view []string
-		for _, tr := range srv.trees {
+		for _, tr := range testTrees(srv) {
 			if tr.Project != proj || tr.Branch != br {
 				continue
 			}
@@ -83,7 +82,6 @@ func TestRefreshPathMatchesFullRebuild(t *testing.T) {
 					b.Path, b.Size, b.Rule, b.Hidden))
 			}
 		}
-		srv.mu.RUnlock()
 		sort.Strings(view)
 		return fmt.Sprint(view)
 	}
@@ -258,9 +256,8 @@ func TestRefreshPathAddsBrandNewFile(t *testing.T) {
 	}
 
 	// 树里必须有这个 Block。
-	srv.mu.RLock()
 	found := false
-	for _, tr := range srv.trees {
+	for _, tr := range testTrees(srv) {
 		if tr.Project != proj || tr.Branch != br {
 			continue
 		}
@@ -270,7 +267,6 @@ func TestRefreshPathAddsBrandNewFile(t *testing.T) {
 			}
 		}
 	}
-	srv.mu.RUnlock()
 	if !found {
 		t.Fatalf("新文件 %s 没有进 tree.Blocks —— 增量路径对「树里还没有的 path」是 no-op", path)
 	}

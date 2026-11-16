@@ -130,10 +130,14 @@ func (ix *Index) WriteBinary(path string) (err error) {
 		return err
 	}
 
+	// 先摊平出一份只读视图：写盘期间索引可能被并发写入，
+	// 摊平后本次写出的就是某一瞬间的一致状态（不会撕裂到半新半旧）。
+	v := ix.View()
+
 	// ① 地址表（docLen 的键就是全部文档地址）
-	addrs := make([]string, 0, len(ix.docLen))
-	addrIdx := make(map[string]int, len(ix.docLen))
-	for a := range ix.docLen {
+	addrs := make([]string, 0, len(v.DocLen))
+	addrIdx := make(map[string]int, len(v.DocLen))
+	for a := range v.DocLen {
 		addrIdx[a] = len(addrs)
 		addrs = append(addrs, a)
 	}
@@ -143,8 +147,8 @@ func (ix *Index) WriteBinary(path string) (err error) {
 	}
 
 	// ② 词表
-	terms := make([]string, 0, len(ix.postings))
-	for t := range ix.postings {
+	terms := make([]string, 0, len(v.Postings))
+	for t := range v.Postings {
 		terms = append(terms, string(t))
 	}
 	bw.uvarint(uint64(len(terms)))
@@ -154,14 +158,14 @@ func (ix *Index) WriteBinary(path string) (err error) {
 
 	// ③ 每个文档的长度/字节数/时间
 	for _, a := range addrs {
-		bw.uvarint(uint64(ix.docLen[a]))
-		bw.uvarint(uint64(ix.docSize[a]))
-		bw.svarint(ix.docTime[a])
+		bw.uvarint(uint64(v.DocLen[a]))
+		bw.uvarint(uint64(v.DocSize[a]))
+		bw.svarint(v.DocTime[a])
 	}
 
 	// ④ 倒排：词 → (地址下标, 词频)
 	for _, t := range terms {
-		docs := ix.postings[Token(t)]
+		docs := v.Postings[Token(t)]
 		bw.uvarint(uint64(len(docs)))
 		for a, tf := range docs {
 			idx, ok := addrIdx[a]
@@ -179,7 +183,7 @@ func (ix *Index) WriteBinary(path string) (err error) {
 		termIdx[t] = i
 	}
 	for _, a := range addrs {
-		toks := ix.docTokens[a]
+		toks := v.DocTokens[a]
 		bw.uvarint(uint64(len(toks)))
 		for _, tk := range toks {
 			if i, ok := termIdx[string(tk)]; ok {
@@ -245,12 +249,16 @@ func ReadBinary(path string) (*Index, error) {
 	}
 
 	ix := New()
-	ix.totalDocs = nAddr
+	ix.totalDocs.Store(int64(nAddr))
+	var sumLen int64
 	for _, a := range addrs {
-		ix.docLen[a] = int(br.uvarint())
-		ix.docSize[a] = int(br.uvarint())
-		ix.docTime[a] = br.svarint()
+		n := int(br.uvarint())
+		ix.docLen.Store(a, n)
+		sumLen += int64(n)
+		ix.docSize.Store(a, int(br.uvarint()))
+		ix.docTime.Store(a, br.svarint())
 	}
+	ix.sumDocLen.Store(sumLen)
 	if br.err != nil {
 		return nil, br.err
 	}
@@ -271,7 +279,13 @@ func ReadBinary(path string) (*Index, error) {
 				m[addrs[ai]] = tf
 			}
 		}
-		ix.postings[Token(t)] = m
+		ps := newPostingSlot()
+		entries := make([]postingEntry, 0, len(m))
+		for addr, tf := range m {
+			entries = append(entries, postingEntry{Addr: addr, TF: tf})
+		}
+		ps.list.Store(&postingList{entries: entries})
+		ix.postings.Store(Token(t), ps)
 	}
 
 	for _, a := range addrs {
@@ -289,7 +303,7 @@ func ReadBinary(path string) (*Index, error) {
 				toks = append(toks, Token(terms[ti]))
 			}
 		}
-		ix.docTokens[a] = toks
+		ix.docTokens.Store(a, toks)
 	}
 	if br.err != nil {
 		return nil, br.err
@@ -323,33 +337,34 @@ type PostingEntry struct {
 	TF      int
 }
 
-// TakeSnapshot 在调用方持读锁的极短窗口里复制只读结构。
+// TakeSnapshot 复制出一份只读结构。索引自身无锁，可以直接取。
 func (ix *Index) TakeSnapshot() *Snapshot {
+	v := ix.View()
 	s := &Snapshot{
-		Addrs:   make([]string, 0, len(ix.docLen)),
-		Terms:   make([]string, 0, len(ix.postings)),
-		DocLen:  make([]int, 0, len(ix.docLen)),
-		DocSize: make([]int, 0, len(ix.docSize)),
-		DocTime: make([]int64, 0, len(ix.docTime)),
+		Addrs:   make([]string, 0, len(v.DocLen)),
+		Terms:   make([]string, 0, len(v.Postings)),
+		DocLen:  make([]int, 0, len(v.DocLen)),
+		DocSize: make([]int, 0, len(v.DocSize)),
+		DocTime: make([]int64, 0, len(v.DocTime)),
 	}
-	addrIdx := make(map[string]int, len(ix.docLen))
-	for a := range ix.docLen {
+	addrIdx := make(map[string]int, len(v.DocLen))
+	for a := range v.DocLen {
 		addrIdx[a] = len(s.Addrs)
 		s.Addrs = append(s.Addrs, a)
-		s.DocLen = append(s.DocLen, ix.docLen[a])
-		s.DocSize = append(s.DocSize, ix.docSize[a])
-		s.DocTime = append(s.DocTime, ix.docTime[a])
+		s.DocLen = append(s.DocLen, v.DocLen[a])
+		s.DocSize = append(s.DocSize, v.DocSize[a])
+		s.DocTime = append(s.DocTime, v.DocTime[a])
 	}
 
-	termIdx := make(map[string]int, len(ix.postings))
-	for t := range ix.postings {
+	termIdx := make(map[string]int, len(v.Postings))
+	for t := range v.Postings {
 		termIdx[string(t)] = len(s.Terms)
 		s.Terms = append(s.Terms, string(t))
 	}
 
 	s.Postings = make([][]PostingEntry, len(s.Terms))
 	for i, t := range s.Terms {
-		docs := ix.postings[Token(t)]
+		docs := v.Postings[Token(t)]
 		entries := make([]PostingEntry, 0, len(docs))
 		for a, tf := range docs {
 			if idx, ok := addrIdx[a]; ok {
@@ -361,7 +376,7 @@ func (ix *Index) TakeSnapshot() *Snapshot {
 
 	s.Tokens = make([][]int, len(s.Addrs))
 	for i, a := range s.Addrs {
-		toks := ix.docTokens[a]
+		toks := v.DocTokens[a]
 		indices := make([]int, 0, len(toks))
 		for _, tk := range toks {
 			if ti, ok := termIdx[string(tk)]; ok {

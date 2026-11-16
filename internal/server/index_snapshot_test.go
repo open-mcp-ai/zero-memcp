@@ -231,9 +231,7 @@ func TestIndexSnapshotMatchesLiveIndex(t *testing.T) {
 		t.Fatalf("commit: %v", err)
 	}
 
-	srv.mu.RLock()
-	liveDocs, liveTerms := srv.idx.Docs(), srv.idx.Terms()
-	srv.mu.RUnlock()
+	liveDocs, liveTerms := srv.idxNow().Docs(), srv.idxNow().Terms()
 
 	if err := srv.saveIndexSnapshot(); err != nil {
 		t.Fatalf("save: %v", err)
@@ -241,9 +239,7 @@ func TestIndexSnapshotMatchesLiveIndex(t *testing.T) {
 	if !srv.tryLoadIndexSnapshot("zero") {
 		t.Fatal("快照应当被采用")
 	}
-	srv.mu.RLock()
-	snapDocs, snapTerms := srv.idx.Docs(), srv.idx.Terms()
-	srv.mu.RUnlock()
+	snapDocs, snapTerms := srv.idxNow().Docs(), srv.idxNow().Terms()
 
 	if liveDocs != snapDocs || liveTerms != snapTerms {
 		t.Fatalf("快照与内存索引不等价：live docs=%d terms=%d，snapshot docs=%d terms=%d",
@@ -299,9 +295,7 @@ func TestSnapshotPreservesLayer(t *testing.T) {
 	// 存快照前：Layer 必须是 thought
 	var wantLayer string
 	func() {
-		srv.mu.RLock()
-		defer srv.mu.RUnlock()
-		for _, tr := range srv.trees {
+		for _, tr := range testTrees(srv) {
 			for _, b := range tr.Blocks {
 				if strings.HasSuffix(b.Path, "declared.md") {
 					wantLayer = b.Layer
@@ -318,10 +312,7 @@ func TestSnapshotPreservesLayer(t *testing.T) {
 	}
 
 	// 清空内存后从快照恢复
-	srv.mu.Lock()
-	srv.trees = nil
-	srv.idx = nil
-	srv.mu.Unlock()
+	srv.publishTrees(nil, nil)
 
 	if !srv.tryLoadIndexSnapshot("zero") {
 		t.Fatal("快照没能命中——这条测试测不到恢复路径")
@@ -331,9 +322,7 @@ func TestSnapshotPreservesLayer(t *testing.T) {
 	var gotLayer string
 	var semantic bool
 	func() {
-		srv.mu.RLock()
-		defer srv.mu.RUnlock()
-		for _, tr := range srv.trees {
+		for _, tr := range testTrees(srv) {
 			for _, b := range tr.Blocks {
 				if strings.HasSuffix(b.Path, "declared.md") {
 					gotLayer = b.Layer

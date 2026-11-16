@@ -134,9 +134,22 @@ type Server struct {
 	// cfgFilePtr 是配置的原子快照。Reload 在运行中整体替换它，
 	// 读者一次 Load 就拿到完整的一份，不会读到半个新旧混合体。
 	cfgFilePtr atomic.Pointer[config.File]
-	mu         sync.RWMutex
-	trees []*memory.Tree
-	idx   *index.Index
+
+	// treesPtr 是「记忆库当前长什么样」的不可变快照（树列表 + 索引）。
+	//
+	// 原来这里是 mu sync.RWMutex + trees []*memory.Tree + idx *index.Index。
+	// 那把锁是 2026-11-16 那次 fatal error 的保护对象：
+	// concurrent map iteration and map write，进程直接没掉。
+	// 根因不是「忘了加锁」，而是「靠纪律保护一个可变的共享结构」——
+	// 纪律一定漏。
+	//
+	// 现在：读路径一次 Load 拿到底，写路径取 treeTok 令牌后
+	// 造新快照再 Store。Index 自身也已无锁（见 internal/index）。
+	treesPtr atomic.Pointer[treeSet]
+	// treeTok 串行化记忆库写者（重建分支索引 + 换树）。
+	// treeTokOnce 保证它被懒创建——零值 Server 也能安全取用。
+	treeTok     chan struct{}
+	treeTokOnce sync.Once
 
 	// clock 告诉客户端「记忆库有更新」。
 	//
@@ -627,10 +640,7 @@ func (s *Server) Reload() error {
 		}
 	}
 
-	s.mu.Lock()
-	s.trees = trees
-	s.idx = idx
-	s.mu.Unlock()
+	s.publishTrees(trees, idx)
 	startupStage("reload: index built (read %.1fs, tokenize %.1fs)",
 		readNS.Seconds(), tokenizeNS.Seconds())
 
@@ -865,8 +875,6 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, authErr.Error(), http.StatusUnauthorized)
 		return
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	// 注入哪些块完全由这张凭证决定：能力位 x 决定给不给规则，
 	// 挂载表决定看得见哪些项目与分支。没有任何 query 参数能改变它。
@@ -892,7 +900,7 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 
 	// 注入必须以「一个项目 = 一条身份线」为单位。
 	//
-	// 踩过的坑：早先这里直接遍历 s.trees 全量叠加，而 s.trees 是
+	// 踩过的坑：早先这里直接遍历 s.treeList() 全量叠加，而 s.treeList() 是
 	// (项目, 分支) 粒度的——同一个项目有几个分支就有几棵树。
 	// blackegg/me 有 zero / main / chat 三条分支，于是三套身份
 	// 同时进了同一个系统提示：「我是简」与「我是 QQ 群助手」并列，
@@ -903,7 +911,7 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 	// 一次对话只能归属一个身份。
 	byProject := make(map[string][]*memory.Tree)
 	var projects []string
-	for _, t := range s.trees {
+	for _, t := range s.treeList() {
 		// 挂载表之外的仓库连「存在」都不该被看到
 		if !caller.Mount.Visible(t.Project, t.Branch) {
 			continue
@@ -1010,9 +1018,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// 索引规模是跨项目的信息，只有携带凭证时才给。
 	caller, authErr := s.authenticate(r)
 	if authErr == nil {
-		s.mu.RLock()
 		totalBlocks, injectBlocks, docs := 0, 0, 0
-		for _, t := range s.trees {
+		for _, t := range s.treeList() {
 			if !s.allowed(caller, t.Project, t.Branch, configBitRead) {
 				continue
 			}
@@ -1020,11 +1027,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			injectBlocks += len(t.Injectable())
 			docs += len(t.Indexable())
 		}
-		s.mu.RUnlock()
 		resp["docs_indexed"] = docs
 		// 词表规模是全局的：它不按项目切分，所以只给全命名空间的调用者。
 		if caller.Mount.Empty() {
-			resp["terms_indexed"] = s.idx.Terms()
+			resp["terms_indexed"] = s.idxNow().Terms()
 		}
 		resp["total_blocks"] = totalBlocks
 		resp["inject_blocks"] = injectBlocks
@@ -1045,8 +1051,6 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	type projItem struct {
 		Name   string `json:"name"`
@@ -1054,7 +1058,7 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 		Rules  int    `json:"rules"`
 	}
 	var list []projItem
-	for _, t := range s.trees {
+	for _, t := range s.treeList() {
 		if !s.allowed(caller, t.Project, t.Branch, configBitRead) {
 			continue
 		}
@@ -1100,11 +1104,9 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 		req.Limit = 3
 	}
 
-	s.mu.RLock()
 	// 多取一些，权限与挂载过滤后再截断——否则受限凭证的 limit=3
 	// 会因为前 3 条都被过滤掉而返回空，看起来像"搜不到"。
-	hits := s.idx.SearchCovered(req.Text, req.Limit*4, req.Floor, recallMinCoverage, s.weightCount, nil)
-	s.mu.RUnlock()
+	hits := s.idxNow().SearchCovered(req.Text, req.Limit*4, req.Floor, recallMinCoverage, s.weightCount, nil)
 
 	type HitView struct {
 		Addr    string   `json:"addr"`
@@ -1666,7 +1668,6 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 踩过的坑：只回 "addr (score)" 时，模型看不出这篇讲什么，必须逐个 read，
 		// 读三四篇之后它就换 rg 去翻目录了——不是它不想用记忆工具，是记忆工具
 		// 每回答一个问题都要它做 N 次额外往返。给摘要能把 N 次 read 压成 0 次。
-		s.mu.RLock()
 		// 先按「这张凭证看得见什么」收窄候选集合，再打分排序。
 		//
 		// 顺序不能反：索引是所有分支的合集，先取全局 top-N 再按权限
@@ -1691,7 +1692,7 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 而不是报错——静默走偏比报错贵得多。
 		query, scopes := splitScopes(rest)
 		scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
-		hits := s.idx.SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
+		hits := s.idxNow().SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
 			return allowedHit(addr) && scopeMatch(addr)
 		})
 		permHits := make([]index.Hit, 0, len(hits))
@@ -1713,7 +1714,7 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			}
 		}
 		hits = permHits
-		// 摘要必须在锁内取完：snippet 读的是 s.trees，而 Reload 会在
+		// 摘要必须在锁内取完：snippet 读的是 s.treeList()，而 Reload 会在
 		// s.mu.Lock() 里把它整体换掉。在锁外调用等于读一份随时会
 		// 被替换的切片——-race 能稳定复现（TestRecallConcurrentWithReload）。
 		snips := make([]string, len(hits))
@@ -1737,11 +1738,10 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 真正的解法见 docs：把索引读路径改成不可变快照 + atomic.Pointer。
 		var outsideAddr string
 		if len(hits) == 0 && len(scopes) > 0 {
-			if outside := s.idx.SearchCovered(query, 1, 0, recallMinCoverage, s.weightCount, allowedHit); len(outside) > 0 {
+			if outside := s.idxNow().SearchCovered(query, 1, 0, recallMinCoverage, s.weightCount, allowedHit); len(outside) > 0 {
 				outsideAddr = outside[0].Addr
 			}
 		}
-		s.mu.RUnlock()
 		if len(hits) == 0 {
 			text := "no matches"
 			// 带 scope 却没命中时，多跑一次不带 scope 的判定：
@@ -1813,8 +1813,6 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		if len(fields) == 0 {
 			return TermResult{}, errors.New("read syntax: read <addr> [<addr> ...]")
 		}
-		s.mu.RLock()
-		defer s.mu.RUnlock()
 
 		var out strings.Builder
 		missing := []string{}
@@ -2071,21 +2069,19 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 词表规模是**全局**事实（它不按项目切分），所以与 /health
 		// 同一口径：只给全命名空间的调用者。早先这里无条件返回，
 		// 于是 health 刻意隐藏的东西在 status 里一读就到。
-		s.mu.RLock()
 		docs := 0
-		for _, t := range s.trees {
+		for _, t := range s.treeList() {
 			if !s.allowed(c, t.Project, t.Branch, configBitRead) {
 				continue
 			}
 			docs += len(t.Indexable())
 		}
-		// Terms 必须在锁内读：Reload 会在 s.mu.Lock() 里整体替换 s.idx，
+		// Terms 必须在锁内读：Reload 会在 s.mu.Lock() 里整体替换 s.idxNow()，
 		// 锁外调用就是和写方赛跑（-race 可复现）。
 		terms := 0
 		if c.Mount.Empty() {
-			terms = s.idx.Terms()
+			terms = s.idxNow().Terms()
 		}
-		s.mu.RUnlock()
 
 		// 语义侧与同步侧必须进 status。
 		//
@@ -2236,10 +2232,8 @@ func textResult(s string) map[string]any {
 //
 // 这一屏输出比读文档快：它直接告诉你哪些块会被注入、哪些进索引、哪些被跳过。
 func (s *Server) Report(w io.Writer, c Caller) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	for _, t := range s.trees {
+	for _, t := range s.treeList() {
 		if !s.branchVisible(c, t.Project, t.Branch) {
 			continue
 		}
@@ -2257,7 +2251,7 @@ func (s *Server) Report(w io.Writer, c Caller) {
 		fmt.Fprintf(w, "  --- %d blocks / %d rules / %d index bytes\n",
 			st.Blocks, st.Rules, st.IndexBytes)
 	}
-	fmt.Fprintf(w, "\nIndex: %d blocks / %d terms\n", s.idx.Docs(), s.idx.Terms())
+	fmt.Fprintf(w, "\nIndex: %d blocks / %d terms\n", s.idxNow().Docs(), s.idxNow().Terms())
 }
 
 // snippet 取一块内容的摘要：优先返回命中词附近的那段，取不到就返回开头。
@@ -2269,7 +2263,7 @@ func (s *Server) snippet(addr, query string, limit int) string {
 	// 以前把整个 ID 直接交给 Find，分支前缀永远匹配不上，
 	// recall 有命中却永远不给摘要。先拆 ID，按项目+分支找树，再传 path。
 	if project, branch, path, ok := memory.SplitID(addr); ok {
-		for _, t := range s.trees {
+		for _, t := range s.treeList() {
 			if t.Project == project && t.Branch == branch {
 				if b, found := t.Find(path); found {
 					bb := b
@@ -2279,7 +2273,7 @@ func (s *Server) snippet(addr, query string, limit int) string {
 			}
 		}
 	} else {
-		for _, t := range s.trees {
+		for _, t := range s.treeList() {
 			if b, ok := t.Find(addr); ok {
 				bb := b
 				block = &bb
@@ -2380,14 +2374,12 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 		project, branch string
 		blocks          []memory.Block
 	}
-	s.mu.RLock()
-	snaps := make([]treeSnap, 0, len(s.trees))
-	for _, tr := range s.trees {
+	snaps := make([]treeSnap, 0, len(s.treeList()))
+	for _, tr := range s.treeList() {
 		blocks := make([]memory.Block, len(tr.Blocks))
 		copy(blocks, tr.Blocks)
 		snaps = append(snaps, treeSnap{project: tr.Project, branch: tr.Branch, blocks: blocks})
 	}
-	s.mu.RUnlock()
 
 	// 收集候选块（顺序 = 快照顺序，输出必须可复现）。
 	type cand struct {
@@ -2528,11 +2520,9 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 
 // execLog 按时间倒序看最近 N 篇的摘要。
 func (s *Server) execLog(n int, scope string, c Caller) (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	var all []memory.Block
-	for _, tr := range s.trees {
+	for _, tr := range s.treeList() {
 		if !s.allowed(c, tr.Project, tr.Branch, configBitRead) {
 			continue
 		}
@@ -2564,7 +2554,7 @@ func (s *Server) execLog(n int, scope string, c Caller) (string, error) {
 	}
 	entries := make([]entry, len(all))
 	for i, b := range all {
-		t := s.idx.DocTime(b.ID())
+		t := s.idxNow().DocTime(b.ID())
 		if t == 0 {
 			t = b.Time
 		}
@@ -2601,8 +2591,6 @@ func (s *Server) execLog(n int, scope string, c Caller) (string, error) {
 
 // execLs 列出某天的切片。
 func (s *Server) execLs(rest string, c Caller) (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	// ls [date] [--scope <tree>]
 	//
@@ -2622,7 +2610,7 @@ func (s *Server) execLs(rest string, c Caller) (string, error) {
 	scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
 
 	var matches []memory.Block
-	for _, tr := range s.trees {
+	for _, tr := range s.treeList() {
 		if !s.allowed(c, tr.Project, tr.Branch, configBitRead) {
 			continue
 		}

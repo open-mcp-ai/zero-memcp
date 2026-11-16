@@ -73,32 +73,35 @@ type SnapshotData struct {
 }
 
 // Export 把索引导出成可序列化形态。
+//
+// 基于 View() 展开一次：这是落盘/全量重建用的，不在热路径上。
 func (ix *Index) Export() *SnapshotData {
+	v := ix.View()
 	d := &SnapshotData{
-		Postings:  make(map[string]map[string]int32, len(ix.postings)),
-		DocLen:    make(map[string]int32, len(ix.docLen)),
-		DocSize:   make(map[string]int32, len(ix.docSize)),
-		DocTime:   make(map[string]int64, len(ix.docTime)),
-		DocTokens: make(map[string][]string, len(ix.docTokens)),
-		TotalDocs: ix.totalDocs,
+		Postings:  make(map[string]map[string]int32, len(v.Postings)),
+		DocLen:    make(map[string]int32, len(v.DocLen)),
+		DocSize:   make(map[string]int32, len(v.DocSize)),
+		DocTime:   make(map[string]int64, len(v.DocTime)),
+		DocTokens: make(map[string][]string, len(v.DocTokens)),
+		TotalDocs: v.TotalDocs,
 	}
-	for tok, docs := range ix.postings {
+	for tok, docs := range v.Postings {
 		m := make(map[string]int32, len(docs))
 		for addr, tf := range docs {
 			m[addr] = int32(tf)
 		}
 		d.Postings[string(tok)] = m
 	}
-	for addr, n := range ix.docLen {
+	for addr, n := range v.DocLen {
 		d.DocLen[addr] = int32(n)
 	}
-	for addr, n := range ix.docSize {
+	for addr, n := range v.DocSize {
 		d.DocSize[addr] = int32(n)
 	}
-	for addr, t := range ix.docTime {
+	for addr, t := range v.DocTime {
 		d.DocTime[addr] = t
 	}
-	for addr, toks := range ix.docTokens {
+	for addr, toks := range v.DocTokens {
 		s := make([]string, len(toks))
 		for i, tk := range toks {
 			s[i] = string(tk)
@@ -111,29 +114,34 @@ func (ix *Index) Export() *SnapshotData {
 // Import 从快照重建索引。
 func Import(d *SnapshotData) *Index {
 	ix := New()
-	ix.totalDocs = d.TotalDocs
+	ix.totalDocs.Store(int64(d.TotalDocs))
 	for tok, docs := range d.Postings {
-		m := make(map[string]int, len(docs))
+		ps := newPostingSlot()
+		entries := make([]postingEntry, 0, len(docs))
 		for addr, tf := range docs {
-			m[addr] = int(tf)
+			entries = append(entries, postingEntry{Addr: addr, TF: int(tf)})
 		}
-		ix.postings[Token(tok)] = m
+		ps.list.Store(&postingList{entries: entries})
+		ix.postings.Store(Token(tok), ps)
 	}
+	var sumLen int64
 	for addr, n := range d.DocLen {
-		ix.docLen[addr] = int(n)
+		ix.docLen.Store(addr, int(n))
+		sumLen += int64(n)
 	}
+	ix.sumDocLen.Store(sumLen)
 	for addr, n := range d.DocSize {
-		ix.docSize[addr] = int(n)
+		ix.docSize.Store(addr, int(n))
 	}
 	for addr, t := range d.DocTime {
-		ix.docTime[addr] = t
+		ix.docTime.Store(addr, t)
 	}
 	for addr, toks := range d.DocTokens {
 		ts := make([]Token, len(toks))
 		for i, s := range toks {
 			ts[i] = Token(s)
 		}
-		ix.docTokens[addr] = ts
+		ix.docTokens.Store(addr, ts)
 	}
 	return ix
 }
@@ -248,10 +256,11 @@ func writeGobAtomic(path string, v any) error {
 
 // AllDocs 返回索引里全部文档 ID 的集合（校验快照与树是否对得上用）。
 func (ix *Index) AllDocs() map[string]struct{} {
-	out := make(map[string]struct{}, ix.totalDocs)
-	for addr := range ix.docLen {
-		out[addr] = struct{}{}
-	}
+	out := make(map[string]struct{}, ix.totalDocs.Load())
+	ix.docLen.Range(func(k, _ any) bool {
+		out[k.(string)] = struct{}{}
+		return true
+	})
 	return out
 }
 

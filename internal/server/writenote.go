@@ -236,10 +236,8 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// 这些词在重启前搜不到、重启后才出现——同一份记忆的可检索性
 	// 随进程生命周期变化，docLen 也跟着变，BM25 分数跟着漂。
 	blockID := memory.MakeID(targetProject, writeBranch, path)
-	s.mu.Lock()
-	s.idx.AddWithTime(blockID, content, now.Unix())
+	s.idxNow().AddWithTime(blockID, content, now.Unix())
 	s.addBlockLocked(targetProject, repo, writeBranch, path, int64(len(content)), now.Unix())
-	s.mu.Unlock()
 
 	s.bumpClock()
 	// 写入改变了树状态：请求一次语义索引追平。
@@ -256,7 +254,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 //   - 这张凭证的挂载表里可见
 //   - 有 w 权限
 //
-// 三者缺一不可。早先的实现取「s.trees 里第一个项目」，于是受限凭证
+// 三者缺一不可。早先的实现取「s.treeList() 里第一个项目」，于是受限凭证
 // 会被告知「项目 X 不在你的可见范围内」——而它其实有别的可写仓库。
 func (s *Server) writeTarget(c Caller, defaultBranch string) (project, branch string, pol manifest.Policy, err error) {
 	// 候选是「(项目, 分支)」而不是光秃秃的项目名。

@@ -193,10 +193,7 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 
 	s.seedDedup(trees)
 
-	s.mu.Lock()
-	s.trees = trees
-	s.idx = idx
-	s.mu.Unlock()
+	s.publishTrees(trees, idx)
 
 	startupStage("reload: index from snapshot: %d docs, %d terms in %.1fs",
 		idx.Docs(), idx.Terms(), time.Since(t0).Seconds())
@@ -227,27 +224,27 @@ func (s *Server) saveIndexSnapshot() error {
 	if dir == "" || os.Getenv("ZERO_MEMCP_NO_INDEX_SNAPSHOT") != "" {
 		return nil
 	}
-	// 整段导出必须持读写锁。
+	// 索引内部已无锁（见 internal/index），所以这里不需要任何互斥：
+	// TakeSnapshot 遍历的是 sync.Map / 原子发布的分词倒排，
+	// 并发写入不会撕裂它，也不会触发 fatal error: concurrent map
+	// iteration and map write。
 	//
-	// 踩过的坑：早先只在取 ix 指针时持锁，然后锁外 Export()。
-	// 而写入路径是在 s.mu.Lock() 里调 idx.AddWithTime 的——
-	// 于是「后台存快照」与「用户写入」同时动同一张 map，
-	// 进程直接 fatal error: concurrent map iteration and map write。
-	// 那不是 error，是 runtime 直接杀进程，没有任何 recover 机会。
-	s.mu.RLock()
-	if s.idx == nil {
-		s.mu.RUnlock()
+	// 早先这段必须持 s.mu.RLock()，因为 Index 内部是裸 map、
+	// 靠那把锁保护。教训记在这里：那把锁漏过两次，第二次是
+	// 进程直接没掉，没有任何 recover 机会。
+	ix := s.idxNow()
+	if ix == nil {
 		return nil
 	}
-	ix := s.idx
+	treeNow := s.treeList()
 	heads := make(map[string]string, 16)
 	trees := make([]string, 0, 16)
-	for _, t := range s.trees {
+	for _, t := range treeNow {
 		trees = append(trees, treeHeadKey(t.Project, t.Branch))
 	}
 	docs, terms := ix.Docs(), ix.Terms()
-	treeSnaps := make([]index.TreeSnapshot, 0, len(s.trees))
-	for _, t := range s.trees {
+	treeSnaps := make([]index.TreeSnapshot, 0, len(treeNow))
+	for _, t := range treeNow {
 		bs := make([]index.BlockSnapshot, len(t.Blocks))
 		for i, b := range t.Blocks {
 			bs[i] = index.BlockSnapshot{
@@ -260,20 +257,7 @@ func (s *Server) saveIndexSnapshot() error {
 			Project: t.Project, Branch: t.Branch, Blocks: bs,
 		})
 	}
-	// 在持锁的同一窗口里把倒排表复制出来。
-	//
-	// 这是修一个真实的 race（2026-11-16，-race 抓到）：
-	// 早先这里只复制了 trees，然后锁外直接调 ix.WriteBinary。
-	// 而 WriteBinary 要遍历 ix.docLen / ix.postings / ix.docTokens，
-	// 与此同时并发写入在跑 refreshPath → ix.AddWithTime 改写同样的 map。
-	// 后果是 runtime 直接 fatal error: concurrent map iteration and map write
-	// ——不是 error，是杀进程，没有 recover 机会。
-	//
-	// 为什么不用「整段 WriteBinary 持 RLock」：写盘要 gzip 几十 MB、
-	// 做 fsync，持锁期间所有写入都被卡住。快照是后台任务，不该阻塞前台。
-	// 复制只遍历 map 取值，微秒级。
 	snap := ix.TakeSnapshot()
-	s.mu.RUnlock()
 
 	// heads 从仓库读，不从内存猜：内存里的 head 是「上次刷新时」的，
 	// 而快照必须精确记录「这份索引对应哪个 commit」。

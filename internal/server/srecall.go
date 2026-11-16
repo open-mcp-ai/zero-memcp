@@ -51,7 +51,6 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	vHits := s.semanticSearch(query)
 
 	// 2) BM25 路：照常在当前凭证可见范围内跑
-	s.mu.RLock()
 	allowedHit := func(addr string) bool {
 		proj, br, _, ok := memory.SplitID(addr)
 		if !ok {
@@ -69,7 +68,7 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 		}
 		return addrUnderScope(addr, scope)
 	}
-	bmHits := s.idx.SearchCovered(query, 8, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
+	bmHits := s.idxNow().SearchCovered(query, 8, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
 		return allowedHit(addr) && scopeMatch(addr)
 	})
 
@@ -148,7 +147,6 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 			companion: comp,
 		})
 	}
-	s.mu.RUnlock()
 
 	// 去重：
 	//

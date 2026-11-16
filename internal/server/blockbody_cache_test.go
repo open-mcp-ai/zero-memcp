@@ -35,10 +35,9 @@ func TestBlockBodyCacheIsReleased(t *testing.T) {
 		t.Fatalf("reload: %v", err)
 	}
 
-	srv.mu.RLock()
 	var leaked int
 	var leakedPath string
-	for _, tr := range srv.trees {
+	for _, tr := range testTrees(srv) {
 		for _, b := range tr.Blocks {
 			if b.Body != nil {
 				leaked++
@@ -48,7 +47,6 @@ func TestBlockBodyCacheIsReleased(t *testing.T) {
 			}
 		}
 	}
-	srv.mu.RUnlock()
 
 	if leaked > 0 {
 		t.Fatalf("Reload 之后还有 %d 个 Block 挂着正文缓存（例如 %s）；"+
@@ -66,9 +64,8 @@ func TestBlockBodyCacheDoesNotChangeContent(t *testing.T) {
 		t.Fatalf("write: %v", err)
 	}
 
-	srv.mu.RLock()
 	var blk *memory.Block
-	for _, tr := range srv.trees {
+	for _, tr := range testTrees(srv) {
 		if tr.Project != "blackegg/me" || tr.Branch != "fact" {
 			continue
 		}
@@ -79,7 +76,6 @@ func TestBlockBodyCacheDoesNotChangeContent(t *testing.T) {
 			}
 		}
 	}
-	srv.mu.RUnlock()
 	if blk == nil {
 		t.Fatal("找不到刚写的块")
 	}

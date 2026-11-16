@@ -139,24 +139,18 @@ func isExecutableScript(path string) bool {
 // tree 解析）。写一条记忆触发一次全量重建，写入就会变成秒级操作，
 // 而写入是热路径。
 func (s *Server) addBlockLocked(project string, repo *gitstore.Repo, branch, path string, size int64, mtime int64) {
-	if s.idx == nil {
+	idx := s.idxNow()
+	if idx == nil {
 		return
 	}
+	release, err := s.acquireTreeWrite()
+	if err != nil {
+		return
+	}
+	defer release()
+
 	r := repo
 	read := func() ([]byte, error) { return r.Read(branch, path) }
-
-	// 找现有的树；没有就新建
-	var tree *memory.Tree
-	for _, t := range s.trees {
-		if t.Project == project && t.Branch == branch {
-			tree = t
-			break
-		}
-	}
-	if tree == nil {
-		tree = &memory.Tree{Project: project, Branch: branch}
-		s.trees = append(s.trees, tree)
-	}
 
 	// blob hash 必须一起更新：后台语义追平靠它判断「内容变没变」，
 	// 不更新的话那个块会被永久当成「已嵌入、没变化」——
@@ -166,26 +160,44 @@ func (s *Server) addBlockLocked(project string, repo *gitstore.Repo, branch, pat
 		hash = e.Hash
 	}
 
+	cur := s.treeList()
+	next := cloneTreeList(cur)
+
+	// 已发布的树不可修改：先 clone 那一棵，改副本。
+	ti := findTree(next, project, branch)
+	var tree *memory.Tree
+	if ti < 0 {
+		tree = &memory.Tree{Project: project, Branch: branch}
+		next = append(next, tree)
+	} else {
+		tree = cloneTree(next[ti])
+		next[ti] = tree
+	}
+
 	// 同路径覆盖（同一毫秒内重写同一文件时不会产生重复条目）
+	replaced := false
 	for i := range tree.Blocks {
 		if tree.Blocks[i].Path == path {
 			tree.Blocks[i].Size = size
 			tree.Blocks[i].Time = mtime
 			tree.Blocks[i].Hash = hash
-			return
+			replaced = true
+			break
 		}
 	}
-
-	tree.Blocks = append(tree.Blocks, memory.Block{
-		Project: project,
-		Branch:  branch,
-		Path:    path,
-		Size:    size,
-		Time:    mtime,
-		Hash:    hash,
-		Read:    read,
-	})
-	tree.Sort()
+	if !replaced {
+		tree.Blocks = append(tree.Blocks, memory.Block{
+			Project: project,
+			Branch:  branch,
+			Path:    path,
+			Size:    size,
+			Time:    mtime,
+			Hash:    hash,
+			Read:    read,
+		})
+		tree.Sort()
+	}
+	s.publishTrees(next, idx)
 }
 
 // indexedPaths 返回内存树里某条分支的全部路径（副本）。
@@ -193,9 +205,7 @@ func (s *Server) addBlockLocked(project string, repo *gitstore.Repo, branch, pat
 // 用于「只要路径」的场景（如 trees 列目录）。索引里没有这条分支时
 // 返回 nil，调用方据此退回真扫一次仓库。
 func (s *Server) indexedPaths(project, branch string) []string {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, t := range s.trees {
+	for _, t := range s.treeList() {
 		if t.Project != project || t.Branch != branch {
 			continue
 		}
@@ -387,31 +397,35 @@ func (s *Server) refreshPath(project, branch, path string, exists bool) error {
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	release, lerr := s.acquireTreeWrite()
+	if lerr != nil {
+		return lerr
+	}
+	defer release()
 
-	// ① 索引：先撤销这个 id 的旧条目（可能是内容变了，也可能是文件没了）。
-	if s.idx != nil {
-		s.idx.Remove(id)
+	idx := s.idxNow()
+	// ① 索引：内部无锁，直接增删。
+	if idx != nil {
+		idx.Remove(id)
 		if exists && !block.Hidden && text != "" {
-			s.idx.AddWithTime(id, text, stamp)
+			idx.AddWithTime(id, text, stamp)
 		}
 	}
 
-	// ② 树：替换或移除对应 Block。
+	// ② 树：不可变发布。先复制树列表，再克隆目标树并修改副本。
+	cur := s.treeList()
+	next := cloneTreeList(cur)
+	ti := findTree(next, project, branch)
 	var tree *memory.Tree
-	for _, t := range s.trees {
-		if t.Project == project && t.Branch == branch {
-			tree = t
-			break
-		}
-	}
-	if tree == nil {
+	if ti < 0 {
 		if !exists {
 			return nil
 		}
 		tree = &memory.Tree{Project: project, Branch: branch}
-		s.trees = append(s.trees, tree)
+		next = append(next, tree)
+	} else {
+		tree = cloneTree(next[ti])
+		next[ti] = tree
 	}
 
 	replaced := false
@@ -420,7 +434,7 @@ func (s *Server) refreshPath(project, branch, path string, exists bool) error {
 			continue
 		}
 		if exists {
-			block.Body = nil // 只在这一轮有用，不留给长期树
+			block.Body = nil // 只在这一轮有用，不留进长期树
 			tree.Blocks[i] = block
 		} else {
 			tree.Blocks = append(tree.Blocks[:i], tree.Blocks[i+1:]...)
@@ -433,6 +447,7 @@ func (s *Server) refreshPath(project, branch, path string, exists bool) error {
 		tree.Blocks = append(tree.Blocks, block)
 		tree.Sort()
 	}
+	s.publishTrees(next, idx)
 
 	// ③ SKILL.md 变了要重解析策略：它决定「谁能看见什么」。
 	if exists && (path == "SKILL.md" || strings.HasSuffix(path, "/SKILL.md")) {
@@ -472,48 +487,48 @@ func (s *Server) refreshBranch(project, branch string) error {
 		}
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	release, lerr := s.acquireTreeWrite()
+	if lerr != nil {
+		return lerr
+	}
+	defer release()
 
-	if s.idx != nil {
+	idx := s.idxNow()
+	if idx != nil {
 		// 先撤销旧分支的全部 doc，再按新树加回去。
-		for _, old := range s.trees {
+		for _, old := range s.treeList() {
 			if old.Project != project || old.Branch != branch {
 				continue
 			}
-			for _, b := range old.Indexable() {
-				s.idx.Remove(b.ID())
+			for _, blk := range old.Indexable() {
+				idx.Remove(blk.ID())
 			}
 		}
-		for _, b := range tree.Indexable() {
-			data, rerr := s.readBlock(b)
+		for _, blk := range tree.Indexable() {
+			data, rerr := s.readBlock(blk)
 			if rerr != nil {
 				continue
 			}
-			stamp := b.Time
-			if at := sliceAtTime(string(data), b.Path); at > 0 {
+			stamp := blk.Time
+			if at := sliceAtTime(string(data), blk.Path); at > 0 {
 				stamp = at
 			}
-			s.idx.AddWithTime(b.ID(), string(data), stamp)
+			idx.AddWithTime(blk.ID(), string(data), stamp)
 		}
 	}
 	// 索引建完就扔掉扫描期缓存：留着等于整分支正文常驻内存。
-	// （见 Reload 里的同一段说明。）
 	for i := range tree.Blocks {
 		tree.Blocks[i].Body = nil
 	}
 
-	replaced := false
-	for i, old := range s.trees {
-		if old.Project == project && old.Branch == branch {
-			s.trees[i] = tree
-			replaced = true
-			break
-		}
+	cur := s.treeList()
+	next := cloneTreeList(cur)
+	if ti := findTree(next, project, branch); ti < 0 {
+		next = append(next, tree)
+	} else {
+		next[ti] = tree
 	}
-	if !replaced {
-		s.trees = append(s.trees, tree)
-	}
+	s.publishTrees(next, idx)
 	return nil
 }
 
@@ -545,28 +560,33 @@ func (s *Server) refreshBranches(project string, branches []string, reason strin
 // 为什么不能只 refreshBranch：归档之后源分支在 refs 里已经不存在，
 // 而索引里它的 doc 还在——症状是「归档了但还能 recall 到」。
 func (s *Server) dropBranch(project, branch string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for i, t := range s.trees {
-		if t.Project != project || t.Branch != branch {
-			continue
-		}
-		if s.idx != nil {
-			for _, b := range t.Indexable() {
-				s.idx.Remove(b.ID())
-			}
-		}
-		s.trees = append(s.trees[:i], s.trees[i+1:]...)
+	release, err := s.acquireTreeWrite()
+	if err != nil {
 		return
 	}
+	defer release()
+
+	cur := s.treeList()
+	ti := findTree(cur, project, branch)
+	if ti < 0 {
+		return
+	}
+	idx := s.idxNow()
+	if idx != nil {
+		for _, b := range cur[ti].Indexable() {
+			idx.Remove(b.ID())
+		}
+	}
+	next := make([]*memory.Tree, 0, len(cur)-1)
+	next = append(next, cur[:ti]...)
+	next = append(next, cur[ti+1:]...)
+	s.publishTrees(next, idx)
 }
 
 // allIndexableBlocks 返回全库可索引块的副本（测试与诊断用）。
 func (s *Server) allIndexableBlocks() []memory.Block {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 	var out []memory.Block
-	for _, t := range s.trees {
+	for _, t := range s.treeList() {
 		out = append(out, t.Indexable()...)
 	}
 	return out

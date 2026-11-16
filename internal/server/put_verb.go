@@ -294,7 +294,9 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 	}
 
 	if strings.HasPrefix(rest, "-") {
-		s.treeWatch.Clear(c.Identity)
+		if err := s.treeWatch.Clear(c.Identity); err != nil {
+			return TermResult{}, err
+		}
 		return TermResult{
 			Text:       "all watches cleared",
 			Structured: map[string]any{"ok": true, "cleared": true},
@@ -323,7 +325,9 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		}
 	}
 
-	s.treeWatch.Add(c.Identity, TreeWatch{Project: proj, Branch: branch, Path: treePath, Since: since})
+	if err := s.treeWatch.Add(c.Identity, TreeWatch{Project: proj, Branch: branch, Path: treePath, Since: since}); err != nil {
+		return TermResult{}, err
+	}
 	where := proj + "@" + branch
 	if treePath != "" {
 		where += "/" + treePath

@@ -1,7 +1,6 @@
 package server
 
 import (
-	"sync"
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/embed"
@@ -32,17 +31,7 @@ import (
 
 // semanticMaintainer 管理后台追平协程。零值可用（未启动状态）。
 type semanticMaintainer struct {
-	mu   sync.Mutex
-	stop chan struct{}
-	kick chan struct{} // 容量 1：写入后请求尽快追平
-}
-
-func (m *semanticMaintainer) stopLocked() {
-	if m.stop != nil {
-		close(m.stop)
-		m.stop = nil
-	}
-	m.kick = nil
+	runner backgroundRunner
 }
 
 // startSemanticMaintainer 启动后台追平。interval<=0 用默认 60s。
@@ -51,15 +40,11 @@ func (s *Server) startSemanticMaintainer(interval time.Duration) {
 		interval = 60 * time.Second
 	}
 	m := &s.semanticMaint
-	m.mu.Lock()
-	if m.stop != nil {
-		m.mu.Unlock()
+	run, ok := m.runner.start()
+	if !ok {
 		return // 已经在跑
 	}
-	stop := make(chan struct{})
-	kick := make(chan struct{}, 1)
-	m.stop, m.kick = stop, kick
-	m.mu.Unlock()
+	stop, kick := run.stop, run.kick
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -85,26 +70,13 @@ func (s *Server) startSemanticMaintainer(interval time.Duration) {
 
 // stopSemanticMaintainer 停掉后台协程（Close 时调用）。
 func (s *Server) stopSemanticMaintainer() {
-	m := &s.semanticMaint
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.stopLocked()
+	s.semanticMaint.runner.stopNow()
 }
 
 // kickSemantic 请求尽快追平（写入后调用）。非阻塞：
 // 通道满了说明已有一笔待执行，全量比对一次就够，丢掉这笔请求。
 func (s *Server) kickSemantic() {
-	m := &s.semanticMaint
-	m.mu.Lock()
-	kick := m.kick
-	m.mu.Unlock()
-	if kick == nil {
-		return
-	}
-	select {
-	case kick <- struct{}{}:
-	default:
-	}
+	s.semanticMaint.runner.kick()
 }
 
 // catchUpSemantic 把语义索引追平到当前树状态。

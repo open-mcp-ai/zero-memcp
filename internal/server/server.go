@@ -131,8 +131,10 @@ type Server struct {
 	// dataDir 是数据根，吊销凭证时需要它定位 system/tokens。
 	dataDir string
 
-	cfgMu sync.RWMutex
-	mu    sync.RWMutex
+	// cfgFilePtr 是配置的原子快照。Reload 在运行中整体替换它，
+	// 读者一次 Load 就拿到完整的一份，不会读到半个新旧混合体。
+	cfgFilePtr atomic.Pointer[config.File]
+	mu         sync.RWMutex
 	trees []*memory.Tree
 	idx   *index.Index
 
@@ -205,8 +207,6 @@ type Server struct {
 	// lock 是数据目录的跨进程独占锁。进程崩溃时内核自动释放。
 	lock *instanceLock
 
-	// cfgFile 是配置内容，cfgLookup 是它的运行时索引。
-	cfgFile *config.File
 	// cfgLookup 是配置的运行时索引，用 atomic.Pointer 持有。
 	//
 	// 为什么不能是普通字段：reload 会在运行中替换它，而它有 11 处
@@ -260,29 +260,39 @@ type Server struct {
 	// 而 maintain 可能正在 repo.Commit——那条路径不经过写入队列，
 	// 会直接写 ref。不等待就关库，等于让提交和关库赛跑。
 	maintainDone chan struct{}
-	// startMu 保护下面两个字段：Start 写、Close 读。
-	startMu         sync.Mutex
-	maintainStarted bool
+	// maintainStarted 用 CAS 表达「只有一个 Start 真正启动维护循环」：
+	// 检查并置位合成一次原子操作，不需要配对 Lock/Unlock。
+	maintainStarted atomic.Bool
 
-	// netMu 保护下面两个字段：Start 在 goroutine 里写，Addr/Close 在别处读。
-	netMu       sync.Mutex
-	httpServers []*http.Server
-	listens     []ListenBlock
-	listener    net.Listener
+	// netState 是监听器/HTTP 服务器的原子快照。
+	// Start 在 goroutine 里写，Addr/Close 在别处读 —— 用原子指针交换，
+	// 读者永远看到一份完整的、而非被就地改写的切片。
+	netState atomic.Pointer[netSnapshot]
+	listens  []ListenBlock
+}
+
+// netSnapshot 是一份不可变的网络资源快照。
+type netSnapshot struct {
+	listener net.Listener
+	servers  []*http.Server
+}
+
+func (s *Server) loadNet() *netSnapshot {
+	if n := s.netState.Load(); n != nil {
+		return n
+	}
+	return &netSnapshot{}
 }
 
 // setListener 记录监听器，供 Addr 和 Close 使用。
 func (s *Server) setListener(ln net.Listener) {
-	s.netMu.Lock()
-	s.listener = ln
-	s.netMu.Unlock()
+	cur := s.loadNet()
+	s.netState.Store(&netSnapshot{listener: ln, servers: cur.servers})
 }
 
 // getListener 读取监听器。
 func (s *Server) getListener() net.Listener {
-	s.netMu.Lock()
-	defer s.netMu.Unlock()
-	return s.listener
+	return s.loadNet().listener
 }
 
 // New 构建并校验服务端。校验在启动前完成，不在运行中抛出。
@@ -424,7 +434,6 @@ func New(cfg Config) (*Server, error) {
 		projects:      NewProjectStore(cfg.DataDir),
 		tokens:        tokens,
 		rev:           rev,
-		cfgFile:       cfgFile,
 		defaultBranch: branch,
 		passwords:     pwStore,
 		grants:        auth.NewGrantStore(cfg.DataDir),
@@ -442,7 +451,9 @@ func New(cfg Config) (*Server, error) {
 			close(ch)
 			return ch
 		}(),
+
 	}
+	s.cfgFilePtr.Store(cfgFile)
 	if lookup != nil {
 		s.cfgLookup.Store(lookup)
 	}
@@ -520,9 +531,7 @@ func (s *Server) Reload() error {
 		if newFile, err := config.Load(s.cfg.ConfigFile); err != nil {
 			s.logf("warning: reload failed to re-parse config (keeping the existing config): %v", err)
 		} else {
-			s.cfgMu.Lock()
-			s.cfgFile = newFile
-			s.cfgMu.Unlock()
+			s.cfgFilePtr.Store(newFile)
 			s.cfgLookup.Store(newFile.Build())
 			rems := newFile.Remotes
 			s.remotes.Store(&rems)
@@ -650,21 +659,17 @@ func (s *Server) DescribeProjects() string {
 func (s *Server) Start() error {
 	// Start 只在真正启动维护循环时重建这个通道。
 	// 用 mutex 保护：Start 可能在 goroutine 里跑，Close 同时在等它。
-	s.startMu.Lock()
-	if !s.maintainStarted {
-		s.maintainStarted = true
+	if s.maintainStarted.CompareAndSwap(false, true) {
 		s.maintainDone = make(chan struct{})
 		go s.maintain(s.maintainDone)
 		// 后台对等同步与 maintain 同生命周期：它依赖提交先发生
 		//（脏层未折叠时 syncOnce 会跳过），两者必须一起跑。
-		s.cfgMu.RLock()
-		disabled := s.cfgFile != nil && s.cfgFile.Sync.Disabled
-		s.cfgMu.RUnlock()
+		cf := s.cfgFilePtr.Load()
+		disabled := cf != nil && cf.Sync.Disabled
 		if !disabled {
 			s.startSyncLoop()
 		}
 	}
-	s.startMu.Unlock()
 
 	blocks := s.listens
 	if len(blocks) == 0 {
@@ -698,9 +703,8 @@ func (s *Server) Start() error {
 		}(srv, ln, blk.Addr)
 	}
 
-	s.netMu.Lock()
-	s.httpServers = servers
-	s.netMu.Unlock()
+	cur := s.loadNet()
+	s.netState.Store(&netSnapshot{listener: cur.listener, servers: servers})
 	// 阻塞直到 Close
 	<-s.done
 	return nil
@@ -791,15 +795,8 @@ func (s *Server) Close() error {
 	// 停语义索引的后台追平：它会读仓库，必须在关仓库之前停。
 	s.stopSemanticMaintainer()
 	// 停后台同步：它会 fetch/push，必须在关仓库之前停。
-	s.syncState.mu.Lock()
-	if s.syncState.stop != nil {
-		close(s.syncState.stop)
-		s.syncState.stop = nil
-	}
-	s.syncState.mu.Unlock()
-	s.netMu.Lock()
-	srvs := s.httpServers
-	s.netMu.Unlock()
+	s.syncState.runner.stopNow()
+	srvs := s.loadNet().servers
 	var lastErr error
 	for _, srv := range srvs {
 		if err := srv.Close(); err != nil {
@@ -811,10 +808,10 @@ func (s *Server) Close() error {
 	// 反过来的顺序（先关仓库）会让正在跑的 repo.Commit 撞上
 	// 已关闭的写者：提交本身写的是 ref 和对象，不经过写队列，
 	// 于是它会在一个逻辑上已关闭的仓库上继续写。
-	s.startMu.Lock()
-	done := s.maintainDone
-	s.startMu.Unlock()
-	if done != nil {
+	// maintainDone 只在 CAS 成功的那一次 Start 里被赋值，
+	// 且赋值发生在 Start 返回之前；Close 与 Start 的先后由 Done 频道协调，
+	// 这里直接读即可（读不到就说明维护循环从没启动）。
+	if done := s.maintainDone; done != nil {
 		<-done
 	}
 	if s.projects != nil {

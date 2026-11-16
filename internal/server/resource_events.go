@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
@@ -124,36 +125,37 @@ type subscription struct {
 }
 
 // resourceHub 管理活跃订阅并把变更扇出给关心的订阅者。
+// resourceHub 管理订阅者。
+//
+// 用 sync.Map + atomic.Int64，不用 RWMutex：
+//   - subs 没有跨 key 的不变量（每次只碰一个 sub），正是 sync.Map 的适用面；
+//   - nextID 是纯计数器，atomic.AddInt64 一行就能看出对错，
+//     而 `L.Lock(); id++; L.Unlock()` 的正确性分散在每条路径上。
 type resourceHub struct {
-	mu     sync.RWMutex
-	subs   map[string]*subscription
-	nextID int
+	subs   sync.Map // id -> *subscription
+	nextID atomic.Int64
 }
 
 func newResourceHub() *resourceHub {
-	return &resourceHub{subs: make(map[string]*subscription)}
+	return &resourceHub{}
 }
 
 func (h *resourceHub) add(caller Caller, watches []string) *subscription {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.nextID++
+	n := h.nextID.Add(1)
 	sub := &subscription{
-		id:      "sub:" + strconv.Itoa(h.nextID),
+		id:      "sub:" + strconv.FormatInt(n, 10),
 		caller:  caller,
 		watches: watches,
 		// 缓冲要够吞下突发：一次批量提交可能连着推多条。
 		ch:     make(chan resourceEvent, 32),
 		closed: make(chan struct{}),
 	}
-	h.subs[sub.id] = sub
+	h.subs.Store(sub.id, sub)
 	return sub
 }
 
 func (h *resourceHub) remove(sub *subscription) {
-	h.mu.Lock()
-	delete(h.subs, sub.id)
-	h.mu.Unlock()
+	h.subs.Delete(sub.id)
 	sub.closeMu.Do(func() { close(sub.closed) })
 }
 
@@ -162,12 +164,11 @@ func (h *resourceHub) remove(sub *subscription) {
 // 匹配规则是**前缀**：订阅分支则其下任何子树变更都算，订阅子树则只看
 // 该子树。慢订阅者直接丢弃事件——它可以用 since 补，但不能拖住写入。
 func (h *resourceHub) publish(ev resourceEvent) {
-	h.mu.RLock()
-	subs := make([]*subscription, 0, len(h.subs))
-	for _, s := range h.subs {
-		subs = append(subs, s)
-	}
-	h.mu.RUnlock()
+	var subs []*subscription
+	h.subs.Range(func(_, v any) bool {
+		subs = append(subs, v.(*subscription))
+		return true
+	})
 
 	for _, s := range subs {
 		if !subMatches(s.watches, ev.URI) {

@@ -58,15 +58,15 @@ func TestFanoutHubTracksPerTargetState(t *testing.T) {
 	}
 
 	h.updateTarget("b1", "peer-a", "done", "")
-	if h.batches[0].Completed {
+	if h.load()[0].Completed {
 		t.Fatal("还有一个目标未终态时不该标完成")
 	}
 
 	h.updateTarget("b1", "peer-b", "failed", "connection refused")
-	if !h.batches[0].Completed {
+	if !h.load()[0].Completed {
 		t.Fatal("所有目标都终态后应标完成")
 	}
-	if h.batches[0].DoneAt.IsZero() {
+	if h.load()[0].DoneAt.IsZero() {
 		t.Fatal("完成时应记录结束时刻")
 	}
 
@@ -97,9 +97,7 @@ func TestFanoutHubKeepsBoundedHistory(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		h.add(&FanoutBatch{ID: string(rune('a' + i)), StartedAt: time.Now()})
 	}
-	h.mu.Lock()
-	n := len(h.batches)
-	h.mu.Unlock()
+	n := len(h.load())
 	if n > 5 {
 		t.Fatalf("批次历史应上限 5 条，实际 %d", n)
 	}

@@ -118,8 +118,11 @@ func splitHostPortLoose(v string) (host, port string) {
 // （每次约 40ms、64MB）。不限制的话，一个脚本能把 CPU 和内存打满，
 // 顺便做在线爆破。这里按「连续失败」计数，成功即清零。
 type uiLoginLimiter struct {
-	mu      sync.Mutex
-	fails   map[string]*loginFail
+	// fails 每 key 独立、无跨 key 不变量 → sync.Map；
+	// 同 key 的「读计数 + 加一 + 可能进入锁定」用 CompareAndSwap 重试，
+	// 而不用一把全局 Mutex 把所有人的登录尝试串起来
+	// （那会让一次登录的 40ms 密码哈希阻塞其它来源的判定）。
+	fails   sync.Map // ip -> loginFail（值类型，不可变）
 	maxTry  int
 	lockout time.Duration
 }
@@ -131,7 +134,6 @@ type loginFail struct {
 
 func newUILoginLimiter() *uiLoginLimiter {
 	return &uiLoginLimiter{
-		fails:   map[string]*loginFail{},
 		maxTry:  5,
 		lockout: 5 * time.Minute,
 	}
@@ -139,12 +141,11 @@ func newUILoginLimiter() *uiLoginLimiter {
 
 // allow 报告某个来源现在是否可以尝试登录。
 func (l *uiLoginLimiter) allow(ip string) (bool, time.Duration) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	f, ok := l.fails[ip]
+	v, ok := l.fails.Load(ip)
 	if !ok {
 		return true, 0
 	}
+	f, _ := v.(loginFail)
 	if time.Now().Before(f.until) {
 		return false, time.Until(f.until)
 	}
@@ -152,28 +153,41 @@ func (l *uiLoginLimiter) allow(ip string) (bool, time.Duration) {
 }
 
 // fail 记一次失败，返回是否已进入锁定。
+//
+// 用 CAS 重试而不是加锁：同一个 ip 的并发尝试是极少数，
+// 而 CAS 让「读旧值 → 算新值 → 交换」成为一次可验证的原子决定。
 func (l *uiLoginLimiter) fail(ip string) bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	f, ok := l.fails[ip]
-	if !ok {
-		f = &loginFail{}
-		l.fails[ip] = f
+	now := time.Now()
+	for {
+		v, ok := l.fails.Load(ip)
+		var cur loginFail
+		if ok {
+			cur, _ = v.(loginFail)
+		}
+		// 锁定期已过：计数重新开始。
+		if !cur.until.IsZero() && !now.Before(cur.until) {
+			cur = loginFail{}
+		}
+		next := loginFail{count: cur.count + 1}
+		locked := next.count >= l.maxTry
+		if locked {
+			next = loginFail{until: now.Add(l.lockout)}
+		}
+		if !ok {
+			if _, loaded := l.fails.LoadOrStore(ip, next); !loaded {
+				return locked
+			}
+			continue
+		}
+		if l.fails.CompareAndSwap(ip, cur, next) {
+			return locked
+		}
 	}
-	f.count++
-	if f.count >= l.maxTry {
-		f.count = 0
-		f.until = time.Now().Add(l.lockout)
-		return true
-	}
-	return false
 }
 
 // reset 在登录成功后清掉该来源的失败计数。
 func (l *uiLoginLimiter) reset(ip string) {
-	l.mu.Lock()
-	delete(l.fails, ip)
-	l.mu.Unlock()
+	l.fails.Delete(ip)
 }
 
 // clientIP 取请求来源地址（不含端口）。

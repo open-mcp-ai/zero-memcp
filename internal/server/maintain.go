@@ -37,9 +37,7 @@ func (s *Server) maintain(done chan struct{}) {
 	defCount := 0
 	// cfgFile 会被 Reload 在运行中替换，读它必须持锁。
 	// 这里是唯一「读一份完整快照」的地方，所以整段在锁内取完再放。
-	s.cfgMu.RLock()
-	cf := s.cfgFile
-	s.cfgMu.RUnlock()
+	cf := s.cfgFilePtr.Load()
 	if cf != nil {
 		if d := cf.Commit.Interval; d > 0 {
 			defCommit = d
@@ -177,9 +175,7 @@ func (s *Server) indexSnapshotDue(last time.Time, every time.Duration) bool {
 // 太粗会让「一改就提交」变成「几秒后才提交」，太细会空转。
 func (s *Server) shortestTick(defCommit time.Duration) time.Duration {
 	t := defCommit
-	s.cfgMu.RLock()
-	hasCfg := s.cfgFile != nil
-	s.cfgMu.RUnlock()
+	hasCfg := s.cfgFilePtr.Load() != nil
 	if hasCfg {
 		for _, p := range s.declaredProjects() {
 			if c := s.projects.MemcpConfig(p); c.CommitInterval > 0 && c.CommitInterval < t {

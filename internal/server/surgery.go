@@ -597,10 +597,14 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 	return fmt.Sprintf("committed %s@%s (%d entries, %s)", proj, branch, count, shortSHA(sha)), nil
 }
 
-// execDiff 实现 diff 动词（分支比对 / 未审脏流提取）。
+// execDiff 实现 diff 动词。
 //
-//	diff <project>@<branch>                  列出该分支的全部文件（= 和空树比）
+//	diff <project>[@<branch>]                列出该分支**未提交**的改动
 //	diff <project>@<from> -> <project>@<to>  列出 to 相对 from 的变化
+//
+// 单参数形式与 git 的直觉一致：`git diff` 不带参数就是「工作区相对 HEAD
+// 的改动」。早先它返回「和空树比，也就是整条分支的全部文件」——那和
+// trees 重复，而且让人以为「刚写了这么多」，实际是全部历史。
 //
 // 多分支搬运的用法：
 //
@@ -617,7 +621,9 @@ func (s *Server) execDiff(rest string, c Caller, defaultBranch string) (string, 
 		fromAddr = strings.TrimSpace(left)
 		toAddr = strings.TrimSpace(right)
 	} else {
-		toAddr = rest
+		// 单参数：未提交改动。这是归纳流程的入口——
+		// 先知道「上次 commit 之后写了什么」，再决定读哪几篇。
+		return s.execUncommittedDiff(rest, c, defaultBranch)
 	}
 
 	fromProj, fromBranch, _, err := s.parseBranchAddr(fromAddr)
@@ -1078,4 +1084,48 @@ func (s *Server) splitBranchPath(addr string) (project, branch, path string, ok 
 		return hits[0][0], hits[0][1], p, true
 	}
 	return "", "", "", false
+}
+
+// execUncommittedDiff 列出某条分支尚未提交的改动。
+//
+// 这是 `diff <branch>` 的单参数形式，也是 `pending` 的实现——
+// 两个动词同一件事，只保留一个名字（diff），pending 作为别名。
+func (s *Server) execUncommittedDiff(addr string, c Caller, defaultBranch string) (string, error) {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return "", fmt.Errorf("usage: diff <project>[@<branch>] or diff <project>@<from> -> <project>@<to>")
+	}
+	proj, branch, path, err := s.resolveAddr(addr, c)
+	if err != nil {
+		return "", err
+	}
+	if path != "" {
+		return "", fmt.Errorf("%q specifies a file path; diff takes a branch", addr)
+	}
+	if !s.allowed(c, proj, branch, configBitRead) {
+		return "", fmt.Errorf("%s", s.denyReason(c, proj, branch, configBitRead))
+	}
+
+	repo, err := s.projects.Get(proj)
+	if err != nil {
+		return "", err
+	}
+	changes, err := repo.DirtyChanges(branch)
+	if err != nil {
+		return "", err
+	}
+	if len(changes) == 0 {
+		return fmt.Sprintf("%s@%s: nothing pending", proj, branch), nil
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s@%s: %d pending change(s)\n", proj, branch, len(changes))
+	for _, ch := range changes {
+		mark := "+"
+		if ch.Deleted {
+			mark = "-"
+		}
+		fmt.Fprintf(&sb, "  %s %s\n", mark, memory.MakeID(proj, branch, ch.Path))
+	}
+	return sb.String(), nil
 }

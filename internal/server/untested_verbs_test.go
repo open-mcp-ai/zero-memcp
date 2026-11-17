@@ -39,13 +39,17 @@ func TestDiffReportsAddModifyDelete(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "boss", Cap: "rwx"})
 
-	// 单分支 diff：列出分支内全部文件的当前状态
+	// 单分支 diff：未提交的改动（与 git diff 的直觉一致）。
+	// 早先它返回「和空树比 = 整条分支全部文件」，那和 trees 重复。
 	out, err := callMCP(t, srv, tok, "diff blackegg/me@zero")
 	if err != nil {
 		t.Fatalf("diff 单分支失败: %v", err)
 	}
 	if !strings.Contains(out, "blackegg/me@zero") {
 		t.Fatalf("diff 缺少项目分支头: %s", out)
+	}
+	if !strings.Contains(out, "nothing pending") {
+		t.Fatalf("干净分支应报告 nothing pending，实际: %s", out)
 	}
 
 	// 建一条新分支，两边产生差异

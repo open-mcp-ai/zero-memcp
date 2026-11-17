@@ -65,12 +65,24 @@ func (s *Server) maintain(done chan struct{}) {
 	// 而它的价值只体现在「下次启动」。
 	var lastSnapAt = time.Now()
 	snapDone := false
+	// 脏层批量刷盘：每 2 秒把「已写未 fsync」的脏文件落盘一次。
+	//
+	// 为什么不每次写都刷：绝大多数崩溃是进程崩溃而非断电，页缓存还在。
+	// 每写必刷会把单条写入从 0.5ms 拖到几毫秒，只换一个窄窗口的安全。
+	// 2 秒是折中：断电最多丢 2 秒的写入，而 2 秒内攒的往往只有几条。
+	lastSyncAt := time.Now()
 
 	for {
 		select {
 		case <-s.done:
 			return
 		case <-tick.C:
+			// 刷盘优先于一切：它是数据安全的底线，不受提交周期影响。
+			if time.Since(lastSyncAt) >= 2*time.Second {
+				s.syncDirtyAll()
+				lastSyncAt = time.Now()
+			}
+
 			projects, err := s.projects.Projects()
 			if err != nil {
 				continue
@@ -190,6 +202,26 @@ func (s *Server) shortestTick(defCommit time.Duration) time.Duration {
 		t = 100 * time.Millisecond
 	}
 	return t
+}
+
+// syncDirtyAll 把所有仓库的待刷脏文件 fsync 落盘。
+//
+// 失败只记日志不中断：刷盘失败意味着磁盘有问题，但继续服务
+// 仍然比整体停摆好——下一次刷盘会重试同一批文件。
+func (s *Server) syncDirtyAll() {
+	projects, err := s.projects.Projects()
+	if err != nil {
+		return
+	}
+	for _, proj := range projects {
+		repo, err := s.projects.Get(proj)
+		if err != nil {
+			continue
+		}
+		if err := repo.SyncDirtyNow(); err != nil {
+			s.logf("dirty sync %s: %v", proj, err)
+		}
+	}
 }
 
 // commitRepo 提交单个仓库的全部脏分支。

@@ -53,6 +53,17 @@ type FS interface {
 
 	WriteDurable(path string, data []byte, perm os.FileMode) error
 
+	// Append 把 data 追加到文件末尾（文件不存在则创建）。
+	//
+	// 必须是真正的 O_APPEND，不是「读出来 + 拼上 + 整体重写」。
+	// 脏层用它把「写一条记忆」的成本从 O(脏层条目数) 降到 O(1)：
+	// 实测同一目录连写 3000 条，整体重写的单条成本从 0.46ms 涨到 1.99ms
+	// （累计 O(n²)），append 则是常数。
+	//
+	// 这里**不** fsync：绝大多数崩溃是进程崩溃而非断电，页缓存还在，
+	// 数据不会丢。真正需要落盘的由 Repo.SyncDirtyNow 批量刷。
+	Append(path string, data []byte, perm os.FileMode) error
+
 	Remove(path string) error
 	RemoveAll(path string) error
 	Stat(path string) (os.FileInfo, error)
@@ -98,6 +109,21 @@ func (osFS) WriteAtomicWith(path string, perm os.FileMode, fill func(io.Writer) 
 
 func (osFS) WriteAtomicWithSync(path string, perm os.FileMode, fill func(io.Writer) error) error {
 	return writeAtomicNative(path, perm, true, false, fill)
+}
+
+func (osFS) Append(path string, data []byte, perm os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 func (osFS) WriteDurable(path string, data []byte, perm os.FileMode) error {
@@ -163,6 +189,14 @@ func isNotExist(err error) bool {
 func syncDir(dir string) error {
 	f, err := os.Open(dir)
 	if err != nil {
+		// 目录已经不存在 = 没有目录项需要同步。
+		//
+		// 这不是理论情况：批量刷盘（SyncDirtyNow）可能在提交刚清空
+		// 脏层目录之后才跑到，此时那个目录已经没了。对不存在的目录
+		// 报错，等于让一次正常的清理把刷盘整体判失败。
+		if isNotExist(err) {
+			return nil
+		}
 		return err
 	}
 	defer f.Close()

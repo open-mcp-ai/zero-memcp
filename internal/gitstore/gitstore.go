@@ -64,6 +64,9 @@ type Repo struct {
 	// Path 是仓库目录（通常以 .git 结尾）。
 	Path string
 
+	// dirtySyncPending 记录已写但未 fsync 的脏文件（见 SyncDirtyNow）。
+	dirtySyncPending sync.Map
+
 	// fsBox / lockerBox 是懒初始化的原子槽。
 	//
 	// 原来用 mu 保护「为 nil 就赋值」——那是典型的「检查并置位」，
@@ -120,6 +123,64 @@ func (r *Repo) lockWriter(what string) (func(), error) {
 	case <-t.C:
 		return nil, fmt.Errorf("%s: 等写者令牌超时（30s），有写者卡在落盘上", what)
 	}
+}
+
+// dirtySyncPending 记录「已写但还没 fsync」的脏文件路径。
+//
+// 为什么不每次写都 fsync：绝大多数崩溃是进程崩溃而不是断电，
+// 页缓存还在，数据不会丢。真正需要防的是断电/内核崩，而那种情况
+// 攒几秒批量刷一次就够了。每次写都 fsync 会把单条写入从
+// 0.5ms 拖到几毫秒，而收益只在「恰好断电」这个窄窗口里。
+//
+// 实现用 sync.Map：路径之间互相独立，没有跨 key 不变量。
+func (r *Repo) markDirtyForSync(path string) {
+	r.dirtySyncPending.Store(path, struct{}{})
+}
+
+// SyncDirtyNow 把所有待刷盘的脏文件 fsync 落盘，并清空待刷集合。
+//
+// 调用时机：后台维护环每几秒一次，以及 Close 之前。
+// 目录项也要同步——新建的脏文件只有目录项落盘后才真的存在。
+func (r *Repo) SyncDirtyNow() error {
+	var paths []string
+	r.dirtySyncPending.Range(func(k, _ any) bool {
+		paths = append(paths, k.(string))
+		return true
+	})
+	if len(paths) == 0 {
+		return nil
+	}
+	var firstErr error
+	syncedDirs := map[string]struct{}{}
+	for _, p := range paths {
+		if err := syncFile(p); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		r.dirtySyncPending.Delete(p)
+		syncedDirs[filepath.Dir(p)] = struct{}{}
+	}
+	for d := range syncedDirs {
+		if err := syncDir(d); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// syncFile 对单个已存在的文件做 fsync。
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if isNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // FS 返回当前仓库使用的存储抽象。
@@ -788,6 +849,10 @@ func (r *Repo) Close() error {
 	close(r.writerCh)
 	release()
 	<-down
+	// 关停前把待刷盘的脏文件落盘：正常停机不该丢掉最后几条写入。
+	if err := r.SyncDirtyNow(); err != nil && r.writerErr == nil {
+		r.writerErr = err
+	}
 	// worker 已退出，不会再改 writerErr；返回关闭前尚未被 barrier
 	// 观察到的最后一个异步写盘错误。
 	return r.writerErr

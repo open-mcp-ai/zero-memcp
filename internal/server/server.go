@@ -2029,6 +2029,10 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		out, err := s.execCommit(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
+	case "pending":
+		out, err := s.execPending(rest, c, defaultBranch)
+		return TermResult{Text: out}, err
+
 	case "write":
 		if err := s.requireBranchWide(rest, c); err != nil {
 			return TermResult{}, err

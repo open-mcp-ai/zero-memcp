@@ -533,3 +533,59 @@ func (r *Repo) cleanItemsAt(rootTree, dir string) ([]treeItem, error) {
 	}
 	return r.treeItems(sha)
 }
+
+// DirtyChange 是一条未提交的改动。
+type DirtyChange struct {
+	// Path 是树内路径（相对树根，用 / 分隔）。
+	Path string
+	// Deleted 为真表示这是一条墓碑（提交后该路径消失）。
+	Deleted bool
+	// Mode 与 SHA 只在 Deleted 为假时有意义。
+	Mode Mode
+	SHA  string
+}
+
+// DirtyChanges 返回某分支全部未提交改动的清单，按路径排序。
+//
+// 为什么需要它：Pending() 只给条数。调用方要「把这批改动归纳成什么」
+// 就必须先知道是哪些文件——没有清单就只能全量重读或者猜。
+//
+// 它不认识任何业务概念：不知道谁是人格层、谁是流水、哪条该被归纳。
+// 归纳的策略归调用方，这里只回答「哪些路径还没进 commit」。
+func (r *Repo) DirtyChanges(ref string) ([]DirtyChange, error) {
+	normRef := normalizeRef(ref)
+	if err := r.syncDirtyWriter(); err != nil {
+		return nil, err
+	}
+	unlockDirty := r.rlockDirty()
+	defer unlockDirty()
+
+	dirs, err := r.listDirtyDirs(normRef)
+	if err != nil {
+		return nil, err
+	}
+	var out []DirtyChange
+	for _, dir := range dirs {
+		n, lerr := r.loadDirtyNode(normRef, dir)
+		if lerr != nil || n == nil {
+			continue
+		}
+		prefix := ""
+		if dir != "" {
+			prefix = dir + "/"
+		}
+		for name, e := range n.set {
+			out = append(out, DirtyChange{
+				Path:    prefix + name,
+				Mode:    e.Mode,
+				SHA:     e.SHA,
+				Deleted: false,
+			})
+		}
+		for name := range n.del {
+			out = append(out, DirtyChange{Path: prefix + name, Deleted: true})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out, nil
+}

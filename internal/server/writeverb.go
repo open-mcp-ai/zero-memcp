@@ -18,10 +18,29 @@ import (
 //
 // 仅 root：一个能改 SKILL.md 的人可以改「谁看见什么」，
 // 那比改内容本身危险。
+// execWrite 把内容写到**指定路径**（区别于 put：put 生成时间戳文件名）。
+//
+// # 权限模型
+//
+// 这里曾经硬性要求 root。放开它是因为「让调用方维护自己的知识结构」
+// 这件事必须能写指定路径——而 root 门槛把这个能力锁给了管理员。
+//
+// 放开之后仍然逐条走 ACL：
+//
+//   - requireBranchWide：这条分支在凭证里必须是整分支可见，
+//     不能是被子树收窄过的（否则「写 SKILL.md」这种根路径操作无从判定）；
+//   - allowed(..., configBitWrite)：必须对这条分支有 w 权限。
+//
+// 于是能力边界是：**有某条分支的 w 权限 = 能改这条分支上任何文件**。
+// 这是刻意扩大的范围：早先 w 只够 append 新记忆（put 生成新名字，
+// 覆盖不了已有文件），现在包含改写与新建。
+//
+// 风险与代价（不藏）：
+//   - 拿 w 的调用方能改 SKILL.md 这类注入系统提示的文件，等于能改写
+//     自己的身份约束；
+//   - 缓解不是靠这里加白名单（那会把「改哪些文件」写死进服务端），
+//     而是靠 git 历史可回溯 + 规范化地址可核对 diff。
 func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string, error) {
-	if err := s.requireRoot(c); err != nil {
-		return "", err
-	}
 
 	addr, content, ok := strings.Cut(rest, "--")
 	if !ok {

@@ -118,6 +118,16 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Usage:  "commit [<project>[@<branch>]] [-m msg]",
 	},
 	{
+		// pending：列出上次 commit 之后还没进版本库的路径。
+		//
+		// 归纳流程的第一步。它不认识任何业务概念——不知道谁是人格层、
+		// 谁是流水，只回答「哪些路径还没进 commit」。
+		Name:   "pending",
+		Detail: detail_pending,
+		Kind:   term.KindFlags,
+		Usage:  "pending <project>[@<branch>]",
+	},
+	{
 		Name:   "diff",
 		Detail: detail_diff,
 		Kind:   term.KindFlags,
@@ -473,6 +483,18 @@ func reconstructCmd(st directive.Statement) string {
 }
 
 // credentialVerbs 是「put 需要 <name> 位置参数 + 正文」的那两个复合动词。
+const detail_pending = `pending —— 列出尚未提交的改动路径。
+
+用法：pending <project>[@<branch>]
+
+输出每条改动一行，前面是 +（新增或覆盖）或 -（删除），
+后面是可直接喂给 read 的规范地址（project@branch:path）。
+
+commit 之后清单清空。
+
+它只回答「哪些路径还没进 commit」。至于这批改动该被如何归纳、
+哪些值得留下、commit message 写什么，都是调用方的事。`
+
 var credentialVerbs = map[string]bool{"remote-key": true, "remote-secret": true}
 
 func (s *Server) newTerm(v Viewer, c Caller) (*term.Term, *termHandler) {

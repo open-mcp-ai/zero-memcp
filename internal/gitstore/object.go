@@ -361,3 +361,42 @@ func sha1OfBlob(data []byte) string {
 	h.Write(data)
 	return hex.EncodeToString(h.Sum(nil))
 }
+
+// writeTagObject 写一个 annotated tag 对象（带正文），返回它的 SHA。
+//
+// 与 writeCommit 同构：git 的 tag 对象就是「指向某个对象的带正文记录」。
+//
+//	object <sha>
+//	type commit
+//	tag <name>
+//	tagger <ident> <stamp> <tz>
+//
+//	<正文>
+//
+// 为什么要 annotated tag 而不是轻量 tag（只是一个 ref 文件）：
+// 轻量 tag 存不下任何话。而「这一批记忆到底讲了什么」正是要在
+// 标记那一刻写下来的东西——正文就是摘要本身。
+func (r *Repo) writeTagObject(name, targetSHA, message string, when time.Time) (string, error) {
+	if err := validSHA(targetSHA); err != nil {
+		return "", err
+	}
+	var buf bytes.Buffer
+	fmt.Fprintf(&buf, "object %s\n", targetSHA)
+	buf.WriteString("type commit\n")
+	fmt.Fprintf(&buf, "tag %s\n", name)
+
+	_, offset := when.Zone()
+	sign := "+"
+	if offset < 0 {
+		sign = "-"
+		offset = -offset
+	}
+	tz := fmt.Sprintf("%s%02d%02d", sign, offset/3600, (offset%3600)/60)
+	fmt.Fprintf(&buf, "tagger %s %d %s\n", identity, when.Unix(), tz)
+	buf.WriteString("\n")
+	buf.WriteString(message)
+	if !strings.HasSuffix(message, "\n") {
+		buf.WriteString("\n")
+	}
+	return r.writeObject("tag", buf.Bytes())
+}

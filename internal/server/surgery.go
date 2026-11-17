@@ -249,12 +249,27 @@ func (s *Server) execTag(rest string, c Caller, defaultBranch string) (string, e
 	if len(args) >= 3 {
 		ref = args[2]
 	}
+	// 摘要正文从 `-m` 之后的原始串里取（不按空格切，摘要里可以有空格）。
+	message := ""
+	if idx := strings.Index(rest, "-m "); idx >= 0 {
+		message = strings.TrimSpace(rest[idx+3:])
+	}
 	if !s.allowed(c, project, ref, configBitWrite) {
 		return "", fmt.Errorf("%s", s.denyReason(c, project, ref, configBitWrite))
 	}
 	repo, err := s.projects.Get(project)
 	if err != nil {
 		return "", err
+	}
+	if message != "" {
+		// annotated tag：正文就是这一批记忆的摘要。
+		tagSHA, terr := repo.TagWithMessage(name, ref, message)
+		if terr != nil {
+			return "", terr
+		}
+		sha, _ := repo.Resolve(ref)
+		return fmt.Sprintf("created annotated tag %s -> %s@%s (%s), message: %s",
+			name, project, ref, shortSHA(sha), shortSHA(tagSHA)), nil
 	}
 	if err := repo.Tag(name, ref); err != nil {
 		return "", err

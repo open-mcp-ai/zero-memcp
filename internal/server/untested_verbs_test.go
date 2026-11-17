@@ -258,3 +258,48 @@ func TestWriteRestoresPayloadMarker(t *testing.T) {
 		t.Fatal("编码 marker 被落盘了")
 	}
 }
+
+// annotated tag 必须在对象库里写出真正的 tag 对象，正文是调用方给的摘要。
+//
+// 理由（用户定调）：tag 可以带信息，就相当于做一个摘要。
+// 它把摘要直接挂在 git 的 tag 对象里，随 push 到远端，git show <tag> 直接能读。
+func TestTagWithMessageCreatesAnnotatedTag(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "boss", Cap: "rwx"})
+
+	if _, err := callMCP(t, srv, tok, "put blackegg/me -- 记忆内容"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m seed"); err != nil {
+		t.Fatal(err)
+	}
+
+	summary := "今天上午完成了 zero-memcp 无锁化改造"
+	out, err := callMCP(t, srv, tok, "tag blackegg/me milestone-1 zero -m "+summary)
+	if err != nil {
+		t.Fatalf("tag -m 失败: %v", err)
+	}
+	if !strings.Contains(out, "annotated tag milestone-1") {
+		t.Fatalf("没有认出 annotated tag: %s", out)
+	}
+
+	repo, err := srv.projects.Get("blackegg/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 走到「这个 tag 指向的对象确实是 tag 对象，且正文含摘要」。
+	// 用仓库自己的读路径，不直接摸文件——压缩与对象编码归它管。
+	sha, ok, rerr := repo.ReadTagObject("milestone-1")
+	if rerr != nil {
+		t.Fatalf("读 tag 对象: %v", rerr)
+	}
+	if !ok {
+		t.Fatal("milestone-1 不是 annotated tag（没有 tag 对象）")
+	}
+	if !strings.Contains(sha.Body, summary) {
+		t.Fatalf("tag 正文没有摘要：%q", sha.Body)
+	}
+	if !strings.Contains(sha.Body, "type commit") {
+		t.Fatalf("tag 对象格式不对：%q", sha.Body)
+	}
+}

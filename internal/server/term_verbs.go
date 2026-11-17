@@ -144,9 +144,9 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:      "tag",
 		Detail:    detail_tag,
 		Kind:      term.KindFlags,
-		Flags:     []string{"d"},
+		Flags:     []string{"d", "m"},
 		Valueless: []string{"d"},
-		Usage:     "tag [-d] <project> [<name> [<ref>]]",
+		Usage:     "tag [-d] <project> [<name> [<ref>]] [-m msg]",
 	},
 	{
 		Name:   "cp",

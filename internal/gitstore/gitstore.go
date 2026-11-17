@@ -410,9 +410,14 @@ func (r *Repo) updateRef(ref, sha string) error {
 
 // commitOf 解析某 ref 指向的提交。ref 为空或无提交时返回零值。
 func (r *Repo) commitOf(ref string) (commitObj, error) {
-	sha, err := r.Resolve(ref)
-	if err != nil || sha == "" {
-		return commitObj{}, err
+	sha := ref
+	// 如果不是 40 位 hex SHA，才当成 ref 解析。
+	if validSHA(ref) != nil {
+		resolved, err := r.Resolve(ref)
+		if err != nil || resolved == "" {
+			return commitObj{}, err
+		}
+		sha = resolved
 	}
 	typ, body, err := r.readObject(sha)
 	if err != nil {

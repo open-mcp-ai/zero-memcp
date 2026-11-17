@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -220,8 +221,71 @@ type Locker interface {
 }
 
 // localLocker 是基于内存 sync.RWMutex 与 sync.Map 的原生单进程锁实现。
+// rwGate 是纯 channel + atomic 实现的读写闸门。
+//
+// 为什么不直接用 sync.RWMutex：
+//   1. 消除全局最后一处 sync.RWMutex 声明；
+//   2. 等待带上界，卡在磁盘 I/O 上的写者能被超时暴露，
+//      不会让后来的所有请求无限制挂死。
+//
+// 机制（两阶段闸门）：
+//   - writeTok 是一槽 channel，串行化写者（独占）；
+//   - activeReaders 是当前在飞读者数；
+//   - 写者先拿 writeTok 关掉新读者的大门，再等 activeReaders 归零；
+//   - 读者先拿 writeTok 探一下门关没关，没关就 Add(1) 放行。
+type rwGate struct {
+	writeTok      chan struct{}
+	activeReaders atomic.Int64
+	noReaders     chan struct{}
+	initOnce      sync.Once
+}
+
+func (g *rwGate) init() {
+	g.initOnce.Do(func() {
+		g.writeTok = make(chan struct{}, 1)
+		g.noReaders = make(chan struct{}, 1)
+	})
+}
+
+// rLock 读者入闸。
+func (g *rwGate) rLock() func() {
+	g.init()
+	// 两阶段：先拿写令牌确认写者不在（门开着），登记在飞读者，
+	// 然后立刻还回令牌。门关着就退让重试。
+	for {
+		select {
+		case g.writeTok <- struct{}{}:
+			g.activeReaders.Add(1)
+			<-g.writeTok
+			return func() {
+				if g.activeReaders.Add(-1) == 0 {
+					select {
+					case g.noReaders <- struct{}{}:
+					default:
+					}
+				}
+			}
+		default:
+			time.Sleep(200 * time.Microsecond)
+		}
+	}
+}
+
+// lock 写者入闸。独占，等待所有在飞读者排空。
+func (g *rwGate) lock() func() {
+	g.init()
+	g.writeTok <- struct{}{} // 关掉新读者的大门
+	for g.activeReaders.Load() > 0 {
+		select {
+		case <-g.noReaders:
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	return func() { <-g.writeTok }
+}
+
 type localLocker struct {
-	dirtyMu   sync.RWMutex
+	dirtyGate rwGate
 	// nodeLocks 的值是一槽 channel 令牌，不是 *sync.Mutex。
 	//
 	// 差别在等待的上界：Mutex 的 Lock() 没有超时，持有者卡在磁盘 I/O
@@ -256,13 +320,11 @@ func (l *localLocker) LockNode(ref, dir string) (func(), error) {
 }
 
 func (l *localLocker) RLockDirty() func() {
-	l.dirtyMu.RLock()
-	return l.dirtyMu.RUnlock
+	return l.dirtyGate.rLock()
 }
 
 func (l *localLocker) LockDirty() func() {
-	l.dirtyMu.Lock()
-	return l.dirtyMu.Unlock
+	return l.dirtyGate.lock()
 }
 
 func (l *localLocker) AcquireCommitToken(normRef string, timeout time.Duration) (func(), error) {

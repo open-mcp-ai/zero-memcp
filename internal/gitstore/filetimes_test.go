@@ -3,6 +3,7 @@ package gitstore
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 // 真实现场（2026-11-13，3060 hub）：
@@ -27,6 +28,7 @@ func TestFileTimesUsesLastTouchingCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(1100 * time.Millisecond)
 	if err := r.Write("main", "b.md", []byte("b1"), ModeContent); err != nil {
 		t.Fatal(err)
 	}
@@ -34,6 +36,7 @@ func TestFileTimesUsesLastTouchingCommit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	time.Sleep(1100 * time.Millisecond)
 	if err := r.Write("main", "a.md", []byte("a2"), ModeContent); err != nil {
 		t.Fatal(err)
 	}
@@ -172,4 +175,76 @@ func commitTimeUnix(t *testing.T, r *Repo, sha string) int64 {
 		t.Fatalf("%s is %s, not a commit", sha, typ)
 	}
 	return parseCommit(body).When.Unix()
+}
+
+// TestFileTimesWalksParentChainBySHA 锁定一个静默失效了两年的 bug。
+//
+// 症状：fileTimes 声称返回「最后一次改动某路径的 commit 时间」，
+// 实际上**所有路径都拿到了 tip commit 的时间**。
+//
+// 根因：祖先链是靠 `r.commitOf(cur.Parents[0])` 走的，而 commitOf
+// 只把入参当 ref 名去 refs/ 里找。传 40 位 SHA 进去时它找
+// refs/heads/<sha>，找不到就返回 ("", nil)——零值 commit + nil error。
+// 调用方 `if perr != nil` 判断不出来，于是拿着 Tree="" 的零值去
+// diffTree("", cur.Tree)，得到的是**整棵树全部文件**，第一次迭代
+// 就把所有路径都记成 tip 的时间，然后因为 len(out) >= len(wanted) 直接 break。
+//
+// 为什么原来没被发现：原测试三个 commit 落在同一秒内，
+// 时间戳完全相同，错误的实现和正确的实现给出同一组数字。
+// 换句话说那条测试钉的根本不是「哪一次提交」。
+func TestFileTimesWalksParentChainBySHA(t *testing.T) {
+	r := newTestRepo(t)
+
+	// 三次提交必须跨秒，否则「取哪一次提交的时间」无法区分。
+	// 1.05s 是刻意的：大于 1 秒保证跨秒，又不必等满两秒。
+	tick := func() { time.Sleep(1050 * time.Millisecond) }
+
+	if err := r.Write("main", "a.md", []byte("a1"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	c1, err := r.Commit("main", "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick()
+
+	if err := r.Write("main", "b.md", []byte("b1"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := r.Commit("main", "c2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tick()
+
+	// 只改 a.md：b.md 的「最后一次改动」应当停留在 c2。
+	if err := r.Write("main", "a.md", []byte("a2"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	c3, err := r.Commit("main", "c3")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	times, err := r.fileTimes("main")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 三个 commit 的时间必须两两不同，否则这个测试本身就没意义。
+	t1 := commitTimeUnix(t, r, c1)
+	t2 := commitTimeUnix(t, r, c2)
+	t3 := commitTimeUnix(t, r, c3)
+	if t1 == t2 || t2 == t3 || t1 == t3 {
+		t.Skipf("三个 commit 落在同一秒（%d/%d/%d），本用例无法区分，跳过", t1, t2, t3)
+	}
+
+	if got := times["b.md"]; got != t2 {
+		t.Fatalf("b.md 的时间应当是「最后一次改动它的 commit」(c2=%d)，实际 %d（c3=%d）——"+
+			"取到 tip 时间说明祖先链根本没走通，所有文件都会被记成最新时间",
+			t2, got, t3)
+	}
+	if got := times["a.md"]; got != t3 {
+		t.Fatalf("a.md 的时间应当是 c3=%d，实际 %d", t3, got)
+	}
 }

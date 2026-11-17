@@ -5,7 +5,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -20,8 +19,7 @@ type flakyEmbedServer struct {
 	srv      *httptest.Server
 	down     atomic.Bool
 	calls    atomic.Int64
-	mu       sync.Mutex
-	seenText []string
+	texts    atomic.Pointer[[]string]
 	dim      int
 }
 
@@ -39,9 +37,17 @@ func newFlakyEmbedServer(t *testing.T, dim int) *flakyEmbedServer {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.calls.Add(int64(len(req.Input)))
-		f.mu.Lock()
-		f.seenText = append(f.seenText, req.Input...)
-		f.mu.Unlock()
+		for {
+			cur := []string(nil)
+			if p := f.texts.Load(); p != nil {
+				cur = *p
+			}
+			next := append([]string(nil), cur...)
+			next = append(next, req.Input...)
+			if f.texts.CompareAndSwap(f.texts.Load(), &next) {
+				break
+			}
+		}
 
 		type item struct {
 			Embedding []float32 `json:"embedding"`

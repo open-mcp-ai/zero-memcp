@@ -211,6 +211,14 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		PayloadType: term.PayloadVar,
 		Usage:       "write <p>@<br>/<path> $TEXT",
 	},
+	{
+		Name:        "apply",
+		Detail:      detail_apply,
+		Kind:        term.KindPayload,
+		Target:      true,
+		PayloadType: term.PayloadVar,
+		Usage:       "apply <project>[@<branch>] $PATCHES",
+	},
 
 	// ── 同步与远端 ──
 	{
@@ -558,3 +566,23 @@ func renderReply(reply envelope.Reply, h *termHandler) TermResult {
 		Empty:      allEmpty,
 	}
 }
+
+const detail_apply = `apply —— 批量写（一次工具往返改写/删除多个文件）。
+
+用法：
+  apply <project>[@<branch>] $PATCHES
+
+其中 $PATCHES 必须是 JSON 数组（通过 vars/args 传递）：
+  [
+    {"op": "write",  "path": "SKILL.md",    "content": "..."},
+    {"op": "write",  "path": "07-topic.md", "content": "..."},
+    {"op": "delete", "path": "08-old.md"}
+  ]
+
+为什么用它而不是连续多次 write：
+  1. 一次往返：不用在模型上下文里塞 N 条工具调用与返回
+  2. 先全部校验、再全部落盘：语法/路径/权限有一处错，一个字节都不写
+  3. 逐个 path 刷新索引，不重扫整条分支
+
+注意：apply 只写脏层、不自动 commit。写与封箱是两件事，
+全部写完由调用方显式调用 commit。`

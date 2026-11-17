@@ -31,20 +31,29 @@ type repoState struct {
 // 流水记忆仓库希望「攒一批再提交」（历史整洁）。同一套周期伺候不了两者。
 func (s *Server) maintain(done chan struct{}) {
 	defer close(done)
-	// 全局缺省
-	defCommit := 30 * time.Second
+	// 全局缺省：**不自动提交**。
+	//
+	// commit 的主路径是调用方（agent 插件）在上下文里总结完近期活动、
+	// 写好 message 之后主动调。系统自己按钟点刷 commit，只会把
+	// git 历史变成一堆无意义的 "batch of N"。
+	//
+	// 不提交不等于不安全：对象和脏层都已落盘（脏层还有延迟 fsync），
+	// 重启时从脏层继续。代价只是「外部 git clone 看不到新内容」。
+	defCommit := time.Duration(0)
 	defGC := 24 * time.Hour
 	defCount := 0
 	// cfgFile 会被 Reload 在运行中替换，读它必须持锁。
 	// 这里是唯一「读一份完整快照」的地方，所以整段在锁内取完再放。
 	cf := s.cfgFilePtr.Load()
 	if cf != nil {
-		if d := cf.Commit.Interval; d > 0 {
-			defCommit = d
-		}
-		if d := cf.GC.Interval; d > 0 {
-			defGC = d
-		}
+		// 0 表示「不按这个条件触发」，必须被尊重，不能回落成默认值。
+		//
+		// 这条曾经是错的：`if d > 0 { defCommit = d }` 让显式写的 0
+		// 被当成「没配」，于是回落成 30 秒——用户想关掉自动提交，
+		// 配了 0，结果系统照样每 30 秒刷一次 commit。
+		// 现在 [commit] 段缺省即 0，语义就是「完全由调用方手动 commit」。
+		defCommit = cf.Commit.Interval
+		defGC = cf.GC.Interval
 		defCount = cf.Commit.Count
 	}
 
@@ -124,9 +133,16 @@ func (s *Server) maintain(done chan struct{}) {
 				// 两条触发条件，任一满足就折叠：
 				//   ① 条数达到 count（攒批：历史整洁，对象少）
 				//   ② 距离上次提交超过 interval（时效：不让内容长期隐形）
-				if interval > 0 && count > 0 {
+				// 两个条件互相独立：0 只关掉它自己那一条。
+				//
+				// 早先写成 `interval > 0 && count > 0`，于是
+				// 「按条数触发、不限时间」这种搭配根本不可能配出来——
+				// 配了 count 也永远不触发，而配置里看不出任何异常。
+				if interval > 0 || count > 0 {
 					pending := repo.Pending()
-					if pending > 0 && (pending >= count || time.Since(st.lastCommit) >= interval) {
+					byCount := count > 0 && pending >= count
+					byTime := interval > 0 && time.Since(st.lastCommit) >= interval
+					if pending > 0 && (byCount || byTime) {
 						if n, cerr := s.commitRepo(repo, proj, pending); cerr != nil {
 							s.logf("%s automatic commit failed: %v", proj, cerr)
 						} else if n > 0 {
@@ -186,17 +202,20 @@ func (s *Server) indexSnapshotDue(last time.Time, every time.Duration) bool {
 //
 // 太粗会让「一改就提交」变成「几秒后才提交」，太细会空转。
 func (s *Server) shortestTick(defCommit time.Duration) time.Duration {
+	// 循环本身还负责刷盘、gc、索引快照、外部推进检测、语义追平。
+	// 没有自动提交时这些事都是低频的，1 秒一次足够——不必 100ms 空转。
+	const idleTick = time.Second
+
 	t := defCommit
-	hasCfg := s.cfgFilePtr.Load() != nil
-	if hasCfg {
+	if t <= 0 {
+		t = idleTick
+	}
+	if cf := s.cfgFilePtr.Load(); cf != nil {
 		for _, p := range s.declaredProjects() {
 			if c := s.projects.MemcpConfig(p); c.CommitInterval > 0 && c.CommitInterval < t {
 				t = c.CommitInterval
 			}
 		}
-	}
-	if t > time.Second {
-		t = time.Second
 	}
 	if t < 100*time.Millisecond {
 		t = 100 * time.Millisecond

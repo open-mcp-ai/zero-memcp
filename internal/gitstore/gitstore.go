@@ -66,6 +66,12 @@ type Repo struct {
 
 	// dirtySyncPending 记录已写但未 fsync 的脏文件（见 SyncDirtyNow）。
 	dirtySyncPending sync.Map
+	// dirtyCache 是脏层节点的进程内缓存（ref\x00dir -> *dirtyNode）。
+	//
+	// 没有它，每次写入都要把整个脏文件读出来解析一遍算差量——
+	// 实测 3000 条同目录写入，单条成本仍然从 0.24ms 涨到 1.15ms。
+	// 有了它，写入是纯内存改一个 map + append 一行。
+	dirtyCache sync.Map
 
 	// fsBox / lockerBox 是懒初始化的原子槽。
 	//

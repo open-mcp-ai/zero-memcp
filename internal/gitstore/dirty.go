@@ -281,7 +281,16 @@ func decodeDirtyNode(data []byte) *dirtyNode {
 }
 
 // loadDirtyNode 读一个目录的脏覆盖。文件不存在返回 nil（不是错误）。
+// loadDirtyNode 读一个目录的脏覆盖。文件不存在返回 nil（不是错误）。
+//
+// 命中进程内缓存就直接返回同一个指针：脏层的唯一写者是本进程，
+// 而同目录的写入由 lockDirtyFile 串行化，所以拿到指针后改它再 save
+// 是安全的。外部 git 工具不会碰 dirty/ 目录（见包注释）。
 func (r *Repo) loadDirtyNode(ref, dir string) (*dirtyNode, error) {
+	key := normalizeRef(ref) + "\x00" + dir
+	if v, ok := r.dirtyCache.Load(key); ok {
+		return v.(*dirtyNode), nil
+	}
 	data, err := r.FS().ReadFile(r.dirtyFilePath(ref, dir))
 	if err != nil {
 		if isNotExist(err) {
@@ -297,6 +306,7 @@ func (r *Repo) loadDirtyNode(ref, dir string) (*dirtyNode, error) {
 		lines = 1
 	}
 	n.markPersisted(lines)
+	r.dirtyCache.Store(key, n)
 	return n, nil
 }
 
@@ -360,8 +370,29 @@ func (r *Repo) saveDirtyNode(ref, dir string, n *dirtyNode) error {
 	return nil
 }
 
+// putDirtyNode 把节点放回缓存（写路径用过之后调）。
+func (r *Repo) putDirtyNode(ref, dir string, n *dirtyNode) {
+	r.dirtyCache.Store(normalizeRef(ref)+"\x00"+dir, n)
+}
+
+// dropDirtyCache 清掉某条分支的全部缓存节点（提交清空脏层后必须调）。
+func (r *Repo) dropDirtyCache(ref string) {
+	prefix := normalizeRef(ref) + "\x00"
+	var keys []any
+	r.dirtyCache.Range(func(k, _ any) bool {
+		if s, ok := k.(string); ok && len(s) >= len(prefix) && s[:len(prefix)] == prefix {
+			keys = append(keys, k)
+		}
+		return true
+	})
+	for _, k := range keys {
+		r.dirtyCache.Delete(k)
+	}
+}
+
 // deleteDirtyNode 删一个目录的脏覆盖。不存在不算错。
 func (r *Repo) deleteDirtyNode(ref, dir string) error {
+	r.dirtyCache.Delete(normalizeRef(ref) + "\x00" + dir)
 	if err := r.FS().Remove(r.dirtyFilePath(ref, dir)); err != nil && !isNotExist(err) {
 		return err
 	}
@@ -420,6 +451,7 @@ func sortDirtyDirs(dirs []string) {
 
 // clearDirtyRef 删掉某分支的整个脏层。
 func (r *Repo) clearDirtyRef(ref string) error {
+	defer r.dropDirtyCache(ref)
 	if err := r.FS().RemoveAll(r.dirtyDirPath(ref)); err != nil {
 		return fmt.Errorf("clean up dirty layer: %w", err)
 	}

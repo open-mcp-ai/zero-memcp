@@ -163,6 +163,15 @@ func (s *Server) maintain(done chan struct{}) {
 				}
 			}
 
+			// 每天第一次有新写入时，在当时的 tip 上打一个锚点 tag。
+			//
+			// 「到 tag 为止」是召回侧遍历的边界：fileTimes 沿父链走时
+			// 走到锚点就停，不必重走整个历史（实测 main.chat 8.29s → 0.24s）。
+			// tag 会随 push 到远端，所以换机器、从备份恢复同样受益。
+			//
+			// 只在**有写入**的日子打：闲着的日子打一串空锚点没有意义。
+			s.maybeWriteDailyCheckpoints(projects)
+
 			s.checkExternalUpdates()
 
 			// 定期把索引快照落盘：下次启动就不必重扫重分词。
@@ -221,6 +230,38 @@ func (s *Server) shortestTick(defCommit time.Duration) time.Duration {
 		t = 100 * time.Millisecond
 	}
 	return t
+}
+
+// maybeWriteDailyCheckpoints 给「今天有写入但还没打锚点」的分支打一个 tag。
+//
+// 时机选择：放在维护环里而不是写路径上。写路径是热路径（0.5ms），
+// 而算一次完整 fileTimes 可能要几百毫秒到几秒——不能挂在 put 上。
+// 维护环每秒跑一次，晚一秒打上完全够用。
+func (s *Server) maybeWriteDailyCheckpoints(projects []string) {
+	today := time.Now().Format("2006-01-02")
+	for _, proj := range projects {
+		repo, err := s.projects.Get(proj)
+		if err != nil {
+			continue
+		}
+		for _, ref := range repo.PendingRefs() {
+			if repo.HasDailyCheckpoint(ref, today) {
+				continue
+			}
+			// 打锚点要算出「此刻每个路径的最后改动时间」。
+			// 已经有昨天的锚点时这一步是增量的（只走今天那一段），很便宜。
+			if _, err := repo.List(ref); err != nil {
+				continue
+			}
+			times, err := repo.FileTimes(ref)
+			if err != nil {
+				continue
+			}
+			if err := repo.WriteDailyCheckpoint(ref, today, "", times); err != nil {
+				s.logf("daily checkpoint %s@%s: %v", proj, ref, err)
+			}
+		}
+	}
 }
 
 // syncDirtyAll 把所有仓库的待刷脏文件 fsync 落盘。

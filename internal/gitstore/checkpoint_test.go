@@ -41,9 +41,7 @@ func TestCheckpointDoesNotChangeAnswer(t *testing.T) {
 	}
 
 	// 无锚点：真走一遍父链
-	if err := r.FS().Remove(r.checkpointPath("main")); err != nil && !isNotExist(err) {
-		t.Fatal(err)
-	}
+	_ = r.FS().RemoveAll(r.Path + "/refs/tags/zmcp")
 	want, err := r.fileTimes("main")
 	if err != nil {
 		t.Fatal(err)
@@ -52,9 +50,12 @@ func TestCheckpointDoesNotChangeAnswer(t *testing.T) {
 		t.Fatalf("应有 2 条路径，实际 %d", len(want))
 	}
 
-	// 上面那次调用会写锚点；再算一次，这次会命中锚点
-	if _, err := r.ReadCheckpoint("main"); err != nil {
+	// 锚点由写入侧显式打（fileTimes 是纯读，不写对象）
+	if err := r.WriteDailyCheckpoint("main", "2026-11-17", "摘要", want); err != nil {
 		t.Fatal(err)
+	}
+	if cp, _ := r.LatestDailyCheckpoint("main"); cp == nil {
+		t.Fatal("锚点没写进去")
 	}
 	got, err := r.fileTimes("main")
 	if err != nil {
@@ -83,13 +84,17 @@ func TestCheckpointShortensTraversal(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	// 第一次：建立锚点
-	if _, err := r.fileTimes("main"); err != nil {
+	// 建立锚点（写入侧的职责，不是 fileTimes 的）
+	times0, err := r.fileTimes("main")
+	if err != nil {
 		t.Fatal(err)
 	}
-	cp, err := r.ReadCheckpoint("main")
+	if err := r.WriteDailyCheckpoint("main", "2026-11-17", "摘要", times0); err != nil {
+		t.Fatal(err)
+	}
+	cp, err := r.LatestDailyCheckpoint("main")
 	if err != nil || cp == nil {
-		t.Fatalf("第一次调用后应写下锚点：cp=%v err=%v", cp, err)
+		t.Fatalf("锚点写下后应能读回：cp=%v err=%v", cp, err)
 	}
 
 	// 再提交一次

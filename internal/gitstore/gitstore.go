@@ -1314,6 +1314,9 @@ func (r *Repo) Log(ref string, n int) ([]CommitInfo, error) {
 // diffTree 对相同子树按 SHA 短路，所以每个 commit 的开销等于**它实际
 // 改动的路径数量**而不是仓库总文件数；总复杂度 O(changes)。
 // 一旦所有现存路径都拿到了时间就提前结束，不需要走完整段历史。
+// FileTimes 是 fileTimes 的导出形式（服务端的按日锚点要用它）。
+func (r *Repo) FileTimes(ref string) (map[string]int64, error) { return r.fileTimes(ref) }
+
 func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
 	normRef := normalizeRef(ref)
 	tipSHA, err := r.Resolve(normRef)
@@ -1343,7 +1346,7 @@ func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
 	// 纯 tag 只能截断指针，走到那里仍然不知道更早的历史——所以锚点
 	// 必须带着数据。有了它，遍历只需要覆盖「锚点之后」那一段。
 	// 实测 main.chat（1,506 commit / 3,042 文件）就这么从 8.29s 降到毫秒级。
-	cp, _ := r.ReadCheckpoint(normRef)
+	cp, _ := r.LatestDailyCheckpoint(normRef)
 	out := map[string]int64{}
 	if cp != nil && cp.Commit == tipSHA {
 		// tip 就是锚点：零遍历。
@@ -1401,14 +1404,9 @@ func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
 		cur = *parent
 	}
 
-	// 全部路径都有着落时记下新锚点：下一次就只走「锚点之后」这一段。
-	// 只在 tip 前进了的时候写，避免每次 List 都做一次 JSON 落盘。
-	if len(out) >= len(wanted) && (cp == nil || cp.Commit != tipSHA) {
-		if err := r.WriteCheckpoint(normRef, tipSHA, out); err != nil {
-			// 锚点只是加速，写不进去不影响正确性。
-			r.logCheckpointFailure(normRef, err)
-		}
-	}
+	// 这里**不写**锚点：fileTimes 是读路径（List 会调它），
+	// 读路径里写对象会让人无法解释「为什么读一次就多出来几个对象」。
+	// 锚点由写入侧按天打（见 Server.maybeWriteDailyCheckpoint）。
 	return out, nil
 }
 

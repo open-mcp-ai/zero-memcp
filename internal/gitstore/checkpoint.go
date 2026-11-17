@@ -196,3 +196,138 @@ func (r *Repo) ReadTagObject(name string) (TagObject, bool, error) {
 	}
 	return obj, true, nil
 }
+
+// DailyCheckpointTag 返回某条分支某天的锚点 tag 名。
+//
+//	zmcp/<branch>/<YYYY-MM-DD>
+//
+// 用 refs/tags/ 而不是私有命名空间，是因为 tag 会随 push 到远端——
+// 换一台机器、从备份恢复，都不用重新走一遍父链。
+func DailyCheckpointTag(ref, date string) string {
+	return "zmcp/" + normalizeRef(ref) + "/" + date
+}
+
+// WriteDailyCheckpoint 在 tip 上打一个当天的锚点 tag。
+//
+// tag 正文 = 摘要 + 一行指向数据 blob 的指针：
+//
+//	今天的摘要（人或 AI 写的，可以为空）
+//
+//	zmcp-checkpoint: <blob-sha>
+//
+// 为什么数据放 blob 而不是塞进 tag 正文：main.record 有 4,953 条路径，
+// 序列化后约 150KB。塞进正文会让 `git show <tag>` 吐出一大坨机器数据；
+// 放 blob 则正文保持人类可读，git 还替我们压缩。
+func (r *Repo) WriteDailyCheckpoint(ref, date, summary string, times map[string]int64) error {
+	normRef := normalizeRef(ref)
+	sha, err := r.Resolve(normRef)
+	if err != nil || sha == "" {
+		return err
+	}
+	if len(times) == 0 {
+		return nil
+	}
+	cp := checkpoint{Commit: sha, When: time.Now(), Times: times}
+	data, err := json.Marshal(cp)
+	if err != nil {
+		return err
+	}
+	blobSHA, err := r.writeObject("blob", data)
+	if err != nil {
+		return err
+	}
+
+	// 清理旧格式残留：早先锚点是 zmcp/<branch>（一个 ref 文件），
+	// 现在是 zmcp/<branch>/<date>（目录）。前者存在时后者 mkdir 会失败
+	// （not a directory）。zmcp/ 是我们自己的命名空间，删掉是安全的。
+	legacy := filepath.Join(r.Path, "refs", "tags", "zmcp", filepath.FromSlash(normRef))
+	_ = r.FS().Remove(legacy)
+
+	name := DailyCheckpointTag(normRef, date)
+	body := summary
+	if body != "" && !strings.HasSuffix(body, "\n") {
+		body += "\n"
+	}
+	body += "\nzmcp-checkpoint: " + blobSHA + "\n"
+
+	tagSHA, err := r.writeTagObject(name, sha, body, time.Now())
+	if err != nil {
+		return err
+	}
+	if err := r.updateRef("refs/tags/"+name, tagSHA); err != nil {
+		return err
+	}
+	// 顺手更新「最新锚点」缓存，让下一次 fileTimes 不必扫 tag。
+	_ = r.FS().WriteAtomic(r.checkpointPath(normRef), data, 0o644)
+	return nil
+}
+
+// LatestDailyCheckpoint 找某条分支最近的一个锚点 tag，返回它的数据。
+//
+// 找不到返回 nil（不是错误）：第一次跑的时候本来就没有锚点。
+func (r *Repo) LatestDailyCheckpoint(ref string) (*checkpoint, error) {
+	normRef := normalizeRef(ref)
+	prefix := "zmcp/" + normRef + "/"
+
+	// refs/tags 下找 zmcp/<branch>/<date>，取字典序最大的（日期天然可比）
+	tagsDir := filepath.Join(r.Path, "refs", "tags", "zmcp", filepath.FromSlash(normRef))
+	entries, err := r.FS().ReadDir(tagsDir)
+	if err != nil {
+		if isNotExist(err) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	latest := ""
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		if name > latest {
+			latest = name
+		}
+	}
+	if latest == "" {
+		return nil, nil
+	}
+
+	obj, ok, err := r.ReadTagObject(prefix + latest)
+	if err != nil || !ok {
+		return nil, err
+	}
+	// 从正文里找 zmcp-checkpoint: <sha>
+	var blobSHA string
+	for _, line := range strings.Split(obj.Body, "\n") {
+		if v, found := strings.CutPrefix(line, "zmcp-checkpoint: "); found {
+			blobSHA = strings.TrimSpace(v)
+			break
+		}
+	}
+	if blobSHA == "" || validSHA(blobSHA) != nil {
+		return nil, nil
+	}
+	typ, body, err := r.readObject(blobSHA)
+	if err != nil || typ != "blob" {
+		return nil, nil
+	}
+	var cp checkpoint
+	if err := json.Unmarshal(body, &cp); err != nil {
+		return nil, nil
+	}
+	if cp.Commit == "" || len(cp.Times) == 0 {
+		return nil, nil
+	}
+	return &cp, nil
+}
+
+
+// HasDailyCheckpoint 报告某条分支今天（或指定的日期）是否已有锚点 tag。
+func (r *Repo) HasDailyCheckpoint(ref, date string) bool {
+	path := filepath.Join(r.Path, "refs", "tags",
+		filepath.FromSlash(DailyCheckpointTag(ref, date)))
+	if _, err := r.FS().ReadFile(path); err != nil {
+		return false
+	}
+	return true
+}

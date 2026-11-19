@@ -46,7 +46,9 @@ func TestRecallJSONFlagReturnsStructuredText(t *testing.T) {
 			Addr  string  `json:"addr"`
 			Score float64 `json:"score"`
 		} `json:"results"`
-		Count int `json:"count"`
+		Count  int    `json:"count"`
+		Query  string `json:"query"`
+		TookMs *int64 `json:"tookMs"`
 	}
 	if err := json.Unmarshal([]byte(out), &d); err != nil {
 		t.Fatalf("解析 recall --json 失败: %v，原文: %s", err, out)
@@ -62,21 +64,40 @@ func TestRecallJSONFlagReturnsStructuredText(t *testing.T) {
 		t.Fatalf("hits 与 results 别名不同步: hits=%+v results=%+v", d.Hits[0], d.Results[0])
 	}
 
+	// 审计字段：query 必须原样回显（不是改写后的查询词），tookMs 必须存在。
+	//
+	// 调用方靠这两个字段把「哪条消息、多少分、放行还是拒绝」串成一条链。
+	// 不回显查询，它对账时无法区分「这条消息没查」和「查了但查询词被改了」。
+	if d.Query != "密码学" {
+		t.Fatalf("query 没有原样回显: %q", d.Query)
+	}
+	if d.TookMs == nil {
+		t.Fatalf("缺少 tookMs 字段")
+	}
+	if *d.TookMs < 0 {
+		t.Fatalf("tookMs 不应为负: %d", *d.TookMs)
+	}
+
 	// 2. 空结果时：也必须是合法 JSON，而不是 "no matches"
 	emptyOut, err := callMCP(t, srv, tok, "recall 毫无关系的火星文xyz123 --json")
 	if err != nil {
 		t.Fatalf("空结果 recall --json 报错: %v", err)
 	}
 	var emptyD struct {
-		Hits    []any `json:"hits"`
-		Results []any `json:"results"`
-		Count   int   `json:"count"`
+		Hits    []any  `json:"hits"`
+		Results []any  `json:"results"`
+		Count   int    `json:"count"`
+		Query   string `json:"query"`
+		TookMs  *int64 `json:"tookMs"`
 	}
 	if err := json.Unmarshal([]byte(emptyOut), &emptyD); err != nil {
 		t.Fatalf("空结果不是合法 JSON: %v, 原文: %s", err, emptyOut)
 	}
 	if emptyD.Count != 0 || len(emptyD.Hits) != 0 || len(emptyD.Results) != 0 {
 		t.Fatalf("空结果应该 count=0: %+v", emptyD)
+	}
+	if emptyD.Query == "" || emptyD.TookMs == nil {
+		t.Fatalf("空结果同样要带 query/tookMs: %+v", emptyD)
 	}
 
 	// 3. 不带 --json 时保持原有人话排版（向前兼容）

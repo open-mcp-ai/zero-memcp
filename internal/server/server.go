@@ -1663,6 +1663,11 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 
 	case "recall":
 		// recall <text>
+		//
+		// 计时起点放在最前面：tookMs 要覆盖解析、检索、取摘要的全过程，
+		// 而不是只算检索那一段——调用方拿它做审计，缺的那几毫秒正是
+		// 「为什么这次慢」的线索。
+		tRecall := time.Now()
 		rest = restorePayload(rest)
 		//
 		// 返回地址 + 摘要片段，不是光秃秃的地址。
@@ -1759,7 +1764,10 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 				text = fmt.Sprintf("no matches under scope %s, but the same query matches %s elsewhere in your visible range",
 					strings.Join(scopes, "||"), s.projectOfAddr(outsideAddr))
 			}
-			empty := map[string]any{"hits": []any{}, "results": []any{}, "count": 0, "scopes": scopes}
+			empty := map[string]any{
+				"hits": []any{}, "results": []any{}, "count": 0, "scopes": scopes,
+				"query": query, "tookMs": time.Since(tRecall).Milliseconds(),
+			}
 			if wantJSON {
 				// --json 时空结果也是合法 JSON，不是 "no matches" 这句人话。
 				// 程序消费者据此判空，不需要认识我们的排版。
@@ -1799,6 +1807,12 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			"results": structHits,
 			"count":   len(structHits),
 			"scopes":  scopes,
+			// query 回显与 tookMs 是给审计日志用的：调用方要能把
+			// 「哪条消息、分值多少、判定放行还是拒绝」串起来。
+			// 不回显查询，调用方只能在外面拼字符串对账，而对不上的时候
+			// 分不清是「这条消息没查」还是「查了但改写了查询词」。
+			"query":  query,
+			"tookMs": time.Since(tRecall).Milliseconds(),
 		}
 		if wantJSON {
 			return TermResult{Text: jsonText(structured), Structured: structured}, nil

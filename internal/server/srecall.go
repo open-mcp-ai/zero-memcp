@@ -25,6 +25,7 @@
 package server
 
 import (
+	"time"
 	"fmt"
 	"sort"
 	"strings"
@@ -38,6 +39,8 @@ const (
 )
 
 func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
+	// 计时起点：tookMs 要覆盖向量路 + 关键词路 + 融合去重全过程。
+	tStart := time.Now()
 	rest = restorePayload(rest)
 	// --json 先摘掉：它是返回形态，不是查询词。
 	rest, wantJSON := stripJSONFlag(rest)
@@ -182,7 +185,10 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	result = deduped
 
 	if len(result) == 0 {
-		empty := map[string]any{"hits": []any{}, "results": []any{}, "count": 0}
+		empty := map[string]any{
+			"hits": []any{}, "results": []any{}, "count": 0,
+			"query": query, "tookMs": time.Since(tStart).Milliseconds(),
+		}
 		if wantJSON {
 			return TermResult{Text: jsonText(empty), Structured: empty, Empty: true}, nil
 		}
@@ -225,6 +231,10 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 		"hits":    structHits,
 		"results": structHits, // 同 recall：别名，指向同一份数据
 		"count":   len(structHits),
+		// 审计字段，与 recall 对齐：调用方要把「哪条消息、多少分、
+		// 放行还是拒绝」串起来，回显和耗时是拼这条链的两颗钉子。
+		"query":  query,
+		"tookMs": time.Since(tStart).Milliseconds(),
 	}
 	if wantJSON {
 		return TermResult{Text: jsonText(structured), Structured: structured}, nil

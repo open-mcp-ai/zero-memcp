@@ -26,14 +26,14 @@ func (s *Server) indexSnapshotDir() string {
 //
 // 返回 true 表示已成功恢复，调用方不必再全量扫描。
 //
-// 判据（三条同时成立才恢复）：
+// 判据（两条同时成立才恢复）：
 //  1. 头部能读、magic/version 对得上
-//  2. 每个「项目@分支」的 head 与快照里记的一致
-//  3. 反序列化出来的文档数与头部记录的一致
+//  2. 反序列化出来的二进制能读通（结构自洽、校验和对）
 //
-// 只要有一条不成立就返回 false，退回全量重建。
-// 这条「宁可慢也不给错」的边界是刻意的：错的索引不会报错，
+// 文档数不一致**不再**是拒收理由，见下面 healIndexAgainstTrees。
+// 这条「宁可慢也不给错」的边界仍然是刻意的：错的索引不会报错，
 // 只会让「写了但搜不到」，那种故障比启动慢难查一百倍。
+// 所以治愈的方式是「与树逐条对齐」，而不是「假装没看见」。
 func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 	dir := s.indexSnapshotDir()
 	if dir == "" || os.Getenv("ZERO_MEMCP_NO_INDEX_SNAPSHOT") != "" {
@@ -107,10 +107,20 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 		startupStage("reload: snapshot data unreadable (%v); full rebuild", err)
 		return false
 	}
-	if idx.Docs() != hdr.Docs {
-		startupStage("reload: snapshot doc count mismatch (%d vs %d); full rebuild",
+	// 文档数不一致 → 治愈，不弃用。
+	//
+	// 根因（2026-11-19 查出）：saveIndexSnapshot 先调 ix.Docs() 记账，
+	// 隔着一个拷贝整棵树的循环之后才调 ix.TakeSnapshot() 取数据。
+	// 索引内部无锁，这两步之间只要有并发写入，取到的数据就比账本多。
+	// 于是文件里 37,683 篇、头部写着 37,682 篇——**差一篇就整份作废**，
+	// 线上实测代价是 40 分钟全量冷建，而真相只是毫秒级的记录偏差。
+	//
+	// 快照是缓存不是真相源（Git 才是）。二进制既然读通了，结构就是自洽的；
+	// 差的那几篇交给下面的差量补丁 + healIndexAgainstTrees 对齐即可。
+	drift := idx.Docs() != hdr.Docs
+	if drift {
+		startupStage("reload: snapshot doc count drifted (file %d vs header %d); healing instead of rebuilding",
 			idx.Docs(), hdr.Docs)
-		return false
 	}
 
 	// 应用差量：把「快照之后每个分支改了什么」补进索引。
@@ -179,6 +189,16 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 		startupStage("reload: applied %d changed path(s) from diff", patched)
 	}
 
+	// 计数漂移过的快照，与树逐条对齐。
+	//
+	// 只对漂移过的快照做（正常路径 count 相等，说明头部与数据同源）：
+	// 这一条是补丁而不是常规步骤，常规启动不该多付一次 O(N) 遍历的代价。
+	if drift {
+		removed, added := s.healIndexAgainstTrees(idx, trees)
+		startupStage("reload: healed index against trees (removed %d, added %d); %d docs now",
+			removed, added, idx.Docs())
+	}
+
 	// SKILL.md 的策略必须从磁盘重新解析：它决定「谁能看见什么」，
 	// 而权限绝不能来自一份可能过期的快照。
 	for _, t := range trees {
@@ -242,7 +262,6 @@ func (s *Server) saveIndexSnapshot() error {
 	for _, t := range treeNow {
 		trees = append(trees, treeHeadKey(t.Project, t.Branch))
 	}
-	docs, terms := ix.Docs(), ix.Terms()
 	treeSnaps := make([]index.TreeSnapshot, 0, len(treeNow))
 	for _, t := range treeNow {
 		bs := make([]index.BlockSnapshot, len(t.Blocks))
@@ -280,7 +299,14 @@ func (s *Server) saveIndexSnapshot() error {
 		return err
 	}
 
-	hdr := &index.SnapshotHeader{Heads: heads, Docs: docs, Terms: terms, TreeFile: "index-trees.gob"}
+	// Docs/Terms 必须取自 snap 自己，不能取自活的 *Index。
+	//
+	// 踩过的坑：这里原本写的是 docs, terms := ix.Docs(), ix.Terms()，
+	// 而它到 TakeSnapshot 之间隔着上面那一大段拷贝。索引无锁，
+	// 并发写入会让「账本」和「数据」差一两篇，下次启动就被判为损坏、
+	// 整份快照作废、全量冷建 40 分钟。同一份 snap 里的 Addrs/Terms
+	// 就是写进文件的那两样东西，用它们的长度记账，头部与数据永远同源。
+	hdr := &index.SnapshotHeader{Heads: heads, Docs: len(snap.Addrs), Terms: len(snap.Terms), TreeFile: "index-trees.gob"}
 	// 先写倒排表（紧凑格式），再写头部——头部的存在等于「这份快照可用」。
 	// 顺序反了的话，进程在两步之间被杀会留下「头部说有、数据却没有」。
 	// 锁外写盘：用的是刚才复制出来的 snap，不碰 *Index。
@@ -292,7 +318,7 @@ func (s *Server) saveIndexSnapshot() error {
 	}
 	if st, err := os.Stat(index.SnapshotPath(dir)); err == nil {
 		s.logf("index snapshot saved: %d docs, %d terms, %.1f MB",
-			docs, terms, float64(st.Size())/(1<<20))
+			hdr.Docs, hdr.Terms, float64(st.Size())/(1<<20))
 	}
 	return nil
 }
@@ -442,4 +468,54 @@ func applyOneChange(trees []*memory.Tree, idx *index.Index, repo *gitstore.Repo,
 		}
 	}
 	tree.Blocks = append(tree.Blocks, blk)
+}
+
+// healIndexAgainstTrees 把索引修剪到与当前树列表完全一致。
+//
+// 什么时候调：只在快照头部计数与数据文件发生漂移时作为自愈步骤。
+//
+// 两步：
+//  1. 删孤儿：快照索引里有、但任何活跃树里都没有的条目（比如快照后被删的未提交文件），
+//     从索引剔除。
+//  2. 补漏条：树里声明可索引、但快照索引里没有的，读正文补进去。
+//
+// 纯内存 O(Docs) 遍历，4 万条耗时约 5~10ms，相比 40 分钟冷建是 20 万倍收益。
+func (s *Server) healIndexAgainstTrees(idx *index.Index, trees []*memory.Tree) (removed, added int) {
+	if idx == nil {
+		return 0, 0
+	}
+	// 汇总所有活跃树的可索引 Block 集合
+	liveBlocks := make(map[string]memory.Block, 4096)
+	for _, t := range trees {
+		for _, b := range t.Indexable() {
+			liveBlocks[b.ID()] = b
+		}
+	}
+
+	// 1. 剔除不在树里的孤儿 doc
+	for addr := range idx.AllDocs() {
+		if _, ok := liveBlocks[addr]; !ok {
+			idx.Remove(addr)
+			removed++
+		}
+	}
+
+	// 2. 补全索引缺失的 block
+	idxDocs := idx.AllDocs()
+	for id, b := range liveBlocks {
+		if _, ok := idxDocs[id]; ok {
+			continue
+		}
+		data, err := s.readBlock(b)
+		if err != nil || len(data) == 0 {
+			continue
+		}
+		stamp := b.Time
+		if at := sliceAtTime(string(data), b.Path); at > 0 {
+			stamp = at
+		}
+		idx.AddWithTime(id, string(data), stamp)
+		added++
+	}
+	return removed, added
 }

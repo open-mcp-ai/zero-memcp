@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -59,12 +60,39 @@ func OpenHTTP(cfg HTTPConfig) (*HTTPEmbedder, error) {
 	if timeout <= 0 {
 		timeout = 10 * time.Second
 	}
+	// Transport 必须显式给。
+	//
+	// 用 http.Client{} 的默认 Transport 会踩两个坑：
+	//
+	// 1) Proxy: ProxyFromEnvironment——本机回环地址不该走代理，
+	//    而环境里一旦有 HTTP_PROXY（容器、CI、装了代理工具的机器），
+	//    对 127.0.0.1 的请求也会被塞进代理，每次多几秒。
+	//    回环就是回环，这里显式禁用，不做任何环境推断。
+	//
+	// 2) 默认 MaxIdleConnsPerHost 只有 2。嵌入这个用途是
+	//    「一条查询 + 一批后台重建」并发，2 个空闲连接不够，
+	//    多出来的每次新建 TCP。
+	//
+	// （注：最初排查 3060 延迟时曾误以为默认 Transport 导致 3s 停顿，
+	// 后查明是 PowerShell 破坏了对比组 curl 的 JSON 引号触发了 400 速错。
+	// 尽管如此，显式禁用 Proxy 与扩大连接池本身仍是正确的工程实践。）
+	tr := &http.Transport{
+		Proxy: nil,
+		DialContext: (&net.Dialer{
+			Timeout:   5 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		MaxIdleConns:          16,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       90 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	}
 	e := &HTTPEmbedder{
 		endpoint: ep,
 		model:    cfg.Model,
 		dim:      cfg.Dim,
 		apiKey:   cfg.APIKey,
-		client:   &http.Client{Timeout: timeout},
+		client:   &http.Client{Timeout: timeout, Transport: tr},
 	}
 	// 探测：一次真实的小请求，确认服务在、模型对、维度对得上。
 	probe, err := e.Embed("ping")

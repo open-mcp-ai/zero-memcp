@@ -6,6 +6,7 @@ package manifest
 
 import (
 	"strings"
+	"time"
 )
 
 // Policy 是从 SKILL.md 里读出的动作策略。
@@ -14,9 +15,25 @@ type Policy struct {
 	Name string
 	// Target 是写入目标仓库名。空表示用项目自己。
 	Target string
-	// Layout 控制路径组织：date (YYYY-MM-DD/HHMMSS.sss) 或 flat (HHMMSS.sss)。
+	// Layout 控制路径组织：date (YYYY-MM-DD[/槽]/HHMMSS.sss) 或 flat (HHMMSS.sss)。
 	// 缺省 date。
 	Layout string
+	// Span 是日期目录下再分一层的**时间跨度**（如 "10m"）。0 表示不分（旧行为）。
+	//
+	// 为什么要分：单目录文件数决定 tree 对象大小，而 tree 是不可变结构——
+	// 往一个已有 3000 文件的目录再写一条，要重写 163 KB 的 tree。
+	// 实测 thought/2026-11-11 = 3006 文件 / 163 KB，一天两千条写入
+	// 就是 300 MB 的 tree 反复重写。
+	//
+	// 槽名 = 当天从 00:00 起的第几个 Span（0 开始），所以路径依然是
+	// 纯函数：给定时间就能算出落在哪个目录，不需要查表。
+	//
+	// 为什么是「日期目录 + 数字槽」而不是纯数字桶：纯数字桶要保持
+	// 叶子小，桶数就必须多，而桶数直接变成父目录的条目数——
+	// span=10m 时一年 52,560 个桶，父目录 tree 2.6 MB，
+	// 而且每小时开 6 个新桶，等于把热点从叶子搬到了父级。
+	// 日期目录是冷目录（一天最多被创建一次），数字槽才是热的那个。
+	Span time.Duration
 	// Kinds 是允许写入的分类列表。空表示用默认白名单。
 	Kinds []string
 	// Inject 报告是否注入系统提示：every_turn / never（缺省根据文件名与 mode）
@@ -119,6 +136,13 @@ func Parse(project string, raw []byte) Policy {
 			case "layout":
 				if v == "flat" || v == "date" {
 					p.Layout = v
+				}
+			case "span":
+				// 接受 Go duration 写法（"10m"、"600s"、"1h"）。
+				// 非法值不静默忽略——写错就是写错，回退到「不分槽」
+				// 会让调用方以为生效了却一点没变，那是最难查的一种失败。
+				if d, err := time.ParseDuration(v); err == nil && d > 0 {
+					p.Span = d
 				}
 			case "kinds":
 				// 支持 [a, b, c] 或多行

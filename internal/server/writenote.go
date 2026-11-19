@@ -191,6 +191,26 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	path := stamp
 	if pol.Layout == "date" {
 		path = now.Format("2006-01-02") + "/" + stamp
+		// 日期目录下再分一层数字槽。
+		//
+		// 槽号是「当天从 00:00 起的第几个 Span」，纯函数，给定时间就能算，
+		// 不需要查表也不需要状态。日期目录本身是冷目录（一天最多建一次），
+		// 而槽目录是热的——把热的那层压到几十个文件，写一次改的是
+		// 一点几 KB 的 tree，而不是几千条目的 163 KB。
+		if pol.Span > 0 {
+			dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+			slot := int(now.Sub(dayStart) / pol.Span)
+			maxSlot := int(24*time.Hour/pol.Span) - 1
+			if maxSlot < 0 {
+				maxSlot = 0
+			}
+			if slot > maxSlot {
+				// 夏令时把一天拉长到 25 小时时会出现；夹到最后一个槽，
+				// 绝不产生越界槽号（那会让路径随时间倒退）。
+				slot = maxSlot
+			}
+			path = now.Format("2006-01-02") + "/" + fmt.Sprintf("%03d", slot) + "/" + stamp
+		}
 	}
 	// 树前缀把切片放进指定子树：树路径即语义，不另设 kind 分类。
 	if treePrefix = strings.Trim(treePrefix, "/"); treePrefix != "" {

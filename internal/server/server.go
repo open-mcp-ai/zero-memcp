@@ -1692,6 +1692,12 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 这条以前根本没有：splitScope 拿到 scope 却没人用，`--scope`
 		// 里的词被当成搜索词一起送进索引。症状是「召回结果莫名其妙」，
 		// 而不是报错——静默走偏比报错贵得多。
+		// --json 是「怎么返回」，不是「查什么」：必须在 splitScopes 之前摘掉。
+		//
+		// 给程序消费者用（例如唤醒前闸门要按分数阈值决定要不要叫醒 agent）。
+		// 文本投影里分数是排版的一部分（`addr (73.79)`），解析它要靠正则，
+		// 而正则对排版变化毫无抵抗力——改一下缩进或小数位就静默取不到分。
+		rest, wantJSON := stripJSONFlag(rest)
 		query, scopes := splitScopes(rest)
 		scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
 		hits := s.idxNow().SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
@@ -1753,11 +1759,13 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 				text = fmt.Sprintf("no matches under scope %s, but the same query matches %s elsewhere in your visible range",
 					strings.Join(scopes, "||"), s.projectOfAddr(outsideAddr))
 			}
-			return TermResult{
-				Text:       text,
-				Structured: map[string]any{"hits": []any{}, "count": 0, "scopes": scopes},
-				Empty:      true,
-			}, nil
+			empty := map[string]any{"hits": []any{}, "results": []any{}, "count": 0, "scopes": scopes}
+			if wantJSON {
+				// --json 时空结果也是合法 JSON，不是 "no matches" 这句人话。
+				// 程序消费者据此判空，不需要认识我们的排版。
+				return TermResult{Text: jsonText(empty), Structured: empty, Empty: true}, nil
+			}
+			return TermResult{Text: text, Structured: empty, Empty: true}, nil
 		}
 		var sb strings.Builder
 		structHits := make([]any, 0, len(hits))
@@ -1784,12 +1792,20 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 				"snippet": snip,
 			})
 		}
+		structured := map[string]any{
+			"hits":  structHits,
+			// results 是 hits 的别名：不同调用方对「命中列表」的叫法不一样，
+			// 而两份投影指向同一份数据，多一个键不增加成本。
+			"results": structHits,
+			"count":   len(structHits),
+			"scopes":  scopes,
+		}
+		if wantJSON {
+			return TermResult{Text: jsonText(structured), Structured: structured}, nil
+		}
 		return TermResult{
-			Text: strings.TrimRight(sb.String(), "\n"),
-			Structured: map[string]any{
-				"hits":  structHits,
-				"count": len(structHits),
-			},
+			Text:       strings.TrimRight(sb.String(), "\n"),
+			Structured: structured,
 		}, nil
 
 	case "srecall":
@@ -2763,4 +2779,14 @@ func (s *Server) requireBranchWide(rest string, c Caller) error {
 			proj, br, c.Mount.rootOf(proj, br))
 	}
 	return nil
+}
+
+// jsonText 把一个对象格式化成一行紧凑 JSON（用于 --json 动词）。
+// 永远不返回空串；序列化失败退回一个带 error 键的合法 JSON。
+func jsonText(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%q}`, err.Error())
+	}
+	return string(b)
 }

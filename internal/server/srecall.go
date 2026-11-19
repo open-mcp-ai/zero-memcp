@@ -39,8 +39,10 @@ const (
 
 func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	rest = restorePayload(rest)
+	// --json 先摘掉：它是返回形态，不是查询词。
+	rest, wantJSON := stripJSONFlag(rest)
 	if bad, ok := unknownFlag(rest); ok {
-		return TermResult{}, fmt.Errorf("srecall: unknown flag %q (supported: --scope)", bad)
+		return TermResult{}, fmt.Errorf("srecall: unknown flag %q (supported: --scope, --json)", bad)
 	}
 	query, scope := splitScope(rest)
 	if query == "" {
@@ -180,11 +182,11 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	result = deduped
 
 	if len(result) == 0 {
-		return TermResult{
-			Text:       "no matches",
-			Structured: map[string]any{"hits": []any{}, "count": 0},
-			Empty:      true,
-		}, nil
+		empty := map[string]any{"hits": []any{}, "results": []any{}, "count": 0}
+		if wantJSON {
+			return TermResult{Text: jsonText(empty), Structured: empty, Empty: true}, nil
+		}
+		return TermResult{Text: "no matches", Structured: empty, Empty: true}, nil
 	}
 
 	var sb strings.Builder
@@ -219,11 +221,16 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 		structHits[i] = m
 	}
 
+	structured := map[string]any{
+		"hits":    structHits,
+		"results": structHits, // 同 recall：别名，指向同一份数据
+		"count":   len(structHits),
+	}
+	if wantJSON {
+		return TermResult{Text: jsonText(structured), Structured: structured}, nil
+	}
 	return TermResult{
-		Text: strings.TrimRight(sb.String(), "\n"),
-		Structured: map[string]any{
-			"hits":  structHits,
-			"count": len(structHits),
-		},
+		Text:       strings.TrimRight(sb.String(), "\n"),
+		Structured: structured,
 	}, nil
 }

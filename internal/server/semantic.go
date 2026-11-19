@@ -369,6 +369,34 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 	var reused int    // 指纹没变直接复用的
 	start := time.Now()
 
+	// 按内容指纹反查旧向量：指纹 → 任意一个曾有该内容的旧地址。
+	//
+	// 为什么需要这张表：旧向量按「地址」存，而地址里带着路径。文件一改名
+	// （规整分桶、挪出白名单、换分支前缀），地址就变了，按地址查必然 miss——
+	// 于是 3 万篇没改一个字的记忆会被当成新文档全部重算嵌入，代价是几十分钟
+	// 的 Ollama 排队。
+	//
+	// 但向量只取决于**内容**。同一段文字放在哪个路径，向量完全一样。所以
+	// 地址没命中、指纹命中时，把那份向量原样借给新地址。改名因此变成纯内存
+	// 操作，零推理。
+	//
+	// 为什么不干脆把主键换成 blob 哈希：哈希确实更纯（同内容天然共享一份
+	// 向量），但它会让权限过滤、时间加成、思维↔记录配对、虚拟地址这四处
+	// 全部改依赖「哈希 → 地址」翻译层，改动面远大于收益；而「改路径不重算」
+	// 这个目标，指纹反查已经 100% 达成。
+	byPrint := make(map[string]string, len(cachedPrints))
+	if cached != nil {
+		for id, fp := range cachedPrints {
+			if _, ok := byPrint[fp]; ok {
+				continue
+			}
+			if cached.Has(id) {
+				byPrint[fp] = id
+			}
+		}
+	}
+	var reusedByPrint int
+
 	// 隔离检查：退避期内的切片直接跳过，不参与本轮。
 	//
 	// 判据只看「时间到没到」，不看重试次数——退避长度本身已经由
@@ -405,7 +433,25 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 				}
 			}
 		}
+		// 地址换了、内容没换：向旧地址借这份向量，同样零推理。
+		// 这一支就是「规整化 / 改名 / 换分支」不重算的根据。
+		if cached != nil {
+			if oldID, ok := byPrint[fp]; ok {
+				if vecs := cached.VectorOf(oldID); vecs != nil {
+					if err := ix.Add(j.id, vecs); err == nil {
+						prints[j.id] = fp
+						reused++
+						reusedByPrint++
+						continue
+					}
+				}
+			}
+		}
 		toEmbed = append(toEmbed, j)
+	}
+
+	if reusedByPrint > 0 {
+		s.logf("semantic: %d slice(s) reused across renamed paths (same content, new address)", reusedByPrint)
 	}
 
 	if cached != nil {

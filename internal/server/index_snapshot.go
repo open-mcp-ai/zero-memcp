@@ -371,8 +371,7 @@ func (s *Server) restoreTreesFromSnapshot(defaultBranch string) ([]*memory.Tree,
 		if !declared[ts.Project] {
 			return nil, fmt.Errorf("snapshot has project %q which is no longer declared", ts.Project)
 		}
-		repo, rerr := s.projects.Get(ts.Project)
-		if rerr != nil {
+		if _, rerr := s.projects.Get(ts.Project); rerr != nil {
 			return nil, fmt.Errorf("open project %s: %w", ts.Project, rerr)
 		}
 		// 分支必须还存在：被归档的分支不能从快照里复活。
@@ -400,7 +399,13 @@ func (s *Server) restoreTreesFromSnapshot(defaultBranch string) ([]*memory.Tree,
 				Hidden:  bs.Hidden,
 				Hash:    bs.Hash,
 				Layer:   bs.Layer,
-				Read:    func() ([]byte, error) { return repo.Read(br, path) },
+				Read: func() ([]byte, error) {
+					r, err := s.projects.Get(proj)
+					if err != nil {
+						return nil, err
+					}
+					return r.Read(br, path)
+				},
 			}
 		}
 		out = append(out, t)

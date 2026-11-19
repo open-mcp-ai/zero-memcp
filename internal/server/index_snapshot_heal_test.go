@@ -113,3 +113,37 @@ func TestSnapshotCountDriftHealsInsteadOfRebuild(t *testing.T) {
 func writeHeaderForTest(dir string, hdr *index.SnapshotHeader) error {
 	return index.SaveSnapshot(dir, hdr, nil)
 }
+
+// 孤儿卡片必须留证（不能静默删掉）。
+//
+// 场景：快照索引里多出一条「树里没有」的条目（模拟文件异常消失）。
+// 自愈删掉它后，必须返回那条地址作样本，供日志留证；不能只返回一个总数。
+func TestHealReportsDroppedOrphanAddresses(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "test", Cap: "rwx"})
+
+	if _, err := callMCP(t, srv, tok, "write blackegg/me@fact:keep.md -- zzz-keep"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callMCP(t, srv, tok, "commit blackegg/me@fact -m seed"); err != nil {
+		t.Fatal(err)
+	}
+
+	idx := srv.idxNow()
+	const ghost = "blackegg/me@fact:vanished-without-trace.md"
+	idx.Add(ghost, "phantom content")
+
+	removed, _, orphans := srv.healIndexAgainstTrees(idx, srv.treeList())
+	if removed != 1 {
+		t.Fatalf("期望剔除 1 条孤儿，实际 %d", removed)
+	}
+	found := false
+	for _, o := range orphans {
+		if o == ghost {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("孤儿被静默清掉了，样本里没有它的地址：%v", orphans)
+	}
+}

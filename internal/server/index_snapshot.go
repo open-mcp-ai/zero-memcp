@@ -194,9 +194,19 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 	// 只对漂移过的快照做（正常路径 count 相等，说明头部与数据同源）：
 	// 这一条是补丁而不是常规步骤，常规启动不该多付一次 O(N) 遍历的代价。
 	if drift {
-		removed, added := s.healIndexAgainstTrees(idx, trees)
+		removed, added, orphans := s.healIndexAgainstTrees(idx, trees)
 		startupStage("reload: healed index against trees (removed %d, added %d); %d docs now",
 			removed, added, idx.Docs())
+		for _, addr := range orphans {
+			startupStage("reload:   dropped orphan card: %s", addr)
+		}
+		if removed > orphanAlarmThreshold {
+			// 超过阈值就不再当日常删除看待：一整条分支消失、或者对象丢失，
+			// 都长这个样子，而它只会在日志里出现这一次。
+			startupStage("reload: WARNING %d orphan card(s) dropped this run — "+
+				"too many for routine deletes; verify the Git repo before trusting search results",
+				removed)
+		}
 	}
 
 	// SKILL.md 的策略必须从磁盘重新解析：它决定「谁能看见什么」，
@@ -480,9 +490,11 @@ func applyOneChange(trees []*memory.Tree, idx *index.Index, repo *gitstore.Repo,
 //  2. 补漏条：树里声明可索引、但快照索引里没有的，读正文补进去。
 //
 // 纯内存 O(Docs) 遍历，4 万条耗时约 5~10ms，相比 40 分钟冷建是 20 万倍收益。
-func (s *Server) healIndexAgainstTrees(idx *index.Index, trees []*memory.Tree) (removed, added int) {
+// 返回被剔除的地址样本（最多 orphanSampleLimit 条）：孤儿卡片是「记录消失」的
+// 唯一物证，清掉它必须留下痕迹，不能静默。
+func (s *Server) healIndexAgainstTrees(idx *index.Index, trees []*memory.Tree) (removed, added int, orphans []string) {
 	if idx == nil {
-		return 0, 0
+		return 0, 0, nil
 	}
 	// 汇总所有活跃树的可索引 Block 集合
 	liveBlocks := make(map[string]memory.Block, 4096)
@@ -493,10 +505,19 @@ func (s *Server) healIndexAgainstTrees(idx *index.Index, trees []*memory.Tree) (
 	}
 
 	// 1. 剔除不在树里的孤儿 doc
+	//
+	// 孤儿卡片有两种来源，含义天差地别：
+	//   ① 正常删除（delete 动词、清理写错地方的记录）——清掉即可；
+	//   ② 异常消失（对象丢失、分支被重置、合并出岔子）——此时这张卡片
+	//      是全库唯一还记得「这里曾有过一篇」的物证。
+	// 所以清归清，地址要留下来给调用方打日志。
 	for addr := range idx.AllDocs() {
 		if _, ok := liveBlocks[addr]; !ok {
 			idx.Remove(addr)
 			removed++
+			if len(orphans) < orphanSampleLimit {
+				orphans = append(orphans, addr)
+			}
 		}
 	}
 
@@ -517,5 +538,13 @@ func (s *Server) healIndexAgainstTrees(idx *index.Index, trees []*memory.Tree) (
 		idx.AddWithTime(id, string(data), stamp)
 		added++
 	}
-	return removed, added
+	return removed, added, orphans
 }
+
+// orphanSampleLimit 是一次自愈里最多留证的孤儿地址条数。
+// 只取样不上报全量：正常清理可能是几百条，全打出来只会淹没日志；
+// 而真正要看的是「有没有、大概什么形态」，十条足够。
+const orphanSampleLimit = 10
+
+// orphanAlarmThreshold 是一次自愈里「多到不像日常删除」的阈值。
+const orphanAlarmThreshold = 100

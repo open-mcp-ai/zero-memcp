@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -178,5 +179,52 @@ func BenchmarkSearch10k(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		ix.Search(q, 8, 0.3)
+	}
+}
+
+// 同名模型换了权重（修订号变了）时，缓存必须判过期。
+//
+// 这是「静默失真」的唯一防线：bge-m3 升级一次量化，模型名一个字没变，
+// 但向量空间已经不同。若只比名字，新旧向量会混在同一个索引里，
+// 不报错、不重建，相似度从此无人可信。
+func TestLoadRejectsStaleModelRev(t *testing.T) {
+	dir := t.TempDir()
+	ix := New(4)
+	if err := ix.Add("a", []float32{1, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := ix.SaveRev(dir, "bge-m3", "weights-v1", nil, map[string]string{"a": "fp"}); err != nil {
+		t.Fatal(err)
+	}
+	// 同一份修订号：可读
+	if _, _, err := LoadRev(dir, "bge-m3", "weights-v1"); err != nil {
+		t.Fatalf("同修订号应可读，实际 %v", err)
+	}
+	// 修订号变了：必须过期
+	if _, _, err := LoadRev(dir, "bge-m3", "weights-v2"); err != ErrStale {
+		t.Fatalf("修订号不符应返回 ErrStale，实际 %v", err)
+	}
+	// 旧版本没记修订号（空串）：与任何非空值都不相等，触发一次重建
+	if _, _, err := LoadRev(dir, "bge-m3", ""); err == nil {
+		t.Fatal("空修订号与 weights-v1 不应视为相同")
+	}
+}
+
+// 不同模型必须落在不同子目录，切过去再切回来不能踩掉对方。
+func TestResolveDirKeepsModelsApart(t *testing.T) {
+	base := "/data/vectors"
+	a := ResolveDir(base, "bge-m3", "v1")
+	b := ResolveDir(base, "bge-small-zh-int8", "")
+	if a == b {
+		t.Fatalf("不同模型解析到同一目录：%s", a)
+	}
+	// 同名不同修订也必须分开
+	c := ResolveDir(base, "bge-m3", "v2")
+	if a == c {
+		t.Fatalf("同模型不同修订解析到同一目录：%s", a)
+	}
+	// 目录名要可读，且不含斜杠（在 base 下一级）
+	if strings.Contains(strings.TrimPrefix(a, base+"/"), "/") {
+		t.Fatalf("模型目录名不应再含子路径：%s", a)
 	}
 }

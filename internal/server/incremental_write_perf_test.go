@@ -39,19 +39,38 @@ func TestWriteAndDeleteDoNotScaleWithBranchSize(t *testing.T) {
 			t.Fatalf("seed commit: %v", err)
 		}
 
-		// 量 write。
-		t0 := time.Now()
-		if _, err := callMCP(t, srv, tok, "write blackegg/me@fact:probe-w.md -- hello"); err != nil {
-			t.Fatalf("write: %v", err)
-		}
-		writeEl = time.Since(t0)
+		// 量 write / delete：各取 5 次的最小值。
+		//
+		// 为什么不用单次采样：这两个动作里含着「等前一笔落盘」的屏障，
+		// 而落盘走的是延迟批量 fsync。前一笔若正好还在批量窗口内，这一次
+		// 就要多等 ~1ms。实测 600 文件时 delete 在 111µs 与 1515µs 之间
+		// 二相分布，单次采样会约 1/4 概率随机失败——那种测试会训练人
+		// 忽略报警，比没有更糟。
+		//
+		// 取最小值而不是平均值：我们要的是「这个动作本身有多贵」，
+		// 而不是「这台机器当时有多忙」。调度抖动、GC、fsync 排队都只会
+		// 让某次变慢，不会让它变快。
+		const rounds = 5
+		writeEl = time.Hour
+		deleteEl = time.Hour
+		for r := 0; r < rounds; r++ {
+			path := fmt.Sprintf("probe-w-%d.md", r)
+			t0 := time.Now()
+			if _, err := callMCP(t, srv, tok, "write blackegg/me@fact:"+path+" -- hello"); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			if el := time.Since(t0); el < writeEl {
+				writeEl = el
+			}
 
-		// 量 delete。
-		t0 = time.Now()
-		if _, err := callMCP(t, srv, tok, "delete blackegg/me@fact:probe-w.md"); err != nil {
-			t.Fatalf("delete: %v", err)
+			t0 = time.Now()
+			if _, err := callMCP(t, srv, tok, "delete blackegg/me@fact:"+path); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			if el := time.Since(t0); el < deleteEl {
+				deleteEl = el
+			}
 		}
-		deleteEl = time.Since(t0)
 		return writeEl, deleteEl
 	}
 

@@ -63,6 +63,19 @@ type workApplyResult struct {
 	Deleted  int      `json:"deleted"`
 	Missing  []string `json:"missing,omitempty"` // 需要回头去要的 blob
 	Verified int      `json:"verified"`          // 回读校验通过的条数
+	// Conflicted 是「本地也有未同步改动、内容不同」的路径。
+	//
+	// 这些路径**没有**被覆盖：保留本地版本，把对端的版本记进冲突表
+	// 等人工裁决。静默覆盖是最坏的解法——被吃掉的一方毫不知情。
+	Conflicted []workConflict `json:"conflicted,omitempty"`
+}
+
+// workConflict 是一条工作层冲突。
+type workConflict struct {
+	Path      string `json:"path"`
+	LocalSHA  string `json:"local_sha"`
+	RemoteSHA string `json:"remote_sha"`
+	Peer      string `json:"peer"`
 }
 
 // workSyncState 保存每个 (project@branch -> peer) 的水位。
@@ -72,6 +85,8 @@ type workApplyResult struct {
 type workSyncState struct {
 	out sync.Map // string -> *atomic.Int64
 	in  sync.Map // string -> *atomic.Int64
+	// conflicts 是 project\x00branch\x00path -> workConflict。
+	conflicts sync.Map
 }
 
 func newWorkSyncState() *workSyncState {
@@ -115,6 +130,31 @@ func (w *workSyncState) cursors(project, branch, peer string) (out, in int64) {
 	return out, in
 }
 
+// recordWorkConflict 记下一条冲突。
+func (s *Server) recordWorkConflict(project, branch, path, localSHA, remoteSHA, peer string) {
+	s.workSync.conflicts.Store(project+"\x00"+branch+"\x00"+path, workConflict{
+		Path: path, LocalSHA: localSHA, RemoteSHA: remoteSHA, Peer: peer,
+	})
+}
+
+// clearWorkConflict 在两端重新一致后清掉冲突。
+func (s *Server) clearWorkConflict(project, branch, path string) {
+	s.workSync.conflicts.Delete(project + "\x00" + branch + "\x00" + path)
+}
+
+// workConflicts 列出当前未解决的冲突。
+func (s *Server) workConflicts() []workConflict {
+	var out []workConflict
+	s.workSync.conflicts.Range(func(_, v any) bool {
+		if c, ok := v.(workConflict); ok {
+			out = append(out, c)
+		}
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
+	return out
+}
+
 // exportWorkDelta 读出某分支当前完整的工作层改动（tree 事实）。
 //
 // 为什么发全量而不是增量：脏层是按目录覆盖的**状态**，不是日志。
@@ -155,6 +195,21 @@ func (s *Server) importWorkDelta(project, branch string, d *workDelta) (workAppl
 	if err != nil {
 		return res, err
 	}
+
+	// 先把本地工作层读一份索引：判断「这条路径我这儿有没有未同步的改动」。
+	//
+	// 为什么必须判：没有这一步，两台机器同时改同一条记忆的结果是
+	// 后到者静默覆盖先到者——被吃掉的那一方全程不知情，直到某天发现
+	// 自己的话不见了。那种故障无法追，因为没有任何日志、没有任何冲突面。
+	local, lerr := repo.DirtyChanges(branch)
+	if lerr != nil {
+		return res, fmt.Errorf("read local dirty layer: %w", lerr)
+	}
+	localByPath := make(map[string]gitstore.DirtyChange, len(local))
+	for _, ch := range local {
+		localByPath[ch.Path] = ch
+	}
+
 	for _, ch := range d.Changes {
 		if ch.Deleted {
 			// 墓碑先落地：不等 blob，也不需要 blob。
@@ -172,9 +227,27 @@ func (s *Server) importWorkDelta(project, branch string, d *workDelta) (workAppl
 			res.Missing = append(res.Missing, ch.SHA)
 			continue
 		}
+		// 冲突面：本地对同一路径有未同步的不同内容 → 不覆盖，上报。
+		//
+		// 相同内容（我方也是这个 sha）不算冲突：那是同一份改动的
+		// 重复投递，幂等即可。
+		if lch, ok := localByPath[ch.Path]; ok && !lch.Deleted && lch.SHA != ch.SHA {
+			res.Conflicted = append(res.Conflicted, workConflict{
+				Path:      ch.Path,
+				LocalSHA:  lch.SHA,
+				RemoteSHA: ch.SHA,
+				Peer:      d.Node,
+			})
+			s.recordWorkConflict(project, branch, ch.Path, lch.SHA, ch.SHA, d.Node)
+			s.logf("work-sync: CONFLICT %s@%s:%s (local %s vs peer %s from %s) — kept local copy",
+				project, branch, ch.Path, shortSHA(lch.SHA), shortSHA(ch.SHA), d.Node)
+			continue
+		}
 		if err := repo.ApplyChange(branch, ch.Path, gitstore.Mode(ch.Mode), ch.SHA, false); err != nil {
 			return res, fmt.Errorf("apply set %s: %w", ch.Path, err)
 		}
+		// 同路径再次达成一致：把这条冲突记录清掉。
+		s.clearWorkConflict(project, branch, ch.Path)
 		res.Applied++
 	}
 	return res, nil
@@ -319,7 +392,18 @@ func (s *Server) handleWorkPush(w http.ResponseWriter, r *http.Request) {
 	}
 	// 索引热插拔：把刚刚落地的路径立即反映到内存索引，
 	// 让 recall 在本轮就能看见——不必等 commit，也不必重启。
+	//
+	// 只处理**真正落地**的路径：冲突的路径本地内容没变，
+	// 既不该刷新索引，也不该广播「它变了」——那会让订阅方
+	// 去取一份并不存在的新内容。
+	conflicted := make(map[string]bool, len(res.Conflicted))
+	for _, cf := range res.Conflicted {
+		conflicted[cf.Path] = true
+	}
 	for _, ch := range req.Changes {
+		if conflicted[ch.Path] {
+			continue
+		}
 		exists := !ch.Deleted && s.repoHas(req.Project, req.Branch, ch.Path)
 		_ = s.refreshPath(req.Project, req.Branch, ch.Path, exists)
 		// 落地即广播：订阅了这棵树的 MCP 客户端（分身插件）立刻收到
@@ -487,6 +571,28 @@ func (s *Server) repoHas(project, branch, path string) bool {
 	}
 	_, found, serr := repo.Stat(branch, path)
 	return serr == nil && found
+}
+
+// workConflictLines 给 status 报告未解决的工作层冲突。
+//
+// 必须出现在 status 里而不是只写日志：冲突意味着「有两份内容都自称
+// 是这条记忆」，而系统选择了保留本地——这个决定必须由人看见并裁决。
+func (s *Server) workConflictLines(c Caller) []string {
+	cs := s.workConflicts()
+	if len(cs) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(cs)+1)
+	out = append(out, fmt.Sprintf("%d unresolved work-layer conflict(s), local copy kept:", len(cs)))
+	for i, cf := range cs {
+		if i >= 10 {
+			out = append(out, fmt.Sprintf("  ... (%d more)", len(cs)-i))
+			break
+		}
+		out = append(out, fmt.Sprintf("  %s: kept local %s, peer %s offered %s",
+			cf.Path, shortSHA(cf.LocalSHA), cf.Peer, shortSHA(cf.RemoteSHA)))
+	}
+	return out
 }
 
 // workSyncLines 给 status 报告每个对等体推进到哪了。

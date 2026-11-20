@@ -2186,6 +2186,9 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		if wl := s.workSyncLines(c); len(wl) > 0 {
 			text += "\nwork-sync:\n  " + strings.Join(wl, "\n  ")
 		}
+		if cl := s.workConflictLines(c); len(cl) > 0 {
+			text += "\n" + strings.Join(cl, "\n")
+		}
 		if pl := s.patrolLines(); len(pl) > 0 {
 			text += "\n" + strings.Join(pl, "\n")
 		}

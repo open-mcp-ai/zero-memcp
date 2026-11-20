@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
+	"sync/atomic"
 )
 
 // 关注标记（remind）：调用方声明「我关心这棵树」。
@@ -52,8 +52,20 @@ type TreeWatch struct {
 // 键是 identity（由凭证决定）而不是连接：这里没有连接概念了。
 // 关注标记是「这个人关心什么」，属于身份属性，与第几次调用的生命周期无关。
 type TreeWatchHub struct {
-	mu      sync.RWMutex
-	watches map[string][]TreeWatch
+	// state 持有**不可变**的关注表快照。读者 atomic.Load 之后直接用，
+	// 不复制、不阻塞；写者造一份新的再换进去（拷贝-修改-交换）。
+	//
+	// 为什么不用 RWMutex：Add/Clear 要把整张表落盘（json.Marshal + 临时文件 +
+	// fsync + rename）。那把这几百微秒到几毫秒的磁盘动作塞进写锁里，
+	// 所有读者的 remind/status 都跟着排队。而读是热路径，写是偶尔一次。
+	//
+	// 用 sync.Mutex 更糟：它没有超时，落盘卡住（网络盘掉线、杀软扫描）
+	// 会让后续每个 Add 无限期停在 Lock() 上，且持锁者还在做 I/O ——
+	// 这正是 termcp/AGENTS.md:35 记的那 10+ 次死锁的形状。
+	state atomic.Pointer[watchState]
+	// wmu 是一槽 channel 令牌，只串行化写者（保证拷贝-修改-交换不丢更新），
+	// 带超时可退。读者全程不碰它。
+	wmu chan struct{}
 	// path 非空时把整张表落盘。
 	//
 	// 为什么必须落盘：关注标记是「我关心这棵树」这个判断本身，属于身份，
@@ -65,13 +77,31 @@ type TreeWatchHub struct {
 	path string
 }
 
+// watchState 是一份不可变快照。
+type watchState struct {
+	watches map[string][]TreeWatch
+}
+
+func (h *TreeWatchHub) snapshot() map[string][]TreeWatch {
+	if st := h.state.Load(); st != nil {
+		return st.watches
+	}
+	return nil
+}
+
+// beginWrite 取写令牌；返回值必须在写完后调用一次。
+func (h *TreeWatchHub) beginWrite() (func(), error) { return tokenAcquire(h.wmu, "watch") }
+
 func newTreeWatchHub() *TreeWatchHub {
-	return &TreeWatchHub{watches: make(map[string][]TreeWatch)}
+	h := &TreeWatchHub{wmu: make(chan struct{}, 1)}
+	h.state.Store(&watchState{watches: map[string][]TreeWatch{}})
+	return h
 }
 
 // newPersistentTreeWatchHub 打开一份落盘的关注表。文件不存在视为空表。
 func newPersistentTreeWatchHub(path string) (*TreeWatchHub, error) {
-	h := &TreeWatchHub{watches: make(map[string][]TreeWatch), path: path}
+	h := &TreeWatchHub{wmu: make(chan struct{}, 1), path: path}
+	h.state.Store(&watchState{watches: map[string][]TreeWatch{}})
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return h, nil
@@ -91,22 +121,22 @@ func newPersistentTreeWatchHub(path string) (*TreeWatchHub, error) {
 		return h, fmt.Errorf("parse %s: %w (starting with an empty watch table)", path, err)
 	}
 	if doc.Watches != nil {
-		h.watches = doc.Watches
+		h.state.Store(&watchState{watches: doc.Watches})
 	}
 	return h, nil
 }
 
-// saveLocked 把当前表写回磁盘（调用方已持锁）。
+// saveSnapshot 把一份关注表写回磁盘。
 //
 // 写失败不回滚内存：关注丢了只是多读一次树，而把内存改回旧值会让
 // 调用方刚做完的 remind 看起来「成功了但没生效」。日志里出声即可。
-func (h *TreeWatchHub) saveLocked() {
+func (h *TreeWatchHub) saveSnapshot(watches map[string][]TreeWatch) {
 	if h.path == "" {
 		return
 	}
 	body, err := json.MarshalIndent(struct {
 		Watches map[string][]TreeWatch `json:"watches"`
-	}{Watches: h.watches}, "", "  ")
+	}{Watches: watches}, "", "  ")
 	if err != nil {
 		return
 	}
@@ -131,38 +161,67 @@ func (h *TreeWatchHub) saveLocked() {
 }
 
 // Add 为某个身份增加或更新一条关注标记（同 project+branch+path 视为同一条）。
-func (h *TreeWatchHub) Add(identity string, w TreeWatch) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	list := h.watches[identity]
-	for i, cur := range list {
-		if cur.Project == w.Project && cur.Branch == w.Branch && cur.Path == w.Path {
+func (h *TreeWatchHub) Add(identity string, w TreeWatch) error {
+	done, err := h.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer done()
+
+	cur := h.snapshot()
+	// 拷贝-修改-交换：不改动别人正在读的那份 map。
+	next := make(map[string][]TreeWatch, len(cur)+1)
+	for k, v := range cur {
+		next[k] = v
+	}
+	list := make([]TreeWatch, len(cur[identity]), len(cur[identity])+1)
+	copy(list, cur[identity])
+	replaced := false
+	for i, c := range list {
+		if c.Project == w.Project && c.Branch == w.Branch && c.Path == w.Path {
 			// 重新锚定：把基线推到当前头。
 			list[i] = w
-			h.saveLocked()
-			return
+			replaced = true
+			break
 		}
 	}
-	h.watches[identity] = append(list, w)
-	h.saveLocked()
+	if !replaced {
+		list = append(list, w)
+	}
+	next[identity] = list
+
+	h.state.Store(&watchState{watches: next})
+	h.saveSnapshot(next)
+	return nil
 }
 
 // List 返回该身份当前关注的树。
 func (h *TreeWatchHub) List(identity string) []TreeWatch {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	src := h.watches[identity]
+	src := h.snapshot()[identity]
 	out := make([]TreeWatch, len(src))
 	copy(out, src)
 	return out
 }
 
 // Clear 清空该身份的全部关注。
-func (h *TreeWatchHub) Clear(identity string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	delete(h.watches, identity)
-	h.saveLocked()
+func (h *TreeWatchHub) Clear(identity string) error {
+	done, err := h.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer done()
+
+	cur := h.snapshot()
+	next := make(map[string][]TreeWatch, len(cur))
+	for k, v := range cur {
+		if k == identity {
+			continue
+		}
+		next[k] = v
+	}
+	h.state.Store(&watchState{watches: next})
+	h.saveSnapshot(next)
+	return nil
 }
 
 // watchStatus 是 status 动词里的一行关注报告。

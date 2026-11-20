@@ -28,6 +28,7 @@ import (
 	"github.com/open-mcp-ai/zero-memcp/internal/acl"
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
+	"github.com/open-mcp-ai/zero-memcp/internal/embed"
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 	"github.com/open-mcp-ai/zero-memcp/internal/index"
 	"github.com/open-mcp-ai/zero-memcp/internal/manifest"
@@ -131,10 +132,27 @@ type Server struct {
 	// dataDir 是数据根，吊销凭证时需要它定位 system/tokens。
 	dataDir string
 
-	cfgMu sync.RWMutex
-	mu    sync.RWMutex
-	trees []*memory.Tree
-	idx   *index.Index
+	// cfgFilePtr 是配置的原子快照。Reload 在运行中整体替换它，
+	// 读者一次 Load 就拿到完整的一份，不会读到半个新旧混合体。
+	cfgFilePtr atomic.Pointer[config.File]
+
+	// treesPtr 是「记忆库当前长什么样」的不可变快照（树列表 + 索引）。
+	//
+	// 原来这里是 mu sync.RWMutex + trees []*memory.Tree + idx *index.Index。
+	// 那把锁是 2026-11-16 那次 fatal error 的保护对象：
+	// concurrent map iteration and map write，进程直接没掉。
+	// 根因不是「忘了加锁」，而是「靠纪律保护一个可变的共享结构」——
+	// 纪律一定漏。
+	//
+	// 现在：读路径一次 Load 拿到底，写路径取 treeTok 令牌后
+	// 造新快照再 Store。Index 自身也已无锁（见 internal/index）。
+	treesPtr atomic.Pointer[treeSet]
+	// branchToks 按 (project@branch) 分段串行化记忆库写者。
+	//
+	// 早先这里是全库唯一的一把令牌。那把令牌让「写一条记忆」必须排队
+	// 等「任何其他分支的索引重建」——正是「容纳更多 agent」的反面。
+	// 分段后不同分支完全并行；同分支排队，因为它们改的是同一棵树。
+	branchToks sync.Map // "project@branch" -> chan struct{}
 
 	// clock 告诉客户端「记忆库有更新」。
 	//
@@ -159,9 +177,17 @@ type Server struct {
 	semantic semanticState
 	// semanticMaint 管理语义索引的后台追平协程。
 	semanticMaint semanticMaintainer
+	// liveIdx 持有多套同时加载的向量索引（中文模型 + 英文模型并存时各占一套）。
+	liveIdx *liveIndexes
+	// masterKeys 是主人密钥环：多公钥 + 权限位 + 根钥派生。
+	masterKeys *masterKeyring
 
 	// syncState 是后台对等同步的进程内状态（冲突队列、上次同步时间）。
 	syncState syncState
+	// workSync 是工作层同步的水位记录。
+	workSync *workSyncState
+	// patrol 是对象回读巡检状态（见 patrol_loop.go）。
+	patrol patrolState
 
 	// resources 是资源变更订阅中心（MCP subscriptions/listen）。
 	resources *resourceHub
@@ -205,8 +231,6 @@ type Server struct {
 	// lock 是数据目录的跨进程独占锁。进程崩溃时内核自动释放。
 	lock *instanceLock
 
-	// cfgFile 是配置内容，cfgLookup 是它的运行时索引。
-	cfgFile *config.File
 	// cfgLookup 是配置的运行时索引，用 atomic.Pointer 持有。
 	//
 	// 为什么不能是普通字段：reload 会在运行中替换它，而它有 11 处
@@ -260,29 +284,39 @@ type Server struct {
 	// 而 maintain 可能正在 repo.Commit——那条路径不经过写入队列，
 	// 会直接写 ref。不等待就关库，等于让提交和关库赛跑。
 	maintainDone chan struct{}
-	// startMu 保护下面两个字段：Start 写、Close 读。
-	startMu         sync.Mutex
-	maintainStarted bool
+	// maintainStarted 用 CAS 表达「只有一个 Start 真正启动维护循环」：
+	// 检查并置位合成一次原子操作，不需要配对 Lock/Unlock。
+	maintainStarted atomic.Bool
 
-	// netMu 保护下面两个字段：Start 在 goroutine 里写，Addr/Close 在别处读。
-	netMu       sync.Mutex
-	httpServers []*http.Server
-	listens     []ListenBlock
-	listener    net.Listener
+	// netState 是监听器/HTTP 服务器的原子快照。
+	// Start 在 goroutine 里写，Addr/Close 在别处读 —— 用原子指针交换，
+	// 读者永远看到一份完整的、而非被就地改写的切片。
+	netState atomic.Pointer[netSnapshot]
+	listens  []ListenBlock
+}
+
+// netSnapshot 是一份不可变的网络资源快照。
+type netSnapshot struct {
+	listener net.Listener
+	servers  []*http.Server
+}
+
+func (s *Server) loadNet() *netSnapshot {
+	if n := s.netState.Load(); n != nil {
+		return n
+	}
+	return &netSnapshot{}
 }
 
 // setListener 记录监听器，供 Addr 和 Close 使用。
 func (s *Server) setListener(ln net.Listener) {
-	s.netMu.Lock()
-	s.listener = ln
-	s.netMu.Unlock()
+	cur := s.loadNet()
+	s.netState.Store(&netSnapshot{listener: ln, servers: cur.servers})
 }
 
 // getListener 读取监听器。
 func (s *Server) getListener() net.Listener {
-	s.netMu.Lock()
-	defer s.netMu.Unlock()
-	return s.listener
+	return s.loadNet().listener
 }
 
 // New 构建并校验服务端。校验在启动前完成，不在运行中抛出。
@@ -424,17 +458,19 @@ func New(cfg Config) (*Server, error) {
 		projects:      NewProjectStore(cfg.DataDir),
 		tokens:        tokens,
 		rev:           rev,
-		cfgFile:       cfgFile,
 		defaultBranch: branch,
 		passwords:     pwStore,
 		grants:        auth.NewGrantStore(cfg.DataDir),
 		uiLimiter:     newUILoginLimiter(),
 		lock:          startupLock,
 
-		listens:   FromConfig(listenBlocks(cfgFile)),
-		fanouts:   newFanoutHub(),
-		resources: newResourceHub(),
-		done:      make(chan struct{}),
+		listens:    FromConfig(listenBlocks(cfgFile)),
+		fanouts:    newFanoutHub(),
+		resources:  newResourceHub(),
+		workSync:   newWorkSyncState(),
+		liveIdx:    &liveIndexes{},
+		masterKeys: &masterKeyring{},
+		done:       make(chan struct{}),
 		// 默认视为「没有维护循环」：New 之后没 Start 就 Close 的路径
 		// （测试里很常见）不该在这里永久阻塞。
 		maintainDone: func() chan struct{} {
@@ -443,6 +479,7 @@ func New(cfg Config) (*Server, error) {
 			return ch
 		}(),
 	}
+	s.cfgFilePtr.Store(cfgFile)
 	if lookup != nil {
 		s.cfgLookup.Store(lookup)
 	}
@@ -483,6 +520,7 @@ func New(cfg Config) (*Server, error) {
 
 	// 语义向量侧与 BM25 平行异步启动。
 	// 缺失模型配置时静默跳过，不会阻碍服务正常启动。
+	s.loadMasterKeys()
 	s.initSemantic()
 	startupStage("semantic init returned")
 
@@ -520,9 +558,7 @@ func (s *Server) Reload() error {
 		if newFile, err := config.Load(s.cfg.ConfigFile); err != nil {
 			s.logf("warning: reload failed to re-parse config (keeping the existing config): %v", err)
 		} else {
-			s.cfgMu.Lock()
-			s.cfgFile = newFile
-			s.cfgMu.Unlock()
+			s.cfgFilePtr.Store(newFile)
 			s.cfgLookup.Store(newFile.Build())
 			rems := newFile.Remotes
 			s.remotes.Store(&rems)
@@ -618,10 +654,7 @@ func (s *Server) Reload() error {
 		}
 	}
 
-	s.mu.Lock()
-	s.trees = trees
-	s.idx = idx
-	s.mu.Unlock()
+	s.publishTrees(trees, idx)
 	startupStage("reload: index built (read %.1fs, tokenize %.1fs)",
 		readNS.Seconds(), tokenizeNS.Seconds())
 
@@ -650,21 +683,18 @@ func (s *Server) DescribeProjects() string {
 func (s *Server) Start() error {
 	// Start 只在真正启动维护循环时重建这个通道。
 	// 用 mutex 保护：Start 可能在 goroutine 里跑，Close 同时在等它。
-	s.startMu.Lock()
-	if !s.maintainStarted {
-		s.maintainStarted = true
+	if s.maintainStarted.CompareAndSwap(false, true) {
 		s.maintainDone = make(chan struct{})
 		go s.maintain(s.maintainDone)
 		// 后台对等同步与 maintain 同生命周期：它依赖提交先发生
 		//（脏层未折叠时 syncOnce 会跳过），两者必须一起跑。
-		s.cfgMu.RLock()
-		disabled := s.cfgFile != nil && s.cfgFile.Sync.Disabled
-		s.cfgMu.RUnlock()
+		cf := s.cfgFilePtr.Load()
+		disabled := cf != nil && cf.Sync.Disabled
 		if !disabled {
 			s.startSyncLoop()
 		}
+		s.startPatrol(3 * time.Minute)
 	}
-	s.startMu.Unlock()
 
 	blocks := s.listens
 	if len(blocks) == 0 {
@@ -691,16 +721,21 @@ func (s *Server) Start() error {
 		}
 		srv := &http.Server{Handler: s.muxFor(blk)}
 		servers = append(servers, srv)
-		go func(srv *http.Server, ln net.Listener, addr string) {
-			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-				s.logf("server on port %s stopped: %v", addr, err)
+		go func(srv *http.Server, ln net.Listener, blk ListenBlock) {
+			var err error
+			if blk.TLSCert != "" && blk.TLSKey != "" {
+				err = srv.ServeTLS(ln, blk.TLSCert, blk.TLSKey)
+			} else {
+				err = srv.Serve(ln)
 			}
-		}(srv, ln, blk.Addr)
+			if err != nil && err != http.ErrServerClosed {
+				s.logf("server on port %s stopped: %v", blk.Addr, err)
+			}
+		}(srv, ln, blk)
 	}
 
-	s.netMu.Lock()
-	s.httpServers = servers
-	s.netMu.Unlock()
+	cur := s.loadNet()
+	s.netState.Store(&netSnapshot{listener: cur.listener, servers: servers})
 	// 阻塞直到 Close
 	<-s.done
 	return nil
@@ -724,6 +759,10 @@ func (s *Server) muxFor(blk ListenBlock) http.Handler {
 	mux.HandleFunc("/recall", s.handleRecall)
 	mux.HandleFunc("/mcp", s.handleMCP)
 	mux.HandleFunc("/repos/", s.handleGitHTTP)
+	mux.HandleFunc("/sync/work/pull", s.handleWorkPull)
+	mux.HandleFunc("/sync/work/blob", s.handleWorkBlob)
+	mux.HandleFunc("/sync/work/blob/put", s.handleWorkPutBlob)
+	mux.HandleFunc("/sync/work/push", s.handleWorkPush)
 	return &portPolicy{blk: blk, next: mux}
 }
 
@@ -791,15 +830,8 @@ func (s *Server) Close() error {
 	// 停语义索引的后台追平：它会读仓库，必须在关仓库之前停。
 	s.stopSemanticMaintainer()
 	// 停后台同步：它会 fetch/push，必须在关仓库之前停。
-	s.syncState.mu.Lock()
-	if s.syncState.stop != nil {
-		close(s.syncState.stop)
-		s.syncState.stop = nil
-	}
-	s.syncState.mu.Unlock()
-	s.netMu.Lock()
-	srvs := s.httpServers
-	s.netMu.Unlock()
+	s.syncState.runner.stopNow()
+	srvs := s.loadNet().servers
 	var lastErr error
 	for _, srv := range srvs {
 		if err := srv.Close(); err != nil {
@@ -811,10 +843,10 @@ func (s *Server) Close() error {
 	// 反过来的顺序（先关仓库）会让正在跑的 repo.Commit 撞上
 	// 已关闭的写者：提交本身写的是 ref 和对象，不经过写队列，
 	// 于是它会在一个逻辑上已关闭的仓库上继续写。
-	s.startMu.Lock()
-	done := s.maintainDone
-	s.startMu.Unlock()
-	if done != nil {
+	// maintainDone 只在 CAS 成功的那一次 Start 里被赋值，
+	// 且赋值发生在 Start 返回之前；Close 与 Start 的先后由 Done 频道协调，
+	// 这里直接读即可（读不到就说明维护循环从没启动）。
+	if done := s.maintainDone; done != nil {
 		<-done
 	}
 	if s.projects != nil {
@@ -868,8 +900,6 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, authErr.Error(), http.StatusUnauthorized)
 		return
 	}
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	// 注入哪些块完全由这张凭证决定：能力位 x 决定给不给规则，
 	// 挂载表决定看得见哪些项目与分支。没有任何 query 参数能改变它。
@@ -895,7 +925,7 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 
 	// 注入必须以「一个项目 = 一条身份线」为单位。
 	//
-	// 踩过的坑：早先这里直接遍历 s.trees 全量叠加，而 s.trees 是
+	// 踩过的坑：早先这里直接遍历 s.treeList() 全量叠加，而 s.treeList() 是
 	// (项目, 分支) 粒度的——同一个项目有几个分支就有几棵树。
 	// blackegg/me 有 zero / main / chat 三条分支，于是三套身份
 	// 同时进了同一个系统提示：「我是简」与「我是 QQ 群助手」并列，
@@ -906,7 +936,7 @@ func (s *Server) handleIdentity(w http.ResponseWriter, r *http.Request) {
 	// 一次对话只能归属一个身份。
 	byProject := make(map[string][]*memory.Tree)
 	var projects []string
-	for _, t := range s.trees {
+	for _, t := range s.treeList() {
 		// 挂载表之外的仓库连「存在」都不该被看到
 		if !caller.Mount.Visible(t.Project, t.Branch) {
 			continue
@@ -1013,9 +1043,8 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	// 索引规模是跨项目的信息，只有携带凭证时才给。
 	caller, authErr := s.authenticate(r)
 	if authErr == nil {
-		s.mu.RLock()
 		totalBlocks, injectBlocks, docs := 0, 0, 0
-		for _, t := range s.trees {
+		for _, t := range s.treeList() {
 			if !s.allowed(caller, t.Project, t.Branch, configBitRead) {
 				continue
 			}
@@ -1023,11 +1052,10 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 			injectBlocks += len(t.Injectable())
 			docs += len(t.Indexable())
 		}
-		s.mu.RUnlock()
 		resp["docs_indexed"] = docs
 		// 词表规模是全局的：它不按项目切分，所以只给全命名空间的调用者。
 		if caller.Mount.Empty() {
-			resp["terms_indexed"] = s.idx.Terms()
+			resp["terms_indexed"] = s.idxNow().Terms()
 		}
 		resp["total_blocks"] = totalBlocks
 		resp["inject_blocks"] = injectBlocks
@@ -1048,8 +1076,6 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	type projItem struct {
 		Name   string `json:"name"`
@@ -1057,7 +1083,7 @@ func (s *Server) handleProjects(w http.ResponseWriter, r *http.Request) {
 		Rules  int    `json:"rules"`
 	}
 	var list []projItem
-	for _, t := range s.trees {
+	for _, t := range s.treeList() {
 		if !s.allowed(caller, t.Project, t.Branch, configBitRead) {
 			continue
 		}
@@ -1103,11 +1129,9 @@ func (s *Server) handleRecall(w http.ResponseWriter, r *http.Request) {
 		req.Limit = 3
 	}
 
-	s.mu.RLock()
 	// 多取一些，权限与挂载过滤后再截断——否则受限凭证的 limit=3
 	// 会因为前 3 条都被过滤掉而返回空，看起来像"搜不到"。
-	hits := s.idx.SearchCovered(req.Text, req.Limit*4, req.Floor, recallMinCoverage, s.weightCount, nil)
-	s.mu.RUnlock()
+	hits := s.idxNow().SearchCovered(req.Text, req.Limit*4, req.Floor, recallMinCoverage, s.weightCount, nil)
 
 	type HitView struct {
 		Addr    string   `json:"addr"`
@@ -1662,6 +1686,11 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 
 	case "recall":
 		// recall <text>
+		//
+		// 计时起点放在最前面：tookMs 要覆盖解析、检索、取摘要的全过程，
+		// 而不是只算检索那一段——调用方拿它做审计，缺的那几毫秒正是
+		// 「为什么这次慢」的线索。
+		tRecall := time.Now()
 		rest = restorePayload(rest)
 		//
 		// 返回地址 + 摘要片段，不是光秃秃的地址。
@@ -1669,7 +1698,6 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 踩过的坑：只回 "addr (score)" 时，模型看不出这篇讲什么，必须逐个 read，
 		// 读三四篇之后它就换 rg 去翻目录了——不是它不想用记忆工具，是记忆工具
 		// 每回答一个问题都要它做 N 次额外往返。给摘要能把 N 次 read 压成 0 次。
-		s.mu.RLock()
 		// 先按「这张凭证看得见什么」收窄候选集合，再打分排序。
 		//
 		// 顺序不能反：索引是所有分支的合集，先取全局 top-N 再按权限
@@ -1692,9 +1720,15 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 这条以前根本没有：splitScope 拿到 scope 却没人用，`--scope`
 		// 里的词被当成搜索词一起送进索引。症状是「召回结果莫名其妙」，
 		// 而不是报错——静默走偏比报错贵得多。
+		// --json 是「怎么返回」，不是「查什么」：必须在 splitScopes 之前摘掉。
+		//
+		// 给程序消费者用（例如唤醒前闸门要按分数阈值决定要不要叫醒 agent）。
+		// 文本投影里分数是排版的一部分（`addr (73.79)`），解析它要靠正则，
+		// 而正则对排版变化毫无抵抗力——改一下缩进或小数位就静默取不到分。
+		rest, wantJSON := stripJSONFlag(rest)
 		query, scopes := splitScopes(rest)
 		scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
-		hits := s.idx.SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
+		hits := s.idxNow().SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
 			return allowedHit(addr) && scopeMatch(addr)
 		})
 		permHits := make([]index.Hit, 0, len(hits))
@@ -1716,31 +1750,53 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			}
 		}
 		hits = permHits
-		// 摘要必须在锁内取完：snippet 读的是 s.trees，而 Reload 会在
+		// 摘要必须在锁内取完：snippet 读的是 s.treeList()，而 Reload 会在
 		// s.mu.Lock() 里把它整体换掉。在锁外调用等于读一份随时会
 		// 被替换的切片——-race 能稳定复现（TestRecallConcurrentWithReload）。
 		snips := make([]string, len(hits))
 		for i, h := range hits {
 			snips[i] = s.snippet(h.Addr, query, 240)
 		}
-		s.mu.RUnlock()
+		// 「范围外有」的判定也必须在锁内做完。
+		//
+		// 2026-11-16 线上事故：这一句原本写在 s.mu.RUnlock() 之后，
+		// SearchCovered 遍历 idx.docLen / idx.postings 的同时，
+		// 并发写入在 refreshPath → AddWithTime 改同一批 map，于是
+		//
+		//     fatal error: concurrent map iteration and map write
+		//
+		// 这不是 error，是 runtime 直接杀进程——hub 整个挂了，没有 recover。
+		// 而这条路径只在「带 scope 且一条都没命中」时才走，所以它躲了很久：
+		// 直到 dev 的 agent 开始大量做带 scope 的 recall 且频繁落空才被撞出来。
+		//
+		// Index 自身没有互斥（并发保护在 Server.mu 这一层），
+		// 所以**每一次碰 idx 都必须在锁内**——这是纪律，而纪律会漏。
+		// 真正的解法见 docs：把索引读路径改成不可变快照 + atomic.Pointer。
+		var outsideAddr string
+		if len(hits) == 0 && len(scopes) > 0 {
+			if outside := s.idxNow().SearchCovered(query, 1, 0, recallMinCoverage, s.weightCount, allowedHit); len(outside) > 0 {
+				outsideAddr = outside[0].Addr
+			}
+		}
 		if len(hits) == 0 {
 			text := "no matches"
 			// 带 scope 却没命中时，多跑一次不带 scope 的判定：
 			// 「这个范围外有」比「记忆里没有」有用得多——前者说明
 			// 换个范围就找得到，后者会让人以为要重新写一遍。
-			if len(scopes) > 0 {
-				outside := s.idx.SearchCovered(query, 1, 0, recallMinCoverage, s.weightCount, allowedHit)
-				if len(outside) > 0 {
-					text = fmt.Sprintf("no matches under scope %s, but the same query matches %s elsewhere in your visible range",
-						strings.Join(scopes, "||"), s.projectOfAddr(outside[0].Addr))
-				}
+			if outsideAddr != "" {
+				text = fmt.Sprintf("no matches under scope %s, but the same query matches %s elsewhere in your visible range",
+					strings.Join(scopes, "||"), s.projectOfAddr(outsideAddr))
 			}
-			return TermResult{
-				Text:       text,
-				Structured: map[string]any{"hits": []any{}, "count": 0, "scopes": scopes},
-				Empty:      true,
-			}, nil
+			empty := map[string]any{
+				"hits": []any{}, "results": []any{}, "count": 0, "scopes": scopes,
+				"query": query, "tookMs": time.Since(tRecall).Milliseconds(),
+			}
+			if wantJSON {
+				// --json 时空结果也是合法 JSON，不是 "no matches" 这句人话。
+				// 程序消费者据此判空，不需要认识我们的排版。
+				return TermResult{Text: jsonText(empty), Structured: empty, Empty: true}, nil
+			}
+			return TermResult{Text: text, Structured: empty, Empty: true}, nil
 		}
 		var sb strings.Builder
 		structHits := make([]any, 0, len(hits))
@@ -1767,12 +1823,26 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 				"snippet": snip,
 			})
 		}
+		structured := map[string]any{
+			"hits": structHits,
+			// results 是 hits 的别名：不同调用方对「命中列表」的叫法不一样，
+			// 而两份投影指向同一份数据，多一个键不增加成本。
+			"results": structHits,
+			"count":   len(structHits),
+			"scopes":  scopes,
+			// query 回显与 tookMs 是给审计日志用的：调用方要能把
+			// 「哪条消息、分值多少、判定放行还是拒绝」串起来。
+			// 不回显查询，调用方只能在外面拼字符串对账，而对不上的时候
+			// 分不清是「这条消息没查」还是「查了但改写了查询词」。
+			"query":  query,
+			"tookMs": time.Since(tRecall).Milliseconds(),
+		}
+		if wantJSON {
+			return TermResult{Text: jsonText(structured), Structured: structured}, nil
+		}
 		return TermResult{
-			Text: strings.TrimRight(sb.String(), "\n"),
-			Structured: map[string]any{
-				"hits":  structHits,
-				"count": len(structHits),
-			},
+			Text:       strings.TrimRight(sb.String(), "\n"),
+			Structured: structured,
 		}, nil
 
 	case "srecall":
@@ -1798,8 +1868,6 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		if len(fields) == 0 {
 			return TermResult{}, errors.New("read syntax: read <addr> [<addr> ...]")
 		}
-		s.mu.RLock()
-		defer s.mu.RUnlock()
 
 		var out strings.Builder
 		missing := []string{}
@@ -1970,6 +2038,14 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		out, err := s.execDelete(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
+	case "erase":
+		// erase <project>@<branch>/<path> (世界树改写：blob 级彻底抹除)
+		return s.execErase(rest, c, defaultBranch, false)
+
+	case "replace":
+		// replace <project>@<branch>/<path> -- <content> (世界树改写：全链替换为占位文本)
+		return s.execErase(rest, c, defaultBranch, true)
+
 	case "lock":
 		// lock <project>@<branch>
 		out, err := s.execLock(rest, c)
@@ -2014,6 +2090,13 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		out, err := s.execCommit(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
+	case "pending":
+		out, err := s.execPending(rest, c, defaultBranch)
+		return TermResult{Text: out}, err
+
+	case "apply":
+		out, err := s.execApply(rest, c, defaultBranch)
+		return TermResult{Text: out}, err
 	case "write":
 		if err := s.requireBranchWide(rest, c); err != nil {
 			return TermResult{}, err
@@ -2056,21 +2139,19 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 词表规模是**全局**事实（它不按项目切分），所以与 /health
 		// 同一口径：只给全命名空间的调用者。早先这里无条件返回，
 		// 于是 health 刻意隐藏的东西在 status 里一读就到。
-		s.mu.RLock()
 		docs := 0
-		for _, t := range s.trees {
+		for _, t := range s.treeList() {
 			if !s.allowed(c, t.Project, t.Branch, configBitRead) {
 				continue
 			}
 			docs += len(t.Indexable())
 		}
-		// Terms 必须在锁内读：Reload 会在 s.mu.Lock() 里整体替换 s.idx，
+		// Terms 必须在锁内读：Reload 会在 s.mu.Lock() 里整体替换 s.idxNow()，
 		// 锁外调用就是和写方赛跑（-race 可复现）。
 		terms := 0
 		if c.Mount.Empty() {
-			terms = s.idx.Terms()
+			terms = s.idxNow().Terms()
 		}
-		s.mu.RUnlock()
 
 		// 语义侧与同步侧必须进 status。
 		//
@@ -2086,6 +2167,9 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			text = fmt.Sprintf("docs: %d, terms: %d", docs, terms)
 		}
 		text += "\nsemantic: " + sem
+		if c.Mount.Empty() {
+			text += "\n" + embed.CapabilityLine()
+		}
 
 		// 关注的树：回答「有没有该看的新东西」。
 		//
@@ -2102,6 +2186,15 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		syncLines := s.syncStatusLines(c)
 		if len(syncLines) > 0 {
 			text += "\nsync:\n  " + strings.Join(syncLines, "\n  ")
+		}
+		if wl := s.workSyncLines(c); len(wl) > 0 {
+			text += "\nwork-sync:\n  " + strings.Join(wl, "\n  ")
+		}
+		if cl := s.workConflictLines(c); len(cl) > 0 {
+			text += "\n" + strings.Join(cl, "\n")
+		}
+		if pl := s.patrolLines(); len(pl) > 0 {
+			text += "\n" + strings.Join(pl, "\n")
 		}
 		if s.fanouts != nil && c.Mount.Empty() {
 			if fanLines := s.fanouts.describeLines(); len(fanLines) > 0 {
@@ -2221,10 +2314,8 @@ func textResult(s string) map[string]any {
 //
 // 这一屏输出比读文档快：它直接告诉你哪些块会被注入、哪些进索引、哪些被跳过。
 func (s *Server) Report(w io.Writer, c Caller) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
-	for _, t := range s.trees {
+	for _, t := range s.treeList() {
 		if !s.branchVisible(c, t.Project, t.Branch) {
 			continue
 		}
@@ -2242,7 +2333,7 @@ func (s *Server) Report(w io.Writer, c Caller) {
 		fmt.Fprintf(w, "  --- %d blocks / %d rules / %d index bytes\n",
 			st.Blocks, st.Rules, st.IndexBytes)
 	}
-	fmt.Fprintf(w, "\nIndex: %d blocks / %d terms\n", s.idx.Docs(), s.idx.Terms())
+	fmt.Fprintf(w, "\nIndex: %d blocks / %d terms\n", s.idxNow().Docs(), s.idxNow().Terms())
 }
 
 // snippet 取一块内容的摘要：优先返回命中词附近的那段，取不到就返回开头。
@@ -2254,7 +2345,7 @@ func (s *Server) snippet(addr, query string, limit int) string {
 	// 以前把整个 ID 直接交给 Find，分支前缀永远匹配不上，
 	// recall 有命中却永远不给摘要。先拆 ID，按项目+分支找树，再传 path。
 	if project, branch, path, ok := memory.SplitID(addr); ok {
-		for _, t := range s.trees {
+		for _, t := range s.treeList() {
 			if t.Project == project && t.Branch == branch {
 				if b, found := t.Find(path); found {
 					bb := b
@@ -2264,7 +2355,7 @@ func (s *Server) snippet(addr, query string, limit int) string {
 			}
 		}
 	} else {
-		for _, t := range s.trees {
+		for _, t := range s.treeList() {
 			if b, ok := t.Find(addr); ok {
 				bb := b
 				block = &bb
@@ -2365,14 +2456,12 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 		project, branch string
 		blocks          []memory.Block
 	}
-	s.mu.RLock()
-	snaps := make([]treeSnap, 0, len(s.trees))
-	for _, tr := range s.trees {
+	snaps := make([]treeSnap, 0, len(s.treeList()))
+	for _, tr := range s.treeList() {
 		blocks := make([]memory.Block, len(tr.Blocks))
 		copy(blocks, tr.Blocks)
 		snaps = append(snaps, treeSnap{project: tr.Project, branch: tr.Branch, blocks: blocks})
 	}
-	s.mu.RUnlock()
 
 	// 收集候选块（顺序 = 快照顺序，输出必须可复现）。
 	type cand struct {
@@ -2513,11 +2602,9 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 
 // execLog 按时间倒序看最近 N 篇的摘要。
 func (s *Server) execLog(n int, scope string, c Caller) (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	var all []memory.Block
-	for _, tr := range s.trees {
+	for _, tr := range s.treeList() {
 		if !s.allowed(c, tr.Project, tr.Branch, configBitRead) {
 			continue
 		}
@@ -2549,7 +2636,7 @@ func (s *Server) execLog(n int, scope string, c Caller) (string, error) {
 	}
 	entries := make([]entry, len(all))
 	for i, b := range all {
-		t := s.idx.DocTime(b.ID())
+		t := s.idxNow().DocTime(b.ID())
 		if t == 0 {
 			t = b.Time
 		}
@@ -2586,8 +2673,6 @@ func (s *Server) execLog(n int, scope string, c Caller) (string, error) {
 
 // execLs 列出某天的切片。
 func (s *Server) execLs(rest string, c Caller) (string, error) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	// ls [date] [--scope <tree>]
 	//
@@ -2607,7 +2692,7 @@ func (s *Server) execLs(rest string, c Caller) (string, error) {
 	scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
 
 	var matches []memory.Block
-	for _, tr := range s.trees {
+	for _, tr := range s.treeList() {
 		if !s.allowed(c, tr.Project, tr.Branch, configBitRead) {
 			continue
 		}
@@ -2751,4 +2836,14 @@ func (s *Server) requireBranchWide(rest string, c Caller) error {
 			proj, br, c.Mount.rootOf(proj, br))
 	}
 	return nil
+}
+
+// jsonText 把一个对象格式化成一行紧凑 JSON（用于 --json 动词）。
+// 永远不返回空串；序列化失败退回一个带 error 键的合法 JSON。
+func jsonText(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%q}`, err.Error())
+	}
+	return string(b)
 }

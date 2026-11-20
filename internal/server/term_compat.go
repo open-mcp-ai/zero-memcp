@@ -44,7 +44,7 @@ const noTargetSentinel = "~NOMEMTREE~"
 
 // payloadVerbs 是 payload 动词：它们的正文只能是一个引用。
 var payloadVerbs = map[string]bool{
-	"put": true, "write": true,
+	"put": true, "write": true, "apply": true, "replace": true,
 	"remote-key": true, "remote-secret": true,
 }
 

@@ -294,7 +294,9 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 	}
 
 	if strings.HasPrefix(rest, "-") {
-		s.treeWatch.Clear(c.Identity)
+		if err := s.treeWatch.Clear(c.Identity); err != nil {
+			return TermResult{}, err
+		}
 		return TermResult{
 			Text:       "all watches cleared",
 			Structured: map[string]any{"ok": true, "cleared": true},
@@ -323,7 +325,9 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		}
 	}
 
-	s.treeWatch.Add(c.Identity, TreeWatch{Project: proj, Branch: branch, Path: treePath, Since: since})
+	if err := s.treeWatch.Add(c.Identity, TreeWatch{Project: proj, Branch: branch, Path: treePath, Since: since}); err != nil {
+		return TermResult{}, err
+	}
 	where := proj + "@" + branch
 	if treePath != "" {
 		where += "/" + treePath
@@ -490,6 +494,24 @@ func splitScope(rest string) (query, scope string) {
 //
 // 这里在**语句切分之前**就把 `||` 认成 scope 分隔符，所以
 // `a||b||c` 不会被当成三条语句。
+// stripJSONFlag 摘掉 --json 并报告是否出现过。
+//
+// 为什么 --json 不走 splitScopes：它是「怎么返回」而不是「查什么」，
+// 混进 query 会让它变成搜索词（--json 被当成一个 token 参与匹配），
+// 症状是「加了 --json 之后结果全变了」而没有任何报错。
+func stripJSONFlag(rest string) (string, bool) {
+	want := false
+	out := make([]string, 0, 4)
+	for _, f := range strings.Fields(rest) {
+		if f == "--json" {
+			want = true
+			continue
+		}
+		out = append(out, f)
+	}
+	return strings.Join(out, " "), want
+}
+
 func splitScopes(rest string) (query string, scopes []string) {
 	query = strings.TrimSpace(rest)
 	for {
@@ -583,7 +605,7 @@ func unknownFlag(rest string) (string, bool) {
 		if f == "-" {
 			continue
 		}
-		if f == "--scope" {
+		if f == "--scope" || f == "--json" {
 			continue
 		}
 		return f, true

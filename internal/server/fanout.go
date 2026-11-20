@@ -2,7 +2,7 @@ package server
 
 import (
 	"fmt"
-	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
@@ -35,62 +35,105 @@ type FanoutTarget struct {
 	Err    string    `json:"err,omitempty"`
 }
 
+// fanoutHub 保存最近几批扇出记录。
+//
+// 两条纪律，缺一不可：
+//
+//  1. **外部结构用原子快照**：batches 换成 atomic.Pointer，读者拿到的
+//     那份切片永远不被修改（写者造新的再换进去）。
+//  2. **批次本身也必须不可变**：FanoutBatch 里有一个 Targets map。
+//     如果 updateTarget 原地改这个 map，而 status 正在遍历它，
+//     就是 concurrent map iteration and map write —— runtime 直接杀进程。
+//     所以更新时整批克隆，连同 Targets 一起复制。
+//
+// 只换外层不换内层，是这类 bug 最常见的写法：看起来"已经无锁了"，
+// 实际上读写仍在同一张 map 上撞。
 type fanoutHub struct {
-	mu      sync.Mutex
-	batches []*FanoutBatch
+	state atomic.Pointer[[]*FanoutBatch]
+	wmu   chan struct{}
 }
 
 func newFanoutHub() *fanoutHub {
-	return &fanoutHub{}
+	h := &fanoutHub{wmu: make(chan struct{}, 1)}
+	h.state.Store(&[]*FanoutBatch{})
+	return h
 }
 
-func (h *fanoutHub) add(b *FanoutBatch) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.batches = append([]*FanoutBatch{b}, h.batches...)
-	if len(h.batches) > 5 {
-		h.batches = h.batches[:5]
+func (h *fanoutHub) load() []*FanoutBatch {
+	if p := h.state.Load(); p != nil {
+		return *p
 	}
+	return nil
+}
+
+func (h *fanoutHub) store(b []*FanoutBatch) { h.state.Store(&b) }
+
+func (h *fanoutHub) add(b *FanoutBatch) error {
+	done, err := tokenAcquire(h.wmu, "fanout.add")
+	if err != nil {
+		return err
+	}
+	defer done()
+
+	cur := h.load()
+	next := make([]*FanoutBatch, 0, len(cur)+1)
+	next = append(next, b)
+	next = append(next, cur...)
+	if len(next) > 5 {
+		next = next[:5]
+	}
+	h.store(next)
+	return nil
 }
 
 func (h *fanoutHub) updateTarget(batchID, remoteName, status, errStr string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for _, b := range h.batches {
+	done, err := tokenAcquire(h.wmu, "fanout.updateTarget")
+	if err != nil {
+		return
+	}
+	defer done()
+
+	cur := h.load()
+	for i, b := range cur {
 		if b.ID != batchID {
 			continue
 		}
-		if b.Targets == nil {
-			b.Targets = map[string]FanoutTarget{}
+		// 整批克隆：绝不改 cur 里那份（status 可能正在遍历它的 Targets）。
+		clone := *b
+		targets := make(map[string]FanoutTarget, len(b.Targets)+1)
+		for k, v := range b.Targets {
+			targets[k] = v
 		}
-		b.Targets[remoteName] = FanoutTarget{
-			Status: status,
-			At:     time.Now(),
-			Err:    errStr,
-		}
-		// 检查是否全部目标都已处于终态
+		targets[remoteName] = FanoutTarget{Status: status, At: time.Now(), Err: errStr}
+		clone.Targets = targets
+
 		allDone := true
-		for _, t := range b.Targets {
+		for _, t := range targets {
 			if t.Status == "pending" || t.Status == "running" {
 				allDone = false
 				break
 			}
 		}
 		if allDone {
-			b.Completed = true
-			b.DoneAt = time.Now()
+			clone.Completed = true
+			clone.DoneAt = time.Now()
 		}
+
+		next := make([]*FanoutBatch, len(cur))
+		copy(next, cur)
+		next[i] = &clone
+		h.store(next)
 		return
 	}
 }
 
 // activeOrRecent 返回正在进行中、或完成不到 1 分钟的批次。
+//
+// 返回的指针指向不可变批次，调用方可以放心读。
 func (h *fanoutHub) activeOrRecent() []*FanoutBatch {
-	h.mu.Lock()
-	defer h.mu.Unlock()
 	var out []*FanoutBatch
 	now := time.Now()
-	for _, b := range h.batches {
+	for _, b := range h.load() {
 		if !b.Completed || now.Sub(b.DoneAt) < 1*time.Minute {
 			out = append(out, b)
 		}
@@ -159,7 +202,7 @@ func (s *Server) triggerFanout(project, ref, newSHA, trigger string) {
 	for _, rm := range targets {
 		batch.Targets[rm.Name] = FanoutTarget{Status: "pending", At: time.Now()}
 	}
-	s.fanouts.add(batch)
+	_ = s.fanouts.add(batch)
 
 	go func() {
 		for _, rm := range targets {
@@ -168,9 +211,10 @@ func (s *Server) triggerFanout(project, ref, newSHA, trigger string) {
 			s.syncOnce(project, rm)
 			// 根据 lastErr 确认是否出现错误
 			key := project + "@" + rm.Name
-			s.syncState.mu.Lock()
-			errStr := s.syncState.lastErr[key]
-			s.syncState.mu.Unlock()
+			errStr := ""
+			if v, ok := s.syncState.lastErr.Load(key); ok {
+				errStr, _ = v.(string)
+			}
 
 			if errStr != "" {
 				s.fanouts.updateTarget(batch.ID, rm.Name, "failed", errStr)

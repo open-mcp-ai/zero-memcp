@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
+	"github.com/open-mcp-ai/zero-memcp/internal/memory"
 )
 
 // seedDedup 绝不能把全库历史切片全读一遍。
@@ -41,29 +42,29 @@ func TestSeedDedupDoesNotReadHistoricalSlices(t *testing.T) {
 	// 挂读盘计数器
 	var oldReads atomic.Int64
 	var todayReads atomic.Int64
-	srv.mu.Lock()
-	for _, tr := range srv.trees {
-		for i := range tr.Blocks {
-			b := tr.Blocks[i]
-			orig := b.Read
-			if orig == nil {
-				continue
-			}
-			path := b.Path
-			tr.Blocks[i].Read = func() ([]byte, error) {
-				if dateInPath(path) == oldDate {
-					oldReads.Add(1)
+	mutateTrees(t, srv, func(trees []*memory.Tree) {
+		for _, tr := range trees {
+			for i := range tr.Blocks {
+				b := tr.Blocks[i]
+				orig := b.Read
+				if orig == nil {
+					continue
 				}
-				if dateInPath(path) == today {
-					todayReads.Add(1)
+				path := b.Path
+				tr.Blocks[i].Read = func() ([]byte, error) {
+					if dateInPath(path) == oldDate {
+						oldReads.Add(1)
+					}
+					if dateInPath(path) == today {
+						todayReads.Add(1)
+					}
+					return orig()
 				}
-				return orig()
 			}
 		}
-	}
-	srv.mu.Unlock()
+	})
 
-	srv.seedDedup(srv.trees)
+	srv.seedDedup(testTrees(srv))
 
 	if n := oldReads.Load(); n > 0 {
 		t.Fatalf("seedDedup 读了 %d 次历史切片——它应当只看最近 72 小时", n)

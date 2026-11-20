@@ -8,6 +8,7 @@ import (
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
+	"github.com/open-mcp-ai/zero-memcp/internal/gittransport"
 )
 
 // 对等同步：把「fetch → merge → push」编排成一个后台循环。
@@ -52,16 +53,18 @@ type syncConflict struct {
 
 // syncState 是同步循环的进程内状态。
 type syncState struct {
-	mu sync.Mutex
+	// 三张表各自独立，没有跨 key 的不变量 —— 每次操作只碰一个 key，
+	// 所以用 sync.Map 而不是 map+Mutex：Load/Store/Delete 的对错在那一行
+	// 就能看出来，不需要追踪 Lock/Unlock 是否跨多条 return 路径配平。
+	//
 	// conflicts 是待决议冲突，键为 project@branch。
-	conflicts map[string]syncConflict
+	conflicts sync.Map // key -> syncConflict
 	// lastSync 记录每个 project@remote 的上次成功同步时间。
-	lastSync map[string]time.Time
+	lastSync sync.Map // key -> time.Time
 	// lastErr 记录每个 project@remote 的上次错误（成功即清）。
-	lastErr map[string]string
-	// stop 非 nil 表示循环在跑。
-	stop chan struct{}
-	kick chan struct{}
+	lastErr sync.Map // key -> string
+	// runner 表达「最多一个同步循环在跑」，无锁。
+	runner backgroundRunner
 }
 
 // syncOnce 对一条 auto_sync 远端执行一轮完整同步。
@@ -81,9 +84,18 @@ func (s *Server) syncOnce(project string, rm config.Remote) {
 		return
 	}
 
-	// 铁律一：不隐式提交。有脏层就跳过整个项目——
-	// 合并会推进分支指针，而脏层是相对旧指针的改动，
-	// 在脏层未折叠时合并会让两边语义都不清楚。
+	// 若对端是另一个 zero-memcp 实例（HTTP/HTTPS 且不以 .git 结尾），
+	// 先直接同步工作层改动——无需先 commit，两台机器立刻可见。
+	if isWorkPeerURL(rm.URL) {
+		if perr := s.syncWorkWithRemote(project, rm, repo); perr != nil {
+			s.recordSyncErr(key, "work-sync: "+perr.Error())
+		} else {
+			s.recordSyncOK(key)
+		}
+		return
+	}
+
+	// 传统 Git 远端（GitHub 等）：不隐式提交。有脏层就跳过历史同步。
 	if pending := repo.Pending(); pending > 0 {
 		s.recordSyncErr(key, fmt.Sprintf("%d uncommitted change(s); commit before syncing", pending))
 		return
@@ -202,52 +214,31 @@ func (s *Server) pushOneBranch(c Caller, project string, rm config.Remote, repo 
 }
 
 func (s *Server) recordSyncOK(key string) {
-	s.syncState.mu.Lock()
-	defer s.syncState.mu.Unlock()
-	if s.syncState.lastSync == nil {
-		s.syncState.lastSync = map[string]time.Time{}
-	}
-	if s.syncState.lastErr == nil {
-		s.syncState.lastErr = map[string]string{}
-	}
-	s.syncState.lastSync[key] = time.Now()
-	delete(s.syncState.lastErr, key)
+	s.syncState.lastSync.Store(key, time.Now())
+	s.syncState.lastErr.Delete(key)
 }
 
 func (s *Server) recordSyncErr(key, msg string) {
-	s.syncState.mu.Lock()
-	defer s.syncState.mu.Unlock()
-	if s.syncState.lastErr == nil {
-		s.syncState.lastErr = map[string]string{}
-	}
-	s.syncState.lastErr[key] = msg
+	s.syncState.lastErr.Store(key, msg)
 }
 
 func (s *Server) addSyncConflict(c syncConflict) {
-	s.syncState.mu.Lock()
-	defer s.syncState.mu.Unlock()
-	if s.syncState.conflicts == nil {
-		s.syncState.conflicts = map[string]syncConflict{}
-	}
-	s.syncState.conflicts[c.Project+"@"+c.Branch] = c
+	s.syncState.conflicts.Store(c.Project+"@"+c.Branch, c)
 }
 
 // SyncConflicts 返回待决议冲突的副本（供状态输出与 WebUI）。
 func (s *Server) SyncConflicts() []syncConflict {
-	s.syncState.mu.Lock()
-	defer s.syncState.mu.Unlock()
-	out := make([]syncConflict, 0, len(s.syncState.conflicts))
-	for _, c := range s.syncState.conflicts {
-		out = append(out, c)
-	}
+	var out []syncConflict
+	s.syncState.conflicts.Range(func(_, v any) bool {
+		out = append(out, v.(syncConflict))
+		return true
+	})
 	return out
 }
 
 // ClearSyncConflict 人工处理完冲突后清掉记录。
 func (s *Server) ClearSyncConflict(project, branch string) {
-	s.syncState.mu.Lock()
-	defer s.syncState.mu.Unlock()
-	delete(s.syncState.conflicts, project+"@"+branch)
+	s.syncState.conflicts.Delete(project + "@" + branch)
 }
 
 // syncTargets 列出所有纳入自动同步的 (project, remote)。
@@ -255,9 +246,7 @@ func (s *Server) syncTargets() []struct {
 	Project string
 	Remote  config.Remote
 } {
-	s.cfgMu.RLock()
-	cf := s.cfgFile
-	s.cfgMu.RUnlock()
+	cf := s.cfgFilePtr.Load()
 	if cf == nil {
 		return nil
 	}
@@ -283,9 +272,7 @@ func (s *Server) syncTargets() []struct {
 // 后一半由这里的 ticker 兜底——覆盖「本地没写任何东西但远端有新提交」
 // 这种只读场景，否则一台只读机器永远拉不到别人的更新。
 func (s *Server) startSyncLoop() {
-	s.cfgMu.RLock()
-	cf := s.cfgFile
-	s.cfgMu.RUnlock()
+	cf := s.cfgFilePtr.Load()
 
 	interval := 2 * time.Hour
 	if cf != nil && cf.Sync.Interval > 0 {
@@ -293,15 +280,11 @@ func (s *Server) startSyncLoop() {
 	}
 
 	st := &s.syncState
-	st.mu.Lock()
-	if st.stop != nil {
-		st.mu.Unlock()
+	run, ok := st.runner.start()
+	if !ok {
 		return // 已在跑
 	}
-	stop := make(chan struct{})
-	kick := make(chan struct{}, 1)
-	st.stop, st.kick = stop, kick
-	st.mu.Unlock()
+	stop, kick := run.stop, run.kick
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -335,17 +318,7 @@ func (s *Server) startSyncLoop() {
 
 // kickSync 请求一次尽快同步（提交成功后调用）。非阻塞、去重。
 func (s *Server) kickSync() {
-	st := &s.syncState
-	st.mu.Lock()
-	kick := st.kick
-	st.mu.Unlock()
-	if kick == nil {
-		return
-	}
-	select {
-	case kick <- struct{}{}:
-	default:
-	}
+	s.syncState.runner.kick()
 }
 
 // runSyncPass 对所有 auto_sync 目标跑一轮。
@@ -369,26 +342,71 @@ func (s *Server) syncStatusLines(c Caller) []string {
 		return nil
 	}
 	targets := s.syncTargets()
-	s.syncState.mu.Lock()
-	defer s.syncState.mu.Unlock()
 
 	var out []string
 	for _, t := range targets {
 		key := t.Project + "@" + t.Remote.Name
 		line := fmt.Sprintf("%s -> %s", t.Project, t.Remote.Name)
-		if at, ok := s.syncState.lastSync[key]; ok {
-			line += fmt.Sprintf(" (last %s ago)", time.Since(at).Truncate(time.Second))
+		if v, ok := s.syncState.lastSync.Load(key); ok {
+			if at, ok := v.(time.Time); ok {
+				line += fmt.Sprintf(" (last %s ago)", time.Since(at).Truncate(time.Second))
+			}
 		} else {
 			line += " (never)"
 		}
-		if e := s.syncState.lastErr[key]; e != "" {
-			line += " [" + e + "]"
+		if v, ok := s.syncState.lastErr.Load(key); ok {
+			if e, _ := v.(string); e != "" {
+				line += " [" + e + "]"
+			}
 		}
 		out = append(out, line)
 	}
-	for _, cf := range s.syncState.conflicts {
-		out = append(out, fmt.Sprintf("CONFLICT %s@%s: %s",
-			cf.Project, cf.Branch, strings.Join(cf.Paths, ", ")))
-	}
+	s.syncState.conflicts.Range(func(_, cv any) bool {
+		if cf, ok := cv.(syncConflict); ok {
+			out = append(out, fmt.Sprintf("CONFLICT %s@%s: %s",
+				cf.Project, cf.Branch, strings.Join(cf.Paths, ", ")))
+		}
+		return true
+	})
 	return out
+}
+
+func isWorkPeerURL(rawURL string) bool {
+	u := strings.ToLower(strings.TrimSpace(rawURL))
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		return false
+	}
+	u = strings.TrimRight(u, "/")
+	return !strings.HasSuffix(u, ".git")
+}
+
+func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gitstore.Repo) error {
+	if rm.FetchOnly {
+		return nil
+	}
+	client, err := gittransport.NewTLSClient(gittransport.TLSConfig{
+		CAPath: rm.TLSCA,
+		Pin:    rm.TLSPin,
+	}, 20*time.Second)
+	if err != nil {
+		return err
+	}
+	token, err := s.optionalSecret(rm.HTTPToken, "http_token")
+	if err != nil {
+		return err
+	}
+	for _, br := range rm.Push {
+		if br == "*" {
+			continue
+		}
+		changes, derr := repo.DirtyChanges(br)
+		if derr != nil || len(changes) == 0 {
+			continue
+		}
+		seq := time.Now().UnixNano()
+		if _, perr := s.pushWorkToPeer(client, rm.URL, token, rm.Name, project, br, seq); perr != nil {
+			return perr
+		}
+	}
+	return nil
 }

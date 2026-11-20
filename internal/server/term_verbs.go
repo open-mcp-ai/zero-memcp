@@ -2,7 +2,6 @@ package server
 
 import (
 	"context"
-	"fmt"
 	"strings"
 
 	"github.com/open-mcp-ai/termcp/term"
@@ -46,17 +45,19 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Usage:  "ref <tree> <addr>",
 	},
 	{
-		Name:   "recall",
-		Detail: detail_recall,
-		Kind:   term.KindFlags,
-		Flags:  []string{"scope", "bare", "all"},
-		Usage:  "recall <query> [--scope <tree>] [--bare]",
+		Name:      "recall",
+		Detail:    detail_recall,
+		Kind:      term.KindFlags,
+		Flags:     []string{"scope", "bare", "all", "json"},
+		Valueless: []string{"bare", "all", "json"},
+		Usage:     "recall <query> [--scope <tree>] [--bare] [--json]",
 	},
 	{
-		Name:  "srecall",
-		Kind:  term.KindFlags,
-		Flags: []string{"scope"},
-		Usage: "srecall <query> [--scope <tree>]",
+		Name:      "srecall",
+		Kind:      term.KindFlags,
+		Flags:     []string{"scope", "json"},
+		Valueless: []string{"json"},
+		Usage:     "srecall <query> [--scope <tree>] [--json]",
 	},
 	{
 		Name:   "read",
@@ -118,6 +119,16 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Usage:  "commit [<project>[@<branch>]] [-m msg]",
 	},
 	{
+		// pending：列出上次 commit 之后还没进版本库的路径。
+		//
+		// 归纳流程的第一步。它不认识任何业务概念——不知道谁是人格层、
+		// 谁是流水，只回答「哪些路径还没进 commit」。
+		Name:   "pending",
+		Detail: detail_pending,
+		Kind:   term.KindFlags,
+		Usage:  "pending <project>[@<branch>]",
+	},
+	{
 		Name:   "diff",
 		Detail: detail_diff,
 		Kind:   term.KindFlags,
@@ -134,9 +145,9 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:      "tag",
 		Detail:    detail_tag,
 		Kind:      term.KindFlags,
-		Flags:     []string{"d"},
+		Flags:     []string{"d", "m"},
 		Valueless: []string{"d"},
-		Usage:     "tag [-d] <project> [<name> [<ref>]]",
+		Usage:     "tag [-d] <project> [<name> [<ref>]] [-m msg]",
 	},
 	{
 		Name:   "cp",
@@ -157,6 +168,23 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Detail: detail_delete,
 		Kind:   term.KindFlags,
 		Usage:  "delete <p>@<br>/<path>...",
+	},
+	{
+		Name:   "erase",
+		Detail: detail_erase,
+		Kind:   term.KindFlags,
+		Target: true,
+		Flags:  []string{"nonce", "sig", "expires"},
+		Usage:  "erase <p>@<br>/<path> [--nonce N --expires T --sig B64]",
+	},
+	{
+		Name:        "replace",
+		Detail:      detail_replace,
+		Kind:        term.KindPayload,
+		Target:      true,
+		Flags:       []string{"nonce", "sig", "expires"},
+		PayloadType: term.PayloadVar,
+		Usage:       "replace <p>@<br>/<path> [--nonce N --expires T --sig B64] $TEXT",
 	},
 	{
 		Name:  "deleted",
@@ -200,6 +228,14 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Target:      true,
 		PayloadType: term.PayloadVar,
 		Usage:       "write <p>@<br>/<path> $TEXT",
+	},
+	{
+		Name:        "apply",
+		Detail:      detail_apply,
+		Kind:        term.KindPayload,
+		Target:      true,
+		PayloadType: term.PayloadVar,
+		Usage:       "apply <project>[@<branch>] $PATCHES",
 	},
 
 	// ── 同步与远端 ──
@@ -473,6 +509,18 @@ func reconstructCmd(st directive.Statement) string {
 }
 
 // credentialVerbs 是「put 需要 <name> 位置参数 + 正文」的那两个复合动词。
+const detail_pending = `pending —— 列出尚未提交的改动路径。
+
+用法：pending <project>[@<branch>]
+
+输出每条改动一行，前面是 +（新增或覆盖）或 -（删除），
+后面是可直接喂给 read 的规范地址（project@branch:path）。
+
+commit 之后清单清空。
+
+它只回答「哪些路径还没进 commit」。至于这批改动该被如何归纳、
+哪些值得留下、commit message 写什么，都是调用方的事。`
+
 var credentialVerbs = map[string]bool{"remote-key": true, "remote-secret": true}
 
 func (s *Server) newTerm(v Viewer, c Caller) (*term.Term, *termHandler) {
@@ -492,8 +540,6 @@ func (s *Server) newTerm(v Viewer, c Caller) (*term.Term, *termHandler) {
 		}
 	})), h
 }
-
-var _ = fmt.Sprintf
 
 // renderReply 将 termcp 的 Reply 渲染为 zero-memcp 的 TermResult 投影。
 //
@@ -536,3 +582,23 @@ func renderReply(reply envelope.Reply, h *termHandler) TermResult {
 		Empty:      allEmpty,
 	}
 }
+
+const detail_apply = `apply —— 批量写（一次工具往返改写/删除多个文件）。
+
+用法：
+  apply <project>[@<branch>] $PATCHES
+
+其中 $PATCHES 必须是 JSON 数组（通过 vars/args 传递）：
+  [
+    {"op": "write",  "path": "SKILL.md",    "content": "..."},
+    {"op": "write",  "path": "07-topic.md", "content": "..."},
+    {"op": "delete", "path": "08-old.md"}
+  ]
+
+为什么用它而不是连续多次 write：
+  1. 一次往返：不用在模型上下文里塞 N 条工具调用与返回
+  2. 先全部校验、再全部落盘：语法/路径/权限有一处错，一个字节都不写
+  3. 逐个 path 刷新索引，不重扫整条分支
+
+注意：apply 只写脏层、不自动 commit。写与封箱是两件事，
+全部写完由调用方显式调用 commit。`

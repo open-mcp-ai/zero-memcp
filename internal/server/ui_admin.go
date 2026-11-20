@@ -24,17 +24,15 @@ func (s *Server) uiOverview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	s.mu.RLock()
 	projects := map[string]int{}
 	branches := map[string]int{}
 	docs := 0
-	for _, t := range s.trees {
+	for _, t := range s.treeList() {
 		projects[t.Project] += len(t.Blocks)
 		branches[t.Project+"@"+t.Branch]++
 		docs += len(t.Indexable())
 	}
-	terms := s.idx.Terms()
-	s.mu.RUnlock()
+	terms := s.idxNow().Terms()
 
 	pending := map[string]int{}
 	for _, p := range s.declaredProjects() {
@@ -562,8 +560,7 @@ func (s *Server) uiSearch(w http.ResponseWriter, r *http.Request) {
 		uiJSON(w, map[string]any{"hits": []any{}})
 		return
 	}
-	s.mu.RLock()
-	hits := s.idx.SearchWeighted(q, 20, 0, s.weightCount)
+	hits := s.idxNow().SearchWeighted(q, 20, 0, s.weightCount)
 	out := make([]map[string]any, 0, len(hits))
 	for _, h := range hits {
 		snip := s.snippet(h.Addr, q, 160)
@@ -573,7 +570,6 @@ func (s *Server) uiSearch(w http.ResponseWriter, r *http.Request) {
 			"snippet": snip,
 		})
 	}
-	s.mu.RUnlock()
 	uiJSON(w, map[string]any{"hits": out})
 }
 

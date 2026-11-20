@@ -5,23 +5,22 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
+	"github.com/open-mcp-ai/zero-memcp/internal/vecindex"
 )
 
 // flakyEmbedServer 模拟 Embedding 服务：可以随时切成故障/恢复。
 type flakyEmbedServer struct {
-	srv      *httptest.Server
-	down     atomic.Bool
-	calls    atomic.Int64
-	mu       sync.Mutex
-	seenText []string
-	dim      int
+	srv   *httptest.Server
+	down  atomic.Bool
+	calls atomic.Int64
+	texts atomic.Pointer[[]string]
+	dim   int
 }
 
 func newFlakyEmbedServer(t *testing.T, dim int) *flakyEmbedServer {
@@ -38,9 +37,17 @@ func newFlakyEmbedServer(t *testing.T, dim int) *flakyEmbedServer {
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		f.calls.Add(int64(len(req.Input)))
-		f.mu.Lock()
-		f.seenText = append(f.seenText, req.Input...)
-		f.mu.Unlock()
+		for {
+			cur := []string(nil)
+			if p := f.texts.Load(); p != nil {
+				cur = *p
+			}
+			next := append([]string(nil), cur...)
+			next = append(next, req.Input...)
+			if f.texts.CompareAndSwap(f.texts.Load(), &next) {
+				break
+			}
+		}
 
 		type item struct {
 			Embedding []float32 `json:"embedding"`
@@ -122,7 +129,7 @@ func TestSemanticSelfHealsAfterOutage(t *testing.T) {
 	defer srv.Close()
 	waitForSemanticReady(t, srv)
 
-	if n := srv.semantic.idx.Len(); n != 2 {
+	if n := srv.semantic.getActive().idx.Len(); n != 2 {
 		t.Fatalf("初始应索引 2 篇，实际 %d", n)
 	}
 
@@ -137,14 +144,12 @@ func TestSemanticSelfHealsAfterOutage(t *testing.T) {
 
 	// 等一两个巡检周期：索引不该变多（服务不可用）
 	time.Sleep(500 * time.Millisecond)
-	// 必须在锁内读：后台 catchUpSemantic 会并发替换 s.semantic.idx，
+	// 必须在锁内读：后台 catchUpSemantic 会并发替换 s.semantic.getActive().idx，
 	// 裸读是数据竞争（-race 会抓到，而且抓到的位置看起来像业务代码）。
-	srv.semantic.mu.RLock()
 	nDuringOutage := 0
-	if srv.semantic.idx != nil {
-		nDuringOutage = srv.semantic.idx.Len()
+	if srv.semantic.getActive().idx != nil {
+		nDuringOutage = srv.semantic.getActive().idx.Len()
 	}
-	srv.semantic.mu.RUnlock()
 	if nDuringOutage != 2 {
 		t.Fatalf("服务不可用期间索引不应增长，实际 %d", nDuringOutage)
 	}
@@ -157,10 +162,12 @@ func TestSemanticSelfHealsAfterOutage(t *testing.T) {
 	// 这个数字本身就是那个 bug 的探针：退避一旦退回来，这里立刻红。
 	deadline := time.Now().Add(6 * time.Second)
 	for time.Now().Before(deadline) {
-		srv.semantic.mu.RLock()
-		ix := srv.semantic.idx
-		ready := srv.semantic.ready
-		srv.semantic.mu.RUnlock()
+		snap := srv.semantic.getActive()
+		var ix *vecindex.Index
+		if snap != nil {
+			ix = snap.idx
+		}
+		ready := srv.semantic.isReady()
 		if ready && ix != nil && ix.Len() >= 3 {
 			// 恢复成功
 			return
@@ -168,15 +175,13 @@ func TestSemanticSelfHealsAfterOutage(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 
-	srv.semantic.mu.RLock()
-	defer srv.semantic.mu.RUnlock()
 	t.Fatalf("服务恢复后 6 秒内未自动补算：索引 %d 篇，err=%q",
 		func() int {
-			if srv.semantic.idx == nil {
+			if srv.semantic.getActive().idx == nil {
 				return 0
 			}
-			return srv.semantic.idx.Len()
-		}(), srv.semantic.err)
+			return srv.semantic.getActive().idx.Len()
+		}(), srv.semantic.getErr())
 }
 
 // TestSemanticStartsDownThenRecovers 锁定更苛刻的场景：
@@ -232,9 +237,7 @@ func TestSemanticStartsDownThenRecovers(t *testing.T) {
 	defer srv.Close()
 
 	// 启动后应处于「不可用」状态，且不 panic
-	srv.semantic.mu.RLock()
-	embNil := srv.semantic.emb == nil
-	srv.semantic.mu.RUnlock()
+	embNil := srv.semantic.getEmb() == nil
 	if !embNil {
 		t.Skip("启动时意外连上了 mock 服务，此用例不适用")
 	}
@@ -243,20 +246,16 @@ func TestSemanticStartsDownThenRecovers(t *testing.T) {
 	flaky.SetDown(false)
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		srv.semantic.mu.RLock()
-		ready := srv.semantic.ready
+		ready := srv.semantic.isReady()
 		var n int
-		if srv.semantic.idx != nil {
-			n = srv.semantic.idx.Len()
+		if snap := srv.semantic.getActive(); snap != nil && snap.idx != nil {
+			n = snap.idx.Len()
 		}
-		srv.semantic.mu.RUnlock()
 		if ready && n >= 1 {
 			return // 自愈成功
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	srv.semantic.mu.RLock()
-	errMsg := srv.semantic.err
-	srv.semantic.mu.RUnlock()
+	errMsg := srv.semantic.getErr()
 	t.Fatalf("启动时不可用、后来恢复，但索引始终没建起来（err=%q）", errMsg)
 }

@@ -22,6 +22,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
@@ -61,6 +62,61 @@ func isSemanticContent(path string) bool {
 	return false
 }
 
+// semanticLayers 是「内容自己声明的层」里，允许进语义索引的那些。
+//
+// 和路径白名单是**两个入口、同一个结果**：路径对了算进，
+// 内容自己写明是这几层之一也算进。
+var semanticLayers = map[string]bool{
+	"thought": true,
+	"record":  true,
+	"review":  true,
+	"fact":    true,
+}
+
+// isSemanticBlock 判断一个块该不该参与语义索引。
+//
+// 两条入口，满足任一即可：
+//
+//  1. **路径**在前缀白名单里（thought/ record/ review/ fact/）——主路径
+//  2. **内容自己声明了** layer: thought|record|review|fact —— 历史数据补票
+//
+// # 为什么第 2 条不能省
+//
+// 2026-11-16 实测：`docs 28187 / semantic 16167`，差 12,020 篇。
+// 缺的全是历史思维链和对话——它们躺在日期根目录（`2026-11-15/xxx.md`），
+// 而当时只认路径前缀，于是这些块**一个向量都没算过**。
+//
+// 症状极难查：数据在、能 grep、能 read，就是语义搜不到。
+// 看起来像「没落盘」，实际是「落了但索引瞎了」——
+// 这两件事对用户是完全不同的说法（前者是数据丢了，后者是数据还在）。
+//
+// 「写错路径」是**已经发生过的事实**，不是可能发生的事。
+// 所以这不是提前加的防护，是补一个已经漏掉的口子。
+//
+// 排除项优先：me/（每轮注入的规则，不靠检索）和点开头的隐藏内容
+// 一律不进，哪怕正文里声明了 layer。
+func isSemanticBlock(b memory.Block) bool {
+	if b.Hidden || memory.HiddenPath(b.Path) {
+		return false
+	}
+	// me/ 装的是每轮注入系统提示的规则，靠注入不靠检索。
+	// 把它放进向量库只会让 recall 里全是规则条文，挤掉真正的内容。
+	if strings.HasPrefix(b.Path, "me/") || strings.Contains(b.Path, "/me/") {
+		return false
+	}
+	if isSemanticContent(b.Path) {
+		return true
+	}
+	layer := b.Layer
+	// 如果扫描阶段没填 Layer 但 Body 已经带在身上（比如测试造的数据、
+	// 或某些直接构造 Block 的快路径），顺手代为解析一次。
+	// 这不引入读盘：Body 已经在内存里。
+	if layer == "" && len(b.Body) > 0 {
+		layer = memory.DeclaredLayer(string(b.Body))
+	}
+	return semanticLayers[layer]
+}
+
 // semanticMinScore 是向量命中的最低余弦相似度。
 //
 // 0.35 的依据是实测分布：无关内容 0.19~0.30，跨语言正解 0.45，
@@ -68,43 +124,71 @@ func isSemanticContent(path string) bool {
 // 又不至于把跨语言的正确答案筛掉——那是这个功能存在的理由。
 const semanticMinScore = 0.35
 
-// semanticState 是向量侧的运行状态。
-type semanticState struct {
-	mu    sync.RWMutex
-	ready bool
-	idx   *vecindex.Index
-	// emb 是常驻推理会话。模型 449MB，每条查询重新加载会把
-	// 延迟从毫秒推到秒级，而且反复 InitializeEnvironment /
-	// DestroyEnvironment 在并发下不可靠。
-	emb embed.Embedder
-	err string // 构建失败的原因，供 status 报告
-	// prints 是当前 idx 的内容指纹表（id -> fingerprint(text)）。
-	// 与 idx 同生共死：每次替换 idx 时一起换。后台追平用它做增量比对，
-	// 避免反复从磁盘读 manifest。
+// semanticSnapshot 是 (idx, prints) 的原子快照。
+//
+// 它们必须同生共死：每次替换 idx 时一起换，读者 Load 一次就拿到
+// 匹配的一对，不会读到「索引是新的、指纹还是旧的」导致增量判定全部失效。
+type semanticSnapshot struct {
+	idx    *vecindex.Index
 	prints map[string]string
+}
 
-	// blobHashes 是「id -> 上一轮看到的 git blob hash」。
-	//
-	// 旁路加速用，不参与落盘：它只回答「这个块的内容能不能确定
-	// 没变」。对得上就不必 readBlock + sha256——后台每 30 秒一次
-	// 的全库读盘就是这么省下来的。
-	//
-	// 值缺失是安全的：缺失只会让那一块退回读盘算指纹（慢一点，
-	// 但答案一样）。
-	blobHashes map[string]string
+// semanticState 是向量侧的运行状态。
+//
+// # 为什么没有锁
+//
+// 拆成三个维度的无锁原语：
+//   - active：(idx, prints) 的原子快照，整体替换；
+//   - emb / err：atomic.Pointer；
+//   - quarantine / blobHashes：sync.Map，每个 id 互相独立；
+//   - building：atomic.Bool（CAS 去重）。
+//
+// 读者（srecall 热路径）全程只做 Load，永不阻塞后台构建；
+// 后台构建（几十秒网络推理）在锁外跑完，最后一次 Store 换上去。
+type semanticState struct {
+	emb        atomic.Pointer[embedHolder]
+	active     atomic.Pointer[semanticSnapshot]
+	err        atomic.Pointer[string]
+	building   atomic.Bool
+	quarantine sync.Map // id -> quarantineEntry
+	blobHashes sync.Map // id -> git blob hash
+}
 
-	// building 为真表示后台正在建索引。此时 srecall 回落到 BM25，
-	// 而不是阻塞等——检索是热路径，不能让人等几十秒。
-	building bool
+type embedHolder struct{ emb embed.Embedder }
 
-	// quarantine 记录「确定嵌不进去」的切片与它的退避状态。
-	//
-	// 为什么必须有它：后台追平每 30 秒跑一次，判据是「指纹不在 prints 里
-	// 就算新增」。一条永远返回 413 的切片因此每轮都会被重新送进去，
-	// 连带它所在的那一批都被二分隔离——实测这会让维护环每 30 秒重算
-	// 一次全量，CPU 长期 100%，而且日志每轮刷同样的错误。
-	// 失败不是不能有，失败必须有代价上限。
-	quarantine map[string]quarantineEntry
+func (st *semanticState) getEmb() embed.Embedder {
+	if h := st.emb.Load(); h != nil {
+		return h.emb
+	}
+	return nil
+}
+
+func (st *semanticState) setEmb(emb embed.Embedder) {
+	st.emb.Store(&embedHolder{emb: emb})
+}
+
+func (st *semanticState) getActive() *semanticSnapshot {
+	return st.active.Load()
+}
+
+func (st *semanticState) setActive(idx *vecindex.Index, prints map[string]string) {
+	st.active.Store(&semanticSnapshot{idx: idx, prints: prints})
+}
+
+func (st *semanticState) getErr() string {
+	if p := st.err.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+func (st *semanticState) setErr(err string) {
+	st.err.Store(&err)
+}
+
+func (st *semanticState) isReady() bool {
+	snap := st.getActive()
+	return snap != nil && snap.idx != nil && st.getEmb() != nil
 }
 
 // quarantineEntry 是一条失败切片的退避状态。
@@ -125,6 +209,37 @@ type quarantineEntry struct {
 // 直接导致 P0 在全库里被压到第 22 名。LaBSE 是 Google 专为跨语言
 // 句向量训练的模型，同一对文本实测 0.97。
 const semanticModelName = "LaBSE-int8"
+
+// vectorDirFor 返回某个模型专属的向量落盘目录。
+//
+// 多索引共存靠这一层子目录实现：远端大模型、本地小模型、同名的不同
+// 修订各占据一个目录，切换时互不覆盖。于是「大模型挂了切小模型、
+// 恢复后切回来」不再需要重算大模型那份——这是降级方案能成立的前提。
+//
+// 手动 index_dir 优先（供运维显式指定），否则由 Model+ModelRev 推导。
+func (s *Server) vectorDirFor(emb embed.Embedder) string {
+	if s.semanticDir == "" {
+		return ""
+	}
+	if p := s.semanticProviderFor(emb.Name()); p != nil && p.IndexDir != "" {
+		return filepath.Join(s.semanticDir, p.IndexDir)
+	}
+	return vecindex.ResolveDir(s.semanticDir, emb.Name(), embed.Revision(emb))
+}
+
+// semanticProviderFor 在配置里找与模型名匹配的 provider（用于取 index_dir、
+// gate_threshold 这类「随模型走」的参数）。
+//
+// 找不到返回 nil：链的名字可能由多个 provider 拼成，此时用默认推导。
+func (s *Server) semanticProviderFor(modelName string) *config.SemanticProvider {
+	for i := range s.cfg.Semantic.Providers {
+		p := &s.cfg.Semantic.Providers[i]
+		if p.Model == modelName || p.Label == modelName {
+			return p
+		}
+	}
+	return nil
+}
 
 // initSemantic 启动时尝试载入向量缓存；缓存缺失或过期就后台重建。
 //
@@ -152,16 +267,12 @@ func (s *Server) initSemantic() {
 		// 启动时全链不可用不再意味着「语义功能死刑」：
 		// 维护协程会周期性重试 OpenChain，嵌入服务恢复后自动补算。
 		// 这正是「写入时 Ollama 没开，开了之后自动追平」的实现路径。
-		s.semantic.mu.Lock()
-		s.semantic.err = fmt.Sprintf("open embedder: %v", err)
-		s.semantic.mu.Unlock()
-		s.logf("semantic: %s — will retry in background", s.semantic.err)
+		s.semantic.setErr(fmt.Sprintf("open embedder: %v", err))
+		s.logf("semantic: %s — will retry in background", s.semantic.getErr())
 		s.startSemanticMaintainer(s.cfg.Semantic.MaintainInterval)
 		return
 	}
-	s.semantic.mu.Lock()
-	s.semantic.emb = emb
-	s.semantic.mu.Unlock()
+	s.semantic.setEmb(emb)
 	s.logf("semantic: embedder ready (dim=%d, model=%s, providers=%v, active=%s)",
 		emb.Dim(), emb.Name(), emb.Providers(), emb.ActiveLabel())
 
@@ -171,8 +282,9 @@ func (s *Server) initSemantic() {
 	// 可用——差异交给增量逻辑按块比对。旧的判定是「任一分支 head
 	// 变了就全废」，日常写一条记忆就要重算 6800 片 12 分钟。
 	var cached *vecindex.Index
-	if vecDir != "" {
-		if ix, prints, err := vecindex.Load(vecDir, emb.Name()); err == nil {
+	modelDir := s.vectorDirFor(emb)
+	if modelDir != "" {
+		if ix, prints, err := vecindex.LoadRev(modelDir, emb.Name(), embed.Revision(emb)); err == nil {
 			if ix.Dim() != emb.Dim() {
 				// 维度对不上说明缓存是别的模型遗留的。宁可重建，
 				// 也不能拿旧向量配新模型——那会静默返回错结果。
@@ -181,12 +293,18 @@ func (s *Server) initSemantic() {
 				cached = ix
 				// 先挂上去：即使接下来要增量补算，检索也已可用，
 				// 不必让 srecall 回落到 BM25 等增量跑完。
-				s.semantic.mu.Lock()
-				s.semantic.idx = ix
-				s.semantic.prints = prints
-				s.semantic.ready = true
-				s.semantic.mu.Unlock()
-				s.logf("semantic: loaded %d vectors from cache (%d prints)", ix.Len(), len(prints))
+				s.semantic.setActive(ix, prints)
+				s.logf("semantic: loaded %d vectors from cache (%d prints, dir=%s)",
+					ix.Len(), len(prints), modelDir)
+			}
+		} else {
+			// 旧版本把 vectors.bin 直接写在根目录。若那里恰好是本模型
+			// 且修订号为空（老 manifest 没有这个字段），继续沿用，
+			// 下次落盘时自动搬进模型子目录，不必手工搬文件。
+			if ix, prints, lerr := vecindex.Load(vecDir, emb.Name()); lerr == nil && ix.Dim() == emb.Dim() {
+				cached = ix
+				s.semantic.setActive(ix, prints)
+				s.logf("semantic: adopting legacy cache at %s (%d vectors)", vecDir, ix.Len())
 			}
 		}
 	}
@@ -194,13 +312,17 @@ func (s *Server) initSemantic() {
 	// 先出声再动工：构建要跑几分钟，日志里必须先有「我开始了」这一行，
 	// 否则排查时无法区分「没启动」和「正在建」。
 	if cached == nil {
-		s.logf("semantic: cache miss, building index in background (dir=%s)", vecDir)
+		s.logf("semantic: cache miss, building index in background (dir=%s)", modelDir)
 	} else {
 		s.logf("semantic: checking cache for incremental updates")
 	}
 
 	// 首轮构建/追平立即跑一次（不等第一个周期）。
 	go s.catchUpSemantic("startup")
+
+	// 若配置里写了多个不同模型（如 zh + en），把其余已建好的索引也挂上，
+	// 形成真正的多索引并存，查询时各路并查再按名次融合。
+	s.loadLiveIndexes()
 
 	// 之后由后台维护协程持续追平：写入触发 + 周期兜底。
 	s.startSemanticMaintainer(s.cfg.Semantic.MaintainInterval)
@@ -247,9 +369,7 @@ func (s *Server) semanticHeads() map[string]string {
 // 复用常驻 embedder，不自己 Open：模型 449MB，建完索引后它还要
 // 继续服务查询，不能在这里 Close 掉。
 func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cached *vecindex.Index, cachedPrints map[string]string) error {
-	s.semantic.mu.RLock()
-	emb := s.semantic.emb
-	s.semantic.mu.RUnlock()
+	emb := s.semantic.getEmb()
 	if emb == nil {
 		return fmt.Errorf("embedder not initialized")
 	}
@@ -262,7 +382,7 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 			// 按**路径**决定是否进语义索引（isSemanticContent），
 			// 不再看分支名。分支可以是任何名字（main、main/record、
 			// task-1729），只要内容在 thought/ 或 record/ 下就参与。
-			if !isSemanticContent(b.Path) {
+			if !isSemanticBlock(b) {
 				continue
 			}
 			data, rerr := s.readBlock(b)
@@ -295,28 +415,58 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 	var reused int    // 指纹没变直接复用的
 	start := time.Now()
 
+	// 按内容指纹反查旧向量：指纹 → 任意一个曾有该内容的旧地址。
+	//
+	// 为什么需要这张表：旧向量按「地址」存，而地址里带着路径。文件一改名
+	// （规整分桶、挪出白名单、换分支前缀），地址就变了，按地址查必然 miss——
+	// 于是 3 万篇没改一个字的记忆会被当成新文档全部重算嵌入，代价是几十分钟
+	// 的 Ollama 排队。
+	//
+	// 但向量只取决于**内容**。同一段文字放在哪个路径，向量完全一样。所以
+	// 地址没命中、指纹命中时，把那份向量原样借给新地址。改名因此变成纯内存
+	// 操作，零推理。
+	//
+	// 为什么不干脆把主键换成 blob 哈希：哈希确实更纯（同内容天然共享一份
+	// 向量），但它会让权限过滤、时间加成、思维↔记录配对、虚拟地址这四处
+	// 全部改依赖「哈希 → 地址」翻译层，改动面远大于收益；而「改路径不重算」
+	// 这个目标，指纹反查已经 100% 达成。
+	byPrint := make(map[string]string, len(cachedPrints))
+	if cached != nil {
+		for id, fp := range cachedPrints {
+			if _, ok := byPrint[fp]; ok {
+				continue
+			}
+			if cached.Has(id) {
+				byPrint[fp] = id
+			}
+		}
+	}
+	var reusedByPrint int
+
 	// 隔离检查：退避期内的切片直接跳过，不参与本轮。
 	//
 	// 判据只看「时间到没到」，不看重试次数——退避长度本身已经由
 	// 次数算出来了。跳过的切片不会进 prints，所以它仍被算作「欠着」，
 	// 时间一到就会自动重试：既不会永久放弃，也不会每轮都撞。
 	now := time.Now()
-	s.semantic.mu.RLock()
-	quar := s.semantic.quarantine
 	var skipped int
 	for _, j := range jobs {
-		if e, ok := quar[j.id]; ok && e.nextTry.After(now) {
-			skipped++
+		if v, ok := s.semantic.quarantine.Load(j.id); ok {
+			e := v.(quarantineEntry)
+			if e.nextTry.After(now) {
+				skipped++
+			}
 		}
 	}
-	s.semantic.mu.RUnlock()
 	if skipped > 0 {
 		s.logf("semantic: %d slice(s) in backoff, skipped this round", skipped)
 	}
 
 	for _, j := range jobs {
-		if e, ok := quar[j.id]; ok && e.nextTry.After(now) {
-			continue
+		if v, ok := s.semantic.quarantine.Load(j.id); ok {
+			if e, _ := v.(quarantineEntry); e.nextTry.After(now) {
+				continue
+			}
 		}
 		fp := fingerprint(j.text)
 		if old, had := cachedPrints[j.id]; had && old == fp && cached != nil && cached.Has(j.id) {
@@ -329,7 +479,25 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 				}
 			}
 		}
+		// 地址换了、内容没换：向旧地址借这份向量，同样零推理。
+		// 这一支就是「规整化 / 改名 / 换分支」不重算的根据。
+		if cached != nil {
+			if oldID, ok := byPrint[fp]; ok {
+				if vecs := cached.VectorOf(oldID); vecs != nil {
+					if err := ix.Add(j.id, vecs); err == nil {
+						prints[j.id] = fp
+						reused++
+						reusedByPrint++
+						continue
+					}
+				}
+			}
+		}
 		toEmbed = append(toEmbed, j)
+	}
+
+	if reusedByPrint > 0 {
+		s.logf("semantic: %d slice(s) reused across renamed paths (same content, new address)", reusedByPrint)
 	}
 
 	if cached != nil {
@@ -403,17 +571,18 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 		return fmt.Errorf("all %d slices failed to embed", len(jobs))
 	}
 
-	if vecDir != "" {
-		if err := ix.Save(vecDir, emb.Name(), heads, prints); err != nil {
+	if saveDir := s.vectorDirFor(emb); saveDir != "" {
+		if err := ix.SaveRev(saveDir, emb.Name(), embed.Revision(emb), heads, prints); err != nil {
 			s.logf("semantic: cache save failed (will rebuild next start): %v", err)
 		}
 	}
 
-	s.semantic.mu.Lock()
-	s.semantic.idx = ix
-	s.semantic.prints = prints
-	s.semantic.ready = true
-	s.semantic.mu.Unlock()
+	// 索引结果另开一棵树（<project>@meta.index），不碰主记录 blob。
+	// 好处：主历史保持干净，而排错需要的「哪版权重、何时、覆盖了哪些
+	// 切片」全在这棵树上，且自带 git diff；写完顺手通知订阅者。
+	s.publishIndexTree(emb.Name(), embed.Revision(emb), emb.Dim(), prints)
+
+	s.semantic.setActive(ix, prints)
 
 	s.logf("semantic: ready with %d vectors (%d reused, %d failed) in %.1fs",
 		ix.Len(), reused, failed, time.Since(start).Seconds())
@@ -444,14 +613,12 @@ func semanticText(raw string) string {
 
 // semanticSearch 在向量索引上查一次。返回空表示未启用或未就绪。
 func (s *Server) semanticSearch(query string) []vecindex.Hit {
-	s.semantic.mu.RLock()
-	ix := s.semantic.idx
-	emb := s.semantic.emb
-	ready := s.semantic.ready
-	s.semantic.mu.RUnlock()
-	if !ready || ix == nil || emb == nil {
+	snap := s.semantic.getActive()
+	emb := s.semantic.getEmb()
+	if snap == nil || snap.idx == nil || emb == nil {
 		return nil
 	}
+	ix := snap.idx
 
 	qv, err := emb.Embed(query)
 	if err != nil {
@@ -551,7 +718,7 @@ func (s *Server) companionRecord(thoughtID string) (string, string) {
 
 // semanticTime 查一条切片的正文时间，优先索引表，回退 commit 时间。
 func (s *Server) semanticTime(id string) int64 {
-	if t := s.idx.DocTime(id); t != 0 {
+	if t := s.idxNow().DocTime(id); t != 0 {
 		return t
 	}
 	return 0
@@ -576,12 +743,9 @@ func (s *Server) addrToVirtualFor(id string) string {
 
 // semanticStatus 给 status 动词报告向量侧状态。
 func (s *Server) semanticStatus() string {
-	s.semantic.mu.RLock()
-	defer s.semantic.mu.RUnlock()
-	// 后端详情（降级链的当前生效应是排查「为什么召回变慢/变差」
-	// 的第一入口）：不依赖锁，Chain 自己是并发安全的。
+	snap := s.semantic.getActive()
 	var backend string
-	if emb := s.semantic.emb; emb != nil {
+	if emb := s.semantic.getEmb(); emb != nil {
 		if ch, ok := emb.(*embed.Chain); ok {
 			backend = " via " + ch.ActiveLabel()
 			// 只在「当前确实在用备用后端」时报降级原因。
@@ -601,12 +765,12 @@ func (s *Server) semanticStatus() string {
 		}
 	}
 	switch {
-	case s.semantic.building:
+	case s.semantic.building.Load():
 		return "building" + backend
-	case s.semantic.ready && s.semantic.idx != nil:
-		return fmt.Sprintf("ready (%d vectors)%s", s.semantic.idx.Len(), backend)
-	case s.semantic.err != "":
-		return "unavailable: " + s.semantic.err
+	case snap != nil && snap.idx != nil:
+		return fmt.Sprintf("ready (%d vectors)%s", snap.idx.Len(), backend)
+	case s.semantic.getErr() != "":
+		return "unavailable: " + s.semantic.getErr()
 	default:
 		return "not initialized"
 	}
@@ -614,10 +778,8 @@ func (s *Server) semanticStatus() string {
 
 // snapshotTrees 取当前树的快照（调用方已持有锁时不要用）。
 func (s *Server) snapshotTrees() []*memory.Tree {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]*memory.Tree, len(s.trees))
-	copy(out, s.trees)
+	out := make([]*memory.Tree, len(s.treeList()))
+	copy(out, s.treeList())
 	return out
 }
 
@@ -626,8 +788,6 @@ func contentHash(s string) string {
 	h := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(h[:8])
 }
-
-var _ = os.Getenv // 保留 os 引用，供后续按环境变量覆盖路径
 
 // semanticChainConfig 把服务配置与环境变量组装成降级链。
 //
@@ -665,6 +825,7 @@ func (s *Server) semanticChainConfig() embed.ChainConfig {
 			LibPath:   p.LibPath,
 			ModelPath: p.ModelPath,
 			VocabPath: p.VocabPath,
+			ModelRev:  p.ModelRev,
 		})
 	}
 
@@ -914,15 +1075,15 @@ func (s *Server) embedIsolate(emb embed.Embedder, jobs []job, failed *int) [][]f
 func transientEmbedError(reason string) bool {
 	r := strings.ToLower(reason)
 	for _, sig := range []string{
-		"all providers failed",   // 整条降级链都连不上
-		"connection refused",     // 后端没起来
-		"no such host",           // DNS 解析不了
-		"service unavailable",    // 503
-		"timeout",                // 超时（含 context deadline exceeded）
+		"all providers failed", // 整条降级链都连不上
+		"connection refused",   // 后端没起来
+		"no such host",         // DNS 解析不了
+		"service unavailable",  // 503
+		"timeout",              // 超时（含 context deadline exceeded）
 		"deadline exceeded",
 		"connection reset",
 		"broken pipe",
-		"eof",                    // 对端提前关闭
+		"eof", // 对端提前关闭
 	} {
 		if strings.Contains(r, sig) {
 			return true
@@ -940,15 +1101,8 @@ func transientEmbedError(reason string) bool {
 //
 // 但「环境不可用」不走退避，见 transientEmbedError 的说明。
 func (s *Server) noteSemanticFailure(id, reason string) {
-	s.semantic.mu.Lock()
-	defer s.semantic.mu.Unlock()
-
-	// 环境不可用：不计入退避，也不污染 quarantine 的失败计数。
-	// 清掉这一条的退避状态，下一轮立刻重试。
 	if transientEmbedError(reason) {
-		if _, ok := s.semantic.quarantine[id]; ok {
-			delete(s.semantic.quarantine, id)
-		}
+		s.semantic.quarantine.Delete(id)
 		return
 	}
 
@@ -956,10 +1110,10 @@ func (s *Server) noteSemanticFailure(id, reason string) {
 		base = time.Minute
 		max  = 2 * time.Hour
 	)
-	if s.semantic.quarantine == nil {
-		s.semantic.quarantine = map[string]quarantineEntry{}
+	var e quarantineEntry
+	if v, ok := s.semantic.quarantine.Load(id); ok {
+		e = v.(quarantineEntry)
 	}
-	e := s.semantic.quarantine[id]
 	e.failures++
 	e.lastErr = reason
 	back := base
@@ -970,5 +1124,22 @@ func (s *Server) noteSemanticFailure(id, reason string) {
 		back = max
 	}
 	e.nextTry = time.Now().Add(back)
-	s.semantic.quarantine[id] = e
+	s.semantic.quarantine.Store(id, e)
+}
+
+// semanticRouteLabel 说明本轮语义检索实际走了哪一路。
+//
+// 它回答的是「这条分数是谁给的」：同一个查询在不同模型下分数不同，
+// 不回显模型就无从比较、也无从怀疑。
+func (s *Server) semanticRouteLabel() string {
+	if lbl := s.liveIndexLabel(); lbl != "" {
+		return lbl
+	}
+	if !s.semantic.isReady() {
+		return "none (lexical only)"
+	}
+	if emb := s.semantic.getEmb(); emb != nil {
+		return emb.Name()
+	}
+	return "unknown"
 }

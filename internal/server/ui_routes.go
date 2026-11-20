@@ -194,6 +194,12 @@ func (s *Server) handleUIAPI(w http.ResponseWriter, r *http.Request) {
 		s.uiGrantAdd(w, r)
 	case "grants/revoke":
 		s.uiGrantRevoke(w, r)
+	case "masterkeys":
+		s.uiMasterKeysList(w, r)
+	case "masterkeys/add":
+		s.uiMasterKeyAdd(w, r)
+	case "masterkeys/revoke":
+		s.uiMasterKeyRevoke(w, r)
 	case "acl":
 		s.uiACLList(w, r)
 	case "acl/put":

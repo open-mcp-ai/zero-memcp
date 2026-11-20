@@ -72,36 +72,34 @@ func TestGrepReadsEachBlockOnce(t *testing.T) {
 
 	// 把每个块的 Read 换成计数版：grep 一次，每块最多读一次。
 	var reads atomic.Int64
-	srv.mu.Lock()
-	for _, tr := range srv.trees {
-		if tr.Project != "blackegg/me" || tr.Branch != "fact" {
-			continue
-		}
-		for i := range tr.Blocks {
-			orig := tr.Blocks[i].Read
-			if orig == nil {
+	mutateTrees(t, srv, func(trees []*memory.Tree) {
+		for _, tr := range trees {
+			if tr.Project != "blackegg/me" || tr.Branch != "fact" {
 				continue
 			}
-			tr.Blocks[i].Read = func() ([]byte, error) {
-				reads.Add(1)
-				return orig()
+			for i := range tr.Blocks {
+				orig := tr.Blocks[i].Read
+				if orig == nil {
+					continue
+				}
+				tr.Blocks[i].Read = func() ([]byte, error) {
+					reads.Add(1)
+					return orig()
+				}
 			}
 		}
-	}
-	srv.mu.Unlock()
+	})
 
 	if _, err := callMCP(t, srv, tok, "grep "+marker+" --scope blackegg/me@fact"); err != nil {
 		t.Fatalf("grep: %v", err)
 	}
 
-	srv.mu.RLock()
 	var blocks int
-	for _, tr := range srv.trees {
+	for _, tr := range testTrees(srv) {
 		if tr.Project == "blackegg/me" && tr.Branch == "fact" {
 			blocks += len(tr.Blocks)
 		}
 	}
-	srv.mu.RUnlock()
 
 	if got := reads.Load(); got > int64(blocks) {
 		t.Fatalf("grep 读了 %d 次盘，而范围内只有 %d 个块——说明命中块被重读了", got, blocks)

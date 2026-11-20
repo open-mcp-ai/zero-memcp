@@ -28,7 +28,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	"github.com/open-mcp-ai/zero-memcp/internal/langdetect"
 	"github.com/open-mcp-ai/zero-memcp/internal/memory"
 )
 
@@ -38,20 +40,30 @@ const (
 )
 
 func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
+	// 计时起点：tookMs 要覆盖向量路 + 关键词路 + 融合去重全过程。
+	tStart := time.Now()
 	rest = restorePayload(rest)
+	// --json 先摘掉：它是返回形态，不是查询词。
+	rest, wantJSON := stripJSONFlag(rest)
 	if bad, ok := unknownFlag(rest); ok {
-		return TermResult{}, fmt.Errorf("srecall: unknown flag %q (supported: --scope)", bad)
+		return TermResult{}, fmt.Errorf("srecall: unknown flag %q (supported: --scope, --json)", bad)
 	}
 	query, scope := splitScope(rest)
 	if query == "" {
 		return TermResult{}, fmt.Errorf("srecall syntax: srecall <text> [--scope <tree>]")
 	}
 
-	// 1) 向量路：异步搜，只在启用且就绪时走
-	vHits := s.semanticSearch(query)
+	// 0) 语言判定：决定先查哪个索引，并作为审计字段回显。
+	//
+	// 为什么必须回显：多索引并存时，同一条查询在中文索引与英文索引下
+	// 分数天然不同（不同模型的空间不可比）。没有 query_lang，
+	// 「昨天同样的问法结果不一样」就无法解释。
+	qLang := langdetect.Detect(query)
+
+	// 1) 向量路：多索引并存时各查各的再按名次融合，单索引退回原路径
+	vHits := s.semanticSearchAll(query)
 
 	// 2) BM25 路：照常在当前凭证可见范围内跑
-	s.mu.RLock()
 	allowedHit := func(addr string) bool {
 		proj, br, _, ok := memory.SplitID(addr)
 		if !ok {
@@ -69,7 +81,7 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 		}
 		return addrUnderScope(addr, scope)
 	}
-	bmHits := s.idx.SearchCovered(query, 8, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
+	bmHits := s.idxNow().SearchCovered(query, 8, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
 		return allowedHit(addr) && scopeMatch(addr)
 	})
 
@@ -148,7 +160,6 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 			companion: comp,
 		})
 	}
-	s.mu.RUnlock()
 
 	// 去重：
 	//
@@ -182,11 +193,16 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	result = deduped
 
 	if len(result) == 0 {
-		return TermResult{
-			Text:       "no matches",
-			Structured: map[string]any{"hits": []any{}, "count": 0},
-			Empty:      true,
-		}, nil
+		empty := map[string]any{
+			"hits": []any{}, "results": []any{}, "count": 0,
+			"query": query, "tookMs": time.Since(tStart).Milliseconds(),
+			"query_lang": string(qLang.Lang), "query_zh_ratio": qLang.ZHRatio,
+			"semantic_route": s.semanticRouteLabel(),
+		}
+		if wantJSON {
+			return TermResult{Text: jsonText(empty), Structured: empty, Empty: true}, nil
+		}
+		return TermResult{Text: "no matches", Structured: empty, Empty: true}, nil
 	}
 
 	var sb strings.Builder
@@ -221,11 +237,24 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 		structHits[i] = m
 	}
 
+	structured := map[string]any{
+		"hits":    structHits,
+		"results": structHits, // 同 recall：别名，指向同一份数据
+		"count":   len(structHits),
+		// 审计字段，与 recall 对齐：调用方要把「哪条消息、多少分、
+		// 放行还是拒绝」串起来，回显和耗时是拼这条链的两颗钉子。
+		"query":  query,
+		"tookMs": time.Since(tStart).Milliseconds(),
+		// 多索引并存时的审计三件套：问了什么、判成什么语言、查了哪一路。
+		"query_lang":     string(qLang.Lang),
+		"query_zh_ratio": qLang.ZHRatio,
+		"semantic_route": s.semanticRouteLabel(),
+	}
+	if wantJSON {
+		return TermResult{Text: jsonText(structured), Structured: structured}, nil
+	}
 	return TermResult{
-		Text: strings.TrimRight(sb.String(), "\n"),
-		Structured: map[string]any{
-			"hits":  structHits,
-			"count": len(structHits),
-		},
+		Text:       strings.TrimRight(sb.String(), "\n"),
+		Structured: structured,
 	}, nil
 }

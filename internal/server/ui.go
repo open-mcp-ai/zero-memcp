@@ -150,9 +150,8 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, caller Caller)
 
 	switch r.URL.Query().Get("action") {
 	case "recent":
-		s.mu.RLock()
 		var list []map[string]any
-		for _, tr := range s.trees {
+		for _, tr := range s.treeList() {
 			if !s.allowed(caller, tr.Project, tr.Branch, configBitRead) {
 				continue
 			}
@@ -169,7 +168,6 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, caller Caller)
 				})
 			}
 		}
-		s.mu.RUnlock()
 
 		sort.Slice(list, func(i, j int) bool {
 			return list[i]["modTime"].(int64) > list[j]["modTime"].(int64)
@@ -180,11 +178,9 @@ func (s *Server) serveAPI(w http.ResponseWriter, r *http.Request, caller Caller)
 		_ = json.NewEncoder(w).Encode(list)
 
 	case "tree":
-		s.mu.RLock()
-		defer s.mu.RUnlock()
 
 		var roots []map[string]any
-		for _, tr := range s.trees {
+		for _, tr := range s.treeList() {
 			if !s.allowed(caller, tr.Project, tr.Branch, configBitRead) {
 				continue
 			}
@@ -245,9 +241,6 @@ func (s *Server) readAddr(addr string, c Caller) (string, error) {
 	if strings.ContainsAny(addr, " \t\r\n") {
 		return "", errors.New("addr must not contain whitespace")
 	}
-
-	s.mu.RLock()
-	defer s.mu.RUnlock()
 
 	proj, br, path, err := s.resolveAddr(addr, c)
 	if err != nil {

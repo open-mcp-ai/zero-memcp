@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 )
 
 // instanceLock 是数据目录级跨进程独占锁。
@@ -22,8 +22,11 @@ import (
 // standalone maintenance CLI 不再存在。纯只读的外部 git clone 不受影响。
 type instanceLock struct {
 	path string
-	file *os.File
-	mu   sync.Mutex
+	// file 用 atomic.Pointer 而不是 *os.File + Mutex：Release 必须幂等
+	// （可能被 defer 调一次、Close 又调一次）。Swap(nil) 让「拿到文件句柄」
+	// 这个动作天然只成功一次，后到者拿到 nil 直接返回——
+	// 不需要在 Release 里逐条判断再赋值，也不会出现两次 close 同一个 fd。
+	file atomic.Pointer[os.File]
 }
 
 func instanceLockPath(dataDir string) string {
@@ -71,7 +74,9 @@ func acquireInstanceLock(dataDir string) (*instanceLock, error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("sync instance lock: %w", err)
 	}
-	return &instanceLock{path: path, file: f}, nil
+	lk := &instanceLock{path: path}
+	lk.file.Store(f)
+	return lk, nil
 }
 
 func readLockPID(path string) int {
@@ -87,14 +92,12 @@ func (l *instanceLock) Release() error {
 	if l == nil {
 		return nil
 	}
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.file == nil {
+	f := l.file.Swap(nil)
+	if f == nil {
 		return nil
 	}
-	unlockErr := unlockOSFile(l.file)
-	closeErr := l.file.Close()
-	l.file = nil
+	unlockErr := unlockOSFile(f)
+	closeErr := f.Close()
 	if unlockErr != nil {
 		return unlockErr
 	}

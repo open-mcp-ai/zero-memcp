@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
@@ -136,9 +137,7 @@ func TestSemanticDeltaHashBypassDoesNotChangeVerdict(t *testing.T) {
 	noBypass := srv.semanticDelta(nil, nil)
 
 	// 清空旁路表，再跑一次「第一轮」形态
-	srv.semantic.mu.Lock()
-	srv.semantic.blobHashes = nil
-	srv.semantic.mu.Unlock()
+	srv.semantic.blobHashes = sync.Map{}
 	again := srv.semanticDelta(nil, nil)
 
 	if noBypass.needsEmbed != again.needsEmbed || noBypass.reusable != again.reusable {
@@ -147,9 +146,7 @@ func TestSemanticDeltaHashBypassDoesNotChangeVerdict(t *testing.T) {
 
 	// 有了旁路表之后，判定结果（needsEmbed + reusable）也必须一致，
 	// 只是多了一条 skippedByHash 的加速路径。
-	srv.semantic.mu.Lock()
-	srv.semantic.blobHashes = nil
-	srv.semantic.mu.Unlock()
+	srv.semantic.blobHashes = sync.Map{}
 	first := srv.semanticDelta(nil, nil)
 	second := srv.semanticDelta(nil, nil)
 	if first.needsEmbed+first.reusable != second.needsEmbed+second.reusable {

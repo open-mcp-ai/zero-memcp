@@ -4,8 +4,6 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-
-	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
 // execMerge 处理 merge <project> <branch> [from <remote>]。
@@ -138,5 +136,3 @@ func (s *Server) mergeCandidates(c Caller, project string) []string {
 	sort.Strings(out)
 	return out
 }
-
-var _ = gitstore.MergeResult{Kind: "merged"}

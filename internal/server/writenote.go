@@ -191,6 +191,26 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	path := stamp
 	if pol.Layout == "date" {
 		path = now.Format("2006-01-02") + "/" + stamp
+		// 日期目录下再分一层数字槽。
+		//
+		// 槽号是「当天从 00:00 起的第几个 Span」，纯函数，给定时间就能算，
+		// 不需要查表也不需要状态。日期目录本身是冷目录（一天最多建一次），
+		// 而槽目录是热的——把热的那层压到几十个文件，写一次改的是
+		// 一点几 KB 的 tree，而不是几千条目的 163 KB。
+		if pol.Span > 0 {
+			dayStart := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+			slot := int(now.Sub(dayStart) / pol.Span)
+			maxSlot := int(24*time.Hour/pol.Span) - 1
+			if maxSlot < 0 {
+				maxSlot = 0
+			}
+			if slot > maxSlot {
+				// 夏令时把一天拉长到 25 小时时会出现；夹到最后一个槽，
+				// 绝不产生越界槽号（那会让路径随时间倒退）。
+				slot = maxSlot
+			}
+			path = now.Format("2006-01-02") + "/" + fmt.Sprintf("%03d", slot) + "/" + stamp
+		}
 	}
 	// 树前缀把切片放进指定子树：树路径即语义，不另设 kind 分类。
 	if treePrefix = strings.Trim(treePrefix, "/"); treePrefix != "" {
@@ -236,10 +256,8 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// 这些词在重启前搜不到、重启后才出现——同一份记忆的可检索性
 	// 随进程生命周期变化，docLen 也跟着变，BM25 分数跟着漂。
 	blockID := memory.MakeID(targetProject, writeBranch, path)
-	s.mu.Lock()
-	s.idx.AddWithTime(blockID, content, now.Unix())
+	s.idxNow().AddWithTime(blockID, content, now.Unix())
 	s.addBlockLocked(targetProject, repo, writeBranch, path, int64(len(content)), now.Unix())
-	s.mu.Unlock()
 
 	s.bumpClock()
 	// 写入改变了树状态：请求一次语义索引追平。
@@ -256,7 +274,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 //   - 这张凭证的挂载表里可见
 //   - 有 w 权限
 //
-// 三者缺一不可。早先的实现取「s.trees 里第一个项目」，于是受限凭证
+// 三者缺一不可。早先的实现取「s.treeList() 里第一个项目」，于是受限凭证
 // 会被告知「项目 X 不在你的可见范围内」——而它其实有别的可写仓库。
 func (s *Server) writeTarget(c Caller, defaultBranch string) (project, branch string, pol manifest.Policy, err error) {
 	// 候选是「(项目, 分支)」而不是光秃秃的项目名。

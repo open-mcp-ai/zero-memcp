@@ -1,7 +1,6 @@
 package server
 
 import (
-	"sync"
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/embed"
@@ -32,17 +31,7 @@ import (
 
 // semanticMaintainer 管理后台追平协程。零值可用（未启动状态）。
 type semanticMaintainer struct {
-	mu   sync.Mutex
-	stop chan struct{}
-	kick chan struct{} // 容量 1：写入后请求尽快追平
-}
-
-func (m *semanticMaintainer) stopLocked() {
-	if m.stop != nil {
-		close(m.stop)
-		m.stop = nil
-	}
-	m.kick = nil
+	runner backgroundRunner
 }
 
 // startSemanticMaintainer 启动后台追平。interval<=0 用默认 60s。
@@ -51,15 +40,11 @@ func (s *Server) startSemanticMaintainer(interval time.Duration) {
 		interval = 60 * time.Second
 	}
 	m := &s.semanticMaint
-	m.mu.Lock()
-	if m.stop != nil {
-		m.mu.Unlock()
+	run, ok := m.runner.start()
+	if !ok {
 		return // 已经在跑
 	}
-	stop := make(chan struct{})
-	kick := make(chan struct{}, 1)
-	m.stop, m.kick = stop, kick
-	m.mu.Unlock()
+	stop, kick := run.stop, run.kick
 
 	go func() {
 		ticker := time.NewTicker(interval)
@@ -85,26 +70,13 @@ func (s *Server) startSemanticMaintainer(interval time.Duration) {
 
 // stopSemanticMaintainer 停掉后台协程（Close 时调用）。
 func (s *Server) stopSemanticMaintainer() {
-	m := &s.semanticMaint
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.stopLocked()
+	s.semanticMaint.runner.stopNow()
 }
 
 // kickSemantic 请求尽快追平（写入后调用）。非阻塞：
 // 通道满了说明已有一笔待执行，全量比对一次就够，丢掉这笔请求。
 func (s *Server) kickSemantic() {
-	m := &s.semanticMaint
-	m.mu.Lock()
-	kick := m.kick
-	m.mu.Unlock()
-	if kick == nil {
-		return
-	}
-	select {
-	case kick <- struct{}{}:
-	default:
-	}
+	s.semanticMaint.runner.kick()
 }
 
 // catchUpSemantic 把语义索引追平到当前树状态。
@@ -115,9 +87,7 @@ func (s *Server) kickSemantic() {
 // 走同一条增量路径补上。
 func (s *Server) catchUpSemantic(reason string) {
 	// 后端为 nil（启动时全链不可用）→ 每个周期尝试重建链。
-	s.semantic.mu.RLock()
-	emb := s.semantic.emb
-	s.semantic.mu.RUnlock()
+	emb := s.semantic.getEmb()
 	if emb == nil {
 		chain, err := embed.OpenChain(s.semanticChainConfig())
 		if err == nil {
@@ -126,15 +96,11 @@ func (s *Server) catchUpSemantic(reason string) {
 		if err != nil {
 			// 仍然不可用：记下原因，等下个周期。这不是错误噪音，
 			// 是「欠着没补」的唯一可见痕迹。
-			s.semantic.mu.Lock()
-			s.semantic.err = "embedder unavailable: " + err.Error()
-			s.semantic.mu.Unlock()
+			s.semantic.setErr("embedder unavailable: " + err.Error())
 			return
 		}
-		s.semantic.mu.Lock()
-		s.semantic.emb = chain
-		s.semantic.err = ""
-		s.semantic.mu.Unlock()
+		s.semantic.setEmb(chain)
+		s.semantic.setErr("")
 		s.logf("semantic: embedder recovered (dim=%d, model=%s, active=%s)",
 			chain.Dim(), chain.Name(), chain.ActiveLabel())
 		emb = chain
@@ -164,12 +130,9 @@ func (s *Server) catchUpSemantic(reason string) {
 	}
 
 	// 正在构建时跳过本轮（避免两个构建并发跑）。
-	s.semantic.mu.Lock()
-	if s.semantic.building {
-		s.semantic.mu.Unlock()
+	if s.semantic.building.Load() {
 		return
 	}
-	s.semantic.mu.Unlock()
 
 	vecDir := s.semanticDir
 	heads := s.semanticHeads()
@@ -178,25 +141,24 @@ func (s *Server) catchUpSemantic(reason string) {
 	var cached *vecindex.Index
 	var prints map[string]string
 	if vecDir != "" {
-		if ix, pr, err := vecindex.Load(vecDir, emb.Name()); err == nil && ix.Dim() == emb.Dim() {
+		if ix, pr, err := vecindex.LoadRev(s.vectorDirFor(emb), emb.Name(), embed.Revision(emb)); err == nil && ix.Dim() == emb.Dim() {
 			cached, prints = ix, pr
 		}
 	}
 
 	// 内存里挂着的索引可能比磁盘新（上一轮追平刚写完还没落盘），
 	// 用内存版做基准，别让刚算完的向量被重算。
-	s.semantic.mu.RLock()
-	if s.semantic.idx != nil {
-		cached = s.semantic.idx
+	if snap := s.semantic.getActive(); snap != nil && snap.idx != nil {
+		cached = snap.idx
+		if snap.prints != nil {
+			prints = snap.prints
+		}
 	}
-	s.semantic.mu.RUnlock()
 
 	delta := s.semanticDelta(cached, prints)
 	if delta.needsEmbed == 0 && delta.removed == 0 && cached != nil {
 		// 无事可做。上次有错误的话清掉。
-		s.semantic.mu.Lock()
-		s.semantic.err = ""
-		s.semantic.mu.Unlock()
+		s.semantic.setErr("")
 		// 记一行：全靠 blob hash 短路的块数。没有这行，就无法判断
 		// 「这次没读盘」是真的没读，还是恰好数据小。
 		s.logf("semantic: delta: %d reusable (%d skipped without reading), %d need embed, %d removed",
@@ -204,24 +166,19 @@ func (s *Server) catchUpSemantic(reason string) {
 		return
 	}
 
-	s.semantic.mu.Lock()
-	s.semantic.building = true
-	s.semantic.mu.Unlock()
+	// CAS 去重：只有一个人能把 building 从 false 翻成 true。
+	// 用 CompareAndSwap 而不是「Load 判断 + Store」，后者两个并发
+	// 调用者会都以为自己是第一个——那是典型的检查并置位竞态。
+	if !s.semantic.building.CompareAndSwap(false, true) {
+		return
+	}
 	go func() {
-		defer func() {
-			s.semantic.mu.Lock()
-			s.semantic.building = false
-			s.semantic.mu.Unlock()
-		}()
+		defer s.semantic.building.Store(false)
 		if err := s.buildSemanticIndex(vecDir, heads, cached, prints); err != nil {
-			s.semantic.mu.Lock()
-			s.semantic.err = err.Error()
-			s.semantic.mu.Unlock()
+			s.semantic.setErr(err.Error())
 			return
 		}
-		s.semantic.mu.Lock()
-		s.semantic.err = ""
-		s.semantic.mu.Unlock()
+		s.semantic.setErr("")
 	}()
 }
 
@@ -257,14 +214,10 @@ func (s *Server) semanticDelta(cached *vecindex.Index, prints map[string]string)
 	// 本轮观察到的 blob hash，用来更新旁路表。
 	observed := make(map[string]string, len(prints)+64)
 
-	s.semantic.mu.RLock()
-	prevHashes := s.semantic.blobHashes
-	s.semantic.mu.RUnlock()
-
 	skippedByHash := 0
 	for _, t := range s.snapshotTrees() {
 		for _, b := range t.Indexable() {
-			if !isSemanticContent(b.Path) {
+			if !isSemanticBlock(b) {
 				continue
 			}
 			id := b.ID()
@@ -280,7 +233,11 @@ func (s *Server) semanticDelta(cached *vecindex.Index, prints map[string]string)
 			// 「没变、可复用」，而它根本没有向量——症状是
 			// 「语义搜不到这条，但 status 显示一切正常」。
 			if b.Hash != "" {
-				if prev, ok := prevHashes[id]; ok && prev == b.Hash {
+				prev, hadPrev := "", false
+				if v, ok := s.semantic.blobHashes.Load(id); ok {
+					prev, hadPrev = v.(string), true
+				}
+				if hadPrev && prev == b.Hash {
 					if _, hadPrint := prints[id]; hadPrint && cached != nil && cached.Has(id) {
 						seen[id] = true
 						observed[id] = b.Hash
@@ -318,9 +275,9 @@ func (s *Server) semanticDelta(cached *vecindex.Index, prints map[string]string)
 		}
 	}
 
-	s.semantic.mu.Lock()
-	s.semantic.blobHashes = observed
-	s.semantic.mu.Unlock()
+	for id, h := range observed {
+		s.semantic.blobHashes.Store(id, h)
+	}
 
 	st.skippedByHash = skippedByHash
 	return st

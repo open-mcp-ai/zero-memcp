@@ -449,3 +449,28 @@ users
 
 List users declared in the config and an access-control summary (root only).
 `
+
+const detail_erase = `
+erase <project>@<branch>/<path>
+
+World-tree rewrite: erase the underlying blob from EVERY commit and tree
+in the branch's history, rewrite affected commits, and remove the loose
+object from disk. Requires the x capability (history rewrite).
+
+Unlike delete (which only hides the path from future commits), erase removes
+the content itself so git log cannot resurrect it. Note: we only promise
+complete erasure within your own repositories; external hosts (GitHub)
+cannot un-remember pushed history.
+
+Example: erase proj/me@zero/2026-11-19/leaked.md
+`
+
+const detail_replace = `
+replace <project>@<branch>/<path> $TEXT
+
+World-tree rewrite with replacement: replace the underlying blob across
+every commit in the branch's history with a safe placeholder text, keeping
+path timelines intact while removing the original blob.
+
+Example: replace proj/me@zero/2026-11-19/leaked.md $TEXT   (vars: {TEXT: "[redacted]"})
+`

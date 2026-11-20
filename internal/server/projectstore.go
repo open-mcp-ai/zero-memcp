@@ -21,17 +21,67 @@ import (
 //   - 每条版本线对应仓库里的一个分支（refs/heads/<name>）
 type ProjectStore struct {
 	dataDir string
+	// slots 是 project -> *repoSlot。用 sync.Map 而不是 map+Mutex：
+	// 这里没有跨 key 的不变量，每次操作只关心一个 project。
+	slots sync.Map
+}
 
-	mu    sync.RWMutex
-	repos map[string]*gitstore.Repo
+// repoSlot 是一个项目的「单飞」占位：第一个到的人负责打开仓库，
+// 其余人等 done 关闭后直接取结果。
+//
+// 为什么不用锁：打开仓库是磁盘 I/O（stat、读 config、建 pack 索引）。
+// 把 I/O 放进互斥锁，遇到慢盘/网络盘就变成全站排队；
+// 而单飞只让**同一个 project** 的并发调用者等待，不同 project 互不影响，
+// 且等待的是 close(done) —— 有明确终点，不像 Lock() 那样没有上界。
+type repoSlot struct {
+	done chan struct{}
+	repo *gitstore.Repo
+	err  error
+}
+
+// acquire 返回该 project 的仓库；不存在时由第一个调用者用 open 创建。
+//
+// open 会在**没有任何共享状态被保护**的情况下执行 —— 它只属于这一次调用。
+func (ps *ProjectStore) acquire(project string, open func(dir string) (*gitstore.Repo, error)) (*gitstore.Repo, error) {
+	fresh := &repoSlot{done: make(chan struct{})}
+	v, loaded := ps.slots.LoadOrStore(project, fresh)
+	if loaded {
+		sl := v.(*repoSlot)
+		<-sl.done
+		return sl.repo, sl.err
+	}
+
+	// 我是第一个：负责打开，然后关掉 done 让后来者经过。
+	repo, err := open(ps.RepoDir(project))
+	fresh.repo, fresh.err = repo, err
+	close(fresh.done)
+	if err != nil {
+		// 失败不留下毒化的 slot：下次调用可以重试。
+		// 否则一次磁盘抖动会把那个 project 永久钉死在错误上。
+		ps.slots.CompareAndDelete(project, fresh)
+	}
+	return repo, err
+}
+
+// each 遍历已打开的仓库，不阻塞任何打开动作。
+func (ps *ProjectStore) each(fn func(*gitstore.Repo)) {
+	ps.slots.Range(func(k, v any) bool {
+		sl := v.(*repoSlot)
+		select {
+		case <-sl.done:
+			if sl.repo != nil {
+				fn(sl.repo)
+			}
+		default:
+			// 还在打开中，跳过。这些仓库还没有被任何请求真正用起来。
+		}
+		return true
+	})
 }
 
 // NewProjectStore 初始化仓库管理器。
 func NewProjectStore(dataDir string) *ProjectStore {
-	return &ProjectStore{
-		dataDir: dataDir,
-		repos:   map[string]*gitstore.Repo{},
-	}
+	return &ProjectStore{dataDir: dataDir}
 }
 
 // RepoDir 返回某个项目的裸仓库路径。
@@ -44,12 +94,8 @@ func (ps *ProjectStore) RepoDir(project string) string {
 // ProjectStore 关闭后不再拥有活动请求，逐个关闭 Repo 会等待已接收的
 // 脏写任务排空，避免进程退出时留下后台 goroutine 或正在进行的文件写入。
 func (ps *ProjectStore) Close() error {
-	ps.mu.Lock()
-	repos := make([]*gitstore.Repo, 0, len(ps.repos))
-	for _, repo := range ps.repos {
-		repos = append(repos, repo)
-	}
-	ps.mu.Unlock()
+	var repos []*gitstore.Repo
+	ps.each(func(r *gitstore.Repo) { repos = append(repos, r) })
 
 	var firstErr error
 	for _, repo := range repos {
@@ -65,25 +111,10 @@ func (ps *ProjectStore) Close() error {
 // 目录不存在时不自动创建——「项目存在」是一个需要明确声明的事，
 // 不该由一次读取顺带造就。写入路径用 Ensure。
 func (ps *ProjectStore) Get(project string) (*gitstore.Repo, error) {
-	ps.mu.RLock()
-	r, ok := ps.repos[project]
-	ps.mu.RUnlock()
-	if ok {
-		return r, nil
-	}
-
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-	if r, ok := ps.repos[project]; ok {
-		return r, nil
-	}
-
-	dir := ps.RepoDir(project)
-	r, err := gitstore.Open(dir)
+	r, err := ps.acquire(project, gitstore.Open)
 	if err != nil {
 		return nil, openError(project, err)
 	}
-	ps.repos[project] = r
 	return r, nil
 }
 
@@ -111,25 +142,15 @@ func openError(project string, err error) error {
 
 // Ensure 保证某个项目存在（不存在则自动 git init --bare）。
 func (ps *ProjectStore) Ensure(project string) (*gitstore.Repo, error) {
-	ps.mu.Lock()
-	defer ps.mu.Unlock()
-
-	if r, ok := ps.repos[project]; ok {
-		return r, nil
-	}
-
-	dir := ps.RepoDir(project)
-	var r *gitstore.Repo
-	var err error
-	if _, statErr := os.Stat(dir); statErr == nil {
-		r, err = gitstore.Open(dir)
-	} else {
-		r, err = gitstore.Init(dir)
-	}
+	r, err := ps.acquire(project, func(dir string) (*gitstore.Repo, error) {
+		if _, statErr := os.Stat(dir); statErr == nil {
+			return gitstore.Open(dir)
+		}
+		return gitstore.Init(dir)
+	})
 	if err != nil {
 		return nil, openError(project, err)
 	}
-	ps.repos[project] = r
 	return r, nil
 }
 
@@ -176,12 +197,8 @@ func (ps *ProjectStore) Projects() ([]string, error) {
 // CommitAll 把所有仓库里攒着的写入落成提交。
 // 返回提交成功的项目数。
 func (ps *ProjectStore) CommitAll(ref, message string) (int, error) {
-	ps.mu.RLock()
 	var repos []*gitstore.Repo
-	for _, r := range ps.repos {
-		repos = append(repos, r)
-	}
-	ps.mu.RUnlock()
+	ps.each(func(r *gitstore.Repo) { repos = append(repos, r) })
 
 	committed := 0
 	for _, r := range repos {
@@ -206,4 +223,31 @@ func (ps *ProjectStore) MemcpConfig(project string) gitstore.MemcpConfig {
 		return gitstore.MemcpConfig{}
 	}
 	return r.MemcpConfig()
+}
+
+// Names 列出磁盘上所有仓库的名字（形如 blackegg/me）。
+//
+// 为什么按目录走而不是按配置走：配置里声明的项目只是「允许存在」，
+// 真正有数据的是磁盘上的那些。后台巡检关心的是**实际存在的数据**——
+// 一个已经从配置里删掉、但目录还留着的仓库，它的对象同样会烂。
+func (ps *ProjectStore) Names() []string {
+	root := filepath.Join(ps.dataDir, "repos")
+	var out []string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".git") {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return nil
+		}
+		rel = strings.TrimSuffix(rel, ".git")
+		out = append(out, filepath.ToSlash(rel))
+		return nil
+	})
+	sort.Strings(out)
+	return out
 }

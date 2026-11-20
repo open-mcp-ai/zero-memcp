@@ -303,6 +303,15 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		}, nil
 	}
 
+	// 只接受一个地址。多出来的参数一定是把 `since <tree> <commit>`
+	// 的写法用在了这里——整段塞进分支名会产生一条永远不生效的订阅
+	// （3060 hub 上真的出现过 branch = "main.shared e8103f18..."）。
+	// 与其静默吞掉，不如当场告诉他该用哪个动词。
+	if len(strings.Fields(rest)) > 1 {
+		return TermResult{}, fmt.Errorf("remind takes a single tree address, got %q; "+
+			"to fetch changes from a known commit use `since <tree> <commit>`", rest)
+	}
+
 	proj, branch, treePath, err := s.parseBranchAddr(rest)
 	if err != nil {
 		return TermResult{}, err

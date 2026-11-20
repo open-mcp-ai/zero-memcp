@@ -121,7 +121,34 @@ func newPersistentTreeWatchHub(path string) (*TreeWatchHub, error) {
 		return h, fmt.Errorf("parse %s: %w (starting with an empty watch table)", path, err)
 	}
 	if doc.Watches != nil {
-		h.state.Store(&watchState{watches: doc.Watches})
+		// 清洗非法条目：带空白/控制字符的分支名在 Git 里不存在，
+		// 它们只可能是历史 bug 留下的幽灵订阅——永远匹配不上，
+		// 却让 status 永远报「没变化」。
+		//
+		// 丢弃必须出声：静默清理会让「我明明 remind 过」变成一次
+		// 无从查起的谜。所以逐条报告，并把清洗后的表写回磁盘，
+		// 免得下次启动又报一遍。
+		dropped := 0
+		clean := make(map[string][]TreeWatch, len(doc.Watches))
+		for identity, list := range doc.Watches {
+			kept := make([]TreeWatch, 0, len(list))
+			for _, w := range list {
+				if err := validateWatchAddr(w.Project, w.Branch, w.Path); err != nil {
+					fmt.Fprintf(os.Stderr, "zero-memcp: watch: dropping invalid entry for %s: %v\n", identity, err)
+					dropped++
+					continue
+				}
+				kept = append(kept, w)
+			}
+			if len(kept) > 0 {
+				clean[identity] = kept
+			}
+		}
+		h.state.Store(&watchState{watches: clean})
+		if dropped > 0 {
+			fmt.Fprintf(os.Stderr, "zero-memcp: watch: %d invalid watch entr(y/ies) dropped; rewritten to %s\n", dropped, path)
+			h.saveSnapshot(clean)
+		}
 	}
 	return h, nil
 }
@@ -160,8 +187,62 @@ func (h *TreeWatchHub) saveSnapshot(watches map[string][]TreeWatch) {
 	_ = os.Rename(name, h.path)
 }
 
+// validateWatchAddr 拒绝不可能存在的关注目标。
+//
+// 要防的具体故障（3060 hub 实盘见过）：
+//
+//	watches.json 里出现了一条
+//	branch = "main.shared e8103f1809f417e58dc667d977fb92351e73b036"
+//
+// 成因是调用方把 `since <tree> <commit>` 的写法用在了 `remind` 上：
+// `remind proj@main.shared e8103f18...` 里多出来的那个 hash 被
+// parseBranchAddr 整段吞进了分支名。它不会报错——只会安静地留下一条
+// 永远匹配不上的订阅：status 永远说「没变化」，而分支其实在动。
+// 这种「登记成功但永远不生效」比直接报错难查得多。
+//
+// 判据不是「像不像分支名」，而是「Git 允许不允许」：分支名不能含空白、
+// 不能含 ~^:?*[\ 与 ".."，也不能以 / 开头或结尾。带空格的 ref 在 Git
+// 里根本不存在，所以这种登记一定是错的。
+func validateWatchAddr(project, branch, path string) error {
+	if project == "" {
+		return fmt.Errorf("watch needs a project")
+	}
+	if branch == "" {
+		return fmt.Errorf("watch needs a branch (use <project>@<branch>[/<path>])")
+	}
+	// 控制字符（含 NUL）一律拒绝：它们不会出现在合法 ref 里，
+	// 而 NUL 尤其危险——它在 C 边界上会截断字符串，让「看起来不同」
+	// 的两个名字在底层变成同一个。
+	if strings.IndexFunc(branch, func(r rune) bool { return r < 0x20 || r == 0x7f }) >= 0 {
+		return fmt.Errorf("invalid branch %q in watch: contains control characters", branch)
+	}
+	if strings.ContainsAny(branch, " \t\r\n") {
+		return fmt.Errorf("invalid branch %q in watch: branch names cannot contain whitespace. "+
+			"If you meant to set a baseline commit, use `since <tree> <commit>` instead of `remind`", branch)
+	}
+	if strings.ContainsAny(project, " \t\r\n") {
+		return fmt.Errorf("invalid project %q in watch: names cannot contain whitespace", project)
+	}
+	for _, bad := range []string{"..", "~", "^", ":", "?", "*", "[", "\\"} {
+		if strings.Contains(branch, bad) {
+			return fmt.Errorf("invalid branch %q in watch: branch names cannot contain %q", branch, bad)
+		}
+	}
+	if strings.HasPrefix(branch, "/") || strings.HasSuffix(branch, "/") {
+		return fmt.Errorf("invalid branch %q in watch: cannot start or end with /", branch)
+	}
+	if strings.ContainsAny(path, "\r\n") {
+		return fmt.Errorf("invalid path in watch: cannot contain newlines")
+	}
+	return nil
+}
+
 // Add 为某个身份增加或更新一条关注标记（同 project+branch+path 视为同一条）。
 func (h *TreeWatchHub) Add(identity string, w TreeWatch) error {
+	// 兜底校验放在唯一入口：不管哪个动词写关注，都不可能落下脏记录。
+	if err := validateWatchAddr(w.Project, w.Branch, w.Path); err != nil {
+		return err
+	}
 	done, err := h.beginWrite()
 	if err != nil {
 		return err

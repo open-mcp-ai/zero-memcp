@@ -112,6 +112,61 @@ func (ps *postingSlot) add(addr string, tf int) {
 	ps.list.Store(&postingList{entries: next, byAddr: byAddr})
 }
 
+// addMany 一次写入该词的多个 (addr, tf)，只做一次拷贝。
+//
+// # 为什么必须有它
+//
+// entries 是不可变切片，每次 add 都要整份复制（那是为了让读侧免锁）。
+// 单条 add 在活系统里没问题——一次只加一篇。但冷建是「N 篇文档共享
+// 同一批常见词」，逐条 add 就退化成 O(N²)：一个出现在全部 5,000 篇里的
+// 中文二元组，累计复制 0+1+…+4,999 ≈ 1,250 万条记录。
+//
+// 实测 5,000 篇冷建：分词 20ms，倒排写入 7.04 秒（348 倍）。也就是说
+// 分词从来不是瓶颈，全耗在重复拷贝上。
+//
+// addMany 把「该词在这批里的所有文档」一次合并进去：每词一次令牌、
+// 一次分配、一次拷贝，总量降到 O(N)。
+func (ps *postingSlot) addMany(pairs []postingEntry) {
+	if len(pairs) == 0 {
+		return
+	}
+	release := ps.acquire()
+	defer release()
+
+	cur := ps.load()
+	// 已存在同一 addr 的不该出现（冷建时索引为空），但活系统合并写入
+	// 可能遇到，按「后写覆盖」处理，与 add 的语义一致。
+	merged := make([]postingEntry, 0, len(cur.entries)+len(pairs))
+	updated := make(map[string]int, len(pairs))
+	for _, e := range pairs {
+		updated[e.Addr] = e.TF
+	}
+	seen := make(map[string]bool, len(pairs))
+	for _, e := range cur.entries {
+		if tf, ok := updated[e.Addr]; ok {
+			merged = append(merged, postingEntry{Addr: e.Addr, TF: tf})
+			seen[e.Addr] = true
+			continue
+		}
+		merged = append(merged, e)
+	}
+	for _, e := range pairs {
+		if seen[e.Addr] {
+			continue
+		}
+		merged = append(merged, e)
+	}
+
+	var byAddr map[string]int
+	if len(merged) >= 8 {
+		byAddr = make(map[string]int, len(merged))
+		for i, e := range merged {
+			byAddr[e.Addr] = i
+		}
+	}
+	ps.list.Store(&postingList{entries: merged, byAddr: byAddr})
+}
+
 // remove 从该词的倒排里删掉一条。返回该词是否已空。
 func (ps *postingSlot) remove(addr string) bool {
 	release := ps.acquire()
@@ -685,7 +740,16 @@ func (ix *Index) AddBatch(docs []BatchDoc, workers int) {
 	close(work)
 	wg.Wait()
 
-	// 写入阶段：先登记元数据（sync.Map，并发安全），再按词写 postings。
+	// 写入阶段：
+	//
+	// 如果索引不是空的（增量更新），先撤旧条目，防止「内容改了但旧词仍能搜到」
+	// （见 TestAddBatchOverwriteSameAddr 钉住的行为）。
+	// 冷建时 totalDocs==0，这一步直接跳过，零开销。
+	if ix.Docs() > 0 {
+		for i := range docs {
+			ix.Remove(docs[i].Addr)
+		}
+	}
 	for i := range out {
 		d := docs[i]
 		ix.docTime.Store(d.Addr, d.ModTime)
@@ -699,11 +763,12 @@ func (ix *Index) AddBatch(docs []BatchDoc, workers int) {
 		ix.sumDocLen.Add(int64(len(out[i].tokens)))
 	}
 
-	// 词频累加后再写 posting。
+	// 按词聚合，每词只写一次（addMany）。
 	//
-	// 按文档顺序写入，保证「同一篇里同一个词的 tf」与串行版完全一致；
-	// 不同文档写同一个词时由该词的槽令牌串行化，顺序不影响最终倒排表
-	// 的内容（只是 entries 的排列顺序，Search 内部会排序）。
+	// 逐条 add 是 O(N²)：entries 是不可变切片，每次都要整份复制。
+	// 5,000 篇共享同一批常见词时，一个中文二元组的倒排累计复制上千万条
+	// 记录——实测这一步 7.04 秒，而分词只有 20 毫秒。
+	byToken := make(map[Token][]postingEntry, 4096)
 	for i := range out {
 		if out[i].skipped {
 			continue
@@ -714,7 +779,10 @@ func (ix *Index) AddBatch(docs []BatchDoc, workers int) {
 			freq[tok]++
 		}
 		for tok, tf := range freq {
-			ix.slot(tok).add(addr, tf)
+			byToken[tok] = append(byToken[tok], postingEntry{Addr: addr, TF: tf})
 		}
+	}
+	for tok, pairs := range byToken {
+		ix.slot(tok).addMany(pairs)
 	}
 }

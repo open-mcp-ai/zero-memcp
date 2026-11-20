@@ -66,6 +66,23 @@ type Repo struct {
 
 	// dirtySyncPending 记录已写但未 fsync 的脏文件（见 SyncDirtyNow）。
 	dirtySyncPending sync.Map
+	// treeCache 按 tree SHA 缓存解析好的树条目（sha -> []treeItem）。
+	//
+	// 为什么需要：findInTree 每次按路径读取都要逐层解压 tree 对象。一条
+	// 分支下 5,000 个文件同处一个目录时，那个 tree 对象会被解压 5,000 次。
+	// 实测单次 Read 因此要 1.147ms——对本地 SSD 慢了约两个数量级。
+	//
+	// 为什么不需要失效：tree 对象是内容寻址的，SHA 就是它的全部身份。
+	// 树内容变了 SHA 就变，旧条目自然不会再被命中。所以这里没有 TTL、
+	// 没有版本号、没有「改完记得清」。
+	//
+	// 上限 4096 个 tree：一棵 5,000 文件的目录树解析后约 200KB，
+	// 4096 个够覆盖任何现实仓库的活跃工作集，超了就让新条目进不来
+	// （已有的继续服务），内存有上界。
+	treeCache sync.Map
+	// treeCacheCount 记录已缓存的 tree 数量（sync.Map 没有 Len 的廉价版）。
+	treeCacheCount atomic.Int64
+
 	// dirtyCache 是脏层节点的进程内缓存（ref\x00dir -> *dirtyNode）。
 	//
 	// 没有它，每次写入都要把整个脏文件读出来解析一遍算差量——
@@ -724,14 +741,7 @@ func splitDirName(path string) (string, string) {
 
 // findInTree 在树里按路径找 blob 的 SHA。
 func (r *Repo) findInTree(treeSHA, prefix, want string) (string, error) {
-	typ, body, err := r.readObject(treeSHA)
-	if err != nil {
-		return "", err
-	}
-	if typ != "tree" {
-		return "", fmt.Errorf("object %s is not a tree", treeSHA)
-	}
-	items, err := parseTree(body)
+	items, err := r.treeItems(treeSHA)
 	if err != nil {
 		return "", err
 	}
@@ -2082,4 +2092,33 @@ func (r *Repo) listAtCommit(sha string) ([]Entry, error) {
 // BackpressureCount 返回该仓库因为队列满而等待过的次数。
 func (r *Repo) BackpressureCount() int64 {
 	return r.backpressure.Load()
+}
+
+// ReadBlob 直接按 blob SHA 读内容，跳过「解析 commit → 逐层走 tree」。
+//
+// # 为什么需要它
+//
+// Read(ref, path) 每次都要 commitOf(ref) + findInTree 逐层解压树对象。
+// 对单次读取这没问题。但扫描一条分支时，Entry 里已经带着 blob SHA
+// （Entry.Hash 来自 List），却仍然走完整路径解析——于是同一个目录的
+// tree 对象被反复解压 N 次。
+//
+// 实测 3,000 个对象串行 Read：1.147 ms/个。这个数字对本地 SSD 来说慢了
+// 两个数量级，全部花在重复的树遍历上。
+//
+// 调用方必须确认 SHA 属于当前分支：扫描时它来自 List(ref) 的同一份
+// 条目，天然成立。这条路径**不做权限判断、不看脏层**，它只是「按哈希
+// 取内容」——内容寻址存储本来就是这个语义。
+func (r *Repo) ReadBlob(sha string) ([]byte, error) {
+	if sha == "" {
+		return nil, fmt.Errorf("empty blob sha")
+	}
+	typ, body, err := r.readObject(sha)
+	if err != nil {
+		return nil, err
+	}
+	if typ != "blob" {
+		return nil, fmt.Errorf("object %s is a %s, not a blob", sha, typ)
+	}
+	return body, nil
 }

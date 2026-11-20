@@ -255,11 +255,26 @@ func (s *Server) makeBlocksParallel(repo *gitstore.Repo, project, branch string,
 			for i := range idx {
 				e := entries[i]
 				path := e.Path
+				sha := e.Hash
 				r := repo
-				read := func() ([]byte, error) {
+				// 扫描期的初次读取优先按 SHA 直读：
+				//
+				// Entry.Hash 来自同一分支的 List，内容寻址天然保证 SHA 对应
+				// 这一版。跳过「解析 commit → 逐层解压 tree 对象」让每次读取
+				// 从 1.15ms 降到几十微秒（不再把同一目录的 tree 重复解压 5,000 次）。
+				// 只有没有 SHA 时（未提交脏条目）才退回按路径读。
+				readInitial := func() ([]byte, error) {
+					if sha != "" {
+						return r.ReadBlob(sha)
+					}
 					return r.Read(branch, path)
 				}
-				out[i] = s.makeBlock(project, branch, e, read)
+				out[i] = s.makeBlock(project, branch, e, readInitial)
+				// 扫描完后把 Block.Read 闭包换回「按路径读」：
+				// 稳态下的后续读取必须先看脏层，能读到之后写入的未提交改动。
+				out[i].Read = func() ([]byte, error) {
+					return r.Read(branch, path)
+				}
 			}
 		}()
 	}

@@ -607,6 +607,7 @@ func (s *Server) Reload() error {
 	// 分段计时：readBlock（读盘/缓存）与 AddWithTime（分词）是两件
 	// 完全不同的事，混在一起看就只知道「慢」而不知道慢在哪。
 	var readNS, tokenizeNS time.Duration
+	var batchDocs []index.BatchDoc
 	for _, t := range trees {
 		startupStage("reload: indexing %s@%s (%d blocks)", t.Project, t.Branch, len(t.Blocks))
 		for _, b := range t.Indexable() {
@@ -616,32 +617,28 @@ func (s *Server) Reload() error {
 			if err != nil {
 				return fmt.Errorf("read %s: %w", b.Addr(), err)
 			}
-			// 时间优先取正文里的 at:/created:，回退 commit 时间。
-			//
-			// 批量导入会把几千篇历史切片打成同一个 commit 时间，
-			// 那份时间对排序和时效权重都是噪声；正文里那个时刻
-			// 才是这条记忆代表的事件发生时间。
 			stamp := b.Time
 			if at := sliceAtTime(string(data), b.Path); at > 0 {
 				stamp = at
 			}
-			tt0 := time.Now()
-			idx.AddWithTime(b.ID(), string(data), stamp)
-			tokenizeNS += time.Since(tt0)
+			batchDocs = append(batchDocs, index.BatchDoc{
+				Addr:    b.ID(),
+				Text:    string(data),
+				ModTime: stamp,
+			})
 
-			// SKILL.md 永远解析策略，不看 b.Rule。
-			//
-			// 踩过的坑：早先要求 b.Rule 为真才解析，而 daily 的 SKILL.md
-			// 声明了 inject: never（它不注入上下文），于是被判为非规则、
-			// 整个跳过——里面的 stream: true / target / kinds 声明全落空。
-			//
-			// 「是不是规则文件（要不要注入）」和「它声不声明写入策略」
-			// 是两件事：流水项目恰恰是最不该注入的，但它必须声明 stream。
 			if b.Path == "SKILL.md" || strings.HasSuffix(b.Path, "/SKILL.md") {
 				s.policies.Store(t.Project, manifest.Parse(t.Project, data))
 			}
 		}
 	}
+	tt0 := time.Now()
+	workers := runtime.NumCPU() * 2
+	if workers > 32 {
+		workers = 32
+	}
+	idx.AddBatch(batchDocs, workers)
+	tokenizeNS = time.Since(tt0)
 
 	// 索引建完，Block.Body 这个「扫描期缓存」就该扔掉。
 	//

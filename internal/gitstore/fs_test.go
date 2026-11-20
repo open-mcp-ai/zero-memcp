@@ -12,8 +12,20 @@ import (
 // spyFS 包装默认 FS，记录关键操作的调用频次，验证 Repo 确实在通过接口路由 I/O。
 type spyFS struct {
 	FS
-	readCount  atomic.Int64
-	writeCount atomic.Int64
+	readCount    atomic.Int64
+	writeCount   atomic.Int64
+	appendCount  atomic.Int64
+	durableCount atomic.Int64
+}
+
+func (s *spyFS) Append(path string, data []byte, perm os.FileMode) error {
+	s.appendCount.Add(1)
+	return s.FS.Append(path, data, perm)
+}
+
+func (s *spyFS) WriteDurable(path string, data []byte, perm os.FileMode) error {
+	s.durableCount.Add(1)
+	return s.FS.WriteDurable(path, data, perm)
 }
 
 func (s *spyFS) ReadFile(path string) ([]byte, error) {
@@ -74,7 +86,7 @@ type spyLocker struct {
 	commitTokens  atomic.Int64
 }
 
-func (s *spyLocker) LockNode(ref, dir string) func() {
+func (s *spyLocker) LockNode(ref, dir string) (func(), error) {
 	s.lockNodeCalls.Add(1)
 	return s.Locker.LockNode(ref, dir)
 }
@@ -123,5 +135,85 @@ func TestIsNotExistUnwrapsWrappedError(t *testing.T) {
 	}
 	if isNotExist(fmt.Errorf("some other error")) {
 		t.Fatalf("不相关错误不应判为 NotExist")
+	}
+}
+
+// 写入脏层走延迟批量 fsync：写时只写页缓存（0.5ms），
+// SyncDirtyNow 负责把待刷盘集合批量 fsync。
+// 理由：用户定调「fsync 自动、定时或延迟做一下，不用每写必刷」。
+func TestDirtyLayerSyncsInBatch(t *testing.T) {
+	dir := t.TempDir()
+	r, err := Init(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 写两条：进脏层、进待刷盘集合，但写入路径本身不硬等 fsync
+	if err := r.Write("main", "a/1.md", []byte("1"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Write("main", "a/2.md", []byte("2"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Barrier(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 此时待刷盘集合里必须有这个目录的脏文件
+	pendingCount := 0
+	r.dirtySyncPending.Range(func(_, _ any) bool {
+		pendingCount++
+		return true
+	})
+	if pendingCount == 0 {
+		t.Fatal("写入后 dirtySyncPending 为空，说明没有登记待刷盘")
+	}
+
+	// 调一次批量刷盘：必须清空集合
+	if err := r.SyncDirtyNow(); err != nil {
+		t.Fatalf("SyncDirtyNow: %v", err)
+	}
+	afterCount := 0
+	r.dirtySyncPending.Range(func(_, _ any) bool {
+		afterCount++
+		return true
+	})
+	if afterCount != 0 {
+		t.Fatalf("SyncDirtyNow 后待刷盘集合未清空，剩 %d 项", afterCount)
+	}
+}
+
+// 脏层写入必须走进程内缓存，不能每次写都重读整个脏文件。
+//
+// 为什么钉这个：脏文件是「一层目录一个文件」的覆盖层，条目随写入
+// 线性增长。每次写都读它 = 单次写入 O(条目数)，累计 O(n²)——实测
+// 3000 条同目录写入从 0.24ms/条 涨到 1.15ms/条。有了缓存之后
+// 整个批次 0.44 秒（原来 3.59 秒）。
+//
+// 用「读盘次数」而不是「耗时」做判据：耗时会随机器波动，计数不会。
+func TestDirtyWriteUsesInProcessCache(t *testing.T) {
+	dir := t.TempDir()
+	spy := &spyFS{FS: DefaultFS()}
+	r, err := InitWith(dir, spy, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const n = 200
+	for i := 0; i < n; i++ {
+		p := filepath.Join("day", fmt.Sprintf("%03d.md", i))
+		if err := r.Write("main", p, []byte("x"), ModeContent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := r.Barrier(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 200 次写入，最多允许读脏文件 ~2 次（首次加载 + 若有压缩重载）。
+	// 没有缓存时这里会是 ~200 次。
+	if got := spy.readCount.Load(); got > 5 {
+		t.Fatalf("同目录写入 %d 次读了 %d 次文件——脏层缓存没生效，"+
+			"单次写入成本会随条目数线性增长", n, got)
 	}
 }

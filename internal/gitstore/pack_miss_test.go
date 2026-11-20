@@ -35,9 +35,7 @@ func TestPackMissDoesNotReparseIndex(t *testing.T) {
 	}
 
 	// 记住缓存里的指纹与 idx 指针。
-	packCacheMu.RLock()
-	before, hadBefore := packCache[r.Path]
-	packCacheMu.RUnlock()
+	before, hadBefore := loadPackCache(r.Path)
 
 	// 再读很多次。每次都走「松散库找到 → 不碰 pack」，
 	// 但我们要确认即使走到 readPacked 也不会重载。
@@ -47,9 +45,7 @@ func TestPackMissDoesNotReparseIndex(t *testing.T) {
 		}
 	}
 
-	packCacheMu.RLock()
-	after, hadAfter := packCache[r.Path]
-	packCacheMu.RUnlock()
+	after, hadAfter := loadPackCache(r.Path)
 
 	if hadBefore != hadAfter {
 		t.Fatalf("缓存存在性变了：before=%v after=%v", hadBefore, hadAfter)
@@ -61,9 +57,7 @@ func TestPackMissDoesNotReparseIndex(t *testing.T) {
 
 	// 直接验证指纹比对本身是廉价的：连续调用不该改变缓存内容。
 	changed := r.packFingerprintChanged()
-	packCacheMu.RLock()
-	after2 := packCache[r.Path]
-	packCacheMu.RUnlock()
+	after2, _ := loadPackCache(r.Path)
 	if hadAfter && changed != (after2.fingerprint != after.fingerprint) {
 		t.Fatalf("packFingerprintChanged 的结果与缓存状态不一致")
 	}
@@ -103,4 +97,14 @@ func TestPackFingerprintDetectsExternalChange(t *testing.T) {
 	if !r.packFingerprintChanged() {
 		t.Fatal("repack 之后指纹没被判定为变化——自愈路径会失效")
 	}
+}
+
+// loadPackCache 是测试用的缓存读取（生产路径直接用 packCache.Load）。
+func loadPackCache(path string) (packCacheEntry, bool) {
+	v, ok := packCache.Load(path)
+	if !ok {
+		return packCacheEntry{}, false
+	}
+	e, _ := v.(packCacheEntry)
+	return e, true
 }

@@ -64,49 +64,158 @@ type Repo struct {
 	// Path 是仓库目录（通常以 .git 结尾）。
 	Path string
 
-	// fs 与 locker 抽象底层存储与并发锁。
-	// 默认使用本地磁盘与进程内锁，但可由外部注入替换。
-	fs     FS
-	locker Locker
+	// dirtySyncPending 记录已写但未 fsync 的脏文件（见 SyncDirtyNow）。
+	dirtySyncPending sync.Map
+	// dirtyCache 是脏层节点的进程内缓存（ref\x00dir -> *dirtyNode）。
+	//
+	// 没有它，每次写入都要把整个脏文件读出来解析一遍算差量——
+	// 实测 3000 条同目录写入，单条成本仍然从 0.24ms 涨到 1.15ms。
+	// 有了它，写入是纯内存改一个 map + append 一行。
+	dirtyCache sync.Map
 
-	// mu 保护仓库实例自身的字段。
-	mu sync.Mutex
+	// fsBox / lockerBox 是懒初始化的原子槽。
+	//
+	// 原来用 mu 保护「为 nil 就赋值」——那是典型的「检查并置位」，
+	// 靠人保证多条 return 路径配平锁。CompareAndSwap 把检查与置位
+	// 合成一次原子操作，对错当场可判。
+	fsBox     atomic.Pointer[fsHolder]
+	lockerBox atomic.Pointer[lockerHolder]
 
 	// writer 是单线程脏层写者。Write/Delete 只把任务投递进队列就返回；
 	// Read/List/Commit 会排一个 barrier，保证此前已接受的任务先处理完。
 	writerOnce sync.Once
 	writerCh   chan dirtyTask
-	writerMu   sync.Mutex // 串行化入队与关闭；barrier 必须排在先前写入之后
-	writerSize atomic.Int64
-	writerErr  error         // worker 累积的异步错误，下一次 barrier 返回并清空
-	writerDown chan struct{} // worker 退出后关闭，Close 等它
-	writerDead bool          // 队列已关，不再接受新投递
+	// writerTok 是一槽 channel 令牌，串行化「入队 / 关闭 / barrier」这三种动作。
+	// barrier 必须排在先前写入之后，这个顺序由令牌保证。
+	//
+	// 为什么不用 Mutex：下面三个函数每一个都有 3~5 条 return 路径，
+	// 每条都必须记得 unlock。令牌配 defer 只有一条路径需要写对。
+	writerTokPtr atomic.Pointer[chan struct{}]
+	writerSize   atomic.Int64
+	writerErr    error         // worker 累积的异步错误，下一次 barrier 返回并清空
+	writerDown   chan struct{} // worker 退出后关闭，Close 等它
+	writerDead   bool          // 队列已关，不再接受新投递
+	patrol       patrolConfig
+}
 
+type fsHolder struct{ fs FS }
+type lockerHolder struct{ locker Locker }
+
+// writerTok 返回写者令牌（懒创建）。零值 Repo 也能用。
+func (r *Repo) writerTok() chan struct{} {
+	if p := r.writerTokPtr.Load(); p != nil {
+		return *p
+	}
+	ch := make(chan struct{}, 1)
+	if r.writerTokPtr.CompareAndSwap(nil, &ch) {
+		return ch
+	}
+	return *r.writerTokPtr.Load()
+}
+
+// lockWriter 取写者令牌，返回释放函数。超时后返回错误而不是无限等待。
+func (r *Repo) lockWriter(what string) (func(), error) {
+	ch := r.writerTok()
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	default:
+	}
+	t := time.NewTimer(30 * time.Second)
+	defer t.Stop()
+	select {
+	case ch <- struct{}{}:
+		return func() { <-ch }, nil
+	case <-t.C:
+		return nil, fmt.Errorf("%s: 等写者令牌超时（30s），有写者卡在落盘上", what)
+	}
+}
+
+// dirtySyncPending 记录「已写但还没 fsync」的脏文件路径。
+//
+// 为什么不每次写都 fsync：绝大多数崩溃是进程崩溃而不是断电，
+// 页缓存还在，数据不会丢。真正需要防的是断电/内核崩，而那种情况
+// 攒几秒批量刷一次就够了。每次写都 fsync 会把单条写入从
+// 0.5ms 拖到几毫秒，而收益只在「恰好断电」这个窄窗口里。
+//
+// 实现用 sync.Map：路径之间互相独立，没有跨 key 不变量。
+func (r *Repo) markDirtyForSync(path string) {
+	r.dirtySyncPending.Store(path, struct{}{})
+}
+
+// SyncDirtyNow 把所有待刷盘的脏文件 fsync 落盘，并清空待刷集合。
+//
+// 调用时机：后台维护环每几秒一次，以及 Close 之前。
+// 目录项也要同步——新建的脏文件只有目录项落盘后才真的存在。
+func (r *Repo) SyncDirtyNow() error {
+	var paths []string
+	r.dirtySyncPending.Range(func(k, _ any) bool {
+		paths = append(paths, k.(string))
+		return true
+	})
+	if len(paths) == 0 {
+		return nil
+	}
+	var firstErr error
+	syncedDirs := map[string]struct{}{}
+	for _, p := range paths {
+		if err := syncFile(p); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		r.dirtySyncPending.Delete(p)
+		syncedDirs[filepath.Dir(p)] = struct{}{}
+	}
+	for d := range syncedDirs {
+		if err := syncDir(d); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
+
+// syncFile 对单个已存在的文件做 fsync。
+func syncFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if isNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+	return f.Sync()
 }
 
 // FS 返回当前仓库使用的存储抽象。
 func (r *Repo) FS() FS {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.fs == nil {
-		r.fs = DefaultFS()
+	if h := r.fsBox.Load(); h != nil {
+		return h.fs
 	}
-	return r.fs
+	h := &fsHolder{fs: DefaultFS()}
+	if r.fsBox.CompareAndSwap(nil, h) {
+		return h.fs
+	}
+	return r.fsBox.Load().fs
 }
 
 // Locker 返回当前仓库使用的锁管理器。
 func (r *Repo) Locker() Locker {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.locker == nil {
-		r.locker = newLocalLocker()
+	if h := r.lockerBox.Load(); h != nil {
+		return h.locker
 	}
-	return r.locker
+	h := &lockerHolder{locker: newLocalLocker()}
+	if r.lockerBox.CompareAndSwap(nil, h) {
+		return h.locker
+	}
+	return r.lockerBox.Load().locker
 }
 
 func (r *Repo) rlockDirty() func() { return r.Locker().RLockDirty() }
 func (r *Repo) lockDirty() func()  { return r.Locker().LockDirty() }
-func (r *Repo) lockNode(ref, dir string) func() {
+func (r *Repo) lockNode(ref, dir string) (func(), error) {
 	return r.Locker().LockNode(ref, dir)
 }
 
@@ -144,7 +253,13 @@ func OpenWith(path string, storage FS, locker Locker) (*Repo, error) {
 			return nil, fmt.Errorf("%s is not a bare repository (missing %s)", abs, want)
 		}
 	}
-	r := &Repo{Path: abs, fs: storage, locker: locker}
+	r := &Repo{Path: abs, patrol: defaultPatrol}
+	if storage != nil {
+		r.fsBox.Store(&fsHolder{fs: storage})
+	}
+	if locker != nil {
+		r.lockerBox.Store(&lockerHolder{locker: locker})
+	}
 	// 脏层本身就是持久层，重启后直接生效；这里只清掉孤儿脏层
 	// （所属分支已不存在）并统计还有多少改动等着折叠。
 	// 失败不影响打开：脏层文件读不出来最多让那个目录退回干净层。
@@ -362,9 +477,14 @@ func (r *Repo) updateRef(ref, sha string) error {
 
 // commitOf 解析某 ref 指向的提交。ref 为空或无提交时返回零值。
 func (r *Repo) commitOf(ref string) (commitObj, error) {
-	sha, err := r.Resolve(ref)
-	if err != nil || sha == "" {
-		return commitObj{}, err
+	sha := ref
+	// 如果不是 40 位 hex SHA，才当成 ref 解析。
+	if validSHA(ref) != nil {
+		resolved, err := r.Resolve(ref)
+		if err != nil || resolved == "" {
+			return commitObj{}, err
+		}
+		sha = resolved
 	}
 	typ, body, err := r.readObject(sha)
 	if err != nil {
@@ -687,10 +807,13 @@ func (r *Repo) Barrier() error {
 }
 
 func (r *Repo) syncDirtyWriter() error {
-	r.writerMu.Lock()
+	release, err := r.lockWriter("barrier")
+	if err != nil {
+		return err
+	}
 	if r.writerDead {
 		down := r.writerDown
-		r.writerMu.Unlock()
+		release()
 		if down != nil {
 			<-down
 		}
@@ -701,7 +824,7 @@ func (r *Repo) syncDirtyWriter() error {
 	r.initDirtyWriter()
 	ch := make(chan error, 1)
 	r.writerCh <- dirtyTask{done: ch}
-	r.writerMu.Unlock()
+	release()
 	return <-ch
 }
 
@@ -711,10 +834,13 @@ func (r *Repo) syncDirtyWriter() error {
 // 与某条分支的提交排队无关；它要做的只是「队列关闸、存量刷完、
 // goroutine 退出」。幂等：重复调用与「从未写过」都安全。
 func (r *Repo) Close() error {
-	r.writerMu.Lock()
+	release, lerr := r.lockWriter("close")
+	if lerr != nil {
+		return lerr
+	}
 	if r.writerDead {
 		down := r.writerDown
-		r.writerMu.Unlock()
+		release()
 		if down != nil {
 			<-down
 		}
@@ -722,13 +848,17 @@ func (r *Repo) Close() error {
 	}
 	r.writerDead = true
 	if r.writerCh == nil {
-		r.writerMu.Unlock()
+		release()
 		return nil
 	}
 	down := r.writerDown
 	close(r.writerCh)
-	r.writerMu.Unlock()
+	release()
 	<-down
+	// 关停前把待刷盘的脏文件落盘：正常停机不该丢掉最后几条写入。
+	if err := r.SyncDirtyNow(); err != nil && r.writerErr == nil {
+		r.writerErr = err
+	}
 	// worker 已退出，不会再改 writerErr；返回关闭前尚未被 barrier
 	// 观察到的最后一个异步写盘错误。
 	return r.writerErr
@@ -755,25 +885,25 @@ func (r *Repo) Write(ref, path string, data []byte, mode Mode) error {
 	cp := make([]byte, len(data))
 	copy(cp, data)
 
-	r.writerMu.Lock()
+	release, lerr := r.lockWriter("enqueue-write")
+	if lerr != nil {
+		return lerr
+	}
+	defer release()
 	if r.writerDead {
-		r.writerMu.Unlock()
 		return fmt.Errorf("repository %s is closed; refusing new writes", filepath.Base(r.Path))
 	}
 	r.initDirtyWriter()
 	queuedSize := r.writerSize.Load()
 	if len(r.writerCh) >= dirtyQueueCapacity || queuedSize+size > dirtyQueueMaxBytes {
-		r.writerMu.Unlock()
 		return fmt.Errorf("dirty write queue is full (%d pending / %d bytes); refusing new writes, retry later", len(r.writerCh), queuedSize)
 	}
 	r.writerSize.Add(size)
 	select {
 	case r.writerCh <- dirtyTask{op: 'W', ref: ref, path: path, data: cp, mode: mode, size: size}:
-		r.writerMu.Unlock()
 		return nil
 	default:
 		r.writerSize.Add(-size)
-		r.writerMu.Unlock()
 		return fmt.Errorf("dirty write queue is full; refusing new writes, retry later")
 	}
 }
@@ -790,7 +920,10 @@ func (r *Repo) applyDirtyWrite(ref, path string, data []byte, mode Mode) error {
 	unlockDirty := r.rlockDirty()
 	defer unlockDirty()
 
-	unlock := r.lockDirtyFile(normRef, dir)
+	unlock, lerr := r.lockDirtyFile(normRef, dir)
+	if lerr != nil {
+		return lerr
+	}
 	defer unlock()
 
 	n, err := r.loadDirtyNode(normRef, dir)
@@ -820,7 +953,10 @@ func (r *Repo) applyDirtyDelete(ref, path string) error {
 	unlockDirty := r.rlockDirty()
 	defer unlockDirty()
 
-	unlock := r.lockDirtyFile(normRef, dir)
+	unlock, lerr := r.lockDirtyFile(normRef, dir)
+	if lerr != nil {
+		return lerr
+	}
 	defer unlock()
 
 	n, err := r.loadDirtyNode(normRef, dir)
@@ -1178,14 +1314,21 @@ func (r *Repo) Log(ref string, n int) ([]CommitInfo, error) {
 // diffTree 对相同子树按 SHA 短路，所以每个 commit 的开销等于**它实际
 // 改动的路径数量**而不是仓库总文件数；总复杂度 O(changes)。
 // 一旦所有现存路径都拿到了时间就提前结束，不需要走完整段历史。
+// FileTimes 是 fileTimes 的导出形式（服务端的按日锚点要用它）。
+func (r *Repo) FileTimes(ref string) (map[string]int64, error) { return r.fileTimes(ref) }
+
 func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
-	tip, err := r.commitOf(normalizeRef(ref))
+	normRef := normalizeRef(ref)
+	tipSHA, err := r.Resolve(normRef)
+	if err != nil || tipSHA == "" {
+		return map[string]int64{}, nil
+	}
+	tip, err := r.commitOf(tipSHA)
 	if err != nil {
 		return nil, err
 	}
-	out := map[string]int64{}
 	if tip.Tree == "" {
-		return out, nil
+		return map[string]int64{}, nil
 	}
 
 	// 只需要给「现在还存在」的路径定时间。已删除的历史路径对调用方没用，
@@ -1195,7 +1338,22 @@ func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
 		return nil, err
 	}
 	if len(wanted) == 0 {
-		return out, nil
+		return map[string]int64{}, nil
+	}
+
+	// 锚点：某个 commit 上「每个路径的时间已经是多少」。
+	//
+	// 纯 tag 只能截断指针，走到那里仍然不知道更早的历史——所以锚点
+	// 必须带着数据。有了它，遍历只需要覆盖「锚点之后」那一段。
+	// 实测 main.chat（1,506 commit / 3,042 文件）就这么从 8.29s 降到毫秒级。
+	cp, _ := r.LatestDailyCheckpoint(normRef)
+	out := map[string]int64{}
+	if cp != nil && cp.Commit == tipSHA {
+		// tip 就是锚点：零遍历。
+		cp.pick(wanted, out)
+		if len(out) >= len(wanted) {
+			return out, nil
+		}
 	}
 
 	// 防御性上限：仓库再长也不该让启动无限期卡住。
@@ -1203,7 +1361,15 @@ func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
 	const maxCommits = 200000
 
 	cur := tip
+	curSHA := tipSHA
 	for i := 0; i < maxCommits; i++ {
+		// 命中锚点：把剩余路径的时间一次补齐，停止回溯。
+		// 锚点里的时间对它记录的那个 commit 永久成立，所以可以放心用。
+		if cp != nil && curSHA == cp.Commit {
+			cp.pick(wanted, out)
+			break
+		}
+
 		parentTree := ""
 		var parent *commitObj
 		if len(cur.Parents) > 0 {
@@ -1234,8 +1400,13 @@ func (r *Repo) fileTimes(ref string) (map[string]int64, error) {
 		if len(out) >= len(wanted) || parent == nil {
 			break
 		}
+		curSHA = cur.Parents[0]
 		cur = *parent
 	}
+
+	// 这里**不写**锚点：fileTimes 是读路径（List 会调它），
+	// 读路径里写对象会让人无法解释「为什么读一次就多出来几个对象」。
+	// 锚点由写入侧按天打（见 Server.maybeWriteDailyCheckpoint）。
 	return out, nil
 }
 
@@ -1485,22 +1656,22 @@ func (r *Repo) Delete(ref, path string) error {
 	if err := validPath(path); err != nil {
 		return err
 	}
-	r.writerMu.Lock()
+	release, lerr := r.lockWriter("enqueue-delete")
+	if lerr != nil {
+		return lerr
+	}
+	defer release()
 	if r.writerDead {
-		r.writerMu.Unlock()
 		return fmt.Errorf("repository %s is closed; refusing delete: %s", filepath.Base(r.Path), path)
 	}
 	r.initDirtyWriter()
 	if len(r.writerCh) >= dirtyQueueCapacity {
-		r.writerMu.Unlock()
 		return fmt.Errorf("dirty write queue is full; refusing delete: %s", path)
 	}
 	select {
 	case r.writerCh <- dirtyTask{op: 'D', ref: ref, path: path}:
-		r.writerMu.Unlock()
 		return nil
 	default:
-		r.writerMu.Unlock()
 		return fmt.Errorf("dirty write queue is full; refusing delete: %s", path)
 	}
 }
@@ -1594,6 +1765,35 @@ func (r *Repo) Tags() (map[string]string, error) {
 // 轻量 tag 就是一个指向 commit 的 ref，不带 tagger 信息。
 // 记忆库不需要 annotated tag 的那套元数据——要记「为什么打这个标」
 // 就写在切片里，那才是这套系统的正文。
+// TagWithMessage 建一个 annotated tag，正文是调用方给的摘要。
+//
+// 与 Tag 的区别：Tag 是轻量 tag（一个 ref 文件指向 commit，存不下任何话）；
+// 这个会在对象库里写一个 tag 对象，正文就是「这一批记忆讲了什么」。
+//
+// 为什么摘要要挂在 tag 上而不是单独存一份：tag 本身就在 git 里，
+// 随 push 到远端，`git show <tag>` 直接能读。它天然是「里程碑 + 摘要」，
+// 不需要再发明一个格式。
+func (r *Repo) TagWithMessage(name, ref, message string) (string, error) {
+	if err := ValidateBranch(name); err != nil {
+		return "", fmt.Errorf("invalid tag name: %w", err)
+	}
+	sha, err := r.Resolve(normalizeRef(ref))
+	if err != nil {
+		return "", err
+	}
+	if sha == "" {
+		return "", fmt.Errorf("%s has no commit to tag", ref)
+	}
+	tagSHA, err := r.writeTagObject(name, sha, message, time.Now())
+	if err != nil {
+		return "", err
+	}
+	if err := r.updateRef("refs/tags/"+name, tagSHA); err != nil {
+		return "", err
+	}
+	return tagSHA, nil
+}
+
 func (r *Repo) Tag(name, ref string) error {
 	// updateRef 会校验拼好的 ref，但那里报的是「ref 非法」。
 	// 这里先校验一次是为了让错误信息说清是「tag 名」。

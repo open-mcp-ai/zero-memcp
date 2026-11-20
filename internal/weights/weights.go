@@ -45,6 +45,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -63,25 +64,40 @@ func shardFile(dir, project string) string {
 	return filepath.Join(dir, filepath.FromSlash(project)+".json")
 }
 
-// shard 是一个项目的完整权重状态。
+// shard 是一个项目的权重状态。
+//
+// Entries 用 sync.Map：每个键（一条记忆地址）互相独立，没有跨键不变量。
+// 更新一条记录是「读计数 → 加一 → 写回」，用 CompareAndSwap 重试，
+// 而不是用一把全局锁把所有人的 recall 串起来——recall 是热路径。
 type shard struct {
-	Version int             `json:"version"`
-	Entries map[string]entry `json:"entries"`
+	Version int
+	Entries sync.Map // addr -> entry
+	dirty   atomic.Bool
+}
 
-	dirty bool
+// shardSlot 是分片的单飞占位：第一个调用者负责读盘，其余人等 done。
+//
+// 为什么必须单飞：loadShard 在 recall 的热路径上被调用，
+// 而它要 os.ReadFile。让每个并发调用者各读一次盘是浪费，
+// 把读盘塞进互斥锁又会让所有 recall 排队——单飞两者都避开。
+type shardSlot struct {
+	done chan struct{}
+	sh   *shard
+	err  error
 }
 
 // Store 是全部项目的权重集合。dir 为空表示纯内存（测试用）。
 type Store struct {
-	mu     sync.Mutex
 	dir    string
-	shards map[string]*shard // project -> shard
-	timer  *time.Timer
+	shards sync.Map // project -> *shardSlot
+	// flushScheduled 去重防抖落盘：第一次写入时排一次 500ms 后的 Flush，
+	// 期间再多的写入不再重复排。用 CAS 表达「只有一个人排」，不需要锁。
+	flushScheduled atomic.Bool
 }
 
 // Open 打开权重存储。dir 为空时退化为纯内存状态（与旧版 path=="" 同语义）。
 func Open(dir string) (*Store, error) {
-	s := &Store{dir: dir, shards: map[string]*shard{}}
+	s := &Store{dir: dir}
 	if dir == "" {
 		return s, nil
 	}
@@ -93,25 +109,69 @@ func Open(dir string) (*Store, error) {
 }
 
 // loadShard 从磁盘读一个项目的分片。文件不存在返回空 shard。
+//
+// 读盘发生在**没有任何共享状态被保护**的情况下，且同一项目只读一次。
 func (s *Store) loadShard(project string) (*shard, error) {
-	if sh, ok := s.shards[project]; ok {
-		return sh, nil
+	fresh := &shardSlot{done: make(chan struct{})}
+	v, loaded := s.shards.LoadOrStore(project, fresh)
+	sl := v.(*shardSlot)
+	if loaded {
+		<-sl.done
+		return sl.sh, sl.err
 	}
-	sh := &shard{Version: formatVersion, Entries: map[string]entry{}}
+
+	sh := &shard{Version: formatVersion}
 	if s.dir != "" {
+		var doc struct {
+			Version int              `json:"version"`
+			Entries map[string]entry `json:"entries"`
+		}
 		data, err := os.ReadFile(shardFile(s.dir, project))
 		if err == nil {
-			_ = json.Unmarshal(data, sh)
-			if sh.Entries == nil {
-				sh.Entries = map[string]entry{}
+			_ = json.Unmarshal(data, &doc)
+			for k, e := range doc.Entries {
+				sh.Entries.Store(k, e)
 			}
-			sh.Version = formatVersion
 		} else if !os.IsNotExist(err) {
+			sl.err = err
+			close(sl.done)
+			s.shards.CompareAndDelete(project, fresh)
 			return nil, err
 		}
+		sh.Version = formatVersion
 	}
-	s.shards[project] = sh
+	sl.sh = sh
+	close(sl.done)
 	return sh, nil
+}
+
+// rangeShards 遍历所有**已加载完成**的分片。
+func (s *Store) rangeShards(fn func(project string, sh *shard)) {
+	s.shards.Range(func(k, v any) bool {
+		sl, ok := v.(*shardSlot)
+		if !ok {
+			return true
+		}
+		select {
+		case <-sl.done:
+			if sl.sh != nil {
+				fn(k.(string), sl.sh)
+			}
+		default:
+			// 还在加载，跳过。
+		}
+		return true
+	})
+}
+
+// getEntry 读一条记录。
+func getEntry(sh *shard, addr string) (entry, bool) {
+	v, ok := sh.Entries.Load(addr)
+	if !ok {
+		return entry{}, false
+	}
+	e, _ := v.(entry)
+	return e, true
 }
 
 // projectOfAddr 从规范键里取项目名。键必须是 project@branch:path（或旧 project@branch/path）。
@@ -128,73 +188,93 @@ func projectOfAddr(addr string) string {
 
 // Count 返回一条记忆的累计读取数。
 func (s *Store) Count(addr string) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	sh, err := s.loadShard(projectOfAddr(addr))
-	if err != nil {
+	if err != nil || sh == nil {
 		return 0
 	}
-	return sh.Entries[addr].Hits
+	e, _ := getEntry(sh, addr)
+	return e.Hits
 }
 
 // LastRead 返回最后读取时间；从未读过返回 0。
 func (s *Store) LastRead(addr string) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	sh, err := s.loadShard(projectOfAddr(addr))
-	if err != nil {
+	if err != nil || sh == nil {
 		return 0
 	}
-	return sh.Entries[addr].Last
+	e, _ := getEntry(sh, addr)
+	return e.Last
 }
 
 // Bump 累加一次读取。返回累加后的计数。
 func (s *Store) Bump(addr string, now int64) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	sh, err := s.loadShard(projectOfAddr(addr))
-	if err != nil {
+	if err != nil || sh == nil {
 		return 0
 	}
-	e := sh.Entries[addr]
-	e.Hits++
-	if now > e.Last {
-		e.Last = now
+	var hits int
+	for {
+		cur, ok := getEntry(sh, addr)
+		next := cur
+		next.Hits++
+		if now > next.Last {
+			next.Last = now
+		}
+		var swapped bool
+		if ok {
+			swapped = sh.Entries.CompareAndSwap(addr, cur, next)
+		} else {
+			_, loaded := sh.Entries.LoadOrStore(addr, next)
+			swapped = !loaded
+		}
+		if swapped {
+			hits = next.Hits
+			break
+		}
 	}
-	sh.Entries[addr] = e
-	sh.dirty = true
-	s.scheduleFlushLocked()
-	return e.Hits
+	sh.dirty.Store(true)
+	s.scheduleFlush()
+	return hits
 }
 
 // Merge 把另一份同结构数据合并进来（对等同步用）。
 // 语义见包注释：hits 取 max，last 取 max。
 // 返回发生变化的键数。
 func (s *Store) Merge(project string, other map[string]entry) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	sh, err := s.loadShard(project)
 	if err != nil {
 		return 0, err
 	}
 	changed := 0
 	for addr, e := range other {
-		cur := sh.Entries[addr]
-		newE := e
-		if cur.Hits > newE.Hits {
-			newE.Hits = cur.Hits
-		}
-		if cur.Last > newE.Last {
-			newE.Last = cur.Last
-		}
-		if newE != cur {
-			sh.Entries[addr] = newE
-			changed++
+		for {
+			cur, ok := getEntry(sh, addr)
+			newE := e
+			if cur.Hits > newE.Hits {
+				newE.Hits = cur.Hits
+			}
+			if cur.Last > newE.Last {
+				newE.Last = cur.Last
+			}
+			if newE == cur {
+				break
+			}
+			var swapped bool
+			if ok {
+				swapped = sh.Entries.CompareAndSwap(addr, cur, newE)
+			} else {
+				_, loaded := sh.Entries.LoadOrStore(addr, newE)
+				swapped = !loaded
+			}
+			if swapped {
+				changed++
+				break
+			}
 		}
 	}
 	if changed > 0 {
-		sh.dirty = true
-		s.scheduleFlushLocked()
+		sh.dirty.Store(true)
+		s.scheduleFlush()
 	}
 	return changed, nil
 }
@@ -206,49 +286,65 @@ func (s *Store) Merge(project string, other map[string]entry) (int, error) {
 //   - 迁移：同一个记忆在项目改名前后的读取是不同时段的事件，10 次 + 5 次
 //     就是它被读了 15 次，必须相加，否则改名等于凭空抹掉旧热度。
 func (s *Store) addMerge(project string, other map[string]entry) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	sh, err := s.loadShard(project)
 	if err != nil {
 		return 0, err
 	}
 	changed := 0
 	for addr, e := range other {
-		cur := sh.Entries[addr]
-		cur.Hits += e.Hits
-		if e.Last > cur.Last {
-			cur.Last = e.Last
+		for {
+			cur, ok := getEntry(sh, addr)
+			next := cur
+			next.Hits += e.Hits
+			if e.Last > next.Last {
+				next.Last = e.Last
+			}
+			var swapped bool
+			if ok {
+				swapped = sh.Entries.CompareAndSwap(addr, cur, next)
+			} else {
+				_, loaded := sh.Entries.LoadOrStore(addr, next)
+				swapped = !loaded
+			}
+			if swapped {
+				changed++
+				break
+			}
 		}
-		sh.Entries[addr] = cur
-		changed++
 	}
 	if changed > 0 {
-		sh.dirty = true
-		s.scheduleFlushLocked()
+		sh.dirty.Store(true)
+		s.scheduleFlush()
 	}
 	return changed, nil
 }
 
 // Export 导出一个项目的全部条目（同步的对端）。
 func (s *Store) Export(project string) map[string]entry {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	sh, err := s.loadShard(project)
-	if err != nil {
+	if err != nil || sh == nil {
 		return nil
 	}
-	out := make(map[string]entry, len(sh.Entries))
-	for k, v := range sh.Entries {
-		out[k] = v
-	}
+	out := map[string]entry{}
+	sh.Entries.Range(func(k, v any) bool {
+		if e, ok := v.(entry); ok {
+			out[k.(string)] = e
+		}
+		return true
+	})
 	return out
 }
 
-func (s *Store) scheduleFlushLocked() {
-	if s.dir == "" || s.timer != nil {
+func (s *Store) scheduleFlush() {
+	if s.dir == "" {
 		return
 	}
-	s.timer = time.AfterFunc(500*time.Millisecond, func() {
+	// CAS 去重：500ms 窗口内只有第一个人排这次落盘。
+	if !s.flushScheduled.CompareAndSwap(false, true) {
+		return
+	}
+	time.AfterFunc(500*time.Millisecond, func() {
+		s.flushScheduled.Store(false)
 		_ = s.Flush()
 	})
 }
@@ -256,31 +352,38 @@ func (s *Store) scheduleFlushLocked() {
 // Flush 把所有脏分片写盘。每个分片独立原子写（tmp + rename），
 // 单个项目的写入不再牵动其他项目。
 func (s *Store) Flush() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.dir == "" {
 		return nil
 	}
-	if s.timer != nil {
-		s.timer.Stop()
-		s.timer = nil
-	}
 	var firstErr error
-	for proj, sh := range s.shards {
-		if !sh.dirty {
-			continue
+	s.rangeShards(func(project string, sh *shard) {
+		if !sh.dirty.Load() {
+			return
 		}
-		if err := flushShard(s.dir, proj, sh); err != nil && firstErr == nil {
-			firstErr = err
-		} else {
-			sh.dirty = false
+		if err := flushShard(s.dir, project, sh); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			return
 		}
-	}
+		sh.dirty.Store(false)
+	})
 	return firstErr
 }
 
 func flushShard(dir, project string, sh *shard) error {
-	data, err := json.MarshalIndent(sh, "", "  ")
+	entries := map[string]entry{}
+	sh.Entries.Range(func(k, v any) bool {
+		if e, ok := v.(entry); ok {
+			entries[k.(string)] = e
+		}
+		return true
+	})
+	doc := struct {
+		Version int              `json:"version"`
+		Entries map[string]entry `json:"entries"`
+	}{Version: sh.Version, Entries: entries}
+	data, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {
 		return err
 	}
@@ -302,21 +405,24 @@ func flushShard(dir, project string, sh *shard) error {
 // Prune 清理索引里已不存在的键（记忆被删后权重不应残留）。
 // exists 只会收到规范键。返回剔除的键数。
 func (s *Store) Prune(exists func(addr string) bool) int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	removed := 0
-	for _, sh := range s.shards {
-		for addr := range sh.Entries {
-			if !exists(addr) {
-				delete(sh.Entries, addr)
-				removed++
+	s.rangeShards(func(_ string, sh *shard) {
+		var gone []any
+		sh.Entries.Range(func(k, _ any) bool {
+			if !exists(k.(string)) {
+				gone = append(gone, k)
 			}
+			return true
+		})
+		for _, k := range gone {
+			sh.Entries.Delete(k)
+			removed++
 		}
-		if removed > 0 {
-			sh.dirty = true
+		if len(gone) > 0 {
+			sh.dirty.Store(true)
 		}
-	}
-	s.scheduleFlushLocked()
+	})
+	s.scheduleFlush()
 	return removed
 }
 
@@ -326,13 +432,11 @@ func (s *Store) Prune(exists func(addr string) bool) int {
 // 如果只看 s.shards，刚启动、什么都没读时就会返回空，
 // 同步会误以为「本机没有任何权重」。
 func (s *Store) Projects() []string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	seen := map[string]bool{}
-	for p := range s.shards {
-		seen[p] = true
-	}
+	s.shards.Range(func(k, _ any) bool {
+		seen[k.(string)] = true
+		return true
+	})
 	if s.dir != "" {
 		_ = filepath.WalkDir(s.dir, func(path string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() || !strings.HasSuffix(path, ".json") {
@@ -358,12 +462,7 @@ func (s *Store) Projects() []string {
 
 // Close 停止防抖计时器并落盘。
 func (s *Store) Close() error {
-	s.mu.Lock()
-	if s.timer != nil {
-		s.timer.Stop()
-		s.timer = nil
-	}
-	s.mu.Unlock()
+	s.flushScheduled.Store(true) // 阻止新的防抖排程
 	return s.Flush()
 }
 

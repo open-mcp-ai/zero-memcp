@@ -27,8 +27,19 @@ import (
 // 换句话说：快照是**优化**，全量重建仍是正确性保底。
 // 这条边界必须守住——否则会出现「启动很快，但搜不到刚写的东西」。
 const (
-	snapshotMagic   = "zmidx1"
-	snapshotVersion = 1
+	snapshotMagic = "zmidx1"
+	// snapshotVersion 是快照格式版本。**字段增删必须递增它。**
+	//
+	// 递增的理由：树快照里存的是「扫描的判定结果」。如果新增了一个
+	// 参与判定的字段（比如 v2 的 Layer），而旧快照里那个字段是零值，
+	// 那么「命中快照」反而会带来错误结论——症状是「启动很快，但
+	// 新功能对历史数据完全不生效」，而且不报错。
+	//
+	// 版本不符时 tryLoadIndexSnapshot 会拒绝快照、退回全量扫描。
+	// 代价是一次慢启动，换来的是「新判据一定作用在全部数据上」。
+	//
+	// v2: BlockSnapshot 增加 Layer（内容自己声明的认知层）
+	snapshotVersion = 2
 )
 
 // SnapshotHeader 是快照的元信息，与倒排表分开存放。
@@ -62,32 +73,35 @@ type SnapshotData struct {
 }
 
 // Export 把索引导出成可序列化形态。
+//
+// 基于 View() 展开一次：这是落盘/全量重建用的，不在热路径上。
 func (ix *Index) Export() *SnapshotData {
+	v := ix.View()
 	d := &SnapshotData{
-		Postings:  make(map[string]map[string]int32, len(ix.postings)),
-		DocLen:    make(map[string]int32, len(ix.docLen)),
-		DocSize:   make(map[string]int32, len(ix.docSize)),
-		DocTime:   make(map[string]int64, len(ix.docTime)),
-		DocTokens: make(map[string][]string, len(ix.docTokens)),
-		TotalDocs: ix.totalDocs,
+		Postings:  make(map[string]map[string]int32, len(v.Postings)),
+		DocLen:    make(map[string]int32, len(v.DocLen)),
+		DocSize:   make(map[string]int32, len(v.DocSize)),
+		DocTime:   make(map[string]int64, len(v.DocTime)),
+		DocTokens: make(map[string][]string, len(v.DocTokens)),
+		TotalDocs: v.TotalDocs,
 	}
-	for tok, docs := range ix.postings {
+	for tok, docs := range v.Postings {
 		m := make(map[string]int32, len(docs))
 		for addr, tf := range docs {
 			m[addr] = int32(tf)
 		}
 		d.Postings[string(tok)] = m
 	}
-	for addr, n := range ix.docLen {
+	for addr, n := range v.DocLen {
 		d.DocLen[addr] = int32(n)
 	}
-	for addr, n := range ix.docSize {
+	for addr, n := range v.DocSize {
 		d.DocSize[addr] = int32(n)
 	}
-	for addr, t := range ix.docTime {
+	for addr, t := range v.DocTime {
 		d.DocTime[addr] = t
 	}
-	for addr, toks := range ix.docTokens {
+	for addr, toks := range v.DocTokens {
 		s := make([]string, len(toks))
 		for i, tk := range toks {
 			s[i] = string(tk)
@@ -100,29 +114,34 @@ func (ix *Index) Export() *SnapshotData {
 // Import 从快照重建索引。
 func Import(d *SnapshotData) *Index {
 	ix := New()
-	ix.totalDocs = d.TotalDocs
+	ix.totalDocs.Store(int64(d.TotalDocs))
 	for tok, docs := range d.Postings {
-		m := make(map[string]int, len(docs))
+		ps := newPostingSlot()
+		entries := make([]postingEntry, 0, len(docs))
 		for addr, tf := range docs {
-			m[addr] = int(tf)
+			entries = append(entries, postingEntry{Addr: addr, TF: int(tf)})
 		}
-		ix.postings[Token(tok)] = m
+		ps.list.Store(&postingList{entries: entries})
+		ix.postings.Store(Token(tok), ps)
 	}
+	var sumLen int64
 	for addr, n := range d.DocLen {
-		ix.docLen[addr] = int(n)
+		ix.docLen.Store(addr, int(n))
+		sumLen += int64(n)
 	}
+	ix.sumDocLen.Store(sumLen)
 	for addr, n := range d.DocSize {
-		ix.docSize[addr] = int(n)
+		ix.docSize.Store(addr, int(n))
 	}
 	for addr, t := range d.DocTime {
-		ix.docTime[addr] = t
+		ix.docTime.Store(addr, t)
 	}
 	for addr, toks := range d.DocTokens {
 		ts := make([]Token, len(toks))
 		for i, s := range toks {
 			ts[i] = Token(s)
 		}
-		ix.docTokens[addr] = ts
+		ix.docTokens.Store(addr, ts)
 	}
 	return ix
 }
@@ -237,10 +256,11 @@ func writeGobAtomic(path string, v any) error {
 
 // AllDocs 返回索引里全部文档 ID 的集合（校验快照与树是否对得上用）。
 func (ix *Index) AllDocs() map[string]struct{} {
-	out := make(map[string]struct{}, ix.totalDocs)
-	for addr := range ix.docLen {
-		out[addr] = struct{}{}
-	}
+	out := make(map[string]struct{}, ix.totalDocs.Load())
+	ix.docLen.Range(func(k, _ any) bool {
+		out[k.(string)] = struct{}{}
+		return true
+	})
 	return out
 }
 
@@ -267,6 +287,7 @@ type BlockSnapshot struct {
 	Rule   bool
 	Hidden bool
 	Hash   string
+	Layer  string
 }
 
 // SaveTrees 把树快照写到 dir 下的独立文件。

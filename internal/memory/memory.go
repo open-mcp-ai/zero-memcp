@@ -40,6 +40,14 @@ type Block struct {
 	Hash string
 	// Read 读出内容。它绑定到具体的仓库与分支。
 	Read func() ([]byte, error)
+	// Layer 是内容自己声明的认知层（thought / record / review / fact），
+	// 空串表示没声明。
+	//
+	// 它在**扫描时**就解析好，不在检索时才去读。
+	// 理由：语义维护每 30 秒问一次「哪些块要重算」，走的是 blob hash
+	// 旁路，那条路的前提是不读盘。如果判层要读盘，旁路就废了——
+	// 12,000 块全量读盘回到了我们花一整天干掉的那个开销。
+	Layer string
 	// Body 是扫描时顺手读到的正文（可能为 nil）。
 	//
 	// 存在的理由是免掉重复读盘：扫描阶段为了判 frontmatter 已经读过
@@ -256,4 +264,42 @@ func SplitID(id string) (project, branch, path string, ok bool) {
 // 地址格式只要有两处独立实现，就会有一处忘记跟着改。
 func MakeID(project, branch, path string) string {
 	return project + "@" + branch + ":" + path
+}
+
+// DeclaredLayer 从内容头部的 frontmatter 里取 `layer:` 的值。
+//
+// # 为什么需要它
+//
+// 记忆该不该进语义索引，早先只看路径前缀（thought/ record/ ...）。
+// 但实测有 12,000 篇历史数据躺在日期根目录（`2026-11-15/xxx.md`），
+// 它们**自己声明了** `layer: thought`，却被前缀判据漏掉——
+// 症状是「数据在、能 read、能 grep，就是语义搜不到」，极难查。
+//
+// 判据应当认内容自己写的话，不能只认目录名。
+//
+// # 双层 frontmatter
+//
+// 真实数据里 layer 经常在**第二层**：外层是写入时套的信封
+// （source/endpoint/created/session），内层才是正文自己的元数据。
+// 所以这里逐层扫，而不是只看第一层。
+//
+// # 为什么限定在头部窗口内
+//
+// 正文里可能引用「layer: thought」这几个字（比如讨论这个字段本身）。
+// 只扫开头 2KB，既覆盖所有真实元数据，又不会把正文里的引用误判成声明。
+func DeclaredLayer(content string) string {
+	const head = 2048
+	if len(content) > head {
+		content = content[:head]
+	}
+	for _, line := range strings.Split(content, "\n") {
+		s := strings.TrimSpace(line)
+		if !strings.HasPrefix(s, "layer:") {
+			continue
+		}
+		v := strings.TrimSpace(strings.TrimPrefix(s, "layer:"))
+		v = strings.Trim(v, `"'`)
+		return strings.ToLower(strings.TrimSpace(v))
+	}
+	return ""
 }

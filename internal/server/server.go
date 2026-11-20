@@ -182,6 +182,8 @@ type Server struct {
 	syncState syncState
 	// workSync 是工作层同步的水位记录。
 	workSync *workSyncState
+	// patrol 是对象回读巡检状态（见 patrol_loop.go）。
+	patrol patrolState
 
 	// resources 是资源变更订阅中心（MCP subscriptions/listen）。
 	resources *resourceHub
@@ -684,6 +686,7 @@ func (s *Server) Start() error {
 		if !disabled {
 			s.startSyncLoop()
 		}
+		s.startPatrol(3 * time.Minute)
 	}
 
 	blocks := s.listens
@@ -711,11 +714,17 @@ func (s *Server) Start() error {
 		}
 		srv := &http.Server{Handler: s.muxFor(blk)}
 		servers = append(servers, srv)
-		go func(srv *http.Server, ln net.Listener, addr string) {
-			if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-				s.logf("server on port %s stopped: %v", addr, err)
+		go func(srv *http.Server, ln net.Listener, blk ListenBlock) {
+			var err error
+			if blk.TLSCert != "" && blk.TLSKey != "" {
+				err = srv.ServeTLS(ln, blk.TLSCert, blk.TLSKey)
+			} else {
+				err = srv.Serve(ln)
 			}
-		}(srv, ln, blk.Addr)
+			if err != nil && err != http.ErrServerClosed {
+				s.logf("server on port %s stopped: %v", blk.Addr, err)
+			}
+		}(srv, ln, blk)
 	}
 
 	cur := s.loadNet()
@@ -2162,6 +2171,12 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		syncLines := s.syncStatusLines(c)
 		if len(syncLines) > 0 {
 			text += "\nsync:\n  " + strings.Join(syncLines, "\n  ")
+		}
+		if wl := s.workSyncLines(c); len(wl) > 0 {
+			text += "\nwork-sync:\n  " + strings.Join(wl, "\n  ")
+		}
+		if pl := s.patrolLines(); len(pl) > 0 {
+			text += "\n" + strings.Join(pl, "\n")
 		}
 		if s.fanouts != nil && c.Mount.Empty() {
 			if fanLines := s.fanouts.describeLines(); len(fanLines) > 0 {

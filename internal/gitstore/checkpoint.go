@@ -2,9 +2,9 @@ package gitstore
 
 import (
 	"encoding/json"
-	"strings"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -320,7 +320,6 @@ func (r *Repo) LatestDailyCheckpoint(ref string) (*checkpoint, error) {
 	}
 	return &cp, nil
 }
-
 
 // HasDailyCheckpoint 报告某条分支今天（或指定的日期）是否已有锚点 tag。
 func (r *Repo) HasDailyCheckpoint(ref, date string) bool {

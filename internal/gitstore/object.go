@@ -44,7 +44,10 @@ func (r *Repo) writeObject(typ string, content []byte) (string, error) {
 	sha := hex.EncodeToString(sum[:])
 	dst := r.objectPath(sha)
 	if _, err := r.FS().Stat(dst); err == nil {
-		return sha, nil
+		if r.objectLooksTrustworthy(dst, sha) {
+			return sha, nil
+		}
+		// 抽检发现内容损坏：不信任旧文件，往下继续走压缩落盘覆盖它
 	}
 
 	if err := r.FS().MkdirAll(filepath.Dir(dst), 0o755); err != nil {

@@ -18,6 +18,8 @@ type ListenBlock struct {
 	Allow   []string
 	Require string
 	Mount   []auth.MountPoint
+	TLSCert string
+	TLSKey  string
 	// WebUI 为真时这个端口注册管理面路由。
 	//
 	// 管理面与 Agent 通道共用同一个 http.Server，但路由表不同：

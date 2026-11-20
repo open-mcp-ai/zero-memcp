@@ -91,11 +91,11 @@ type Repo struct {
 	// 为什么不用 Mutex：下面三个函数每一个都有 3~5 条 return 路径，
 	// 每条都必须记得 unlock。令牌配 defer 只有一条路径需要写对。
 	writerTokPtr atomic.Pointer[chan struct{}]
-	writerSize atomic.Int64
-	writerErr  error         // worker 累积的异步错误，下一次 barrier 返回并清空
-	writerDown chan struct{} // worker 退出后关闭，Close 等它
-	writerDead bool          // 队列已关，不再接受新投递
-
+	writerSize   atomic.Int64
+	writerErr    error         // worker 累积的异步错误，下一次 barrier 返回并清空
+	writerDown   chan struct{} // worker 退出后关闭，Close 等它
+	writerDead   bool          // 队列已关，不再接受新投递
+	patrol       patrolConfig
 }
 
 type fsHolder struct{ fs FS }
@@ -253,7 +253,7 @@ func OpenWith(path string, storage FS, locker Locker) (*Repo, error) {
 			return nil, fmt.Errorf("%s is not a bare repository (missing %s)", abs, want)
 		}
 	}
-	r := &Repo{Path: abs}
+	r := &Repo{Path: abs, patrol: defaultPatrol}
 	if storage != nil {
 		r.fsBox.Store(&fsHolder{fs: storage})
 	}

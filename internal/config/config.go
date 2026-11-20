@@ -118,6 +118,9 @@ type ListenBlock struct {
 	Mount []MountSpec
 	// WebUI 为真时，这个端口才注册管理面路由，默认关闭。
 	WebUI bool
+	// TLSCert 与 TLSKey 指向服务端私有证书与私钥。
+	TLSCert string
+	TLSKey  string
 }
 
 type MountSpec struct {
@@ -217,6 +220,10 @@ type Remote struct {
 	HTTPUser string
 	// HTTPToken 是服务端密钥库里的 token 名，不是 token 本身。
 	HTTPToken string
+	// TLSCA 指向私有根证书路径。
+	TLSCA string
+	// TLSPin 是对端证书公钥的 SHA-256 指纹（显式 pin，防冒名）。
+	TLSPin string
 	// AutoSync 为真时，后台同步循环会把这条远端纳入自动 fetch/merge/push。
 	//
 	// 缺省（false）是保守的：配了一条远端不等于授权它自动双向同步。
@@ -288,8 +295,8 @@ var knownKeys = map[string]map[string]bool{
 	"group":   {"name": true, "members": true},
 	"project": {"name": true, "owner": true, "group": true, "mode": true},
 	"access":  {"user": true, "project": true, "branch": true, "perm": true},
-	"listen":  {"addr": true, "allow": true, "require": true, "mount": true, "webui": true},
-	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true},
+	"listen":  {"addr": true, "allow": true, "require": true, "mount": true, "webui": true, "tls_cert": true, "tls_key": true},
+	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
 }
 
 // checkKeys 拒绝未知分节与未知键。

@@ -258,9 +258,9 @@ type Locker interface {
 // rwGate 是纯 channel + atomic 实现的读写闸门。
 //
 // 为什么不直接用 sync.RWMutex：
-//   1. 消除全局最后一处 sync.RWMutex 声明；
-//   2. 等待带上界，卡在磁盘 I/O 上的写者能被超时暴露，
-//      不会让后来的所有请求无限制挂死。
+//  1. 消除全局最后一处 sync.RWMutex 声明；
+//  2. 等待带上界，卡在磁盘 I/O 上的写者能被超时暴露，
+//     不会让后来的所有请求无限制挂死。
 //
 // 机制（两阶段闸门）：
 //   - writeTok 是一槽 channel，串行化写者（独占）；

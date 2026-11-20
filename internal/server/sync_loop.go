@@ -8,6 +8,7 @@ import (
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
+	"github.com/open-mcp-ai/zero-memcp/internal/gittransport"
 )
 
 // 对等同步：把「fetch → merge → push」编排成一个后台循环。
@@ -83,9 +84,18 @@ func (s *Server) syncOnce(project string, rm config.Remote) {
 		return
 	}
 
-	// 铁律一：不隐式提交。有脏层就跳过整个项目——
-	// 合并会推进分支指针，而脏层是相对旧指针的改动，
-	// 在脏层未折叠时合并会让两边语义都不清楚。
+	// 若对端是另一个 zero-memcp 实例（HTTP/HTTPS 且不以 .git 结尾），
+	// 先直接同步工作层改动——无需先 commit，两台机器立刻可见。
+	if isWorkPeerURL(rm.URL) {
+		if perr := s.syncWorkWithRemote(project, rm, repo); perr != nil {
+			s.recordSyncErr(key, "work-sync: "+perr.Error())
+		} else {
+			s.recordSyncOK(key)
+		}
+		return
+	}
+
+	// 传统 Git 远端（GitHub 等）：不隐式提交。有脏层就跳过历史同步。
 	if pending := repo.Pending(); pending > 0 {
 		s.recordSyncErr(key, fmt.Sprintf("%d uncommitted change(s); commit before syncing", pending))
 		return
@@ -359,4 +369,44 @@ func (s *Server) syncStatusLines(c Caller) []string {
 		return true
 	})
 	return out
+}
+
+func isWorkPeerURL(rawURL string) bool {
+	u := strings.ToLower(strings.TrimSpace(rawURL))
+	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
+		return false
+	}
+	u = strings.TrimRight(u, "/")
+	return !strings.HasSuffix(u, ".git")
+}
+
+func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gitstore.Repo) error {
+	if rm.FetchOnly {
+		return nil
+	}
+	client, err := gittransport.NewTLSClient(gittransport.TLSConfig{
+		CAPath: rm.TLSCA,
+		Pin:    rm.TLSPin,
+	}, 20*time.Second)
+	if err != nil {
+		return err
+	}
+	token, err := s.optionalSecret(rm.HTTPToken, "http_token")
+	if err != nil {
+		return err
+	}
+	for _, br := range rm.Push {
+		if br == "*" {
+			continue
+		}
+		changes, derr := repo.DirtyChanges(br)
+		if derr != nil || len(changes) == 0 {
+			continue
+		}
+		seq := time.Now().UnixNano()
+		if _, perr := s.pushWorkToPeer(client, rm.URL, token, rm.Name, project, br, seq); perr != nil {
+			return perr
+		}
+	}
+	return nil
 }

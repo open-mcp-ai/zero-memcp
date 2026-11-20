@@ -589,4 +589,3 @@ func (r *Repo) DirtyChanges(ref string) ([]DirtyChange, error) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out, nil
 }
-

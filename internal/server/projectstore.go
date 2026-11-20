@@ -224,3 +224,30 @@ func (ps *ProjectStore) MemcpConfig(project string) gitstore.MemcpConfig {
 	}
 	return r.MemcpConfig()
 }
+
+// Names 列出磁盘上所有仓库的名字（形如 blackegg/me）。
+//
+// 为什么按目录走而不是按配置走：配置里声明的项目只是「允许存在」，
+// 真正有数据的是磁盘上的那些。后台巡检关心的是**实际存在的数据**——
+// 一个已经从配置里删掉、但目录还留着的仓库，它的对象同样会烂。
+func (ps *ProjectStore) Names() []string {
+	root := filepath.Join(ps.dataDir, "repos")
+	var out []string
+	_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".git") {
+			return nil
+		}
+		rel, rerr := filepath.Rel(root, path)
+		if rerr != nil {
+			return nil
+		}
+		rel = strings.TrimSuffix(rel, ".git")
+		out = append(out, filepath.ToSlash(rel))
+		return nil
+	})
+	sort.Strings(out)
+	return out
+}

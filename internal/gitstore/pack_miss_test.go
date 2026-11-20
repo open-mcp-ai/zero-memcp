@@ -1,6 +1,5 @@
 package gitstore
 
-
 import (
 	"testing"
 )
@@ -109,4 +108,3 @@ func loadPackCache(path string) (packCacheEntry, bool) {
 	e, _ := v.(packCacheEntry)
 	return e, true
 }
-

@@ -77,6 +77,16 @@ type SemanticProvider struct {
 	LibPath   string
 	ModelPath string
 	VocabPath string
+	// ModelRev 是该模型权重的修订号（如 "sha256:abc..." 或量化版本 "q4_k"）。
+	// 变更它会自动让旧缓存判过期重建，防止新旧权重混用导致空间失真。
+	ModelRev string
+	// Lang 是该后端专长语言（如 "zh"、"en"、"multilingual"），空表示通用。
+	Lang string
+	// GateThreshold 是给唤醒闸门标定的绝对阈值。各模型分数区间不同，
+	// 必须随模型走（例如 bge-m3 用 0.025，bge-small 可能用 0.41）。
+	GateThreshold float64
+	// IndexDir 手动指定落盘子目录（不填则由 Model+ModelRev 自动推导）。
+	IndexDir string
 }
 
 // Server 是监听与身份。
@@ -269,8 +279,9 @@ var knownKeys = map[string]map[string]bool{
 		"label": true, "kind": true, "endpoint": true, "model": true,
 		"dim": true, "api_key": true, "timeout": true,
 		"lib": true, "model_path": true, "vocab": true,
+		"model_rev": true, "lang": true, "gate_threshold": true, "index_dir": true,
 	},
-	"commit":   {"interval": true, "count": true},
+	"commit":  {"interval": true, "count": true},
 	"gc":      {"interval": true},
 	"sync":    {"interval": true, "disabled": true},
 	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
@@ -428,6 +439,20 @@ func ParseFile(raw []byte) (*File, error) {
 		}
 		if p.VocabPath, err = str(sec, ctx, "vocab"); err != nil {
 			return nil, err
+		}
+		if p.ModelRev, err = str(sec, ctx, "model_rev"); err != nil {
+			return nil, err
+		}
+		if p.Lang, err = str(sec, ctx, "lang"); err != nil {
+			return nil, err
+		}
+		if p.IndexDir, err = str(sec, ctx, "index_dir"); err != nil {
+			return nil, err
+		}
+		if v, err := number(sec, ctx, "gate_threshold"); err != nil {
+			return nil, err
+		} else {
+			p.GateThreshold = v
 		}
 		if p.Kind == "" {
 			p.Kind = "http"
@@ -973,6 +998,25 @@ func integer(sec map[string]Value, section, key string) (int64, error) {
 		return 0, fmt.Errorf("%s in %s must be an integer (line %d)", section, key, v.Line)
 	}
 	return v.Int, nil
+}
+
+// number 读一个数值，整数与小数都收。
+//
+// 阈值（gate_threshold）是典型的「写成 0.025 才自然」的字段，
+// 强制整数会逼人写 25 再除 1000，那种换算迟早出错。
+func number(sec map[string]Value, section, key string) (float64, error) {
+	v, ok := sec[key]
+	if !ok {
+		return 0, nil
+	}
+	switch v.Kind {
+	case KindInt:
+		return float64(v.Int), nil
+	case KindFloat:
+		return v.Float, nil
+	default:
+		return 0, fmt.Errorf("%s in %s must be a number (line %d)", section, key, v.Line)
+	}
 }
 
 func boolean(sec map[string]Value, section, key string) (bool, error) {

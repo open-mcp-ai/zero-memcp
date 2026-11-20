@@ -42,6 +42,9 @@ type HTTPConfig struct {
 	APIKey string
 	// Timeout 是单次请求超时。远端应设短，让断网快速降级。
 	Timeout time.Duration
+	// ModelRev 是该服务权重的修订号（如版本号或 SHA）。
+	// 变更它会自动使旧向量缓存失效，防止权重更迭导致空间混用。
+	ModelRev string
 }
 
 // OpenHTTP 建立 HTTP 后端并探测可用性。

@@ -16,11 +16,11 @@ import (
 
 // flakyEmbedServer 模拟 Embedding 服务：可以随时切成故障/恢复。
 type flakyEmbedServer struct {
-	srv      *httptest.Server
-	down     atomic.Bool
-	calls    atomic.Int64
-	texts    atomic.Pointer[[]string]
-	dim      int
+	srv   *httptest.Server
+	down  atomic.Bool
+	calls atomic.Int64
+	texts atomic.Pointer[[]string]
+	dim   int
 }
 
 func newFlakyEmbedServer(t *testing.T, dim int) *flakyEmbedServer {

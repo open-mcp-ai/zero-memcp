@@ -20,8 +20,8 @@ import (
 // # 判据
 //
 // 一条块参与语义索引，满足任一即可：
-//   1. 路径在前缀白名单里（thought/ record/ review/ fact/）—— 主路径
-//   2. 内容自己声明了 layer: thought|record|review|fact —— 历史数据的补票通道
+//  1. 路径在前缀白名单里（thought/ record/ review/ fact/）—— 主路径
+//  2. 内容自己声明了 layer: thought|record|review|fact —— 历史数据的补票通道
 //
 // 第 2 条必须认，因为写错路径是已经发生过的事实，不是可能发生的事。
 func TestSemanticContentRecognisesDeclaredLayer(t *testing.T) {
@@ -133,15 +133,15 @@ func TestBlockLayerParsedAtScanTime(t *testing.T) {
 
 func TestDeclaredLayerEdgeCases(t *testing.T) {
 	cases := map[string]string{
-		"---\nlayer: thought\n---\n":                                  "thought",
-		"---\nlayer: record\n---\n":                                   "record",
-		"---\nsource: x\n---\n\n---\nlayer: thought\n---\n":           "thought",
-		"---\nlayer:thought\n---\n":                                   "thought", // 冒号后无空格
-		"---\nlayer:   thought  \n---\n":                              "thought", // 多余空白
-		"---\nother: 1\n---\n":                                        "",
-		"no frontmatter at all":                                       "",
-		"":                                                            "",
-		"---\nlayer: THOUGHT\n---\n":                                  "thought", // 大小写不敏感
+		"---\nlayer: thought\n---\n":                        "thought",
+		"---\nlayer: record\n---\n":                         "record",
+		"---\nsource: x\n---\n\n---\nlayer: thought\n---\n": "thought",
+		"---\nlayer:thought\n---\n":                         "thought", // 冒号后无空格
+		"---\nlayer:   thought  \n---\n":                    "thought", // 多余空白
+		"---\nother: 1\n---\n":                              "",
+		"no frontmatter at all":                             "",
+		"":                                                  "",
+		"---\nlayer: THOUGHT\n---\n":                        "thought", // 大小写不敏感
 	}
 	for in, want := range cases {
 		if got := memory.DeclaredLayer(in); got != want {

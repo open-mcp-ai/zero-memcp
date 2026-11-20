@@ -242,7 +242,6 @@ func (s *Server) readAddr(addr string, c Caller) (string, error) {
 		return "", errors.New("addr must not contain whitespace")
 	}
 
-
 	proj, br, path, err := s.resolveAddr(addr, c)
 	if err != nil {
 		return "", err

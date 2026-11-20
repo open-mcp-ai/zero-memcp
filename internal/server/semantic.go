@@ -210,6 +210,37 @@ type quarantineEntry struct {
 // 句向量训练的模型，同一对文本实测 0.97。
 const semanticModelName = "LaBSE-int8"
 
+// vectorDirFor 返回某个模型专属的向量落盘目录。
+//
+// 多索引共存靠这一层子目录实现：远端大模型、本地小模型、同名的不同
+// 修订各占据一个目录，切换时互不覆盖。于是「大模型挂了切小模型、
+// 恢复后切回来」不再需要重算大模型那份——这是降级方案能成立的前提。
+//
+// 手动 index_dir 优先（供运维显式指定），否则由 Model+ModelRev 推导。
+func (s *Server) vectorDirFor(emb embed.Embedder) string {
+	if s.semanticDir == "" {
+		return ""
+	}
+	if p := s.semanticProviderFor(emb.Name()); p != nil && p.IndexDir != "" {
+		return filepath.Join(s.semanticDir, p.IndexDir)
+	}
+	return vecindex.ResolveDir(s.semanticDir, emb.Name(), embed.Revision(emb))
+}
+
+// semanticProviderFor 在配置里找与模型名匹配的 provider（用于取 index_dir、
+// gate_threshold 这类「随模型走」的参数）。
+//
+// 找不到返回 nil：链的名字可能由多个 provider 拼成，此时用默认推导。
+func (s *Server) semanticProviderFor(modelName string) *config.SemanticProvider {
+	for i := range s.cfg.Semantic.Providers {
+		p := &s.cfg.Semantic.Providers[i]
+		if p.Model == modelName || p.Label == modelName {
+			return p
+		}
+	}
+	return nil
+}
+
 // initSemantic 启动时尝试载入向量缓存；缓存缺失或过期就后台重建。
 //
 // 为什么后台建：全量 3,255 篇 thought 切片算向量约需数分钟。
@@ -251,8 +282,9 @@ func (s *Server) initSemantic() {
 	// 可用——差异交给增量逻辑按块比对。旧的判定是「任一分支 head
 	// 变了就全废」，日常写一条记忆就要重算 6800 片 12 分钟。
 	var cached *vecindex.Index
-	if vecDir != "" {
-		if ix, prints, err := vecindex.Load(vecDir, emb.Name()); err == nil {
+	modelDir := s.vectorDirFor(emb)
+	if modelDir != "" {
+		if ix, prints, err := vecindex.LoadRev(modelDir, emb.Name(), embed.Revision(emb)); err == nil {
 			if ix.Dim() != emb.Dim() {
 				// 维度对不上说明缓存是别的模型遗留的。宁可重建，
 				// 也不能拿旧向量配新模型——那会静默返回错结果。
@@ -262,7 +294,17 @@ func (s *Server) initSemantic() {
 				// 先挂上去：即使接下来要增量补算，检索也已可用，
 				// 不必让 srecall 回落到 BM25 等增量跑完。
 				s.semantic.setActive(ix, prints)
-				s.logf("semantic: loaded %d vectors from cache (%d prints)", ix.Len(), len(prints))
+				s.logf("semantic: loaded %d vectors from cache (%d prints, dir=%s)",
+					ix.Len(), len(prints), modelDir)
+			}
+		} else {
+			// 旧版本把 vectors.bin 直接写在根目录。若那里恰好是本模型
+			// 且修订号为空（老 manifest 没有这个字段），继续沿用，
+			// 下次落盘时自动搬进模型子目录，不必手工搬文件。
+			if ix, prints, lerr := vecindex.Load(vecDir, emb.Name()); lerr == nil && ix.Dim() == emb.Dim() {
+				cached = ix
+				s.semantic.setActive(ix, prints)
+				s.logf("semantic: adopting legacy cache at %s (%d vectors)", vecDir, ix.Len())
 			}
 		}
 	}
@@ -270,7 +312,7 @@ func (s *Server) initSemantic() {
 	// 先出声再动工：构建要跑几分钟，日志里必须先有「我开始了」这一行，
 	// 否则排查时无法区分「没启动」和「正在建」。
 	if cached == nil {
-		s.logf("semantic: cache miss, building index in background (dir=%s)", vecDir)
+		s.logf("semantic: cache miss, building index in background (dir=%s)", modelDir)
 	} else {
 		s.logf("semantic: checking cache for incremental updates")
 	}
@@ -525,8 +567,8 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 		return fmt.Errorf("all %d slices failed to embed", len(jobs))
 	}
 
-	if vecDir != "" {
-		if err := ix.Save(vecDir, emb.Name(), heads, prints); err != nil {
+	if saveDir := s.vectorDirFor(emb); saveDir != "" {
+		if err := ix.SaveRev(saveDir, emb.Name(), embed.Revision(emb), heads, prints); err != nil {
 			s.logf("semantic: cache save failed (will rebuild next start): %v", err)
 		}
 	}
@@ -776,6 +818,7 @@ func (s *Server) semanticChainConfig() embed.ChainConfig {
 			LibPath:   p.LibPath,
 			ModelPath: p.ModelPath,
 			VocabPath: p.VocabPath,
+			ModelRev:  p.ModelRev,
 		})
 	}
 
@@ -1025,15 +1068,15 @@ func (s *Server) embedIsolate(emb embed.Embedder, jobs []job, failed *int) [][]f
 func transientEmbedError(reason string) bool {
 	r := strings.ToLower(reason)
 	for _, sig := range []string{
-		"all providers failed",   // 整条降级链都连不上
-		"connection refused",     // 后端没起来
-		"no such host",           // DNS 解析不了
-		"service unavailable",    // 503
-		"timeout",                // 超时（含 context deadline exceeded）
+		"all providers failed", // 整条降级链都连不上
+		"connection refused",   // 后端没起来
+		"no such host",         // DNS 解析不了
+		"service unavailable",  // 503
+		"timeout",              // 超时（含 context deadline exceeded）
 		"deadline exceeded",
 		"connection reset",
 		"broken pipe",
-		"eof",                    // 对端提前关闭
+		"eof", // 对端提前关闭
 	} {
 		if strings.Contains(r, sig) {
 			return true

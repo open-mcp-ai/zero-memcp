@@ -467,7 +467,6 @@ func New(cfg Config) (*Server, error) {
 			close(ch)
 			return ch
 		}(),
-
 	}
 	s.cfgFilePtr.Store(cfgFile)
 	if lookup != nil {
@@ -1802,7 +1801,7 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			})
 		}
 		structured := map[string]any{
-			"hits":  structHits,
+			"hits": structHits,
 			// results 是 hits 的别名：不同调用方对「命中列表」的叫法不一样，
 			// 而两份投影指向同一份数据，多一个键不增加成本。
 			"results": structHits,

@@ -8,7 +8,9 @@ package vecindex
 
 import (
 	"container/heap"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +18,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 )
@@ -267,6 +270,7 @@ func (ix *Index) Search(query []float32, topN int, threshold float32) []Hit {
 	}
 	return out
 }
+
 type item struct {
 	i     int
 	score float32
@@ -302,13 +306,26 @@ func (h *topHeap) Pop() any {
 // 任一项对不上，缓存就是过期的，必须重建而不是凑着用——
 // 「凑合能用但结果错」比「直接报错」危险得多。
 type Manifest struct {
-	Magic   uint32            `json:"magic"`
-	Version int               `json:"version"`
-	Dim     int               `json:"dim"`
-	Count   int               `json:"count"`
-	Model   string            `json:"model"`
-	Heads   map[string]string `json:"heads"` // 分支 → commit head（仅诊断用）
-	IDs     []string          `json:"ids"`
+	Magic   uint32 `json:"magic"`
+	Version int    `json:"version"`
+	Dim     int    `json:"dim"`
+	Count   int    `json:"count"`
+	Model   string `json:"model"`
+	// ModelRev 是**同一模型名下的修订号**（权重文件哈希、后端版本等）。
+	//
+	// 为什么光有 Model 不够：换了一份重新量化、或者升级了推理后端之后，
+	// 模型名字往往一个字都没变，但向量空间已经不同。此时若只比 Model，
+	// 新旧向量会被当成同一个空间混在索引里——不报错、不重建，
+	// 相似度从此静默失真。
+	//
+	// 空值表示「未声明修订号」，与任何非空值都不相等，因此从旧版本升级
+	// 上来会触发一次重建。这是有意的：宁可多算一次，不混两个空间。
+	ModelRev string `json:"model_rev,omitempty"`
+	// ModelKey 是落盘子目录名。它在 Save 时由 Model+ModelRev 推导并记下，
+	// 使得「磁盘上这个目录是谁的」不必依赖外部约定。
+	ModelKey string            `json:"model_key,omitempty"`
+	Heads    map[string]string `json:"heads"` // 分支 → commit head（仅诊断用）
+	IDs      []string          `json:"ids"`
 
 	// Prints 是「块 ID → 被向量化文本的内容指纹」。
 	//
@@ -323,8 +340,61 @@ type Manifest struct {
 	Prints map[string]string `json:"prints"`
 }
 
+// ModelKeyFor 由模型名与修订号推导一个安全的目录名。
+//
+// 多个模型（含同名的不同修订）各自独占一个子目录，互不覆盖——
+// 这正是「远端大模型挂了切本地小模型、恢复后切回来」不重算的前提。
+//
+// 规则只保留 [A-Za-z0-9._-]，其余替换成 '-'，并追加修订号的短哈希：
+// 目录名必须可读（人要看），又必须唯一（不同修订不能撞）。
+func ModelKeyFor(model, rev string) string {
+	safe := make([]rune, 0, len(model))
+	for _, r := range model {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '_', r == '-':
+			safe = append(safe, r)
+		default:
+			safe = append(safe, '-')
+		}
+	}
+	key := strings.Trim(string(safe), "-")
+	if key == "" {
+		key = "model"
+	}
+	if len(key) > 48 {
+		key = key[:48]
+	}
+	if rev == "" {
+		return key
+	}
+	sum := sha256.Sum256([]byte(rev))
+	return key + "-" + hex.EncodeToString(sum[:4])
+}
+
+// ResolveDir 返回该模型应该使用的落盘目录。
+//
+// base 是 [semantic] vectors 声明的根目录。多模型共存靠这一层子目录：
+//
+//	<base>/bge-m3/              ← 远端大模型
+//	<base>/bge-small-zh-int8/   ← 本地降级模型
+//
+// 旧版本把 vectors.bin 直接写在 base 下。若那里恰好是本模型且修订号
+// 兼容，调用方会继续用它（见 LoadLegacy），因此升级不需要手工搬文件。
+func ResolveDir(base, model, rev string) string {
+	if base == "" {
+		return ""
+	}
+	return filepath.Join(base, ModelKeyFor(model, rev))
+}
+
 // Save 原子写出 vectors.bin + manifest.json。
 func (ix *Index) Save(dir, model string, heads map[string]string, prints map[string]string) error {
+	return ix.SaveRev(dir, model, "", heads, prints)
+}
+
+// SaveRev 是带修订号的 Save。
+func (ix *Index) SaveRev(dir, model, rev string, heads map[string]string, prints map[string]string) error {
 	// 先取一份快照（块列表 + 有效条数），落盘全程不持任何保护。
 	blocks := ix.loadBlocks()
 	n := int(ix.count.Load())
@@ -381,14 +451,16 @@ func (ix *Index) Save(dir, model string, heads map[string]string, prints map[str
 	}
 
 	m := Manifest{
-		Magic:   magic,
-		Version: version,
-		Dim:     dim,
-		Count:   n,
-		Model:   model,
-		Heads:   heads,
-		IDs:     ids,
-		Prints:  prints,
+		Magic:    magic,
+		Version:  version,
+		Dim:      dim,
+		Count:    n,
+		Model:    model,
+		ModelRev: rev,
+		ModelKey: ModelKeyFor(model, rev),
+		Heads:    heads,
+		IDs:      ids,
+		Prints:   prints,
 	}
 	raw, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
@@ -409,6 +481,14 @@ var ErrStale = errors.New("vector cache is stale or missing")
 // heads 不再参与过期判定（增量索引以 manifest 里的内容指纹为判据，
 // 见 Prints 的注释）；它只是存下来供诊断。
 func Load(dir, expectedModel string) (*Index, map[string]string, error) {
+	return LoadRev(dir, expectedModel, "")
+}
+
+// LoadRev 在 Load 之上再校验修订号。
+//
+// 修订号不匹配 == 向量空间可能不同，必须 ErrStale 让调用方重建。
+// 这是「同名模型换了权重」这个静默故障的唯一防线。
+func LoadRev(dir, expectedModel, expectedRev string) (*Index, map[string]string, error) {
 	raw, err := os.ReadFile(filepath.Join(dir, "manifest.json"))
 	if err != nil {
 		return nil, nil, ErrStale
@@ -421,6 +501,9 @@ func Load(dir, expectedModel string) (*Index, map[string]string, error) {
 		return nil, nil, ErrStale
 	}
 	if m.Model != expectedModel {
+		return nil, nil, ErrStale
+	}
+	if m.ModelRev != expectedRev {
 		return nil, nil, ErrStale
 	}
 

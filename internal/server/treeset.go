@@ -84,7 +84,6 @@ func (s *Server) acquireBranchWrite(project, branch string) (func(), error) {
 	}
 }
 
-
 // publishTrees 用新的树列表替换当前快照（必须在持写令牌时调用）。
 func (s *Server) publishTrees(trees []*memory.Tree, idx *index.Index) {
 	s.treesPtr.Store(&treeSet{trees: trees, idx: idx})

@@ -114,6 +114,7 @@ type ProviderConfig struct {
 	LibPath   string
 	ModelPath string
 	VocabPath string
+	ModelRev  string
 }
 
 // OpenChain 按配置建立降级链。
@@ -192,6 +193,7 @@ func openProvider(pc ProviderConfig) (Embedder, error) {
 			Dim:      pc.Dim,
 			APIKey:   pc.APIKey,
 			Timeout:  pc.Timeout,
+			ModelRev: pc.ModelRev,
 		})
 	case "static":
 		e, err := OpenStatic(StaticConfig{
@@ -222,6 +224,16 @@ func (c *Chain) Dim() int { return c.dim }
 
 // Name 返回链的模型标识。
 func (c *Chain) Name() string { return c.name }
+
+// Rev 返回当前活动后端的修订号。
+func (c *Chain) Rev() string {
+	ps := c.snapshot()
+	i := int(c.active.Load())
+	if i < 0 || i >= len(ps) {
+		return ""
+	}
+	return Revision(ps[i].emb)
+}
 
 // ActiveLabel 返回当前生效的后端名，供 status 展示。
 func (c *Chain) ActiveLabel() string {

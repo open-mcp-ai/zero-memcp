@@ -408,7 +408,9 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 	touchedBranches := map[string]bool{}
 	for _, raw := range srcs {
 		_, sb, _, _ := s.parseBranchAddr(raw)
-		if sb != "" { touchedBranches[sb] = true }
+		if sb != "" {
+			touchedBranches[sb] = true
+		}
 	}
 	touchedBranches[dstBranch] = true
 	for br := range touchedBranches {

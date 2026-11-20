@@ -35,6 +35,7 @@ type StaticConfig struct {
 type Static struct {
 	dim   int
 	name  string
+	rev   string
 	once  sync.Once
 	vocab map[string][]float32
 	err   error
@@ -69,6 +70,7 @@ func (s *Static) load(path string) error {
 	}
 	s.dim = dim
 	s.vocab = vocab
+	s.rev = FileRev(path)
 	return nil
 }
 
@@ -140,6 +142,9 @@ func parseStatic(raw []byte) (int, map[string][]float32, error) {
 func (s *Static) Dim() int     { return s.dim }
 func (s *Static) Name() string { return s.name }
 func (s *Static) Close() error { return nil }
+
+// Rev 返回静态模型文件的哈希，权重改动时自动判过期。
+func (s *Static) Rev() string { return s.rev }
 
 // Embed 把文本变成向量：分词 → 查表 → 加权平均 → L2 归一化。
 func (s *Static) Embed(text string) ([]float32, error) {

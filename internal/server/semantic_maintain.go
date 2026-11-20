@@ -141,7 +141,7 @@ func (s *Server) catchUpSemantic(reason string) {
 	var cached *vecindex.Index
 	var prints map[string]string
 	if vecDir != "" {
-		if ix, pr, err := vecindex.Load(vecDir, emb.Name()); err == nil && ix.Dim() == emb.Dim() {
+		if ix, pr, err := vecindex.LoadRev(s.vectorDirFor(emb), emb.Name(), embed.Revision(emb)); err == nil && ix.Dim() == emb.Dim() {
 			cached, prints = ix, pr
 		}
 	}

@@ -10,7 +10,6 @@ import (
 	"github.com/open-mcp-ai/zero-memcp/internal/memory"
 )
 
-
 // callMCPVars 用一个命名变量传正文——多行 frontmatter 必须走这条路。
 // （`-- <正文>` 的 legacy 写法会把换行吃掉，且 termcp 只认单一 payload 引用。）
 func callMCPVars(t *testing.T, srv *Server, tok, addr, body string) (string, error) {
@@ -51,12 +50,12 @@ func TestRefreshPathMatchesFullRebuild(t *testing.T) {
 
 	// 先铺一批底料，让树里有多样形态的块。
 	seeds := map[string]string{
-		"plain.md":            "普通正文，无 frontmatter",
-		"frontmatter-idx.md":  "---\ninject: every_turn\n---\n\n这条声明了每轮注入",
-		"frontmatter-none.md": "---\nindex: none\n---\n\n这条声明不进检索",
+		"plain.md":             "普通正文，无 frontmatter",
+		"frontmatter-idx.md":   "---\ninject: every_turn\n---\n\n这条声明了每轮注入",
+		"frontmatter-none.md":  "---\nindex: none\n---\n\n这条声明不进检索",
 		"frontmatter-plain.md": "---\nwrite: append\n---\n\n只写了 write 策略",
-		"notes/a.md":          "子目录里的普通文件",
-		"notes/b.md":          "另一个子目录文件",
+		"notes/a.md":           "子目录里的普通文件",
+		"notes/b.md":           "另一个子目录文件",
 	}
 	for p, body := range seeds {
 		if _, err := callMCPVars(t, srv, tok, proj+"@"+br+":"+p, body); err != nil {
@@ -245,9 +244,9 @@ func TestRefreshPathAddsBrandNewFile(t *testing.T) {
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "test", Cap: "rwx"})
 
 	const (
-		proj  = "blackegg/me"
-		br    = "fact"
-		path  = "brand-new/deep/file.md"
+		proj   = "blackegg/me"
+		br     = "fact"
+		path   = "brand-new/deep/file.md"
 		marker = "zzz-brand-new-marker-zzz"
 	)
 

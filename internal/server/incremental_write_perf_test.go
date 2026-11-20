@@ -1,3 +1,5 @@
+//go:build perf
+
 package server
 
 import (
@@ -19,9 +21,6 @@ import (
 // 先在 12 个文件的库上量一次，再在 600 个文件的库上量一次。
 // 真正的增量实现，两者应当同一量级；退回全分支重扫则会是几十倍。
 func TestWriteAndDeleteDoNotScaleWithBranchSize(t *testing.T) {
-	if testing.Short() {
-		t.Skip("scale test")
-	}
 
 	measure := func(t *testing.T, bulk int) (writeEl, deleteEl time.Duration) {
 		t.Helper()
@@ -137,15 +136,4 @@ func TestRefreshPathKeepsIndexConsistent(t *testing.T) {
 	if contains(out, "marker-write-beta") {
 		t.Fatalf("删除之后还能搜到：%s", out)
 	}
-}
-
-func contains(s, sub string) bool {
-	return len(sub) > 0 && len(s) >= len(sub) && (func() bool {
-		for i := 0; i+len(sub) <= len(s); i++ {
-			if s[i:i+len(sub)] == sub {
-				return true
-			}
-		}
-		return false
-	})()
 }

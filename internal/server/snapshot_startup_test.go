@@ -1,3 +1,5 @@
+//go:build perf
+
 package server
 
 import (
@@ -21,9 +23,6 @@ import (
 // 需要读盘，就会把省下来的时间又还回去。所以用断言钉住方向，
 // 而不是靠人记得「别让恢复路径读盘」。
 func TestSnapshotStartupIsFasterThanRebuild(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skip in short mode")
-	}
 	srv, dataDir := setupMountServer(t)
 	repo, err := srv.projects.Get("blackegg/me")
 	if err != nil {

@@ -1,3 +1,5 @@
+//go:build perf
+
 package index
 
 import (
@@ -20,9 +22,6 @@ import (
 // 这里用**规模翻倍的耗时比值**判定，而不是绝对时间：绝对时间随机器
 // 波动，而 O(N²) 的比值是 4x、O(N) 的比值是 2x，差距大到不会误判。
 func TestAddBatchPostingsLinearithmic(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skip in short mode")
-	}
 	run := func(n int) time.Duration {
 		docs := make([]BatchDoc, n)
 		for i := 0; i < n; i++ {

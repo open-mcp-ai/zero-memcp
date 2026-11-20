@@ -25,3 +25,4 @@ bin/
 /assets/*.dylib
 /assets/*.so
 /assets/*.dll
+dist/

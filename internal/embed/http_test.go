@@ -113,8 +113,8 @@ func TestChainDegrade(t *testing.T) {
 
 	// 链上两个都注册了，但 badSrv 在 probe 时就会失败
 	// OpenChain 应该跳过它，只保留 goodSrv
-	if len(chain.providers) != 1 {
-		t.Fatalf("应该只保留可用的 1 个后端，得到 %d", len(chain.providers))
+	if n := len(chain.snapshot()); n != 1 {
+		t.Fatalf("应该只保留可用的 1 个后端，得到 %d", n)
 	}
 	if chain.ActiveLabel() != "local" {
 		t.Fatalf("当前生效应为 local，得到 %s", chain.ActiveLabel())

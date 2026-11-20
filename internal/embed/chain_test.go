@@ -15,9 +15,9 @@ type fakeProvider struct {
 	calls int
 }
 
-func (f *fakeProvider) Dim() int        { return f.dim }
-func (f *fakeProvider) Name() string    { return "fake-" + f.label }
-func (f *fakeProvider) Close() error    { return nil }
+func (f *fakeProvider) Dim() int     { return f.dim }
+func (f *fakeProvider) Name() string { return "fake-" + f.label }
+func (f *fakeProvider) Close() error { return nil }
 func (f *fakeProvider) Embed(text string) ([]float32, error) {
 	f.calls++
 	if f.down {
@@ -40,14 +40,13 @@ func (f *fakeProvider) EmbedBatch(texts []string) ([][]float32, error) {
 }
 
 func newTestChain(head, fallback *fakeProvider) *Chain {
-	return &Chain{
-		providers: []namedEmbedder{
-			{label: head.label, emb: head},
-			{label: fallback.label, emb: fallback},
-		},
-		dim:  head.dim,
-		name: "test-model",
+	ps := []namedEmbedder{
+		{label: head.label, emb: head},
+		{label: fallback.label, emb: fallback},
 	}
+	c := &Chain{dim: head.dim, name: "test-model"}
+	c.providers.Store(&ps)
+	return c
 }
 
 // TestChainClearsStaleError 锁定「恢复后不再报旧错误」。
@@ -157,10 +156,11 @@ func TestChainRecoversProviderMissingAtStartup(t *testing.T) {
 			{Label: "head", Kind: "fake"},
 			{Label: "fallback", Kind: "fake"},
 		}},
-		providers: []namedEmbedder{{label: "fallback", emb: fallback}},
-		dim:       8,
-		name:      "test-model",
+		dim:  8,
+		name: "test-model",
 	}
+	ps := []namedEmbedder{{label: "fallback", emb: fallback}}
+	c.providers.Store(&ps)
 	_ = head
 
 	// 此时链上只有 fallback，active=0（它自己就是链首）。

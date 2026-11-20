@@ -12,7 +12,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -49,9 +48,11 @@ type Chain struct {
 	// 为什么需要：降级链不再是「打开后即不变」的静态结构。启动时连不上
 	// 的后端不能永久丢弃——3060 关机时启动服务，之后再开机，它就该重新
 	// 被用上。这要求运行期能重建 providers，而 Embed 在热路径上读它。
-	mu        sync.RWMutex
-	cfg       ChainConfig
-	providers []namedEmbedder
+	cfg ChainConfig
+	// providers 是不可变切片的原子快照：重建时造新切片再换进去，
+	// 读者 Load 一次就拿到一致的一份。dim/name 在 Open 之后不再改变，
+	// 所以它们是普通字段——把常量字段也放进锁里，只会让人误以为它们会变。
+	providers atomic.Pointer[[]namedEmbedder]
 	dim       int
 	name      string
 	// onTransition 在 active 后端发生切换时被调用（降级 / 全部失败 / 恢复）。
@@ -96,7 +97,7 @@ type ChainConfig struct {
 type ProviderConfig struct {
 	// Label 是诊断用的名字（"3060"、"local"），出现在日志和 status 里。
 	Label string
-	// Kind 是 "http" 或 "onnx"。
+	// Kind 是 "http"、"static" 或 "onnx"。
 	Kind string
 	// Model 是这个后端的模型标识。必须与链上其他后端一致。
 	Model string
@@ -113,6 +114,7 @@ type ProviderConfig struct {
 	LibPath   string
 	ModelPath string
 	VocabPath string
+	ModelRev  string
 }
 
 // OpenChain 按配置建立降级链。
@@ -127,6 +129,7 @@ func OpenChain(cfg ChainConfig) (*Chain, error) {
 
 	c := &Chain{cfg: cfg}
 	var firstErr error
+	var built []namedEmbedder
 	for _, pc := range cfg.Providers {
 		label := pc.Label
 		if label == "" {
@@ -161,9 +164,10 @@ func OpenChain(cfg ChainConfig) (*Chain, error) {
 				"provider %q: model %q != %q (a chain requires ONE model across all providers)",
 				label, emb.Name(), c.name)
 		}
-		c.providers = append(c.providers, namedEmbedder{label: label, emb: emb})
+		built = append(built, namedEmbedder{label: label, emb: emb})
 	}
-	if len(c.providers) == 0 {
+	c.providers.Store(&built)
+	if len(built) == 0 {
 		if firstErr != nil {
 			return nil, fmt.Errorf("%w: %v", ErrAllProvidersDown, firstErr)
 		}
@@ -189,7 +193,17 @@ func openProvider(pc ProviderConfig) (Embedder, error) {
 			Dim:      pc.Dim,
 			APIKey:   pc.APIKey,
 			Timeout:  pc.Timeout,
+			ModelRev: pc.ModelRev,
 		})
+	case "static":
+		e, err := OpenStatic(StaticConfig{
+			ModelPath: pc.ModelPath,
+			Name:      pc.Model,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return e, nil
 	case "onnx", "":
 		e, err := OpenLocal(Config{
 			LibPath:   pc.LibPath,
@@ -201,7 +215,7 @@ func openProvider(pc ProviderConfig) (Embedder, error) {
 		}
 		return e, nil
 	default:
-		return nil, fmt.Errorf("unknown provider kind %q (want http or onnx)", pc.Kind)
+		return nil, fmt.Errorf("unknown provider kind %q (want http, static, or onnx)", pc.Kind)
 	}
 }
 
@@ -210,6 +224,16 @@ func (c *Chain) Dim() int { return c.dim }
 
 // Name 返回链的模型标识。
 func (c *Chain) Name() string { return c.name }
+
+// Rev 返回当前活动后端的修订号。
+func (c *Chain) Rev() string {
+	ps := c.snapshot()
+	i := int(c.active.Load())
+	if i < 0 || i >= len(ps) {
+		return ""
+	}
+	return Revision(ps[i].emb)
+}
 
 // ActiveLabel 返回当前生效的后端名，供 status 展示。
 func (c *Chain) ActiveLabel() string {
@@ -263,11 +287,14 @@ func (c *Chain) markRecovered(atHead bool) {
 	}
 }
 
-// snapshot 取当前生效后端列表的副本。
+// snapshot 取当前生效后端列表。
+//
+// 返回的切片本身不可变，调用方可以直接遍历，不需要再复制。
 func (c *Chain) snapshot() []namedEmbedder {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.providers
+	if p := c.providers.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 // Providers 返回链上所有后端的标签，按优先级排列。
@@ -348,7 +375,7 @@ func (c *Chain) EmbedBatch(texts []string) ([][]float32, error) {
 // Close 关闭链上所有后端。
 func (c *Chain) Close() error {
 	var firstErr error
-	for _, p := range c.providers {
+	for _, p := range c.snapshot() {
 		if err := p.emb.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -431,9 +458,16 @@ func (c *Chain) HealthCheck() (recovered bool, err error) {
 			label, emb.Dim(), emb.Name(), c.dim, c.name)
 	}
 
-	c.mu.Lock()
-	c.providers = append([]namedEmbedder{{label: label, emb: emb}}, c.providers...)
-	c.mu.Unlock()
+	// 拷贝-修改-交换：读侧永不阻塞，也不需要再复制。
+	for {
+		cur := c.snapshot()
+		next := make([]namedEmbedder, 0, len(cur)+1)
+		next = append(next, namedEmbedder{label: label, emb: emb})
+		next = append(next, cur...)
+		if c.providers.CompareAndSwap(c.providers.Load(), &next) {
+			break
+		}
+	}
 	c.active.Store(0)
 	c.note.Store(chainNote{})
 	return true, nil

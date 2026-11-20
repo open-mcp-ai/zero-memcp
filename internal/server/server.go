@@ -180,6 +180,8 @@ type Server struct {
 
 	// syncState 是后台对等同步的进程内状态（冲突队列、上次同步时间）。
 	syncState syncState
+	// workSync 是工作层同步的水位记录。
+	workSync *workSyncState
 
 	// resources 是资源变更订阅中心（MCP subscriptions/listen）。
 	resources *resourceHub
@@ -459,6 +461,7 @@ func New(cfg Config) (*Server, error) {
 		listens:   FromConfig(listenBlocks(cfgFile)),
 		fanouts:   newFanoutHub(),
 		resources: newResourceHub(),
+		workSync:  newWorkSyncState(),
 		done:      make(chan struct{}),
 		// 默认视为「没有维护循环」：New 之后没 Start 就 Close 的路径
 		// （测试里很常见）不该在这里永久阻塞。
@@ -740,6 +743,10 @@ func (s *Server) muxFor(blk ListenBlock) http.Handler {
 	mux.HandleFunc("/recall", s.handleRecall)
 	mux.HandleFunc("/mcp", s.handleMCP)
 	mux.HandleFunc("/repos/", s.handleGitHTTP)
+	mux.HandleFunc("/sync/work/pull", s.handleWorkPull)
+	mux.HandleFunc("/sync/work/blob", s.handleWorkBlob)
+	mux.HandleFunc("/sync/work/blob/put", s.handleWorkPutBlob)
+	mux.HandleFunc("/sync/work/push", s.handleWorkPush)
 	return &portPolicy{blk: blk, next: mux}
 }
 

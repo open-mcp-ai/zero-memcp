@@ -16,7 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,20 +27,29 @@ import (
 
 // seenBodies 记录服务端收到的请求体，用来证明客户端真的走了 v2 命令。
 type seenBodies struct {
-	mu   sync.Mutex
-	list []string
+	list atomic.Pointer[[]string]
 }
 
 func (b *seenBodies) add(raw string) {
-	b.mu.Lock()
-	b.list = append(b.list, raw)
-	b.mu.Unlock()
+	for {
+		cur := b.snapshot()
+		next := append([]string(nil), cur...)
+		next = append(next, raw)
+		if b.list.CompareAndSwap(b.list.Load(), &next) {
+			return
+		}
+	}
+}
+
+func (b *seenBodies) snapshot() []string {
+	if p := b.list.Load(); p != nil {
+		return *p
+	}
+	return nil
 }
 
 func (b *seenBodies) has(sub string) bool {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for _, item := range b.list {
+	for _, item := range b.snapshot() {
 		if strings.Contains(item, sub) {
 			return true
 		}

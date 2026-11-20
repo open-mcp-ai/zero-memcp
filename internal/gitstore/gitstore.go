@@ -96,6 +96,8 @@ type Repo struct {
 	writerDown   chan struct{} // worker 退出后关闭，Close 等它
 	writerDead   bool          // 队列已关，不再接受新投递
 	patrol       patrolConfig
+	// backpressure 统计队列满导致的等待次数（见 enqueue）。
+	backpressure atomic.Int64
 }
 
 type fsHolder struct{ fs FS }
@@ -220,8 +222,21 @@ func (r *Repo) lockNode(ref, dir string) (func(), error) {
 }
 
 const (
-	dirtyQueueCapacity = 256
+	// dirtyQueueCapacity 是队列条数上限。
+	//
+	// 256 太少：一轮会话生成几十条推理链，或者批量导入脚本连写几千条，
+	// worker 只要慢几毫秒，第 257 条就会被直接拒绝。调用方不想要失败，
+	// 它只是发得比落盘快了一点。1024 条 × 平均几 KB 仍在几 MB 量级，
+	// 内存代价可以忽略。
+	dirtyQueueCapacity = 1024
 	dirtyQueueMaxBytes = 64 << 20
+
+	// dirtyQueueWaitTimeout 是队列满时的背压等待上限。
+	//
+	// 满了先等 worker 排水（通常几毫秒），而不是立刻把失败推给调用方。
+	// 但必须有上限：磁盘真卡死或写满时，无限等待会让调用方挂在那里，
+	// 那比报错更难排查。超时才报错，且错误里带上真实占用。
+	dirtyQueueWaitTimeout = 5 * time.Second
 )
 
 // Open 打开一个裸仓库。目录不存在时报错，不自动创建——
@@ -885,26 +900,61 @@ func (r *Repo) Write(ref, path string, data []byte, mode Mode) error {
 	cp := make([]byte, len(data))
 	copy(cp, data)
 
-	release, lerr := r.lockWriter("enqueue-write")
-	if lerr != nil {
-		return lerr
-	}
-	defer release()
-	if r.writerDead {
-		return fmt.Errorf("repository %s is closed; refusing new writes", filepath.Base(r.Path))
-	}
-	r.initDirtyWriter()
-	queuedSize := r.writerSize.Load()
-	if len(r.writerCh) >= dirtyQueueCapacity || queuedSize+size > dirtyQueueMaxBytes {
-		return fmt.Errorf("dirty write queue is full (%d pending / %d bytes); refusing new writes, retry later", len(r.writerCh), queuedSize)
-	}
-	r.writerSize.Add(size)
-	select {
-	case r.writerCh <- dirtyTask{op: 'W', ref: ref, path: path, data: cp, mode: mode, size: size}:
-		return nil
-	default:
-		r.writerSize.Add(-size)
-		return fmt.Errorf("dirty write queue is full; refusing new writes, retry later")
+	return r.enqueue(dirtyTask{op: 'W', ref: ref, path: path, data: cp, mode: mode, size: size})
+}
+
+// enqueue 把一条任务投进写者队列，队列满时先背压等待。
+//
+// 为什么不是「满了就报错」：写入是记忆服务的主动作，调用方（agent 插件、
+// 批量导入、对端同步）几乎不可能自己实现「等一会儿再试」。一把拒绝就等于
+// 让一次正常写入失败，而失败原因（队列满 256 条）对它毫无意义。
+//
+// 为什么要留超时：磁盘写满或卡死时，worker 永远排不出空位。无限等待会让
+// 调用方永久挂住，那种故障比报错难排查一个数量级。5 秒足够吸收任何正常
+// 抖动，之后如实报告。
+func (r *Repo) enqueue(task dirtyTask) error {
+	deadline := time.Now().Add(dirtyQueueWaitTimeout)
+	waited := false
+	for {
+		release, lerr := r.lockWriter("enqueue")
+		if lerr != nil {
+			return lerr
+		}
+		if r.writerDead {
+			release()
+			return fmt.Errorf("repository %s is closed; refusing new writes", filepath.Base(r.Path))
+		}
+		r.initDirtyWriter()
+
+		queued := len(r.writerCh)
+		queuedSize := r.writerSize.Load()
+		fits := queued < dirtyQueueCapacity && queuedSize+task.size <= dirtyQueueMaxBytes
+		if fits {
+			r.writerSize.Add(task.size)
+			select {
+			case r.writerCh <- task:
+				release()
+				return nil
+			default:
+				r.writerSize.Add(-task.size)
+				fits = false
+			}
+		}
+		release()
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("write queue stayed full for %s (%d pending / %d bytes, capacity %d / %d bytes); "+
+				"the disk may be stalled or full", dirtyQueueWaitTimeout, queued, queuedSize,
+				dirtyQueueCapacity, dirtyQueueMaxBytes)
+		}
+		if !waited {
+			waited = true
+			// 只在真的等过时才计数：正常路径不该产生任何可观测开销。
+			// 这个计数是排查「写入变慢」的唯一线索——它会出现在 status 里。
+			r.backpressure.Add(1)
+		}
+		// 让出令牌再睡：持有令牌睡会挡住所有其他写入者。
+		time.Sleep(time.Millisecond)
 	}
 }
 
@@ -1656,24 +1706,9 @@ func (r *Repo) Delete(ref, path string) error {
 	if err := validPath(path); err != nil {
 		return err
 	}
-	release, lerr := r.lockWriter("enqueue-delete")
-	if lerr != nil {
-		return lerr
-	}
-	defer release()
-	if r.writerDead {
-		return fmt.Errorf("repository %s is closed; refusing delete: %s", filepath.Base(r.Path), path)
-	}
-	r.initDirtyWriter()
-	if len(r.writerCh) >= dirtyQueueCapacity {
-		return fmt.Errorf("dirty write queue is full; refusing delete: %s", path)
-	}
-	select {
-	case r.writerCh <- dirtyTask{op: 'D', ref: ref, path: path}:
-		return nil
-	default:
-		return fmt.Errorf("dirty write queue is full; refusing delete: %s", path)
-	}
+	// 令牌与 writerDead 检查都在 enqueue 里做。这里**不能**先拿一次：
+	// lockWriter 是单槽令牌，重入会自己等自己（实测卡满 30 秒超时）。
+	return r.enqueue(dirtyTask{op: 'D', ref: ref, path: path})
 }
 
 // Deleted 返回某分支待提交的删除路径。
@@ -2042,4 +2077,9 @@ func (r *Repo) listAtCommit(sha string) ([]Entry, error) {
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Path < list[j].Path })
 	return list, nil
+}
+
+// BackpressureCount 返回该仓库因为队列满而等待过的次数。
+func (r *Repo) BackpressureCount() int64 {
+	return r.backpressure.Load()
 }

@@ -24,9 +24,20 @@ type File struct {
 	Projects []Project
 	Access   []AccessRule
 	Remotes  []Remote
+	Erase    EraseConfig
+	AuthKeys []AuthKey
 
 	// Path 是它被读出来的位置，仅用于错误信息与日志。
 	Path string
+}
+
+// EraseConfig 控制世界树改写（erase/replace）的第二道门。
+//
+// 配了 public_key 或 require_ticket = true 后，光有 x 能力令牌还不够，
+// 每次改写必须附带持私钥人现场签出的单次票据。
+type EraseConfig struct {
+	PublicKey     string
+	RequireTicket bool
 }
 
 // Semantic 是本地语义向量检索配置。
@@ -288,15 +299,17 @@ var knownKeys = map[string]map[string]bool{
 		"lib": true, "model_path": true, "vocab": true,
 		"model_rev": true, "lang": true, "gate_threshold": true, "index_dir": true,
 	},
-	"commit":  {"interval": true, "count": true},
-	"gc":      {"interval": true},
-	"sync":    {"interval": true, "disabled": true},
-	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
-	"group":   {"name": true, "members": true},
-	"project": {"name": true, "owner": true, "group": true, "mode": true},
-	"access":  {"user": true, "project": true, "branch": true, "perm": true},
-	"listen":  {"addr": true, "allow": true, "require": true, "mount": true, "webui": true, "tls_cert": true, "tls_key": true},
-	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
+	"commit":   {"interval": true, "count": true},
+	"gc":       {"interval": true},
+	"sync":     {"interval": true, "disabled": true},
+	"erase":    {"public_key": true, "require_ticket": true},
+	"user":     {"name": true, "groups": true, "root": true, "pwd": true},
+	"group":    {"name": true, "members": true},
+	"project":  {"name": true, "owner": true, "group": true, "mode": true},
+	"access":   {"user": true, "project": true, "branch": true, "perm": true},
+	"auth.key": {"name": true, "public_key": true, "caps": true, "root": true},
+	"listen":   {"addr": true, "allow": true, "require": true, "mount": true, "webui": true, "tls_cert": true, "tls_key": true},
+	"remote":   {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
 }
 
 // checkKeys 拒绝未知分节与未知键。
@@ -558,6 +571,16 @@ func ParseFile(raw []byte) (*File, error) {
 		f.Remotes = append(f.Remotes, rm)
 	}
 
+	if sec, ok := doc.Sections["erase"]; ok {
+		if f.Erase.PublicKey, err = str(sec, "[erase]", "public_key"); err != nil {
+			return nil, err
+		}
+		if v, err := boolean(sec, "[erase]", "require_ticket"); err != nil {
+			return nil, err
+		} else {
+			f.Erase.RequireTicket = v
+		}
+	}
 	if sec, ok := doc.Sections["sync"]; ok {
 		if v, err := dur(sec, "sync", "interval"); err != nil {
 			return nil, err
@@ -1164,4 +1187,18 @@ func ExpandHome(p string) string {
 		return p
 	}
 	return filepath.Join(home, rest)
+}
+
+// AuthKey 是配置里预置的主人公钥（信任锚）。
+//
+// 为什么允许配多把：
+//
+//	实际组织里人不是孤立的——有根钥（root = true，全权）、
+//	有运维钥（只给 caps = ["rule"] 改规则）、有归档钥（caps = ["erase"]）。
+//	每把钥的名字进审计日志，于是一眼看出是哪个人、哪台离线设备签的字。
+type AuthKey struct {
+	Name      string
+	PublicKey string
+	Caps      []string
+	Root      bool
 }

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
@@ -35,6 +36,13 @@ func (s *Server) execErase(rest string, c Caller, defaultBranch string, withRepl
 		return TermResult{}, fmt.Errorf("erase syntax: erase <project>[@<branch>]/<path>")
 	}
 
+	// 抽出票据参数（--nonce / --expires / --sig），其余部分才是命令正文。
+	tk, restWithoutTicket, perr := extractTicketFlags(rest)
+	if perr != nil {
+		return TermResult{}, perr
+	}
+	rest = restWithoutTicket
+
 	// replace 的正文用 `-- <内容>` 分隔，与 write 完全一致；
 	// payload 变量在 restorePayload 里还原（多行正文必须走 $VAR）。
 	var replacement []byte
@@ -58,6 +66,16 @@ func (s *Server) execErase(rest string, c Caller, defaultBranch string, withRepl
 		return TermResult{}, fmt.Errorf("erase requires the x capability (rewrite history); your cap is %q", c.Cap)
 	}
 
+	action := capErase
+	if withReplacement {
+		action = capReplace
+	}
+	if s.masterKeys != nil && tk.nonce != "" {
+		if _, used := s.masterKeys.used.Load(tk.nonce); used {
+			return TermResult{}, fmt.Errorf("authorization ticket already used (nonce %s) — tickets are single-use", tk.nonce)
+		}
+	}
+
 	project, branch, path, err := s.parseBranchAddr(addr)
 	if err != nil {
 		return TermResult{}, err
@@ -74,12 +92,54 @@ func (s *Server) execErase(rest string, c Caller, defaultBranch string, withRepl
 		return TermResult{}, err
 	}
 
+	// 防重放前置检查必须**先于**对象查找。
+	//
+	// 为什么顺序重要：抹除成功后文件就没了，如果先 Stat 再验票，
+	// 重放一张旧票据会得到「not found」而不是「票据已用过」——
+	// 看起来无害，但一旦对象从备份恢复回同一路径，那张旧票据就又能用了。
+	// 授权检查先于对象查找，语义才对。
 	entry, found, err := repo.Stat(branch, path)
 	if err != nil {
 		return TermResult{}, err
 	}
 	if !found {
 		return TermResult{}, fmt.Errorf("%s:%s not found on branch %s", project, path, branch)
+	}
+
+	// 第二道门：主人用自己的私钥签出的单次授权票据。
+	//
+	// 钥的权限位在这里生效：只给了 caps = ["rule"] 的运维钥，
+	// 即使签名合法也**不能**批准 erase——「能用」和「该用」是两件事。
+	if s.masterKeys != nil && s.masterKeys.count() > 0 {
+		if tk.nonce == "" || tk.sig == "" {
+			ticket := s.issueEraseTicket(project, branch, path, entry.Hash, newTicketNonce())
+			cmdName := "erase"
+			if withReplacement {
+				cmdName = "replace"
+			}
+			return TermResult{
+				Text: "destructive operation requires an authorization ticket.\n\n" +
+					"Sign exactly the text between the two marker lines below with your private key\n" +
+					"(do NOT include the markers or any blank line):\n\n" +
+					"-----BEGIN PAYLOAD-----\n" +
+					ticket.Payload + "\n" +
+					"-----END PAYLOAD-----\n\n" +
+					fmt.Sprintf("then re-run:\n"+
+						"  %s %s@%s/%s --nonce %s --sig <base64-ed25519-signature>\n\n"+
+						"expires: %s (single use)",
+						cmdName, project, branch, path, ticket.Nonce,
+						time.Unix(ticket.ExpiresAt, 0).Format(time.RFC3339)),
+				Structured: map[string]any{"ticket": ticket, "requires_signature": true, "action": action},
+			}, nil
+		}
+		payload := eraseTicketPayload(entry.Hash, project, branch, path, tk.nonce, s.ticketExpiry(tk.nonce))
+		who, aerr := s.masterKeys.authorize(action, payload, tk.sig)
+		if aerr != nil {
+			return TermResult{}, aerr
+		}
+		s.masterKeys.used.Store(tk.nonce, time.Now().Unix())
+		s.masterKeys.issued.Delete(tk.nonce)
+		s.logf("audit: %s authorized by master key %q on %s@%s/%s", action, who, project, branch, path)
 	}
 
 	rep, err := repo.EraseBlob(branch, entry.Hash, replacement)
@@ -152,4 +212,23 @@ func (s *Server) auditErase(c Caller, project, branch string, rep gitstore.Erase
 		return
 	}
 	s.logf("audit: erase %s", string(raw))
+}
+
+// betweenMarkers 取出服务端挑战里两个分隔标记之间的待签文本。
+//
+// 存在的理由：这是「人真实操作」的可执行版本——复制标记之间的内容去签名。
+// 测试照这条路走，才能证明那条提示是能照着做成功的。
+func betweenMarkers(text string) string {
+	const begin = "-----BEGIN PAYLOAD-----"
+	const end = "-----END PAYLOAD-----"
+	i := strings.Index(text, begin)
+	if i < 0 {
+		return ""
+	}
+	rest := text[i+len(begin):]
+	j := strings.Index(rest, end)
+	if j < 0 {
+		return ""
+	}
+	return strings.TrimPrefix(strings.TrimSuffix(rest[:j], "\n"), "\n")
 }

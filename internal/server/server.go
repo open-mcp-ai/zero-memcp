@@ -179,6 +179,8 @@ type Server struct {
 	semanticMaint semanticMaintainer
 	// liveIdx 持有多套同时加载的向量索引（中文模型 + 英文模型并存时各占一套）。
 	liveIdx *liveIndexes
+	// masterKeys 是主人密钥环：多公钥 + 权限位 + 根钥派生。
+	masterKeys *masterKeyring
 
 	// syncState 是后台对等同步的进程内状态（冲突队列、上次同步时间）。
 	syncState syncState
@@ -462,12 +464,13 @@ func New(cfg Config) (*Server, error) {
 		uiLimiter:     newUILoginLimiter(),
 		lock:          startupLock,
 
-		listens:   FromConfig(listenBlocks(cfgFile)),
-		fanouts:   newFanoutHub(),
-		resources: newResourceHub(),
-		workSync:  newWorkSyncState(),
-		liveIdx:   &liveIndexes{},
-		done:      make(chan struct{}),
+		listens:    FromConfig(listenBlocks(cfgFile)),
+		fanouts:    newFanoutHub(),
+		resources:  newResourceHub(),
+		workSync:   newWorkSyncState(),
+		liveIdx:    &liveIndexes{},
+		masterKeys: &masterKeyring{},
+		done:       make(chan struct{}),
 		// 默认视为「没有维护循环」：New 之后没 Start 就 Close 的路径
 		// （测试里很常见）不该在这里永久阻塞。
 		maintainDone: func() chan struct{} {
@@ -517,6 +520,7 @@ func New(cfg Config) (*Server, error) {
 
 	// 语义向量侧与 BM25 平行异步启动。
 	// 缺失模型配置时静默跳过，不会阻碍服务正常启动。
+	s.loadMasterKeys()
 	s.initSemantic()
 	startupStage("semantic init returned")
 

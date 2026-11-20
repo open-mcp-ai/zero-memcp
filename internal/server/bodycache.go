@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
 )
@@ -134,4 +135,72 @@ func (c *bodyCache) hitCount() int64 {
 		return 0
 	}
 	return c.hits.Load()
+}
+
+// warmBodyCache 在后台低速读完全库正文，把解压代价从用户请求挪走。
+//
+// # 为什么需要
+//
+// 快照恢复出的 Block 只带元数据（Path/Size/Hash/Layer），Body 为空。
+// 于是重启后第一次全库 grep 要把 38,183 个 Git 对象逐个解压：
+// 3060 hub 实测 79.8 秒，而缓存热了之后同样的查询只要 232 毫秒。
+// 那 79 秒不是检索贵，是缓存还没热——但它落在用户第一次检索上。
+//
+// # 为什么放后台且限速
+//
+// 启动阶段做的话，等于把 79 秒挪到「服务不可用」窗口里，更糟。
+// 限速是为了不和正在服务的请求抢磁盘：每读完一篇让出一次调度，
+// 机械盘上这样几乎不影响前台延迟。
+//
+// # 为什么不怕浪费
+//
+// 只读当前树上真实存在的块（Block.Read 会走脏层优先，读到最新内容）。
+// 缓存键是 blob 哈希，内容变了旧条目自然不再命中，所以预热不会
+// 「把过期内容写进缓存」——它写进去的就是当下正确的内容。
+func (s *Server) warmBodyCache() {
+	if s.bodies == nil || s.bodies.budget <= 0 {
+		return
+	}
+	go func() {
+		// 启动后先等一会儿：让前几个用户请求先拿到 CPU 与磁盘。
+		select {
+		case <-time.After(3 * time.Second):
+		case <-s.done:
+			return
+		}
+		s.warmBodyCacheNow()
+	}()
+}
+
+// warmBodyCacheNow 同步跑一遍预热（测试直接调它，避免等启动延迟）。
+func (s *Server) warmBodyCacheNow() {
+warm:
+	for _, tr := range s.treeList() {
+		for _, b := range tr.Blocks {
+			if b.Hidden || b.Hash == "" {
+				continue
+			}
+			// 预算已满：再读也进不了缓存，纯粹白烧磁盘。
+			if s.bodies.used.Load() >= s.bodies.budget {
+				break warm
+			}
+			// 已经有缓存就跳过，不重复读盘。
+			if _, ok := s.bodies.get(b.Hash); ok {
+				continue
+			}
+			if _, err := s.readBlock(b); err != nil {
+				continue
+			}
+			select {
+			case <-s.done:
+				return
+			default:
+			}
+			// 让出调度：后台任务不该和正在服务的请求抢时间片。
+			time.Sleep(time.Millisecond)
+		}
+	}
+	stored, hits, skipped, usedMB := s.bodies.stats()
+	startupStage("body cache warmed: %d block(s), %.1f MB (hits=%d skipped=%d)",
+		stored, usedMB, hits, skipped)
 }

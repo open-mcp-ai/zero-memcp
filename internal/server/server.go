@@ -2031,6 +2031,14 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		out, err := s.execDelete(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
+	case "erase":
+		// erase <project>@<branch>/<path> (世界树改写：blob 级彻底抹除)
+		return s.execErase(rest, c, defaultBranch, false)
+
+	case "replace":
+		// replace <project>@<branch>/<path> -- <content> (世界树改写：全链替换为占位文本)
+		return s.execErase(rest, c, defaultBranch, true)
+
 	case "lock":
 		// lock <project>@<branch>
 		out, err := s.execLock(rest, c)

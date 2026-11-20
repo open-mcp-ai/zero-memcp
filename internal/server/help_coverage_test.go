@@ -17,7 +17,7 @@ func TestEveryDispatchedVerbHasHelp(t *testing.T) {
 	dispatchVerbs := []string{
 		"help", "recall", "read", "put", "remind", "trees", "since",
 		"remote-key", "remote-secret", "remote", "fetch", "push", "sync",
-		"branch", "tag", "cp", "mv", "chmod", "delete",
+		"branch", "tag", "cp", "mv", "chmod", "delete", "erase", "replace",
 		"lock", "unlock", "archive", "reset", "diff", "ref",
 		"commit", "write", "config", "reload", "whoami", "users", "status", "grep", "log", "ls",
 	}

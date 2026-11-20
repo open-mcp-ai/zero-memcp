@@ -171,6 +171,21 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Usage:  "delete <p>@<br>/<path>...",
 	},
 	{
+		Name:   "erase",
+		Detail: detail_erase,
+		Kind:   term.KindFlags,
+		Target: true,
+		Usage:  "erase <p>@<br>/<path>",
+	},
+	{
+		Name:        "replace",
+		Detail:      detail_replace,
+		Kind:        term.KindPayload,
+		Target:      true,
+		PayloadType: term.PayloadVar,
+		Usage:       "replace <p>@<br>/<path> $TEXT",
+	},
+	{
 		Name:  "deleted",
 		Kind:  term.KindFlags,
 		Usage: "deleted <project>",

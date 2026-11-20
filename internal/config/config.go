@@ -25,6 +25,7 @@ type File struct {
 	Access   []AccessRule
 	Remotes  []Remote
 	Erase    EraseConfig
+	Search   SearchConfig
 	AuthKeys []AuthKey
 
 	// Path 是它被读出来的位置，仅用于错误信息与日志。
@@ -571,6 +572,14 @@ func ParseFile(raw []byte) (*File, error) {
 		f.Remotes = append(f.Remotes, rm)
 	}
 
+	if sec, ok := doc.Sections["search"]; ok {
+		if v, err := integer(sec, "[search]", "body_cache_mb"); err != nil {
+			return nil, err
+		} else {
+			f.Search.BodyCacheMB = int(v)
+			f.Search.bodyCacheSet = true
+		}
+	}
 	if sec, ok := doc.Sections["erase"]; ok {
 		if f.Erase.PublicKey, err = str(sec, "[erase]", "public_key"); err != nil {
 			return nil, err
@@ -1201,4 +1210,36 @@ type AuthKey struct {
 	PublicKey string
 	Caps      []string
 	Root      bool
+}
+
+// SearchConfig 控制全文检索的资源占用。
+type SearchConfig struct {
+	// BodyCacheMB 是正文缓存预算（MB）。0 表示禁用，-1 表示用默认值。
+	//
+	// 为什么需要它：grep 不带 scope 时要把全库正文读出来跑正则，
+	// 实测 2,000 块 594ms、且第二次仍然 594ms——每次都在从 Git 对象里
+	// 重新 zlib 解压。按线性外推，38,000 篇约 11 秒，而 MCP 调用会超时。
+	//
+	// 缓存键是 blob 哈希，所以不存在失效问题；预算到顶就停止收新条目，
+	// 已有的继续服务。小盒子设小甚至设 0，正确性不变、只是慢回去。
+	BodyCacheMB int
+
+	// bodyCacheSet 记录配置里到底写没写这一项：
+	// 没写 → 用默认值；写了 0 → 明确禁用（小盒子的选择）。
+	bodyCacheSet bool
+}
+
+// BodyCacheBudget 返回生效的正文缓存预算（字节）。
+//
+// 缺省 512MB：38,000 篇 × 平均 3~5KB ≈ 150MB，一次全库 grep 就能全部
+// 装下，之后重复 grep 直接命中内存。小盒子把 body_cache_mb 设小甚至 0，
+// 正确性不变，只是每次重新解压。
+func (c SearchConfig) BodyCacheBudget() int64 {
+	if !c.bodyCacheSet {
+		return 512 << 20
+	}
+	if c.BodyCacheMB <= 0 {
+		return 0
+	}
+	return int64(c.BodyCacheMB) << 20
 }

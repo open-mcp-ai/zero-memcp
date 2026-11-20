@@ -188,6 +188,8 @@ type Server struct {
 	workSync *workSyncState
 	// patrol 是对象回读巡检状态（见 patrol_loop.go）。
 	patrol patrolState
+	// bodies 是按 blob 哈希的正文缓存（见 bodycache.go）。
+	bodies *bodyCache
 
 	// resources 是资源变更订阅中心（MCP subscriptions/listen）。
 	resources *resourceHub
@@ -470,6 +472,7 @@ func New(cfg Config) (*Server, error) {
 		workSync:   newWorkSyncState(),
 		liveIdx:    &liveIndexes{},
 		masterKeys: &masterKeyring{},
+		bodies:     newBodyCache(searchBodyBudget(cfgFile)),
 		done:       make(chan struct{}),
 		// 默认视为「没有维护循环」：New 之后没 Start 就 Close 的路径
 		// （测试里很常见）不该在这里永久阻塞。
@@ -2195,6 +2198,9 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		}
 		if pl := s.patrolLines(); len(pl) > 0 {
 			text += "\n" + strings.Join(pl, "\n")
+		}
+		if bl := s.bodies.statusLine(); bl != "" && c.Mount.Empty() {
+			text += "\n" + bl
 		}
 		if s.fanouts != nil && c.Mount.Empty() {
 			if fanLines := s.fanouts.describeLines(); len(fanLines) > 0 {

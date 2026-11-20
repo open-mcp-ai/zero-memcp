@@ -24,9 +24,20 @@ type File struct {
 	Projects []Project
 	Access   []AccessRule
 	Remotes  []Remote
+	Erase    EraseConfig
+	AuthKeys []AuthKey
 
 	// Path 是它被读出来的位置，仅用于错误信息与日志。
 	Path string
+}
+
+// EraseConfig 控制世界树改写（erase/replace）的第二道门。
+//
+// 配了 public_key 或 require_ticket = true 后，光有 x 能力令牌还不够，
+// 每次改写必须附带持私钥人现场签出的单次票据。
+type EraseConfig struct {
+	PublicKey     string
+	RequireTicket bool
 }
 
 // Semantic 是本地语义向量检索配置。
@@ -61,7 +72,7 @@ type Semantic struct {
 type SemanticProvider struct {
 	// Label 是诊断用的名字（"3060"、"local"），出现在日志与 status。
 	Label string
-	// Kind 是 "http" 或 "onnx"。
+	// Kind 是 "http"、"static" 或 "onnx"。
 	Kind string
 	// Endpoint 是 HTTP 后端的基地址。
 	Endpoint string
@@ -77,6 +88,16 @@ type SemanticProvider struct {
 	LibPath   string
 	ModelPath string
 	VocabPath string
+	// ModelRev 是该模型权重的修订号（如 "sha256:abc..." 或量化版本 "q4_k"）。
+	// 变更它会自动让旧缓存判过期重建，防止新旧权重混用导致空间失真。
+	ModelRev string
+	// Lang 是该后端专长语言（如 "zh"、"en"、"multilingual"），空表示通用。
+	Lang string
+	// GateThreshold 是给唤醒闸门标定的绝对阈值。各模型分数区间不同，
+	// 必须随模型走（例如 bge-m3 用 0.025，bge-small 可能用 0.41）。
+	GateThreshold float64
+	// IndexDir 手动指定落盘子目录（不填则由 Model+ModelRev 自动推导）。
+	IndexDir string
 }
 
 // Server 是监听与身份。
@@ -108,6 +129,9 @@ type ListenBlock struct {
 	Mount []MountSpec
 	// WebUI 为真时，这个端口才注册管理面路由，默认关闭。
 	WebUI bool
+	// TLSCert 与 TLSKey 指向服务端私有证书与私钥。
+	TLSCert string
+	TLSKey  string
 }
 
 type MountSpec struct {
@@ -207,6 +231,10 @@ type Remote struct {
 	HTTPUser string
 	// HTTPToken 是服务端密钥库里的 token 名，不是 token 本身。
 	HTTPToken string
+	// TLSCA 指向私有根证书路径。
+	TLSCA string
+	// TLSPin 是对端证书公钥的 SHA-256 指纹（显式 pin，防冒名）。
+	TLSPin string
 	// AutoSync 为真时，后台同步循环会把这条远端纳入自动 fetch/merge/push。
 	//
 	// 缺省（false）是保守的：配了一条远端不等于授权它自动双向同步。
@@ -269,16 +297,19 @@ var knownKeys = map[string]map[string]bool{
 		"label": true, "kind": true, "endpoint": true, "model": true,
 		"dim": true, "api_key": true, "timeout": true,
 		"lib": true, "model_path": true, "vocab": true,
+		"model_rev": true, "lang": true, "gate_threshold": true, "index_dir": true,
 	},
 	"commit":   {"interval": true, "count": true},
-	"gc":      {"interval": true},
-	"sync":    {"interval": true, "disabled": true},
-	"user":    {"name": true, "groups": true, "root": true, "pwd": true},
-	"group":   {"name": true, "members": true},
-	"project": {"name": true, "owner": true, "group": true, "mode": true},
-	"access":  {"user": true, "project": true, "branch": true, "perm": true},
-	"listen":  {"addr": true, "allow": true, "require": true, "mount": true, "webui": true},
-	"remote":  {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true},
+	"gc":       {"interval": true},
+	"sync":     {"interval": true, "disabled": true},
+	"erase":    {"public_key": true, "require_ticket": true},
+	"user":     {"name": true, "groups": true, "root": true, "pwd": true},
+	"group":    {"name": true, "members": true},
+	"project":  {"name": true, "owner": true, "group": true, "mode": true},
+	"access":   {"user": true, "project": true, "branch": true, "perm": true},
+	"auth.key": {"name": true, "public_key": true, "caps": true, "root": true},
+	"listen":   {"addr": true, "allow": true, "require": true, "mount": true, "webui": true, "tls_cert": true, "tls_key": true},
+	"remote":   {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
 }
 
 // checkKeys 拒绝未知分节与未知键。
@@ -429,11 +460,28 @@ func ParseFile(raw []byte) (*File, error) {
 		if p.VocabPath, err = str(sec, ctx, "vocab"); err != nil {
 			return nil, err
 		}
+		if p.ModelRev, err = str(sec, ctx, "model_rev"); err != nil {
+			return nil, err
+		}
+		if p.Lang, err = str(sec, ctx, "lang"); err != nil {
+			return nil, err
+		}
+		if p.IndexDir, err = str(sec, ctx, "index_dir"); err != nil {
+			return nil, err
+		}
+		if v, err := number(sec, ctx, "gate_threshold"); err != nil {
+			return nil, err
+		} else {
+			p.GateThreshold = v
+		}
 		if p.Kind == "" {
 			p.Kind = "http"
 		}
-		if p.Kind != "http" && p.Kind != "onnx" {
-			return nil, fmt.Errorf("[[semantic.provider]] kind: want http or onnx, got %q", p.Kind)
+		if p.Kind != "http" && p.Kind != "static" && p.Kind != "onnx" {
+			return nil, fmt.Errorf("[[semantic.provider]] kind: want http, static, or onnx, got %q", p.Kind)
+		}
+		if p.Kind == "static" && p.ModelPath == "" {
+			return nil, fmt.Errorf("[[semantic.provider]] %q: kind=\"static\" requires model_path", p.Label)
 		}
 		if p.Kind == "http" && p.Endpoint == "" {
 			return nil, fmt.Errorf("[[semantic.provider]] %q: http provider requires endpoint", p.Label)
@@ -523,6 +571,16 @@ func ParseFile(raw []byte) (*File, error) {
 		f.Remotes = append(f.Remotes, rm)
 	}
 
+	if sec, ok := doc.Sections["erase"]; ok {
+		if f.Erase.PublicKey, err = str(sec, "[erase]", "public_key"); err != nil {
+			return nil, err
+		}
+		if v, err := boolean(sec, "[erase]", "require_ticket"); err != nil {
+			return nil, err
+		} else {
+			f.Erase.RequireTicket = v
+		}
+	}
 	if sec, ok := doc.Sections["sync"]; ok {
 		if v, err := dur(sec, "sync", "interval"); err != nil {
 			return nil, err
@@ -972,6 +1030,25 @@ func integer(sec map[string]Value, section, key string) (int64, error) {
 	return v.Int, nil
 }
 
+// number 读一个数值，整数与小数都收。
+//
+// 阈值（gate_threshold）是典型的「写成 0.025 才自然」的字段，
+// 强制整数会逼人写 25 再除 1000，那种换算迟早出错。
+func number(sec map[string]Value, section, key string) (float64, error) {
+	v, ok := sec[key]
+	if !ok {
+		return 0, nil
+	}
+	switch v.Kind {
+	case KindInt:
+		return float64(v.Int), nil
+	case KindFloat:
+		return v.Float, nil
+	default:
+		return 0, fmt.Errorf("%s in %s must be a number (line %d)", section, key, v.Line)
+	}
+}
+
 func boolean(sec map[string]Value, section, key string) (bool, error) {
 	v, ok := sec[key]
 	if !ok {
@@ -1110,4 +1187,18 @@ func ExpandHome(p string) string {
 		return p
 	}
 	return filepath.Join(home, rest)
+}
+
+// AuthKey 是配置里预置的主人公钥（信任锚）。
+//
+// 为什么允许配多把：
+//
+//	实际组织里人不是孤立的——有根钥（root = true，全权）、
+//	有运维钥（只给 caps = ["rule"] 改规则）、有归档钥（caps = ["erase"]）。
+//	每把钥的名字进审计日志，于是一眼看出是哪个人、哪台离线设备签的字。
+type AuthKey struct {
+	Name      string
+	PublicKey string
+	Caps      []string
+	Root      bool
 }

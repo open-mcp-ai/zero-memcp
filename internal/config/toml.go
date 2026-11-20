@@ -26,14 +26,17 @@ type Document struct {
 	Order []string
 }
 
-// Value 是一个配置值。只保留我们真正需要的四种。
+// Value 是一个配置值。只保留我们真正需要的五种。
 type Value struct {
-	Str  string
-	Int  int64
-	Bool bool
-	List []string
-	Kind Kind
-	Line int
+	Str string
+	Int int64
+	// Float 只在 KindFloat 时有效。分开存而不是统一用 float64，
+	// 是为了让「整数字段被人写了 1.5」仍然能被拒绝，而不是静默取整。
+	Float float64
+	Bool  bool
+	List  []string
+	Kind  Kind
+	Line  int
 }
 
 // Kind 说明这个值是什么类型。
@@ -42,6 +45,9 @@ type Kind int
 const (
 	KindString Kind = iota
 	KindInt
+	// KindFloat 覆盖 0.025 这类阈值字面量。整数仍归 KindInt，
+	// 于是「该写整数的键写了小数」依旧会报错。
+	KindFloat
 	KindBool
 	KindList
 )
@@ -50,6 +56,8 @@ func (v Value) String() string {
 	switch v.Kind {
 	case KindInt:
 		return strconv.FormatInt(v.Int, 10)
+	case KindFloat:
+		return strconv.FormatFloat(v.Float, 'g', -1, 64)
 	case KindBool:
 		if v.Bool {
 			return "true"
@@ -209,6 +217,12 @@ func parseValue(s string, lineNo int) (Value, error) {
 	// 整数
 	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
 		return Value{Int: n, Kind: KindInt, Line: lineNo}, nil
+	}
+	// 浮点（阈值这类字面量需要 0.025 这样的写法）。
+	// 只接受「带小数点」或「带指数」的形式，避免把 1e3 之外的东西
+	// 误判成浮点；ParseFloat 本身足够严格，这里靠它收口。
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return Value{Float: f, Kind: KindFloat, Line: lineNo}, nil
 	}
 
 	return Value{}, fmt.Errorf("line %d: unrecognized value %q (strings must be quoted)", lineNo, s)

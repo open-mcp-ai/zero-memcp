@@ -23,7 +23,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -66,64 +66,111 @@ func (r Rule) Key() string {
 // 读多写极少：每次请求都要判定，而改权限是几天一次的动作。
 // 所以内存里保存一份切片，写入时才落盘；读路径不碰文件系统。
 type Store struct {
-	path string
+	path  string
+	state atomic.Pointer[aclState]
+	// wmu 是一槽 channel 令牌，不保护任何字段，只做「写者串行化」。
+	//
+	// 用令牌而不是 sync.Mutex 的理由（见 termcp/AGENTS.md:31-41）：
+	//   - 持令牌者落盘时卡住，后到写者能靠超时退出，而不是无限期停在 Lock()；
+	//   - 读者完全不参与这把令牌——它们读 state.Load()，永远不排队。
+	// 换句话说：这把令牌的等待是有界的，而 Mutex 的等待没有上界。
+	wmu chan struct{}
+}
 
-	mu    sync.RWMutex
+// aclState 是规则表的一份**不可变**快照。
+//
+// 为什么不可变：读者拿到指针后不持锁、不复制就能直接用。
+// 写入方永远不修改已有快照，而是造一份新的再换进去（拷贝-修改-交换）。
+// 代价是一次写要复制 slices，换来的是读路径彻底无锁——而读是请求热路径，
+// 写是几天一次的动作。
+type aclState struct {
 	rules []Rule
 	// loadErr 记住上次读盘失败的原因，让 status 能回答「为什么一条规则都不生效」。
 	// 静默失败在这里代价极高：看起来像「有人把权限删了」。
 	loadErr error
 }
 
+// writeTimeout 是写者等令牌的上界。
+//
+// 它存在的意义：落盘卡住（磁盘满/杀软扫描/网络盘掉线）时，
+// 后来的写者得到明确错误，而不是把自己的 goroutine 永远挂在这里。
+const writeTimeout = 5 * time.Second
+
 // Open 绑定一个 JSON 文件并读入。文件不存在时视为空表——不是错误，
 // 因为「还没配过授权」和「授权文件坏了」是两件事，不能混在一起。
 func Open(path string) (*Store, error) {
-	s := &Store{path: path}
+	s := &Store{path: path, wmu: make(chan struct{}, 1)}
+	s.state.Store(&aclState{})
 	if err := s.Reload(); err != nil {
 		return nil, err
 	}
 	return s, nil
 }
 
-// Reload 重新读盘。文件不存在 → 空表。
-func (s *Store) Reload() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.reloadLocked()
+// snapshot 返回当前不可变快照。可能为 nil 的防御只给零值 Store 用。
+func (s *Store) snapshot() *aclState {
+	if st := s.state.Load(); st != nil {
+		return st
+	}
+	return &aclState{}
 }
 
-func (s *Store) reloadLocked() error {
-	s.loadErr = nil
-	if s.path == "" {
-		s.rules = nil
-		return nil
+// beginWrite 取写令牌。返回值必须在写完后调用，且只能调一次。
+//
+// 令牌只串行化**写者**：读者全程不碰它，所以落盘慢不会阻塞任何读。
+func (s *Store) beginWrite() (func(), error) {
+	select {
+	case s.wmu <- struct{}{}:
+		return func() { <-s.wmu }, nil
+	default:
 	}
-	raw, err := os.ReadFile(s.path)
-	if errors.Is(err, os.ErrNotExist) {
-		s.rules = nil
-		return nil
+	t := time.NewTimer(writeTimeout)
+	defer t.Stop()
+	select {
+	case s.wmu <- struct{}{}:
+		return func() { <-s.wmu }, nil
+	case <-t.C:
+		return nil, fmt.Errorf("acl: 写令牌等待超时（%v），有写者卡在落盘上", writeTimeout)
 	}
+}
+
+// Reload 重新读盘。文件不存在 → 空表。
+func (s *Store) Reload() error {
+	done, err := s.beginWrite()
 	if err != nil {
-		s.loadErr = err
 		return err
 	}
+	defer done()
+
+	if s.path == "" {
+		s.state.Store(&aclState{})
+		return nil
+	}
+	raw, rerr := os.ReadFile(s.path)
+	if errors.Is(rerr, os.ErrNotExist) {
+		s.state.Store(&aclState{})
+		return nil
+	}
+	if rerr != nil {
+		s.state.Store(&aclState{rules: s.snapshot().rules, loadErr: rerr})
+		return rerr
+	}
 	if len(strings.TrimSpace(string(raw))) == 0 {
-		s.rules = nil
+		s.state.Store(&aclState{})
 		return nil
 	}
 	var doc struct {
 		Rules []Rule `json:"rules"`
 	}
-	// 兼容「文件本身就是一个数组」的写法：手写时更省事。
-	if err := json.Unmarshal(raw, &doc); err != nil {
+	if jerr := json.Unmarshal(raw, &doc); jerr != nil {
 		var bare []Rule
-		if err2 := json.Unmarshal(raw, &bare); err2 != nil {
-			s.loadErr = err
-			return fmt.Errorf("parse %s: %w", s.path, err)
+		if jerr2 := json.Unmarshal(raw, &bare); jerr2 != nil {
+			s.state.Store(&aclState{rules: s.snapshot().rules, loadErr: jerr})
+			return fmt.Errorf("parse %s: %w", s.path, jerr)
 		}
 		doc.Rules = bare
 	}
-	s.rules = normalize(doc.Rules)
+	s.state.Store(&aclState{rules: normalize(doc.Rules)})
 	return nil
 }
 
@@ -183,18 +230,15 @@ func validPerm(p string) bool {
 
 // Rules 返回当前全部规则（副本，调用方随便改）。
 func (s *Store) Rules() []Rule {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	out := make([]Rule, len(s.rules))
-	copy(out, s.rules)
+	st := s.snapshot()
+	out := make([]Rule, len(st.rules))
+	copy(out, st.rules)
 	return out
 }
 
 // LoadErr 返回上次读盘失败的原因（nil 表示正常）。
 func (s *Store) LoadErr() error {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return s.loadErr
+	return s.snapshot().loadErr
 }
 
 // Lookup 判定某用户在某项目某分支上被授予的权限字母。
@@ -203,9 +247,7 @@ func (s *Store) LoadErr() error {
 // 注意「没授权」不等于「拒绝」——调用方还要决定没授权时是回落到
 // 配置的 mode，还是一律拒绝。这里只回答「这张表说了什么」。
 func (s *Store) Lookup(user, project, branch string) (string, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	return lookup(s.rules, user, project, branch)
+	return lookup(s.snapshot().rules, user, project, branch)
 }
 
 func lookup(rules []Rule, user, project, branch string) (string, bool) {
@@ -237,9 +279,7 @@ func lookup(rules []Rule, user, project, branch string) (string, bool) {
 // 判定只看 user，不看项目：管理权是实例级的，没有「只管这个项目」的
 // 半档——真的要分，那是另一个设计（每个项目一个 operator），不是这里。
 func (s *Store) IsAdmin(user string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	for _, r := range s.rules {
+	for _, r := range s.snapshot().rules {
 		if r.User == user && r.Admin {
 			return true
 		}
@@ -274,11 +314,16 @@ func (s *Store) Put(r Rule) (Rule, error) {
 	}
 	r.UpdatedAt = time.Now().Unix()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	next := make([]Rule, 0, len(s.rules)+1)
+	done, err := s.beginWrite()
+	if err != nil {
+		return Rule{}, err
+	}
+	defer done()
+
+	curRules := s.snapshot().rules
+	next := make([]Rule, 0, len(curRules)+1)
 	replaced := false
-	for _, cur := range s.rules {
+	for _, cur := range curRules {
 		if cur.Key() == r.Key() {
 			next = append(next, r)
 			replaced = true
@@ -289,7 +334,7 @@ func (s *Store) Put(r Rule) (Rule, error) {
 	if !replaced {
 		next = append(next, r)
 	}
-	if err := s.commitLocked(next); err != nil {
+	if err := s.commit(next); err != nil {
 		return Rule{}, err
 	}
 	return r, nil
@@ -305,11 +350,16 @@ func (s *Store) Delete(user, project, branch string) error {
 	}
 	key := Rule{User: user, Project: project, Branch: branch}.Key()
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	next := make([]Rule, 0, len(s.rules))
+	done, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer done()
+
+	curRules := s.snapshot().rules
+	next := make([]Rule, 0, len(curRules))
 	found := false
-	for _, cur := range s.rules {
+	for _, cur := range curRules {
 		if cur.Key() == key {
 			found = true
 			continue
@@ -319,7 +369,7 @@ func (s *Store) Delete(user, project, branch string) error {
 	if !found {
 		return ErrNotFound
 	}
-	return s.commitLocked(next)
+	return s.commit(next)
 }
 
 // Replace 整体替换（管理台一次保存多条时用）。
@@ -330,24 +380,27 @@ func (s *Store) Replace(rules []Rule) error {
 			return fmt.Errorf("perm %q must be a subset of rwx", r.Perm)
 		}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.commitLocked(clean)
+	done, err := s.beginWrite()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return s.commit(clean)
 }
 
-// commitLocked 先落盘再换内存。
+// commit 先落盘再换内存。
 //
 // 顺序不能反：先改内存再写盘的话，写盘失败时内存里就有一份磁盘上没有的
 // 授权，重启后权限「莫名其妙消失」，而日志里什么都没有。
-func (s *Store) commitLocked(next []Rule) error {
+// 写盘完成后用 atomic.Pointer 换入新快照，读者立即看到最新状态，0 阻塞。
+func (s *Store) commit(next []Rule) error {
 	sorted := normalize(next)
 	if s.path != "" {
 		if err := writeAtomic(s.path, sorted); err != nil {
 			return err
 		}
 	}
-	s.rules = sorted
-	s.loadErr = nil
+	s.state.Store(&aclState{rules: sorted})
 	return nil
 }
 

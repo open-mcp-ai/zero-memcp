@@ -9,6 +9,8 @@ package main
 import (
 	"fmt"
 	"os"
+
+	"github.com/open-mcp-ai/zero-memcp/internal/embed"
 )
 
 // version 由构建时注入：-ldflags "-X main.version=...".
@@ -19,7 +21,7 @@ func main() {
 	if len(args) > 0 {
 		switch args[0] {
 		case "version", "-V", "--version":
-			fmt.Printf("zero-memcp %s\n", version)
+			fmt.Printf("zero-memcp %s\n%s\n", version, embed.CapabilityLine())
 			return
 		case "help", "-h", "--help":
 			usage(os.Stdout)

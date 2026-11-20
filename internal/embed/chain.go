@@ -97,7 +97,7 @@ type ChainConfig struct {
 type ProviderConfig struct {
 	// Label 是诊断用的名字（"3060"、"local"），出现在日志和 status 里。
 	Label string
-	// Kind 是 "http" 或 "onnx"。
+	// Kind 是 "http"、"static" 或 "onnx"。
 	Kind string
 	// Model 是这个后端的模型标识。必须与链上其他后端一致。
 	Model string
@@ -193,6 +193,15 @@ func openProvider(pc ProviderConfig) (Embedder, error) {
 			APIKey:   pc.APIKey,
 			Timeout:  pc.Timeout,
 		})
+	case "static":
+		e, err := OpenStatic(StaticConfig{
+			ModelPath: pc.ModelPath,
+			Name:      pc.Model,
+		})
+		if err != nil {
+			return nil, err
+		}
+		return e, nil
 	case "onnx", "":
 		e, err := OpenLocal(Config{
 			LibPath:   pc.LibPath,
@@ -204,7 +213,7 @@ func openProvider(pc ProviderConfig) (Embedder, error) {
 		}
 		return e, nil
 	default:
-		return nil, fmt.Errorf("unknown provider kind %q (want http or onnx)", pc.Kind)
+		return nil, fmt.Errorf("unknown provider kind %q (want http, static, or onnx)", pc.Kind)
 	}
 }
 

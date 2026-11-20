@@ -61,7 +61,7 @@ type Semantic struct {
 type SemanticProvider struct {
 	// Label 是诊断用的名字（"3060"、"local"），出现在日志与 status。
 	Label string
-	// Kind 是 "http" 或 "onnx"。
+	// Kind 是 "http"、"static" 或 "onnx"。
 	Kind string
 	// Endpoint 是 HTTP 后端的基地址。
 	Endpoint string
@@ -432,8 +432,11 @@ func ParseFile(raw []byte) (*File, error) {
 		if p.Kind == "" {
 			p.Kind = "http"
 		}
-		if p.Kind != "http" && p.Kind != "onnx" {
-			return nil, fmt.Errorf("[[semantic.provider]] kind: want http or onnx, got %q", p.Kind)
+		if p.Kind != "http" && p.Kind != "static" && p.Kind != "onnx" {
+			return nil, fmt.Errorf("[[semantic.provider]] kind: want http, static, or onnx, got %q", p.Kind)
+		}
+		if p.Kind == "static" && p.ModelPath == "" {
+			return nil, fmt.Errorf("[[semantic.provider]] %q: kind=\"static\" requires model_path", p.Label)
 		}
 		if p.Kind == "http" && p.Endpoint == "" {
 			return nil, fmt.Errorf("[[semantic.provider]] %q: http provider requires endpoint", p.Label)

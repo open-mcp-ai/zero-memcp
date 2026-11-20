@@ -15,9 +15,9 @@ type fakeProvider struct {
 	calls int
 }
 
-func (f *fakeProvider) Dim() int        { return f.dim }
-func (f *fakeProvider) Name() string    { return "fake-" + f.label }
-func (f *fakeProvider) Close() error    { return nil }
+func (f *fakeProvider) Dim() int     { return f.dim }
+func (f *fakeProvider) Name() string { return "fake-" + f.label }
+func (f *fakeProvider) Close() error { return nil }
 func (f *fakeProvider) Embed(text string) ([]float32, error) {
 	f.calls++
 	if f.down {
@@ -156,8 +156,8 @@ func TestChainRecoversProviderMissingAtStartup(t *testing.T) {
 			{Label: "head", Kind: "fake"},
 			{Label: "fallback", Kind: "fake"},
 		}},
-		dim:       8,
-		name:      "test-model",
+		dim:  8,
+		name: "test-model",
 	}
 	ps := []namedEmbedder{{label: "fallback", emb: fallback}}
 	c.providers.Store(&ps)

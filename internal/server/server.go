@@ -28,6 +28,7 @@ import (
 	"github.com/open-mcp-ai/zero-memcp/internal/acl"
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
+	"github.com/open-mcp-ai/zero-memcp/internal/embed"
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 	"github.com/open-mcp-ai/zero-memcp/internal/index"
 	"github.com/open-mcp-ai/zero-memcp/internal/manifest"
@@ -2136,6 +2137,9 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			text = fmt.Sprintf("docs: %d, terms: %d", docs, terms)
 		}
 		text += "\nsemantic: " + sem
+		if c.Mount.Empty() {
+			text += "\n" + embed.CapabilityLine()
+		}
 
 		// 关注的树：回答「有没有该看的新东西」。
 		//

@@ -1,4 +1,4 @@
-//go:build cgo
+//go:build cgo && onnx
 
 // Package embed 把一段文字变成向量，纯本机、不联网。
 //

@@ -30,6 +30,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/open-mcp-ai/zero-memcp/internal/langdetect"
 	"github.com/open-mcp-ai/zero-memcp/internal/memory"
 )
 
@@ -51,6 +52,13 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	if query == "" {
 		return TermResult{}, fmt.Errorf("srecall syntax: srecall <text> [--scope <tree>]")
 	}
+
+	// 0) 语言判定：决定先查哪个索引，并作为审计字段回显。
+	//
+	// 为什么必须回显：多索引并存时，同一条查询在中文索引与英文索引下
+	// 分数天然不同（不同模型的空间不可比）。没有 query_lang，
+	// 「昨天同样的问法结果不一样」就无法解释。
+	qLang := langdetect.Detect(query)
 
 	// 1) 向量路：异步搜，只在启用且就绪时走
 	vHits := s.semanticSearch(query)
@@ -188,6 +196,8 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 		empty := map[string]any{
 			"hits": []any{}, "results": []any{}, "count": 0,
 			"query": query, "tookMs": time.Since(tStart).Milliseconds(),
+			"query_lang": string(qLang.Lang), "query_zh_ratio": qLang.ZHRatio,
+			"semantic_route": s.semanticRouteLabel(),
 		}
 		if wantJSON {
 			return TermResult{Text: jsonText(empty), Structured: empty, Empty: true}, nil
@@ -235,6 +245,10 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 		// 放行还是拒绝」串起来，回显和耗时是拼这条链的两颗钉子。
 		"query":  query,
 		"tookMs": time.Since(tStart).Milliseconds(),
+		// 多索引并存时的审计三件套：问了什么、判成什么语言、查了哪一路。
+		"query_lang":     string(qLang.Lang),
+		"query_zh_ratio": qLang.ZHRatio,
+		"semantic_route": s.semanticRouteLabel(),
 	}
 	if wantJSON {
 		return TermResult{Text: jsonText(structured), Structured: structured}, nil

@@ -1119,3 +1119,17 @@ func (s *Server) noteSemanticFailure(id, reason string) {
 	e.nextTry = time.Now().Add(back)
 	s.semantic.quarantine.Store(id, e)
 }
+
+// semanticRouteLabel 说明本轮语义检索实际走了哪一路。
+//
+// 它回答的是「这条分数是谁给的」：同一个查询在不同模型下分数不同，
+// 不回显模型就无从比较、也无从怀疑。
+func (s *Server) semanticRouteLabel() string {
+	if !s.semantic.isReady() {
+		return "none (lexical only)"
+	}
+	if emb := s.semantic.getEmb(); emb != nil {
+		return emb.Name()
+	}
+	return "unknown"
+}

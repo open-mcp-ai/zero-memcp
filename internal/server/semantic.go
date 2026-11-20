@@ -320,6 +320,10 @@ func (s *Server) initSemantic() {
 	// 首轮构建/追平立即跑一次（不等第一个周期）。
 	go s.catchUpSemantic("startup")
 
+	// 若配置里写了多个不同模型（如 zh + en），把其余已建好的索引也挂上，
+	// 形成真正的多索引并存，查询时各路并查再按名次融合。
+	s.loadLiveIndexes()
+
 	// 之后由后台维护协程持续追平：写入触发 + 周期兜底。
 	s.startSemanticMaintainer(s.cfg.Semantic.MaintainInterval)
 }
@@ -572,6 +576,11 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 			s.logf("semantic: cache save failed (will rebuild next start): %v", err)
 		}
 	}
+
+	// 索引结果另开一棵树（<project>@meta.index），不碰主记录 blob。
+	// 好处：主历史保持干净，而排错需要的「哪版权重、何时、覆盖了哪些
+	// 切片」全在这棵树上，且自带 git diff；写完顺手通知订阅者。
+	s.publishIndexTree(emb.Name(), embed.Revision(emb), emb.Dim(), prints)
 
 	s.semantic.setActive(ix, prints)
 
@@ -1125,6 +1134,9 @@ func (s *Server) noteSemanticFailure(id, reason string) {
 // 它回答的是「这条分数是谁给的」：同一个查询在不同模型下分数不同，
 // 不回显模型就无从比较、也无从怀疑。
 func (s *Server) semanticRouteLabel() string {
+	if lbl := s.liveIndexLabel(); lbl != "" {
+		return lbl
+	}
 	if !s.semantic.isReady() {
 		return "none (lexical only)"
 	}

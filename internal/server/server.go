@@ -177,6 +177,8 @@ type Server struct {
 	semantic semanticState
 	// semanticMaint 管理语义索引的后台追平协程。
 	semanticMaint semanticMaintainer
+	// liveIdx 持有多套同时加载的向量索引（中文模型 + 英文模型并存时各占一套）。
+	liveIdx *liveIndexes
 
 	// syncState 是后台对等同步的进程内状态（冲突队列、上次同步时间）。
 	syncState syncState
@@ -464,6 +466,7 @@ func New(cfg Config) (*Server, error) {
 		fanouts:   newFanoutHub(),
 		resources: newResourceHub(),
 		workSync:  newWorkSyncState(),
+		liveIdx:   &liveIndexes{},
 		done:      make(chan struct{}),
 		// 默认视为「没有维护循环」：New 之后没 Start 就 Close 的路径
 		// （测试里很常见）不该在这里永久阻塞。

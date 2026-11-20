@@ -60,8 +60,8 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	// 「昨天同样的问法结果不一样」就无法解释。
 	qLang := langdetect.Detect(query)
 
-	// 1) 向量路：异步搜，只在启用且就绪时走
-	vHits := s.semanticSearch(query)
+	// 1) 向量路：多索引并存时各查各的再按名次融合，单索引退回原路径
+	vHits := s.semanticSearchAll(query)
 
 	// 2) BM25 路：照常在当前凭证可见范围内跑
 	allowedHit := func(addr string) bool {

@@ -5,7 +5,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
@@ -536,28 +538,75 @@ func (s *Server) dedupKey(project, branch, kind, session, text string) string {
 // 25,000 块降到几十块，耗时从 47 秒变成几毫秒。
 func (s *Server) seedDedup(trees []*memory.Tree) {
 	cutoff := time.Now().Add(-72 * time.Hour).Format("2006-01-02")
-	loaded := 0
+
+	// 只收最近 72 小时内的切片：更早的历史不可能与今天的写入碰撞。
+	var cands []memory.Block
 	for _, t := range trees {
 		for _, b := range t.Blocks {
-			// 路径形如 "2026-11-15/..." 或 "thought/2026-11-15/..."
-			// 早于 cutoff 的历史切片绝不可能与今天的写入碰撞。
 			if d := dateInPath(b.Path); d != "" && d < cutoff {
 				continue
 			}
-			data, err := s.readBlock(b)
-			if err != nil {
-				continue
-			}
-			kind, session, text := parseSliceMeta(string(data))
-			if text == "" {
-				continue
-			}
-			key := s.dedupKey(b.Project, b.Branch, treePrefixOfPath(b.Path)+"/"+kind, session, text)
-			s.dedup.Store(key, b.Path)
-			loaded++
+			cands = append(cands, b)
 		}
 	}
-	_ = loaded
+	if len(cands) == 0 {
+		return
+	}
+
+	// 并行读盘。
+	//
+	// 为什么必须并行：热启动时 Block 来自快照，Body 是 nil，这里每一篇
+	// 都要真正解压一次。实测 5,000 篇串行读盘 9.2 秒——而快照存在的
+	// 全部意义就是让启动更快，结果比冷建（6.1 秒）还慢 50%。
+	// 这些读彼此完全独立，串行做没有任何理由。
+	type seeded struct {
+		key  string
+		path string
+	}
+	out := make([]seeded, len(cands))
+	workers := runtime.NumCPU() * 4
+	if workers > 32 {
+		workers = 32
+	}
+	if workers > len(cands) {
+		workers = len(cands)
+	}
+	var wg sync.WaitGroup
+	idx := make(chan int)
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range idx {
+				b := cands[i]
+				data, err := s.readBlock(b)
+				if err != nil {
+					continue
+				}
+				kind, session, text := parseSliceMeta(string(data))
+				if text == "" {
+					continue
+				}
+				out[i] = seeded{
+					key:  s.dedupKey(b.Project, b.Branch, treePrefixOfPath(b.Path)+"/"+kind, session, text),
+					path: b.Path,
+				}
+			}
+		}()
+	}
+	for i := range cands {
+		idx <- i
+	}
+	close(idx)
+	wg.Wait()
+
+	// 单线程写入去重表：sync.Map 本身并发安全，但保持写入顺序让
+	// 「同一 key 多条命中时保留哪一条」可复现。
+	for _, sd := range out {
+		if sd.key != "" {
+			s.dedup.Store(sd.key, sd.path)
+		}
+	}
 }
 
 // dateInPath 从路径里抽出 YYYY-MM-DD 形状的日期段。找不到返回空。

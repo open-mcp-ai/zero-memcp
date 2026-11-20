@@ -27,7 +27,11 @@ func runDaemon(args []string) {
 	healthURL := fs.String("health", "http://127.0.0.1:1729/health", "Health endpoint URL")
 	_ = fs.Parse(rest)
 
-	dir := resolveDataDir(*dataDir, *configPath)
+	dir, err := resolveDataDir(*dataDir, *configPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "zero-memcp daemon: %v\n", err)
+		os.Exit(1)
+	}
 
 	switch verb {
 	case "status":
@@ -90,26 +94,30 @@ func daemonHelp() {
   status 检查 pid 是否存活并探测 /health`)
 }
 
-func resolveDataDir(explicitData, configPath string) string {
+func resolveDataDir(explicitData, configPath string) (string, error) {
 	if explicitData != "" {
-		return explicitData
+		return explicitData, nil
 	}
 	// 只给了 -config 时，数据目录必须从配置文件里读。
 	//
-	// 早先这里直接回退到 ~/.zero-memcp/data，于是 `daemon start -config X`
-	// 把 pidfile 写到了 home 目录，而 `daemon status -data Y` 去 X 指的
-	// 目录找——两边各看一个地方，状态永远报「未运行」而进程其实好好地跑着。
-	// 这种「两处各记一份真相」的错误，症状比崩溃难查得多。
+	// 失败必须出声：配置文件写错了就当场报错，绝不能静默回退到
+	// ~/.zero-memcp/data。早先吞掉错误静默回退，导致用户指定的配置文件
+	// 有语法错误时，daemon 却在 home 目录下起了个空服务，
+	// 症状是「配置改了但没生效」——排查极其痛苦。
 	if configPath != "" {
-		if f, err := config.Load(configPath); err == nil && f.Server.Data != "" {
-			return f.Server.Data
+		f, err := config.Load(configPath)
+		if err != nil {
+			return "", fmt.Errorf("load config %s: %w", configPath, err)
+		}
+		if f.Server.Data != "" {
+			return f.Server.Data, nil
 		}
 	}
 	home, err := os.UserHomeDir()
 	if err == nil && home != "" {
-		return filepath.Join(home, ".zero-memcp", "data")
+		return filepath.Join(home, ".zero-memcp", "data"), nil
 	}
-	return "data"
+	return "data", nil
 }
 
 func spawnDaemon(configPath, explicitData, dataDir string) error {

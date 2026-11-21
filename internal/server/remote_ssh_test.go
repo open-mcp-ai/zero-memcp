@@ -160,14 +160,15 @@ func TestRemoteKeyFilePermissions(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if keyInfo.Mode().Perm() != 0o600 {
+	// Windows 的 Mode().Perm() 没有实际意义，不作断言；Unix 上必须是 0600。
+	if permsVerifiable() && keyInfo.Mode().Perm() != 0o600 {
 		t.Fatalf("private key mode=%04o, want 0600", keyInfo.Mode().Perm())
 	}
 	dirInfo, err := os.Stat(filepath.Dir(keyPath))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if dirInfo.Mode().Perm() != 0o700 {
+	if permsVerifiable() && dirInfo.Mode().Perm() != 0o700 {
 		t.Fatalf("private key dir mode=%04o, want 0700", dirInfo.Mode().Perm())
 	}
 	st, err := srv.readSSHKey("k1")

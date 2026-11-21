@@ -35,6 +35,26 @@ func localRepoPath(remoteURL string) (string, bool) {
 	if strings.HasPrefix(raw, "/") || strings.HasPrefix(raw, "./") || strings.HasPrefix(raw, "../") {
 		return raw, true
 	}
+	// Windows 绝对路径：C:\data\backup.git 或 C:/data/backup.git。
+	//
+	// 不识别它的代价是整个本地远端同步在 Windows 上不可用，报错还是一句
+	// “unsupported remote transport”——看起来像用户写错了协议，
+	// 实际只是平台路径形态不同。
+	//
+	// 判定条件：盘符字母 + 冒号 +（分隔符或结尾）。只认单个字母，
+	// 避免把 "ssh://host" 这类带冒号的 URL 误判成本地路径。
+	if len(raw) >= 2 && raw[1] == ':' {
+		c := raw[0]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') {
+			if len(raw) == 2 || raw[2] == '\\' || raw[2] == '/' {
+				return raw, true
+			}
+		}
+	}
+	// UNC 路径：\\server\share\repo.git
+	if strings.HasPrefix(raw, `\\`) {
+		return raw, true
+	}
 	return "", false
 }
 

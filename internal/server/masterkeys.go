@@ -198,10 +198,11 @@ func (s *Server) loadKeysDir(baseKeys *[]masterKey, seen map[string]bool) []keyR
 		s.logf("master-keys: %s is not a directory — ignored", dir)
 		return nil
 	}
-	// 权限守门：Windows 下 Mode().Perm() 的组/其他位没有意义，只检查明显过宽的 Unix 权限。
-	if info.Mode().Perm()&0o022 != 0 {
-		s.logf("master-keys: REFUSING %s (mode %04o is group/world-writable; chmod 0700 to enable)",
-			dir, info.Mode().Perm())
+	// 权限守门：只在能用 Unix 权限位的平台上做。
+	// Windows 的 Mode().Perm() 恒为 0666/0777，照搬判断等于拒绝一切。
+	if permsVerifiable() && permTooOpen(info.Mode()) {
+		s.logf("master-keys: REFUSING %s (mode %04o is group/world-writable; %s)",
+			dir, info.Mode().Perm(), permHint())
 		return nil
 	}
 	entries, err := os.ReadDir(dir)
@@ -216,8 +217,8 @@ func (s *Server) loadKeysDir(baseKeys *[]masterKey, seen map[string]bool) []keyR
 		}
 		fpath := filepath.Join(dir, e.Name())
 		fi, serr := os.Lstat(fpath)
-		if serr != nil || fi.Mode().Perm()&0o022 != 0 {
-			s.logf("master-keys: REFUSING %s (writable by group/others; chmod 0600)", fpath)
+		if serr != nil || (permsVerifiable() && permTooOpen(fi.Mode())) {
+			s.logf("master-keys: REFUSING %s (writable by group/others; %s)", fpath, permHint())
 			continue
 		}
 		raw, rerr := os.ReadFile(fpath)

@@ -45,11 +45,15 @@ mode  = "rwx------"
 		DataDir:     dataDir,
 		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
 		Listen:      "127.0.0.1:0",
-		EnforceAuth: true,
+			EnforceAuth: true,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 必须关：实例锁是真实文件柄。不关的话 Windows 上
+	// t.TempDir 的 RemoveAll 会因「文件被另一个进程占用」直接失败，
+	// 看起来像测试逻辑错了，实际是句柄泄漏。
+	t.Cleanup(func() { _ = srv.Close() })
 	// 让水位与当前 heads 对齐（相当于进程正常运行时的状态）
 	for k, v := range srv.treeHeadsSnapshot() {
 		srv.lastCommits.Store(k, v.Commit)

@@ -60,7 +60,19 @@ mode = "rwxr-xr-x"
 	return srv, dataDir
 }
 
+// osWrite 写测试文件。
+//
+// 写 .toml 配置时统一把反斜杠转成正斜杠：
+// Windows 上 t.TempDir() 返回 C:\Users\...，把这种路径直接拼进
+// TOML 双引号字符串会被当成 Unicode 转义序列 \UXXXXXXXX，解析直接报
+// "unsupported escape sequence \U"。TOML 与 Go 的 os 包在 Windows 上
+// 都认正斜杠，所以转一下既合法又等价。
+//
+// 只在 .toml 上转：正文内容里的反斜杠是数据，不能动。
 func osWrite(path, content string) error {
+	if strings.HasSuffix(path, ".toml") {
+		content = strings.ReplaceAll(content, `\`, "/")
+	}
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 

@@ -49,6 +49,8 @@ mode  = "rwx------"
 	if err != nil {
 		t.Fatal(err)
 	}
+	// 必须关：实例锁是真实文件柄，不关会让 Windows 上 TempDir 清理失败。
+	t.Cleanup(func() { _ = srv.Close() })
 
 	tok, err := srv.tokens.Sign(auth.Claims{
 		Sub:  "zero",

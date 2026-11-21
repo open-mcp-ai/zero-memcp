@@ -82,6 +82,7 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 	// 一条分支推进了几个文件，就只重算那几个。
 	current := map[string]string{}
 	treeByKey := map[string]*memory.Tree{}
+	addedBranches := false
 	for _, t := range trees {
 		repo, rerr := s.projects.Get(t.Project)
 		if rerr != nil {
@@ -91,6 +92,9 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 			key := treeHeadKey(t.Project, t.Branch)
 			current[key] = sha
 			treeByKey[key] = t
+			if _, had := hdr.Heads[key]; !had {
+				addedBranches = true
+			}
 		}
 	}
 	for key := range hdr.Heads {
@@ -121,6 +125,9 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 	if drift {
 		startupStage("reload: snapshot doc count drifted (file %d vs header %d); healing instead of rebuilding",
 			idx.Docs(), hdr.Docs)
+	}
+	if addedBranches {
+		startupStage("reload: snapshot predates one or more branches; healing index for the added trees")
 	}
 
 	// 应用差量：把「快照之后每个分支改了什么」补进索引。
@@ -189,11 +196,9 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 		startupStage("reload: applied %d changed path(s) from diff", patched)
 	}
 
-	// 计数漂移过的快照，与树逐条对齐。
-	//
-	// 只对漂移过的快照做（正常路径 count 相等，说明头部与数据同源）：
-	// 这一条是补丁而不是常规步骤，常规启动不该多付一次 O(N) 遍历的代价。
-	if drift {
+	// 计数漂移或新增分支时，与树逐条对齐。新增分支只有 tree
+	// 被补扫，快照的倒排表里没有它的文档，必须走一次补全。
+	if drift || addedBranches {
 		removed, added, orphans := s.healIndexAgainstTrees(idx, trees)
 		startupStage("reload: healed index against trees (removed %d, added %d); %d docs now",
 			removed, added, idx.Docs())
@@ -363,10 +368,16 @@ func (s *Server) restoreTreesFromSnapshot(defaultBranch string) ([]*memory.Tree,
 		for _, br := range repo.Branches() {
 			set[br] = true
 		}
+		// 尚未提交的工作层分支也是真实数据，不能只因为它还没有
+		// refs/heads 就漏掉。
+		for _, br := range repo.PendingRefs() {
+			set[br] = true
+		}
 		existingBranches[p] = set
 	}
 
 	var out []*memory.Tree
+	restored := map[string]map[string]bool{}
 	for _, ts := range snaps {
 		if !declared[ts.Project] {
 			return nil, fmt.Errorf("snapshot has project %q which is no longer declared", ts.Project)
@@ -409,6 +420,32 @@ func (s *Server) restoreTreesFromSnapshot(defaultBranch string) ([]*memory.Tree,
 			}
 		}
 		out = append(out, t)
+		if restored[ts.Project] == nil {
+			restored[ts.Project] = map[string]bool{}
+		}
+		restored[ts.Project][ts.Branch] = true
+	}
+
+	// 快照是「当时有哪些树」，不是「现在只允许有哪些树」。
+	// 对快照之后新建的分支（包括全新项目里的分支）逐条补扫；
+	// 否则它们既不参与后面的 head diff，也不会被全量扫描，
+	// 表现为数据在 Git 里、read 能读，recall/grep 永远看不到。
+	for proj, branches := range existingBranches {
+		repo, rerr := s.projects.Get(proj)
+		if rerr != nil {
+			return nil, rerr
+		}
+		for br := range branches {
+			if restored[proj][br] {
+				continue
+			}
+			startupStage("reload: branch %s@%s is absent from snapshot; scanning it", proj, br)
+			t, serr := s.scanGitProject(repo, proj, br)
+			if serr != nil {
+				return nil, fmt.Errorf("scan new branch %s@%s: %w", proj, br, serr)
+			}
+			out = append(out, t)
+		}
 	}
 	if len(out) == 0 {
 		return nil, errNoSnapshot

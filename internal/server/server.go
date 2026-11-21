@@ -828,8 +828,23 @@ func (p *portPolicy) allows(name string) bool {
 }
 
 // Close 停止全部监听器。
+//
+// 幂等：第二次及以后的调用直接返回。
+//
+// 为什么必须幂等（实测于 2026-11-21）：第一版只把「关闭 done 频道」
+// 包在 sync.Once 里，其余步骤每次都跑。于是第二次 Close 会**再存一次
+// 索引快照**，而此时树集已因首次 Close 拆过，存下去的是陈旧/不完整的
+// 快照——它随后覆盖掉第一次存的那份正确快照，下次启动就吃旧的。
+// 触发条件在生产上真实存在：信号处理与 defer 会各调一次。
 func (s *Server) Close() error {
-	s.doneOnce.Do(func() { close(s.done) })
+	first := false
+	s.doneOnce.Do(func() {
+		close(s.done)
+		first = true
+	})
+	if !first {
+		return nil
+	}
 	// 退出前把索引快照落盘。正常发版（停旧进程 → 启新进程）就靠它
 	// 把「下次启动 33 秒」变成「下次启动读一个文件」。
 	//

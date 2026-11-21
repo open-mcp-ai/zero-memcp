@@ -213,6 +213,33 @@ func (s *Server) importWorkDelta(project, branch string, d *workDelta) (workAppl
 	for _, ch := range d.Changes {
 		if ch.Deleted {
 			// 墓碑先落地：不等 blob，也不需要 blob。
+			//
+			// 墓碑仍然优先落地，但**不许静默**。
+			//
+			// 两个性质要同时成立：
+			//
+			//	① 删除优先——离线节点不得复活已删内容（见
+			//	   TestWorkLayerDeleteDoesNotResurrect）。
+			//	现在本地有未同步改动就拒绝墓碑，会直接破坏它。
+			//
+			//	② 不得静默丢内容——全网两端并发时，
+			//	  「A 删 / B 改」会让 B 的未提交内容消失。
+			//	 实测（2026-11-21）：回执里全是 Applied，没有任何声音。
+			//
+			// 做法：墓碑照旧落地，但把被它覆盖的本地 SHA 记进冲突表
+			// 并在日志里点名。丢弃不再无声，且能被 status 看见。
+			if lch, ok := localByPath[ch.Path]; ok && !lch.Deleted {
+				res.Conflicted = append(res.Conflicted, workConflict{
+					Path:      ch.Path,
+					LocalSHA:  lch.SHA,
+					RemoteSHA: "",
+					Peer:      d.Node,
+				})
+				s.recordWorkConflict(project, branch, ch.Path, lch.SHA, "", d.Node)
+				s.logf("work-sync: DELETE WINS %s@%s:%s (peer %s deleted it; local uncommitted %s was unlinked — "+
+					"blob still exists in the object store if you need to recover it)",
+					project, branch, ch.Path, d.Node, shortSHA(lch.SHA))
+			}
 			if err := repo.ApplyChange(branch, ch.Path, "", "", true); err != nil {
 				return res, fmt.Errorf("apply delete %s: %w", ch.Path, err)
 			}

@@ -3,7 +3,13 @@
 # 纯 Go 偏好：CGO_ENABLED=0，全平台在一台 runner 上并发交叉编译。
 # 编译产物为静态单二进制，并同时生成 .gz 压缩版供 wrapper 快速拉取。
 #
-# 触发：push 以 'v' 开头的 tag（如 v0.1.0）。
+# 触发：push 以 'v' 开头的 tag（如 v0.1.0）。只认 tag，不认分支——
+# 发布是显式动作，不该被一次普通 push 带出来。
+#
+# 流程是三道门：verify（测试）→ build（编译）→ publish（发布）。
+# build 依赖 verify 是有意的：ci.yml 和 release.yml 是两个独立 workflow，
+# 并行执行、互不等待。如果 release 自己不验，那么「测试红了但二进制
+# 已经发出去了」就是必然会发生的事。发出去的版本无法收回。
 name: release
 
 on:
@@ -15,7 +21,25 @@ permissions:
   contents: write
 
 jobs:
+  # 第一道门：测试不过，后面全部不跑。
+  verify:
+    name: gate (vet + tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: 打印工具链
+        run: go version
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test ./... -count=1
+
   build:
+    needs: verify
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -43,10 +67,11 @@ jobs:
         with:
           fetch-depth: 0
 
+      # 版本跟 go.mod 走，不再单写一份：写死过的代价见 ci.yml 的注释。
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.27.x'
-          check-latest: true
+          go-version-file: go.mod
+          cache: true
 
       - name: 编译
         env:
@@ -54,6 +79,7 @@ jobs:
           GOOS: ${{ matrix.os }}
           GOARCH: ${{ matrix.arch }}
         run: |
+          set -eu
           TAG="${GITHUB_REF#refs/tags/}"
           OUT="zero-memcp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
           go build -trimpath \
@@ -63,8 +89,10 @@ jobs:
 
       - name: 压缩 (.gz)
         run: |
+          set -eu
           OUT="zero-memcp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
           gzip -c -9 "dist/${OUT}" > "dist/${OUT}.gz"
+          ls -l dist/
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
@@ -85,19 +113,49 @@ jobs:
           path: all-dist
           merge-multiple: true
 
+      # 版本注入是 ldflags 拼字符串，写错路径时**不会报错**，
+      # 只是版本号静默停在 "dev"。发出去的二进制没人会再去核对这个，
+      # 所以在这里当场执行一次、当场比对。
+      - name: 验证版本号真的注入了
+        run: |
+          set -eu
+          TAG="${GITHUB_REF#refs/tags/}"
+          BIN=all-dist/zero-memcp-linux-amd64
+          chmod +x "$BIN"
+          GOT=$("$BIN" version | head -1)
+          echo "二进制自报版本: $GOT"
+          case "$GOT" in
+            *"$TAG"*) echo "::notice::版本号校验通过 ($TAG)";;
+            *) echo "::error::版本号没注进去：期望包含 $TAG，实际是 '$GOT'（检查 -X main.version 的包路径）"; exit 1;;
+          esac
+
       - name: 生成 SHA256SUMS
         run: |
+          set -eu
           cd all-dist
           sha256sum zero-memcp-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
+      # 重复打同一个 tag 时，gh release create 会因「已存在」直接失败，
+      # 让整条流水线红在一个跟代码无关的地方。已存在就改为覆盖资产。
       - name: 发布 GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -eu
           TAG="${GITHUB_REF#refs/tags/}"
-          gh release create "$TAG" all-dist/* \
-            --title "zero-memcp $TAG" \
-            --generate-notes \
-            --draft=false \
-            --prerelease=false
+          # 带 '-' 的 tag（如 v0.9.0-pre-termcp、v1.0.0-rc.1）视为预发布。
+          PRE=""
+          case "$TAG" in *-*) PRE="--prerelease";; esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在，覆盖资产"
+            gh release upload "$TAG" all-dist/* --clobber
+          else
+            gh release create "$TAG" all-dist/* \
+              --title "zero-memcp $TAG" \
+              --generate-notes \
+              --draft=false \
+              $PRE
+          fi
+          gh release view "$TAG" --json tagName,isPrerelease,assets \
+            --jq '"published \(.tagName) prerelease=\(.isPrerelease) assets=\(.assets|length)"'

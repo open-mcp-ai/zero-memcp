@@ -185,23 +185,10 @@ func isNotExist(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || os.IsNotExist(err)
 }
 
-// syncDir 在 Unix 上 fsync 目录；Windows 上目录不能 fsync，退化为空操作。
-func syncDir(dir string) error {
-	f, err := os.Open(dir)
-	if err != nil {
-		// 目录已经不存在 = 没有目录项需要同步。
-		//
-		// 这不是理论情况：批量刷盘（SyncDirtyNow）可能在提交刚清空
-		// 脏层目录之后才跑到，此时那个目录已经没了。对不存在的目录
-		// 报错，等于让一次正常的清理把刷盘整体判失败。
-		if isNotExist(err) {
-			return nil
-		}
-		return err
-	}
-	defer f.Close()
-	return f.Sync()
-}
+// syncDir 的实现按平台分居：
+//   - syncdir_unix.go：os.Open + Sync（Unix 目录是 fd，可以 fsync）
+//   - syncdir_windows.go：CreateFile + FILE_FLAG_BACKUP_SEMANTICS
+//     （Windows 上目录不是普通文件，只读句柄刷不动）
 
 func (osFS) Remove(path string) error {
 	return os.Remove(path)

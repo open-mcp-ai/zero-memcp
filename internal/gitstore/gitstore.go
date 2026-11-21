@@ -196,8 +196,18 @@ func (r *Repo) SyncDirtyNow() error {
 }
 
 // syncFile 对单个已存在的文件做 fsync。
+//
+// 跨平台要点（Windows 11 实测，2026-11-21）：
+// 必须用 os.O_WRONLY 打开，不能用 os.Open（只读）。Windows 的
+// FlushFileBuffers 要求句柄带 GENERIC_WRITE，只读句柄直接返回
+// ERROR_ACCESS_DENIED；而在 Unix 上只读 fd 也能 fsync。
+// 如果用只读打开，Windows 上的脏层批量刷盘会报：
+//
+//	dirty sync <proj>: sync …\@.dirty: Access is denied.
+//
+// 不追加、不截断、不创建：纯粹为拿到一个可刷盘的句柄。
 func syncFile(path string) error {
-	f, err := os.Open(path)
+	f, err := os.OpenFile(path, os.O_WRONLY, 0)
 	if err != nil {
 		if isNotExist(err) {
 			return nil

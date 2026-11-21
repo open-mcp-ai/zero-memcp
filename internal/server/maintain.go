@@ -263,7 +263,7 @@ func (s *Server) maybeWriteDailyCheckpoints(projects []string) {
 	}
 }
 
-// syncDirtyAll 把所有仓库的待刷脏文件 fsync 落盘。
+// syncDirtyAll 把所有仓库的待刷工作层文件 fsync 落盘。
 //
 // 失败只记日志不中断：刷盘失败意味着磁盘有问题，但继续服务
 // 仍然比整体停摆好——下一次刷盘会重试同一批文件。
@@ -278,7 +278,7 @@ func (s *Server) syncDirtyAll() {
 			continue
 		}
 		if err := repo.SyncDirtyNow(); err != nil {
-			s.logf("dirty sync %s: %v", proj, err)
+			s.logf("worklayer sync %s: %v", proj, err)
 		}
 	}
 }

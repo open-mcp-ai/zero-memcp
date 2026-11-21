@@ -29,6 +29,28 @@ jobs:
       - name: test
         run: go test ./... -count=1
 
+  # Windows 单独跑一遍测试。
+  #
+  # 起因（2026-11-21）：工作层刷盘在 Windows 上从未成功过——
+  # syncFile 用 os.Open（只读句柄）调 f.Sync()，而 Windows 的
+  # FlushFileBuffers 要求 GENERIC_WRITE，于是每 2 秒报一次
+  # "sync …: Access is denied"。Unix 上只读 fd 能 fsync，所以
+  # ubuntu 的 CI 全绿也完全看不见这个故障。
+  #
+  # 只要代码里有平台差异，就必须在真正的平台上跑测试，
+  # 否则「测试通过」只证明了一半。
+  test-windows:
+    name: unit tests (windows)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+          cache: true
+      - name: test gitstore + server
+        run: go test ./internal/gitstore/ ./internal/server/ -count=1
+
   cross:
     name: cross-compile (6 platforms)
     runs-on: ubuntu-latest

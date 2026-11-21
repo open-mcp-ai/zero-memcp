@@ -303,6 +303,7 @@ var knownKeys = map[string]map[string]bool{
 	"commit":   {"interval": true, "count": true},
 	"gc":       {"interval": true},
 	"sync":     {"interval": true, "disabled": true},
+	"search":   {"body_cache_mb": true},
 	"erase":    {"public_key": true, "require_ticket": true},
 	"user":     {"name": true, "groups": true, "root": true, "pwd": true},
 	"group":    {"name": true, "members": true},

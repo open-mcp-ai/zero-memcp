@@ -1,94 +1,68 @@
 # zero-memcp
 
-面向 AI 编码智能体的持久记忆体。
+面向 AI 编码智能体的持久记忆体，以 Git 裸仓库为物理存储、以 MCP 为唯一入口。
 
-你写下的每一条记忆先进单线程脏层写者队列，立即返回确认；写者串行将内容落成 Git blob 并更新对应目录的脏覆盖。
-进程强杀或异常重启后，未封箱的脏层条目依然可读；已提交历史通过内容寻址与 Merkle 树保持不可变。
+**工作层是主体，commit 是历史书签。** 两台机器写完互相可见，不需要先 commit；
+commit 只是"此刻在此处拍了一张照"，给外部 Git 工具与人审计用。
+
+---
 
 ## 核心设计
 
-1. **结构中立的记忆树**：没有额外的「主题」「频道」或「消息总线」概念。树上的路径（如 `team/chat`、`notes`）即为语义域。
-2. **多态原语 `put`**：
-   - `put $TEXT`：写入默认流水记忆树，按时间自动分片；
-   - `put <tree> $TEXT`：写入指定的子树；
-   - `put <tree> --ref <addr>`：在子树中追加已有记忆的引用，不重复复制正文。
-3. **指令与数据彻底分离**：严格遵循 Termcp 规范，`cmd` 只包含指令骨架，真实正文通过 `vars` 或 `args` 传入。未引用的变量直接报错，彻底避免正文拼接引发的命令注入与断句失真。
-4. **子树锚定与差分感知**：
-   - `remind [<tree>]`：登记「我关心这棵树」，并记下当前分支头作为基线；
-   - `status` 报出关注的树有没有往前跑，`since` 取真正的差量；
-   - `since <tree> <commit>`：Agent 醒来后比对两次提交之间的子树差异，O(1) 忽略未修改的子树，只取回实际变动的切片。
-5. **写入只投递，封箱由策略决定**：
-   - `put` 返回只表示「已进入单线程脏层写者队列」，不等待落盘也不提交；
-   - 折叠成 Git 历史由显式 `commit` 或后台 `[commit]` 策略（条数/时间）触发；
-   - 内存脏层与不可变 Git 树分属两层，崩溃只会丢掉尚未落盘的脏文件，不会破坏已提交历史。
-6. **记忆同步**：
-   - `sync` / `fetch` / `push`：节点与远端之间的记忆比对、取回与推送，强制显式指定分支且禁止强推。
-   - `fetch` / `push` / `sync` 全部由内置实现完成，**不依赖系统 Git**：SSH 走 Go SSH，HTTP(S) 走 smart-HTTP（自动协商协议 v2），本地裸仓库路径直接读写对象库。
-   - 松散对象打包（gc）由服务内的 WebUI 管理台手动触发，也可由后台按周期自动执行；CLI 不提供 gc 子命令，避免第二个进程与在线服务并发改仓库。生成 pack + `.idx` v2，`git fsck` 校验通过。
-     **gc 不是 DSL 动词**：合包对上层读写完全透明，不该让 Agent 承担磁盘运维的心智。
+1. **结构中立的记忆树**
+   没有"主题""频道""消息总线"这类额外概念。树上的路径（`team/chat`、`notes`）就是语义域。
 
-## 权限模型
+2. **工作层同步，不依赖 commit**
+   写入先落工作层（`dirty/<branch>/@<dir>.dirty`，纯文本可 `cat`/`diff`）。
+   节点间直接同步这一层：先 tree 后 blob，删除优先落地，被删 blob 永远不会再被请求。
+   commit 把工作层折叠成 Git 历史，是快照而非同步前提。
 
-一条记忆能不能被读写，取决于三层各自收窄，任何一层说不行就是不行：
+3. **指令与数据彻底分离**
+   `cmd` 只放指令骨架，正文一律通过 `vars`/`args` 以变量引用传入。
+   内联正文会被协议直接拒绝——正文里的 `;` 就是分号，不会被当成命令分隔符。
 
-| 层 | 位置 | 作用 |
-|---|---|---|
-| 端口 | `[[listen]] allow` / `mount` | 这个 socket 上存在哪些动词、看得见哪些命名空间 |
-| 配置 | `[[project]] mode/owner` + `[[access]]` | 这个用户名对该项目的读写执行权限 |
-| 凭证 | JWT 的 `cap` 与 `mount` | 这张纸本身的上限，只能比上面两层更窄 |
+4. **单工具，能力在命令空间**
+   MCP 只暴露一个 `term` 工具。能力增长发生在动词层，不在 `tools/list`，
+   所以上下文占用恒定。
 
-`cap` 是 `r`（读）/ `w`（写）/ `x`（规则注入）的任意组合，`mount` 把范围限定到某个项目、某条分支、某个虚拟路径。
+5. **权限落在端口、配置、凭证三层**
+   任一层说不行就是不行，凭证只能收窄不能放大。root 只由 `[[user]] root = true` 决定。
 
-### 能力门（gated）与临时授权
+6. **派生物不当真相**
+   BM25 倒排、索引快照、向量索引都是可重建的缓存；Git 才是真相。
+   快照与现状不一致时**治愈**（差量补丁 + 逐条对齐），不整份弃用。
 
-`gated` 是 `cap` 的子集，在**签发时**就把其中几位按住。被按住的位平时一律拒绝，只有管理台按 (项目, 分支) 临时放行其中某几位之后才生效：
-
-| cap | gated | 平时能做 | 临时授权后 |
-|---|---|---|---|
-| `rwx` | （空） | 全部 | 无需授权 |
-| `rwx` | `x` | 读写，但记忆不会注入系统提示 | 可注入 |
-| `rwx` | `rw` | 只能注入 | 可读、可写 |
-| `r` | `w` | 只有读 | 仍然只能读——`w` 不在 `cap` 里，授权不能凭空造出它 |
-
-三条硬边界：
-
-- 授权只能打开 `gated` 里已经存在的位，不能比 `cap`、挂载点 `cap` 或配置更宽；
-- 授权按 JTI + 项目 + 分支存储，到期或撤销后**下一次请求**即失效，不做缓存；
-- 授权不重签 JWT。凭证本身的内容永远不变，"这次能不能做"由服务端每次读盘判定。
-
-## 管理台（WebUI）
-
-MCP 只管存取记忆；凭证签发、临时授权、打包这类运维动作在管理台上做，**CLI 不提供**这些子命令（同一数据目录只允许一个写者，第二个进程会被实例锁挡住）。
-
-- 与 MCP 共用同一个 http.Server，但鉴权机制完全不同：管理台只认口令登录的会话 cookie，MCP 只认 `Authorization: Bearer`；
-- 两个方向互相拒绝：拿 Bearer 打管理台会被 403，拿会话 cookie 打 `/mcp` 会被 401（即使同时带了有效 Bearer 也一样，必须一次只用一条通道）；
-- **管理台一定存在，不是开关能关掉的**：容器里、npm-wrapper 后面都拿不到命令行，「默认关闭」等于把用户永久锁死在门外。端口只决定它挂在哪儿——
-  - 单端口部署：那个端口就是入口；
-  - 多端口且没有任何端口写 `webui = true`：自动挂在第一个端口；
-  - 多端口且某端口显式写了 `webui = true`：只挂在那一个上，其余端口的 `/`、`/api`、`/ui/*` **根本不存在**（404），而不是「存在但拒绝」。
-  启动日志会把入口地址打印出来（`WebUI: http://127.0.0.1:1729/`）。
-- 首次启动生成随机初始口令，打印一次到 stderr，首次登录后强制修改；改口令会清空所有会话；
-- 口令以 argon2id 摘要存在 `system/ui.passwd`，不进 TOML（`config show` 会把配置回显给 Agent）。
+---
 
 ## 快速上手
 
-### 1. 编译与启动
+### 编译
 
 ```bash
-go build -o zero-memcp ./cmd/zero-memcp
-./zero-memcp -data ~/.zero-memcp -listen 127.0.0.1:1729
+go build -o zero-memcp ./cmd/zero-memcp            # 默认：http + static 嵌入
+go build -tags onnx ./cmd/zero-memcp               # 追加 ONNX（需 CGO + libonnxruntime）
 ```
 
-### 2. 通过 Termcp 协议调用
+`zero-memcp version` 会打印本二进制编译进了哪些嵌入能力。
+
+### 启动
+
+```bash
+zero-memcp serve -data ~/.zero-memcp/data -config ~/.zero-memcp/zero-memcp.toml
+# 兼容旧写法：
+zero-memcp -data ~/.zero-memcp/data -listen 127.0.0.1:1729
+```
+
+首次启动会生成签名密钥与一次性管理口令，口令打印一次到 stderr，登录后必须修改。
+
+### 调用（MCP）
 
 ```json
 {
   "name": "term",
   "arguments": {
     "cmd": "put team/chat $TEXT",
-    "vars": {
-      "TEXT": "今天完成记忆体核心架构收敛：纯粹的 Merkle 树模型，取消独立总线。"
-    }
+    "vars": { "TEXT": "今天收敛了工作层同步：不再依赖 commit。" }
   }
 }
 ```
@@ -96,151 +70,129 @@ go build -o zero-memcp ./cmd/zero-memcp
 ```json
 {
   "name": "term",
-  "arguments": {
-    "cmd": "recall $1",
-    "args": ["记忆体核心架构"]
-  }
+  "arguments": { "cmd": "recall $1", "args": ["工作层同步"] }
 }
 ```
 
-### 3. 查看树增量
+---
 
-```json
-{
-  "name": "term",
-  "arguments": {
-    "cmd": "since team/chat a1b2c3d4e5f6..."
-  }
-}
-```
-
-## DSL 原语一览
+## 常用动词
 
 | 动词 | 用法 | 说明 |
 |---|---|---|
-| `put` | `put [<tree>] $TEXT` | 写入正文，投递至脏层并立即返回确认 |
-| `put` | `put <tree> --ref <addr>` | 追加已有记忆的稳定指针 |
-| `recall` | `recall <text> [--scope <tree>]` | 语义联想与回想，返回内容摘要与匹配度 |
-| `read` | `read <addr> [...]` | 细读一个或多个具体切片 |
-| `grep` | `grep <pattern> [--scope <tree>]` | 全文正则精确检索（符号、IP、代码名） |
-| `log` | `log [N]` | 时间线追溯 |
-| `ls` | `ls [date]` | 按日期列出切片条目 |
-| `trees` | `trees <project>[@<branch>]` | 查看子树目录结构 |
-| `remind` | `remind [<tree>]` | 登记/查看关注的树（`status` 会报它动没动） |
-| `since` | `since <tree> <commit>` | 取回自某次提交以来的子树差分 |
-| `sync` | `sync <project> [<remote>]` | 检查与远端的记忆领先/落后差异 |
-| `fetch` | `fetch <project> [<remote>]` | 取回远端历史（不改动本地活动分支） |
-| `push` | `push <project> [<remote>] <branch>` | 显式推送一个获准分支（内置客户端；一次一个，不批量） |
-| `remote-key` | `remote-key list/put/delete` | root 管理仅服务端可读的 SSH 私钥 |
-| `remote-secret` | `remote-secret list/put/delete` | root 管理仅服务端可读的 HTTP token |
-| `status`| `status` | 查看记忆索引与文档规模 |
-| `help` | `help [<verb>]` | 动词手册与用法指南 |
+| `put` | `put [<tree>] $TEXT` | 写入正文，投递到工作层并立即返回 |
+| `ref` | `ref <tree> <addr>` | 追加已有记忆的引用，不复制正文 |
+| `recall` | `recall <q> [--scope T] [--json]` | BM25 检索；配置嵌入后端后可用 `srecall` |
+| `read` | `read <addr> [...]` | 细读具体切片 |
+| `grep` | `grep <pat> [--scope T]` | 全文正则，符号/IP/代码名精确命中 |
+| `log` / `ls` | `log [N]` / `ls [date]` | 时间线与按日期列举 |
+| `trees` | `trees <project>[@<branch>]` | 查看树结构 |
+| `remind` / `since` | `remind <tree>` / `since <tree> <commit>` | 关注某棵树并取回差量 |
+| `status` | `status` | 索引规模、冲突、同步水位、缓存占用 |
+| `commit` | `commit [<p>[@<br>]] [-m msg]` | 把工作层折叠成历史书签 |
+| `write` | `write <p>@<br>/<path> $TEXT` | 精确路径写入 |
+| `apply` | `apply <p>[@<br>] $PATCHES` | 一次往返多文件改写 |
+| `sync` / `fetch` / `push` / `merge` | 见 `help` | 内置传输，不依赖系统 Git |
+| `help` | `help [<verb>]` / `help --all` | 动词手册 |
+
+维护类动词（`pending`/`diff`/`branch`/`tag`/`cp`/`mv`/`delete`/`archive`/`reset`/
+`lock`/`unlock`/`chmod`/`erase`/`replace`/`conflict`）见 `help --all`。
 
 ### 一条命令跑多条语句
 
-用 `;` 或换行分隔，一次往返执行多个动词：
-
 ```
-recall q --scope proj@fact; recall q --scope proj@record
+recall q --scope p@fact || recall q --scope p@record || recall q --scope p@thought
 ```
 
-`&&` 表示「上一条查到了才继续」，`||` 表示「上一条没查到才继续」。分层记忆主要靠后者——它让回落只在需要时才付出代价：
+`;` 顺序执行，`&&` 上一条**查到内容**才继续，`||` 上一条没查到才继续。
+判据是"命中"而非退出码——搜不到不是错误，真正的错误（语法、权限）一律中断整条链。
 
-```
-recall q --scope proj@fact || recall q --scope proj@record || recall q --scope proj@thought
-```
+---
 
-上层命中时只查一次；上层为空才下沉。注意这里的「成功」是**查到内容**，不是 shell 的退出码：搜不到不是错误，所以若按退出码判断，`||` 永远不会触发。真正的错误（语法、权限）无论哪种操作符都会中断整条链。
+## 权限模型
 
-`--` 之后是正文，永不参与解析，所以正文里的 `;` 就是分号。操作符前后要留空格，正文用 `vars`/`args` 传。
+| 层 | 位置 | 作用 |
+|---|---|---|
+| 端口 | `[[listen]] allow / mount / require` | 这个 socket 上存在哪些动词、看得见哪些命名空间 |
+| 配置 | `[[project]] mode/owner` + `[[access]]` | 该用户对该项目的读写执行权限 |
+| 凭证 | JWT 的 `cap` / `mount` / `gated` | 这张纸本身的上限，只能更窄 |
 
-### SSH 远端推送（当前最小闭环）
+**能力门（gated）**：签发时就按住其中几位，平时一律拒绝，
+只有管理台按 (项目, 分支) 临时放行后才生效。授权不重签 JWT，
+按 JTI + 项目 + 分支存储，到期或撤销后下一次请求即失效。
 
-私钥通过 root 凭证的 `vars` 安全地与命令分离后写入服务端 `system/sshkeys/`（目录 `0700`、文件 `0600`），私钥内容不会回显：
+**注意**：`enforce_auth = false`（默认）时，本机任意进程不带凭证即被视为 root。
+多用户机器或容器里必须打开。
 
-```json
-{
-  "name": "term",
-  "arguments": {
-    "cmd": "remote-key put github-deploy -- $KEY",
-    "vars": { "KEY": "-----BEGIN OPENSSH PRIVATE KEY-----\n..." }
-  }
-}
-```
+---
 
-远端声明绑定私钥名及预先核验的 SSH host fingerprint：
+## 管理台（WebUI）
+
+MCP 管记忆存取；凭证签发、临时授权、对象打包这类运维动作在管理台做。
+
+- 与 MCP 共用 http.Server，但鉴权完全分离：两种凭据**互相拒绝**；
+- 管理台一定存在，不是开关能关掉的（容器里拿不到命令行，"默认关闭"等于把人锁在门外）；
+- 端口只决定它挂在哪儿：单端口就是入口；多端口没写 `webui = true` 时落在第一个；
+  写了就只挂在那一个上，其余端口的管理路由根本不存在（404 而非 403）；
+- 口令以 argon2id 存在 `system/ui.passwd`，不进 TOML（`config show` 会回显给 Agent）。
+
+CLI 因此只剩 `serve` / `daemon` / `version` / `help`：装配与诊断，不是客户端。
+
+---
+
+## 同步
+
+两种远端，按 URL 形状分流：
+
+| 远端形态 | 走什么 | 是否需要 commit |
+|---|---|---|
+| `http(s)://` 且不以 `.git` 结尾（另一个 zero-memcp） | 工作层同步 `/sync/work/*` | **不需要** |
+| 其他（GitHub、本地裸仓库、SSH） | Git fetch/merge/push | 需要先提交 |
 
 ```toml
 [[remote]]
-project  = "blackegg/daily"
-name     = "github"
-url      = "git@github.com:org/daily.git"
-ssh_key  = "github-deploy"
-host_key = "SHA256:<预先核验的指纹>"
-push     = ["zero"]
+project   = "blackegg/daily"
+name      = "hub"
+url       = "http://10.10.10.12:1729"
+push      = ["zero"]
+auto_sync = true      # 不写就不进后台循环
+on_receive = false    # 依赖 auto_sync
 ```
 
-一次 `push` 只接受一个分支；未加密 OpenSSH PEM 私钥；拒绝非快进；SSH host key 必须匹配 pin。
+四条纪律：不自动 push（除显式 `auto_sync`）、不隐式 commit、
+不强推、冲突不静默（保留本地并上报，`status` 点名）。
 
-### HTTPS 远端推送
+SSH 私钥与 HTTP token 由 root 写入服务端密钥库，配置只引用名字；
+明文 `http://` 只对回环地址放行。
 
-token 同样由 root 写入服务端密钥库，配置只引用名字，token 本身不进 TOML、不进 URL：
+---
 
-```json
-{
-  "name": "term",
-  "arguments": {
-    "cmd": "remote-secret put gh -- $TOKEN",
-    "vars": { "TOKEN": "ghp_..." }
-  }
-}
-```
+## 文档
 
-```toml
-[[remote]]
-project    = "blackegg/daily"
-name       = "github"
-url        = "https://github.com/org/daily.git"
-http_user  = "x-access-token"
-http_token = "gh"
-push       = ["zero"]
-```
+| 文件 | 内容 |
+|---|---|
+| [`docs/FEATURES.md`](docs/FEATURES.md) | **能力矩阵与已知限制**（以代码为准，标注验证状态） |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | 架构决策记录：为什么不用那些更省事的做法 |
+| [`docs/DESIGN-WORKLAYER.md`](docs/DESIGN-WORKLAYER.md) | 工作层同步协议、水位、抹除与审计 |
+| [`zero-memcp.example.toml`](zero-memcp.example.toml) | 带注释的完整配置样例 |
 
-明文 `http://` 只对回环地址放行——token 不能被发到网络上。
+---
 
-### 把外部历史推进来
-
-注入一份已经成形的历史（另一台机器的备份、一次批量导入）不该被拆成几千条 `put`。声明一个允许 `git-receive-pack` 的端口，就能用原生 `git push` 推进来：
-
-```toml
-[[listen]]
-addr  = "0.0.0.0:1731"
-allow = ["git-upload-pack", "git-receive-pack"]
-```
-
-> **两套地址策略要分清楚。**
-> `-listen` / `[server] listen` 是**主端口**（MCP 全能力入口），只接受回环地址——`0.0.0.0:1729` 会在启动时报错退出。
-> `[[listen]]` 块是**额外端口**，可以绑任意地址，靠 `allow` 白名单收窄能力。
-> 暴露到公网前先想清楚：这些端口是明文 HTTP，凭证一旦被网络嗅到就是权限泄露，
-> 所以生产环境应该放在反代（Nginx / Tailscale / WireGuard）后面。
+## 构建与测试
 
 ```bash
-git push http://zero:<token>@host:1731/repos/daily.git HEAD:refs/heads/import
+make test      # 常规测试
+make perf      # 性能回归（//go:build perf）
+make check     # vet + 常规测试
+make all       # vet + test + perf
+make cross     # 六平台交叉编译
 ```
 
-四条边界：
+无锁纪律（禁止 `sync.Mutex` / `sync.RWMutex`）由 `internal/guard` 在常规测试里检查，
+不需要单独目标——跑 `make test` 就会执行。
 
-- **只接受快进**。非快进会被拒绝并说明原因；覆盖已有历史要走 `reset`（root 显式动作），不走 push。
-- **只接受 `refs/heads/*`**，不接受删除分支（`delete-refs` 没有广告）。
-- **凭证必须有对应分支的写权限**，端口没声明 `git-receive-pack` 时直接 403。
-- **落地即重建索引**，并广播树脉冲——外部推进的 ref 不会变成静默写入。
+CI 在三个地方跑：`ubuntu-latest`（vet + 全量测试）、
+`windows-latest`（gitstore + server）、六平台交叉编译。
 
-推到一个新分支之后再决定要不要采纳：
-
-```
-reset daily@zero from daily@import
-```
-
-协议细节：取回优先用 v2（`ls-refs` + `fetch`），服务端不支持时退回 v0；协商时带本地分支尖作为 `have`，避免每次拉完整历史；v2 的 packfile 段按 side-band-64k 解复用（0x01 数据 / 0x02 进度 / 0x03 错误）。
-
-推送与取回都支持三种远端：`ssh://git@host/org/repo.git`（或 `git@host:org/repo.git`）、`https://host/org/repo.git`、以及本地裸仓库路径（备份盘、挂载卷）。本地路径写的是对方的对象库，不参与对方进程的锁，适合「目标是一份安静的备份」。
+**平台差异必须在真平台验证**：Windows 上曾有四处真实缺陷
+（路径归一化、密钥权限位、本地远端路径、句柄释放）只在真机暴露。

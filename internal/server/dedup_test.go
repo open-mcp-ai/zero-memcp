@@ -71,7 +71,7 @@ name  = "notes"
 owner = "zero"
 mode  = "rwx------"
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	_ = osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg)
 
 	open := func() *Server {

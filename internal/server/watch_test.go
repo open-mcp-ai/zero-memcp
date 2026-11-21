@@ -15,7 +15,7 @@ func newWatchTestServer(t *testing.T) (*Server, string) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [[user]]
 name = "zero"

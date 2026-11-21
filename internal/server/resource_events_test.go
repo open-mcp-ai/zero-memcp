@@ -91,7 +91,7 @@ func startListenServer(t *testing.T) (*Server, string, string) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 endpoint = "testnode"
 
 [[user]]

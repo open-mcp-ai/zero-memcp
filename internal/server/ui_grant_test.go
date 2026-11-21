@@ -371,7 +371,7 @@ name  = "proj"
 owner = "zero"
 mode  = "rwx------"
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
 	}

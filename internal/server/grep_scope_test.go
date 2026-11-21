@@ -18,7 +18,7 @@ func TestGrepScope(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [[user]]
 name = "zero"
@@ -116,7 +116,7 @@ func TestGrepCaseSensitivityMatchesShell(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [[user]]
 name = "zero"
@@ -182,7 +182,7 @@ func TestGrepCount(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [[user]]
 name = "zero"

@@ -33,7 +33,7 @@ name  = "team/daily"
 owner = "subagent"
 mode  = "rwx------"
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +121,7 @@ name  = "team/empty"
 owner = "zero"
 mode  = "rwxrwxrwx"
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
 		t.Fatal(err)
 	}

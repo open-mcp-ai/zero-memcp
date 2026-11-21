@@ -235,7 +235,7 @@ name  = "daily"
 owner = "zero"
 mode  = "rwxrwxrwx"
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -400,7 +400,7 @@ user    = "chat"
 project = "daily"
 perm    = "w"
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -533,7 +533,7 @@ name    = "origin"
 url     = "__REMOTE__"
 push    = ["zero"]
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	cfg = strings.ReplaceAll(cfg, "__REMOTE__", remoteDir)
 	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
 		t.Fatal(err)

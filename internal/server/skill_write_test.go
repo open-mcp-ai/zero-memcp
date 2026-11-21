@@ -15,7 +15,7 @@ func TestSkillDeclaresWriteAction(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [[user]]
 name = "zero"

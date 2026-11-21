@@ -23,7 +23,7 @@ func newTestServer(t *testing.T, tomlContent string) (*Server, string) {
 	if tomlContent == "" {
 		tomlContent = `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [[user]]
 name = "zero"
@@ -180,7 +180,7 @@ owner = "alice"
 mode  = "rwxr-xr-x"
 `
 	dataDir := t.TempDir()
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	_ = osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg)
 
 	// 在两个仓库里各放一个文件
@@ -309,7 +309,7 @@ func TestCountTriggeredCommit(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [commit]
 interval = "1h"    # 全局设得很长
@@ -410,7 +410,7 @@ name  = "shared"
 owner = "zero"
 mode  = "rwxrwxrwx"
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
 		t.Fatal(err)
 	}

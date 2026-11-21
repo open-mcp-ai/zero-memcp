@@ -1624,9 +1624,18 @@ func ValidateRepoName(name string) error { return validateSegments("project name
 // ValidateCredName 校验用户名/凭证名：它们不进目录树，不允许斜杠。
 func ValidateCredName(name string) error { return validateSegments("name", name, false) }
 
-// validPath 校验树内路径。与 ValidateBranch 同源，只是错误措辞不同
-// （路径与分支名对使用者是两件事）。
+// validPath 校验树内路径。
+//
+// 跨平台归一化：树内路径标准一律是正斜杠 /。Windows 上通过
+// filepath.Join 拼出来的路径会带反斜杠 \，如果不归一化，
+// 校验里的 strings.ContainsAny(..., "\\") 会把系统的路径分隔符
+// 当成非法字符拒绝掉（TestPackReadCompatibility / TestDirtyWriteUsesInProcessCache
+// 在 Windows CI 上当场暴露）。
+//
+// 归一化在进入校验之前做，所以 "day/000.md" 合法、"day\000.md"
+// 在 Windows 上被归一化为 "day/000.md" 同样合法。
 func validPath(path string) error {
+	path = filepath.ToSlash(path)
 	return validateSegments("path", path, true)
 }
 
@@ -1719,6 +1728,7 @@ func (r *Repo) Recover() (RecoveryResult, error) {
 
 // Delete 把删除动作投递进脏写入队列。
 func (r *Repo) Delete(ref, path string) error {
+	path = filepath.ToSlash(path)
 	// 与 Write 同理：墓碑写在 dirty/<branch>/ 里。
 	if err := ValidateBranch(normalizeRef(ref)); err != nil {
 		return err

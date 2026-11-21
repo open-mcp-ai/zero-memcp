@@ -60,7 +60,7 @@ name  = "other/secret"
 owner = "zero"
 mode  = "rwx------"
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
 		t.Fatal(err)
 	}

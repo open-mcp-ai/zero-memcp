@@ -68,7 +68,7 @@ name    = "mirror"
 url     = "__URL__"
 fetch_only = true
 `
-	cfg = strings.ReplaceAll(cfg, "__DATA__", dataDir)
+	cfg = strings.ReplaceAll(cfg, "__DATA__", filepath.ToSlash(dataDir))
 	cfg = strings.ReplaceAll(cfg, "__URL__", remoteDir)
 	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
 		t.Fatal(err)

@@ -13,7 +13,7 @@ func TestPutTreePrefixAndRef(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [[user]]
 name = "zero"
@@ -88,7 +88,7 @@ func TestSinceTreeDelta(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [[user]]
 name = "zero"
@@ -164,7 +164,7 @@ func TestPutDoesNotTriggerExternalReload(t *testing.T) {
 	dataDir := t.TempDir()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = "` + filepath.ToSlash(dataDir) + `"
 
 [[user]]
 name = "zero"

@@ -115,7 +115,7 @@ func (s *Server) readSecret(name string) (string, error) {
 	if !st.Mode().IsRegular() {
 		return "", errors.New("token must be a regular file")
 	}
-	if st.Mode().Perm() != 0o600 {
+	if permsVerifiable() && st.Mode().Perm() != 0o600 {
 		return "", fmt.Errorf("token permissions are not 0600: %04o", st.Mode().Perm())
 	}
 	data, err := os.ReadFile(path)

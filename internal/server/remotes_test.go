@@ -113,7 +113,7 @@ func TestRemoteVerbListsDeclaredRemotes(t *testing.T) {
 		t.Fatalf("mirror 应标记为只读: %s", out)
 	}
 	// 脱敏后的 URL 里不应出现凭证（本测试 URL 本就没有）
-	if strings.Contains(out, remoteDir) == false {
+	if strings.Contains(out, filepath.ToSlash(remoteDir)) == false {
 		t.Fatalf("应显示远端地址: %s", out)
 	}
 }

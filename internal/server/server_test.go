@@ -213,6 +213,7 @@ mode  = "rwxr-xr-x"
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = srv.Close() })
 
 	aliceTok := mintToken(t, dataDir, "alice")
 	bobTok := mintToken(t, dataDir, "bob")
@@ -256,6 +257,7 @@ func TestRuleBitInjectedIntoSystem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = srv.Close() })
 
 	req := httptest.NewRequest(http.MethodGet, "/identity", nil)
 	req.RemoteAddr = "127.0.0.1:12345"
@@ -346,6 +348,7 @@ mode  = "rwx------"
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = srv.Close() })
 	repo, err := srv.projects.Ensure("daily")
 	if err != nil {
 		t.Fatal(err)
@@ -446,6 +449,7 @@ mode  = "rwxrwxrwx"
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { _ = srv.Close() })
 
 	rootTok := mintToken(t, dataDir, "zero")
 	bobTok := mintToken(t, dataDir, "bob")

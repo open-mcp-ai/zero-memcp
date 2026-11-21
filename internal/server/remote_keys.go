@@ -112,7 +112,8 @@ func (s *Server) readSSHKey(name string) ([]byte, error) {
 	if st.Size() > 64<<10 {
 		return nil, errors.New("SSH private key file exceeds 64 KiB")
 	}
-	if st.Mode().Perm() != 0o600 {
+	// Windows 的 Perm() 不提供真实 ACL 信息，不能据此拒绝密钥。
+	if permsVerifiable() && st.Mode().Perm() != 0o600 {
 		return nil, fmt.Errorf("SSH private key permissions are not 0600: %04o", st.Mode().Perm())
 	}
 	return os.ReadFile(path)

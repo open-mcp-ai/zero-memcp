@@ -98,12 +98,12 @@ http_token = "gh"
 		t.Fatalf("远端应推进到 %s，实际 %s", head, got)
 	}
 
-	// token 文件必须 0600。
+	// Unix 上 token 文件必须 0600；Windows 的 Perm() 不反映真实 ACL。
 	st, err := os.Stat(filepath.Join(dataDir, "system", "secrets", "gh"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Mode().Perm() != 0o600 {
+	if permsVerifiable() && st.Mode().Perm() != 0o600 {
 		t.Fatalf("token 文件权限 %04o，应为 0600", st.Mode().Perm())
 	}
 }

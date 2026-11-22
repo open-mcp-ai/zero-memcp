@@ -33,7 +33,7 @@ LABEL org.opencontainers.image.source="https://github.com/open-mcp-ai/zero-memcp
 LABEL org.opencontainers.image.description="Git-backed memory server for coding agents (MCP)"
 LABEL org.opencontainers.image.licenses="MIT"
 
-RUN apk add --no-cache ca-certificates tzdata git \
+RUN apk add --no-cache ca-certificates tzdata \
     && addgroup -S -g 1000 zero \
     && adduser -S -u 1000 -G zero -h /data zero \
     && mkdir -p /etc/zero-memcp /data \

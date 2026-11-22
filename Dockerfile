@@ -17,14 +17,14 @@
 #
 # 容器默认以 uid 1000 (zero) 运行，避免 root 权限在挂载卷上制造无法回收的文件。
 
-FROM golang:1.24-alpine AS build
+FROM golang:1.27-alpine AS build
 ARG GOPROXY=https://proxy.golang.org,direct
 ARG VERSION=dev
 ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath \
-    -ldflags="-s -w -X main.version=$VERSION -X github.com/open-mcp-ai/zero-memcp/internal/server.Version=$VERSION" \
+    -ldflags="-s -w -X main.version=$VERSION" \
     -o /out/zero-memcp ./cmd/zero-memcp
 
 FROM alpine:3.21

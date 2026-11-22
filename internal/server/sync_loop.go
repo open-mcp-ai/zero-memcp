@@ -327,13 +327,28 @@ func (s *Server) kickSync() {
 }
 
 // runSyncPass 对所有 auto_sync 目标跑一轮。
+//
+// 顺序有意义：**命令流对端（工作层）先跑，Git 远端随后**。
+//
+// 踩过的坑（2026-11-23 实时备份实测）：两个目标按配置顺序串行跑，
+// 而 Git 远端（hub-3060）要 fetch + merge + push 整个仓库，很慢。
+// 它排在前面时，刚写下的记忆会被堵在它的后面——写后即时推送做了，
+// 备份却几十秒不到，库看起来像没生效。
+//
+// Git 远端是「快照给外部看」，晚几秒无影响；工作层对端是活链路，
+// 必须优先。
 func (s *Server) runSyncPass(reason string) {
 	targets := s.syncTargets()
 	if len(targets) == 0 {
 		return
 	}
-	for _, t := range targets {
-		s.syncOnce(t.Project, t.Remote)
+	for _, pass := range []bool{true, false} {
+		for _, t := range targets {
+			if isWorkPeerURL(t.Remote.URL) != pass {
+				continue
+			}
+			s.syncOnce(t.Project, t.Remote)
+		}
 	}
 	_ = reason
 }

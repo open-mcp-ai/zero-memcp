@@ -53,7 +53,13 @@ type opContext struct {
 }
 
 func (s *Server) newOpContext(project, branch string) (*opContext, error) {
-	repo, err := s.projects.Get(project)
+	// 落地命令流时自动建库：与 writeverb / writenote 保持一致。
+	//
+	// 踩过的坑（2026-11-22 备份实测抓到）：原实现用 projects.Get，
+	// 结果一个全新的备份节点（配置里已声明项目、但 repos/ 下还没有 .git）
+	// 收第一笔推流时直接报 500: project "X" has no repository yet。
+	// 既然鉴权已在 handleOpPush 通过，就该在这里自动 init 裸库。
+	repo, err := s.projects.Ensure(project)
 	if err != nil {
 		return nil, err
 	}

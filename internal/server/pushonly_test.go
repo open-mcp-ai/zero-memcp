@@ -203,3 +203,54 @@ auto_sync  = true
 		})
 	}
 }
+
+// 推给一个配置声明了项目、但尚未建库的新节点，接收端必须自动建库，
+// 不能报 500 "has no repository yet"。
+func TestOpPushAutoInitsRepositoryOnEmptyPeer(t *testing.T) {
+	laptop, laptopData := setupMountServer(t)
+	backup, backupData := setupMountServer(t)
+	tokLaptop := mintRestricted(t, laptopData, auth.Claims{Sub: "zero", Cap: "rwx"})
+	tokBackup := mintRestricted(t, backupData, auth.Claims{Sub: "zero", Cap: "rwx"})
+
+	write := func(s *Server, tok, path, body string) {
+		t.Helper()
+		if _, err := callMCPRaw(t, s, tok, map[string]any{
+			"name": "term",
+			"arguments": map[string]any{
+				"cmd":  "write blackegg/brand-new@zero:" + path + " $BODY",
+				"vars": map[string]string{"BODY": body},
+			},
+		}); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+
+	// 接收端只在配置里声明该项目，但**从未写过任何内容**（没有 repos/ 下的目录）。
+	// 在 backup 的 projects 里确认它不存在：
+	if _, err := backup.projects.Get("blackegg/brand-new"); err == nil {
+		t.Fatal("测试前提：brand-new 仓库在开始前不应存在")
+	}
+
+	// 主机写第一条记忆：
+	write(laptop, tokLaptop, "first.md", "第一条")
+
+	srvBackup := httptest.NewServer(backup.muxFor(ListenBlock{Addr: "127.0.0.1:0"}))
+	defer srvBackup.Close()
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	rm := configRemote{
+		Name:     "backup",
+		URL:      srvBackup.URL,
+		Token:    tokBackup,
+		Push:     []string{"zero"},
+		PushOnly: true,
+	}
+	if err := laptop.syncOpsWithRemote(client, rm, "blackegg/brand-new"); err != nil {
+		t.Fatalf("推给新节点应自动建库，实际失败: %v", err)
+	}
+
+	// 接收端应自动建库且能读出这条记忆：
+	if out, err := callMCP(t, backup, tokBackup, "read blackegg/brand-new@zero:first.md"); err != nil || out == "" {
+		t.Fatalf("接收端建库后应能读出内容: err=%v out=%q", err, out)
+	}
+}

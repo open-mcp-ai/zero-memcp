@@ -34,6 +34,14 @@ func (s *Server) exportOps(project, branch string, after int64) (opBatch, error)
 	if err != nil {
 		return batch, err
 	}
+	// 读侧播种：对端从位点 0 开始拉、而本地日志尚为空时，
+	// 先把当前整棵树作为第一条批量命令播进日志。
+	// 这保证了升级到命令流之前的所有历史能完整同步给对端。
+	if after == 0 && l.Last() == 0 {
+		if serr := l.seedIfEmpty(); serr != nil {
+			s.logf("oplog: seed initial tree for %s@%s: %v", project, branch, serr)
+		}
+	}
 	batch.Ops = l.Since(after)
 	batch.To = l.Last()
 	return batch, nil

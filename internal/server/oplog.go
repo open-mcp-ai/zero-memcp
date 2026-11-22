@@ -109,6 +109,13 @@ type opLog struct {
 
 	state atomic.Pointer[opLogState]
 	wmu   chan struct{}
+	// seed 在日志为空时给出「当前整棵树」的条目，用来登记一条批量命令。
+	//
+	// 为什么需要它：升级到命令流之前写入过的内容不在日志里。若不播种，
+	// 对端从位点 0 拉只会拿到「升级之后的新写入」——历史整段缺失，
+	// 而且两边都不报错。这正是「整树 = 批量命令」要解决的情形：
+	// 一棵对端没有的树，在命令流里就是一条 opTree。
+	seed func() ([]opEntry, error)
 }
 
 // opLogState 是日志的不可变快照。
@@ -217,6 +224,77 @@ func (l *opLog) Append(op treeOp) (treeOp, error) {
 	}
 	defer done()
 
+	// 第一条命令之前先把当前整棵树播种成一条批量命令。
+	// 必须在同一把令牌里做：否则 flatten 与 append 之间有窗口，
+	// 会把一条「旧树」排在新写入之后，重放出错误终局。
+	if err := l.seedLocked(); err != nil {
+		return op, err
+	}
+
+	st := l.snapshot()
+	op.Seq = st.last + 1
+	if op.Ts == 0 {
+		op.Ts = time.Now().Unix()
+	}
+	line, err := json.Marshal(op)
+	if err != nil {
+		return op, err
+	}
+	if err := os.MkdirAll(l.dir, 0o755); err != nil {
+		return op, err
+	}
+	f, err := os.OpenFile(l.file, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return op, err
+	}
+	if _, err := f.Write(append(line, '\n')); err != nil {
+		_ = f.Close()
+		return op, err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return op, err
+	}
+	if err := f.Close(); err != nil {
+		return op, err
+	}
+
+	next := make([]treeOp, len(st.ops)+1)
+	copy(next, st.ops)
+	next[len(st.ops)] = op
+	l.state.Store(&opLogState{ops: next, last: op.Seq})
+	return op, nil
+}
+
+// seedLocked 在日志为空时登记一条整树批量命令。调用方必须已持有令牌。
+func (l *opLog) seedLocked() error {
+	if l.seed == nil || l.snapshot().last > 0 {
+		return nil
+	}
+	entries, err := l.seed()
+	if err != nil {
+		return err
+	}
+	if len(entries) == 0 {
+		return nil
+	}
+	_, err = l.appendLocked(treeOp{Kind: opTree, Batch: entries})
+	return err
+}
+
+// seedIfEmpty 供读侧调用：对端来要命令而本地还没有日志时，
+// 先把整棵树播种成一条命令，否则对端永远拿不到历史内容。
+func (l *opLog) seedIfEmpty() error {
+	done, err := l.acquire()
+	if err != nil {
+		return err
+	}
+	defer done()
+	return l.seedLocked()
+}
+
+// appendLocked 写一条命令，调用方必须已持有令牌。
+func (l *opLog) appendLocked(op treeOp) (treeOp, error) {
 	st := l.snapshot()
 	op.Seq = st.last + 1
 	if op.Ts == 0 {
@@ -256,15 +334,17 @@ func (l *opLog) Append(op treeOp) (treeOp, error) {
 //
 // 用 sync.Map 存 *opLog：日志对象本身带并发纪律，这里只管按名取。
 type opLogStore struct {
-	root string // <data>/system/oplog/<node>/
-	node string
-	logs sync.Map // "project\x00branch" -> *opLog
+	root   string // <data>/system/oplog/<node>/
+	node   string
+	logs   sync.Map // "project\x00branch" -> *opLog
+	seeder func(project, branch string) ([]opEntry, error)
 }
 
-func newOpLogStore(dataDir, node string) *opLogStore {
+func newOpLogStore(dataDir, node string, seeder func(project, branch string) ([]opEntry, error)) *opLogStore {
 	return &opLogStore{
-		root: filepath.Join(dataDir, "system", "oplog", node),
-		node: node,
+		root:   filepath.Join(dataDir, "system", "oplog", node),
+		node:   node,
+		seeder: seeder,
 	}
 }
 
@@ -279,6 +359,9 @@ func (st *opLogStore) For(project, branch string) (*opLog, error) {
 	dir := filepath.Join(st.root, escapeLogPart(project))
 	file := filepath.Join(dir, escapeLogPart(branch)+".ndjson")
 	l := newOpLog(dir, file)
+	if st.seeder != nil {
+		l.seed = func() ([]opEntry, error) { return st.seeder(project, branch) }
+	}
 	if err := l.Load(); err != nil {
 		return nil, err
 	}

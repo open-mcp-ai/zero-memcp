@@ -56,8 +56,22 @@ func TestOpsSyncBidirectionalUsesIndependentWatermarks(t *testing.T) {
 	if _, err := b.pushOpsToPeer(client, srvA.URL, tokA, "a", "blackegg/me", "zero"); err != nil {
 		t.Fatalf("B 推 A: %v", err)
 	}
-	if got := b.peerOutSeq("blackegg/me", "zero", "a"); got != 1 {
-		t.Fatalf("推水位应是 B 自己的 seq 1，实际 %d", got)
+	// 真正的不变量不是「等于 1」而是：推水位必须等于**自己本地日志**的位点，
+	// 且与拉水位无关。
+	//
+	// （播种会让本地日志先有一条 opTree，所以具体数字不是 1。
+	// 写死数字的话，每加一种「本地会自动产生命令」的机制，这个测试就假红一次。）
+	localLog, err := b.opLogs.For("blackegg/me", "zero")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outSeq := b.peerOutSeq("blackegg/me", "zero", "a")
+	inSeq := b.peerSeq("blackegg/me", "zero", b.resolvePeer("a"))
+	if outSeq != localLog.Last() {
+		t.Fatalf("推水位应等于本地日志位点 %d，实际 %d", localLog.Last(), outSeq)
+	}
+	if outSeq == inSeq {
+		t.Fatalf("推与拉的水位不应相同（in=%d out=%d）——相同说明两个方向又共用了同一个游标", inSeq, outSeq)
 	}
 	out, err := callMCP(t, a, tokA, "read blackegg/me@zero:b1.md")
 	if err != nil {

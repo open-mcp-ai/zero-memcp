@@ -480,7 +480,7 @@ func New(cfg Config) (*Server, error) {
 		fanouts:     newFanoutHub(),
 		resources:   newResourceHub(),
 		workSync:    newWorkSyncState(),
-		opLogs:      newOpLogStore(cfg.DataDir, nodeIdentity(cfg)),
+		opLogs:      nil, // 下面在 srv 构造后初始化（seeder 需要引用 srv）
 		watermarkMu: make(chan struct{}, 1),
 		liveIdx:     &liveIndexes{},
 		masterKeys:  &masterKeyring{},
@@ -494,6 +494,7 @@ func New(cfg Config) (*Server, error) {
 			return ch
 		}(),
 	}
+	s.opLogs = newOpLogStore(cfg.DataDir, nodeIdentity(cfg), s.flattenTreeToOps)
 	s.cfgFilePtr.Store(cfgFile)
 	if lookup != nil {
 		s.cfgLookup.Store(lookup)

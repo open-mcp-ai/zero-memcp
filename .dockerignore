@@ -1,0 +1,32 @@
+# 构建上下文黑名单。
+#
+# 没有它，`docker build .` 会把 .git（几百 MB 历史）和 models/（606MB 模型）
+# 一起塞进上下文——每次 CI 都得先上传几百兆才轮到编译，而它们对镜像毫无用处。
+
+.git
+.github
+.gitignore
+.ext-align
+
+# 模型与动态库：镜像不含语义检索所需的模型，需要时由使用者挂载或另行下载。
+models/*.onnx
+models/*.dylib
+models/*.so
+
+# 构建产物
+/zero-memcp
+/zmcp
+bin/
+dist/
+*.exe
+*.out
+*.test
+
+# 本地数据与临时目录
+/tmp/
+.DS_Store
+._*
+
+# 文档与示例不影响编译
+docs/
+*.md

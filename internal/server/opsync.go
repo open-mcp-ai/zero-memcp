@@ -67,6 +67,16 @@ func (s *Server) peerSeq(project, branch, peerNode string) int64 {
 	return in
 }
 
+// peerOutSeq 是「对端已确认收到我本地日志的哪一位」。
+//
+// 推与拉的水位绝不能共用（2026-11-22 狗粮实测抓到）：
+// 镜像从上游拉到 seq 80 后，若推方向也读 in=80，就会拿它去截
+// 自己只有 1 条的本地日志，永远导出空批次；status 却仍报同步成功。
+func (s *Server) peerOutSeq(project, branch, peerNode string) int64 {
+	out, _ := s.workSync.cursors(project, branch, peerNode)
+	return out
+}
+
 // learnPeerIdentity 记住「配置里的对端别名 ↔ 对端自报的日志属主名」。
 //
 // 为什么必须有这张表（测试抓到的真 bug）：
@@ -227,7 +237,7 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	}
 	// 推的水位：我作为日志属主，对端（peerName）确认到哪一位。
 	// 推方向由本端记，因为对端不会主动告诉我它收到哪了。
-	after := s.peerSeq(project, branch, peerName)
+	after := s.peerOutSeq(project, branch, s.resolvePeer(peerName))
 	batch, err := s.exportOps(project, branch, after)
 	if err != nil {
 		return zero, err
@@ -269,6 +279,11 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	}
 	// 只有对端确认之后才推进本地水位。
 	s.workSync.noteOut(project, branch, peerName, l.Last())
+	// 每轮推进后立即落盘：进程被 kill 不会走 Close，
+	// 水位留在内存就等于下次重启全量重拉。
+	if serr := s.saveOpSyncState(); serr != nil {
+		s.logf("opsync: save watermark after push: %v", serr)
+	}
 	return res, nil
 }
 
@@ -315,6 +330,9 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 			return res, err
 		}
 		s.commitOpsLocal(project, branch, batch.Node, batch.Ops, res)
+	}
+	if serr := s.saveOpSyncState(); serr != nil {
+		s.logf("opsync: save watermark after pull: %v", serr)
 	}
 	return res, nil
 }

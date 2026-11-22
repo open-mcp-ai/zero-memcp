@@ -191,6 +191,8 @@ type Server struct {
 	// 工作层的增量改动与历史层的整树同步都是它里面的命令，
 	// 区别只是粒度：单条 set/delete/rename，或一条携带整棵树的批量命令。
 	opLogs *opLogStore
+	// watermarkMu 串行化水位落盘（一槽 channel 令牌，与其它写者同纪律）。
+	watermarkMu chan struct{}
 	// peerAliases 记录「配置里的对端别名 → 对端自报的日志属主名」。
 	// 水位键必须用属主名，否则同一台机器换个别名就从头重拉。
 	peerAliases sync.Map
@@ -474,15 +476,16 @@ func New(cfg Config) (*Server, error) {
 		uiLimiter:     newUILoginLimiter(),
 		lock:          startupLock,
 
-		listens:    FromConfig(listenBlocks(cfgFile)),
-		fanouts:    newFanoutHub(),
-		resources:  newResourceHub(),
-		workSync:   newWorkSyncState(),
-		opLogs:     newOpLogStore(cfg.DataDir, nodeIdentity(cfg)),
-		liveIdx:    &liveIndexes{},
-		masterKeys: &masterKeyring{},
-		bodies:     newBodyCache(searchBodyBudget(cfgFile)),
-		done:       make(chan struct{}),
+		listens:     FromConfig(listenBlocks(cfgFile)),
+		fanouts:     newFanoutHub(),
+		resources:   newResourceHub(),
+		workSync:    newWorkSyncState(),
+		opLogs:      newOpLogStore(cfg.DataDir, nodeIdentity(cfg)),
+		watermarkMu: make(chan struct{}, 1),
+		liveIdx:     &liveIndexes{},
+		masterKeys:  &masterKeyring{},
+		bodies:      newBodyCache(searchBodyBudget(cfgFile)),
+		done:        make(chan struct{}),
 		// 默认视为「没有维护循环」：New 之后没 Start 就 Close 的路径
 		// （测试里很常见）不该在这里永久阻塞。
 		maintainDone: func() chan struct{} {
@@ -494,6 +497,16 @@ func New(cfg Config) (*Server, error) {
 	s.cfgFilePtr.Store(cfgFile)
 	if lookup != nil {
 		s.cfgLookup.Store(lookup)
+	}
+
+	// 同步水位落盘：重启后不重拉已经同步过的命令。
+	//
+	// 不落盘的代价不是"多干活"而是"每次重启白烧一遍全量索引"：
+	// 位点归零 → 对端整份日志重放 → 每条路径都 refreshPath + 广播。
+	// 命令幂等所以数据不会坏，日志里也看不出错，只是慢。
+	if serr := s.loadOpSyncState(); serr != nil {
+		startupStage("opsync state: %v", serr)
+		s.logf("opsync state: %v", serr)
 	}
 
 	// 关注表落盘：重启后两个分身仍记得自己关注哪条共享分支。
@@ -858,6 +871,10 @@ func (s *Server) Close() error {
 	})
 	if !first {
 		return nil
+	}
+	// 同步水位先落盘：后面会停同步循环与仓库，那时位点已经不再变化。
+	if err := s.saveOpSyncState(); err != nil {
+		s.logf("opsync state save on shutdown failed: %v", err)
 	}
 	// 退出前把索引快照落盘。正常发版（停旧进程 → 启新进程）就靠它
 	// 把「下次启动 33 秒」变成「下次启动读一个文件」。

@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
+	"github.com/open-mcp-ai/zero-memcp/internal/gittransport"
 )
 
 // 写入必须尽快流到备份端，而不是干等轮询。
@@ -108,4 +110,71 @@ http_token = "tok-backup"
 		time.Sleep(300 * time.Millisecond)
 	}
 	t.Fatal("15 秒内备份端没收到刚写入的内容：写后推送没生效")
+}
+
+// 批量推送不能被短超时掐死。
+//
+// 实测故障（2026-11-23）：写后即时推送上线当天，weft@main.record 积压
+// 111 条命令，每轮推送都报
+//
+//	sync ... failed: push main.record: Post ".../sync/ops/push":
+//	context deadline exceeded (Client.Timeout exceeded while awaiting headers)
+//
+// 原因：给命令流同步复用了 Git 传输的 20 秒整请求预算。而批量推送必须
+// 等对端把整批命令应用完才回响应头——ARM 备份节点上 111 条远超 20 秒。
+// 失败后只等下一轮轮询重试，远端永远追不上。
+//
+// 这条测试让对端故意慢 3 秒响应，验证 push 仍然成功。
+func TestBulkPushOutlivesShortClientTimeout(t *testing.T) {
+	backup, backupData := setupMountServer(t)
+	tokBackup := mintRestricted(t, backupData, auth.Claims{Sub: "zero", Cap: "rwx"})
+
+	// 包一层：每个请求先睡 3 秒再交给真实 handler。
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(3 * time.Second)
+		backup.muxFor(ListenBlock{Addr: "127.0.0.1:0"}).ServeHTTP(w, r)
+	}))
+	defer slow.Close()
+
+	host, hostData := setupMountServer(t)
+	tokHost := mintRestricted(t, hostData, auth.Claims{Sub: "zero", Cap: "rwx"})
+
+	// 写 3 条，制造一个需要多轮往返的批次。
+	write := func(path string) {
+		t.Helper()
+		if _, err := callMCPRaw(t, host, tokHost, map[string]any{
+			"name": "term",
+			"arguments": map[string]any{
+				"cmd":  "write blackegg/me@zero:" + path + " $BODY",
+				"vars": map[string]string{"BODY": "批量推送测试 " + path},
+			},
+		}); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	for _, p := range []string{"b1.md", "b2.md", "b3.md"} {
+		write(p)
+	}
+
+	client, err := gittransport.NewSyncClient(gittransport.TLSConfig{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rm := configRemote{
+		Name:     "slow-backup",
+		URL:      slow.URL,
+		Token:    tokBackup,
+		Push:     []string{"zero"},
+		PushOnly: true,
+	}
+	// 旧实现用 20 秒整请求预算 + 3 秒响应延迟 × 多轮（push → 补 blob → 重放）
+	// 会踩线；新实现不设整请求上限，必须通过。
+	if err := host.syncOpsWithRemote(client, rm, "blackegg/me"); err != nil {
+		t.Fatalf("批量推送给慢对端应成功，实际: %v", err)
+	}
+	for _, p := range []string{"b1.md", "b2.md", "b3.md"} {
+		if out, rerr := callMCP(t, backup, tokBackup, "read blackegg/me@zero:"+p); rerr != nil || out == "" {
+			t.Fatalf("备份端应有 %s: err=%v", p, rerr)
+		}
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -81,6 +82,40 @@ func NewTLSClient(cfg TLSConfig, timeout time.Duration) (*http.Client, error) {
 			return http.ErrUseLastResponse
 		},
 	}, nil
+}
+
+// NewSyncClient 给「命令流同步」用的 HTTP 客户端。
+//
+// 与 NewTLSClient 的区别在超时语义，而这个区别是实测撞出来的
+// （2026-11-23 写后即时推送上线当天）：
+//
+//	批量推送一个请求要等对端把整批命令应用完才返回响应头。
+//	111 条命令在 ARM 备份节点上超过 20 秒，于是每一轮都
+//	"context deadline exceeded"，而重试只等下一轮轮询——
+//	远端永远追不上，且失败原因只有一行超时。
+//
+// 所以这里不设 Client.Timeout（那是**整请求**预算，对批量同步
+// 没有合理的常数），改设：
+//
+//	ResponseHeaderTimeout —— 卡住等响应头的时间，有界
+//	DialContextTimeout    —— 连不上要快速失败，而不是挂满
+//	TLSHandshakeTimeout   —— 同上
+//
+// 体流不设上限：对端算完才开始写响应，写出来之后就是纯传输。
+func NewSyncClient(cfg TLSConfig) (*http.Client, error) {
+	base, err := NewTLSClient(cfg, time.Minute)
+	if err != nil {
+		return nil, err
+	}
+	base.Timeout = 0
+	if tr, ok := base.Transport.(*http.Transport); ok {
+		tr.DialContext = (&net.Dialer{
+			Timeout:   15 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext
+		tr.ResponseHeaderTimeout = 5 * time.Minute
+	}
+	return base, nil
 }
 
 func normalizePin(pin string) string {

@@ -438,10 +438,12 @@ func isWorkPeerURL(rawURL string) bool {
 //	  若配置没写 Pull，但写了 Push，默认把同一批分支也纳入拉取——
 //	  因为通常对等节点的意图就是「这几条分支实时对齐」。
 func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gitstore.Repo) error {
-	client, err := gittransport.NewTLSClient(gittransport.TLSConfig{
+	// 命令流同步用专用的客户端：批量推送要等对端应用完整批才回响应头，
+	// 20 秒的整请求预算是给 Git 传输定的，套在这里会让稍大的批次必败。
+	client, err := gittransport.NewSyncClient(gittransport.TLSConfig{
 		CAPath: rm.TLSCA,
 		Pin:    rm.TLSPin,
-	}, 20*time.Second)
+	})
 	if err != nil {
 		return err
 	}

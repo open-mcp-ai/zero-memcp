@@ -376,6 +376,14 @@ func isWorkPeerURL(rawURL string) bool {
 	if !strings.HasPrefix(u, "http://") && !strings.HasPrefix(u, "https://") {
 		return false
 	}
+	// 剥掉 query string：?insecure=1 这种参数不改变它是一个 Git 仓库的性质。
+	//
+	// 踩过的坑（2026-11-22 拓扑实测抓到）：原实现只做 TrimRight("/")，
+	// 结果 "...zero.git?insecure=1" 因为结尾不是 .git 被误判成工作层对端，
+	// 既破坏了拓扑视图，又导致同步循环向 Git 端点发命令流请求。
+	if i := strings.Index(u, "?"); i >= 0 {
+		u = u[:i]
+	}
 	u = strings.TrimRight(u, "/")
 	return !strings.HasSuffix(u, ".git")
 }

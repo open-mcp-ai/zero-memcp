@@ -3,6 +3,7 @@ package server
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
@@ -34,6 +35,9 @@ type opApplyResult struct {
 	Conflicted []workConflict `json:"conflicted,omitempty"`
 	// Rejected 是因故没能落地的命令（缺对象之外的原因）。
 	Rejected []string `json:"rejected,omitempty"`
+	// Kept 是权威整树里本地有未提交改动、因而拒绝被覆盖的路径。
+	// 它们既不在 Applied 也不在 Deleted 里——必须能被看见。
+	Kept []string `json:"kept,omitempty"`
 }
 
 // opContext 是一次应用所需要的本地上下文。
@@ -91,8 +95,11 @@ func (ctx *opContext) currentSHA(path string) (string, bool) {
 //
 // opTree 在这里展开成多条 set：这就是「历史层整树同步 = 批量命令流」
 // 的落点。展开后与其它命令走完全相同的落地路径，没有第二套。
+//
+// Replace 为真时**展开不了**——它需要本地当前的路径表才能算出
+// 「批次里没有 = 已删除」，那只能在 applyOps 里带上下文处理。
 func expandOp(op treeOp) []treeOp {
-	if op.Kind != opTree {
+	if op.Kind != opTree || op.Replace {
 		return []treeOp{op}
 	}
 	out := make([]treeOp, 0, len(op.Batch))
@@ -103,6 +110,59 @@ func expandOp(op treeOp) []treeOp {
 		})
 	}
 	return out
+}
+
+// applyTreeReplace 应用一条**权威整树**命令。
+//
+// 语义：批次里的路径按 set 落地；本地有、批次里没有、且本地没有
+// 未提交改动的路径，一律墓碑——对端已经把它删了。
+//
+// 为什么必须这样（2026-11-22 部署前发现）：只展开成 set 的整树同步
+// 只能加不能减。把一台落后八天的节点当成上游，会把八天里删掉的
+// 内容全部复活；反过来，上游的删除也永远传不下来。
+//
+// 未提交改动一律保留：那是「正在想、还没说出口」的内容，不能被
+// 一次远端整树覆盖掉。这类路径计入 Kept 并在日志点名。
+func (s *Server) applyTreeReplace(project, branch, peerNode string, ctx *opContext, op treeOp, res *opApplyResult) error {
+	inBatch := make(map[string]bool, len(op.Batch))
+	for _, e := range op.Batch {
+		inBatch[e.Path] = true
+		one := treeOp{Seq: op.Seq, Node: op.Node, Ts: op.Ts, Kind: opSet, Path: e.Path, Mode: e.Mode, SHA: e.SHA}
+		missing, err := s.applyOp(project, branch, peerNode, ctx, one, res)
+		if err != nil {
+			res.Rejected = append(res.Rejected, fmt.Sprintf("tree set %s: %v", e.Path, err))
+			continue
+		}
+		if missing != "" {
+			res.Missing = append(res.Missing, missing)
+		}
+	}
+
+	// 本地有、批次里没有 → 对端已删除。
+	var gone []string
+	for path := range ctx.clean {
+		if inBatch[path] {
+			continue
+		}
+		if lch, ok := ctx.local[path]; ok && !lch.Deleted {
+			// 本地有未提交改动：保留，不静默吃掉。
+			res.Kept = append(res.Kept, path)
+			continue
+		}
+		gone = append(gone, path)
+	}
+	sort.Strings(gone)
+	for _, path := range gone {
+		tomb := treeOp{Seq: op.Seq, Node: op.Node, Ts: op.Ts, Kind: opDelete, Path: path}
+		if _, err := s.applyOp(project, branch, peerNode, ctx, tomb, res); err != nil {
+			res.Rejected = append(res.Rejected, fmt.Sprintf("tree delete %s: %v", path, err))
+		}
+	}
+	if len(res.Kept) > 0 {
+		s.logf("op-sync: TREE REPLACE %s@%s kept %d locally-modified path(s): %s",
+			project, branch, len(res.Kept), strings.Join(res.Kept, ", "))
+	}
+	return nil
 }
 
 // applyOp 应用一条已展开的命令。
@@ -211,6 +271,12 @@ func (s *Server) applyOps(project, branch, peerNode string, ops []treeOp) (opApp
 	}
 	seenMissing := map[string]bool{}
 	for _, raw := range ops {
+		if raw.Kind == opTree && raw.Replace {
+			if terr := s.applyTreeReplace(project, branch, peerNode, ctx, raw, &res); terr != nil {
+				res.Rejected = append(res.Rejected, fmt.Sprintf("tree replace: %v", terr))
+			}
+			continue
+		}
 		for _, op := range expandOp(raw) {
 			missing, aerr := s.applyOp(project, branch, peerNode, ctx, op, &res)
 			if aerr != nil {

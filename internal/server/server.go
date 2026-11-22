@@ -191,6 +191,8 @@ type Server struct {
 	// 工作层的增量改动与历史层的整树同步都是它里面的命令，
 	// 区别只是粒度：单条 set/delete/rename，或一条携带整棵树的批量命令。
 	opLogs *opLogStore
+	// syncLog 记录同步流水（供 agent 问「记忆体情况」时读出当前与对端状态）。
+	syncLog *syncJournal
 	// watermarkMu 串行化水位落盘（一槽 channel 令牌，与其它写者同纪律）。
 	watermarkMu chan struct{}
 	// peerAliases 记录「配置里的对端别名 → 对端自报的日志属主名」。
@@ -481,6 +483,7 @@ func New(cfg Config) (*Server, error) {
 		resources:   newResourceHub(),
 		workSync:    newWorkSyncState(),
 		opLogs:      nil, // 下面在 srv 构造后初始化（seeder 需要引用 srv）
+		syncLog:     newSyncJournal(filepath.Join(cfg.DataDir, "system", "synclog.ndjson")),
 		watermarkMu: make(chan struct{}, 1),
 		liveIdx:     &liveIndexes{},
 		masterKeys:  &masterKeyring{},
@@ -508,6 +511,11 @@ func New(cfg Config) (*Server, error) {
 	if serr := s.loadOpSyncState(); serr != nil {
 		startupStage("opsync state: %v", serr)
 		s.logf("opsync state: %v", serr)
+	}
+
+	// 同步流水：读入最近的流水，供 agent 问状态时回答。
+	if jerr := s.syncLog.Load(syncJournalKeep); jerr != nil {
+		s.logf("synclog load: %v", jerr)
 	}
 
 	// 关注表落盘：重启后两个分身仍记得自己关注哪条共享分支。

@@ -78,6 +78,13 @@ type treeOp struct {
 	SHA  string `json:"sha,omitempty"`
 	// Batch 是 tree 命令展开后的批量载荷，仅 opTree 使用。
 	Batch []opEntry `json:"batch,omitempty"`
+	// Replace 为真表示这条批量命令是**权威的整棵树**：
+	// 本地有、而批次里没有的路径，都是对端已删除的，必须一并墓碑。
+	//
+	// 为什么必须有它（2026-11-22 部署前发现）：只展开成 set 的话，
+	// 「整树同步」只能加不能减。对端删掉的内容会在接收端活下来——
+	// 正是「离线节点复活已删内容」那个不变量被破。
+	Replace bool `json:"replace,omitempty"`
 }
 
 // opEntry 是批量命令里的一项。
@@ -278,7 +285,7 @@ func (l *opLog) seedLocked() error {
 	if len(entries) == 0 {
 		return nil
 	}
-	_, err = l.appendLocked(treeOp{Kind: opTree, Batch: entries})
+	_, err = l.appendLocked(treeOp{Kind: opTree, Batch: entries, Replace: true})
 	return err
 }
 

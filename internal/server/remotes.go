@@ -415,7 +415,12 @@ func (s *Server) execWorkPeerSync(project string, rm config.Remote, repo *gitsto
 func (s *Server) execSync(rest string, c Caller) (TermResult, error) {
 	project, name := splitProjectRemote(rest)
 	if project == "" {
-		return TermResult{}, fmt.Errorf("sync requires <project> [<remote>]")
+		// 无参的 sync = 同步流水视图。
+		//
+		// 这是 agent 问「记忆体什么情况」时该看到的：本机到哪了、
+		// 对端到哪了、最近几轮推拉的结果。写进 stderr 日志等于只有
+		// 翻机器的人看得见；而上下游两边的 agent 都需要自己能读到。
+		return s.syncVerbNoArgs(c)
 	}
 	if !s.projectVisibleFor(c, project) {
 		return TermResult{}, fmt.Errorf("project %q is outside this credential's visible scope", project)

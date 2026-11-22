@@ -138,6 +138,16 @@ func (s *Server) handleOpPull(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// 上游视角：谁在什么时候把我拉到了哪一位。
+	//
+	// 这条记录让「在上游问记忆体情况」能回答：有哪些下游、各自追到哪了、
+	// 有没有落下的。没有它，上游只知道自己在写，不知道谁跟上了。
+	s.recordSync(syncRecord{
+		Dir: "served", Peer: req.Node, Node: req.Node,
+		Project: req.Project, Branch: req.Branch,
+		From: req.After, To: batch.To, PeerHead: int(batch.From),
+		Applied: len(batch.Ops),
+	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batch)
 }
@@ -163,6 +173,14 @@ func (s *Server) handleOpPush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// 被推方视角：某个下游把它的命令推给了我。
+	s.recordSync(syncRecord{
+		Dir: "received", Peer: batch.Node, Node: batch.Node,
+		Project: batch.Project, Branch: batch.Branch,
+		From: batch.From, To: batch.To,
+		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
+		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
+	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
 }
@@ -287,6 +305,13 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	}
 	// 只有对端确认之后才推进本地水位。
 	s.workSync.noteOut(project, branch, peerName, l.Last())
+	s.recordSync(syncRecord{
+		Dir: "push", Peer: peerName, Node: s.resolvePeer(peerName),
+		Project: project, Branch: branch,
+		From: after, To: l.Last(), PeerHead: len(batch.Ops),
+		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
+		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
+	})
 	// 每轮推进后立即落盘：进程被 kill 不会走 Close，
 	// 水位留在内存就等于下次重启全量重拉。
 	if serr := s.saveOpSyncState(); serr != nil {
@@ -311,6 +336,13 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	// 即使这一批是空的，对端属主名也已经学到了——水位键从此稳定。
 	s.learnPeerIdentity(peerName, batch.Node)
 	if len(batch.Ops) == 0 {
+		// 空批次也要留痕：否则「下游问上游有没有新东西」时，
+		// 流水里看不到任何证据，容易误判成同步没在跑。
+		s.recordSync(syncRecord{
+			Dir: "pull", Peer: peerName, Node: batch.Node,
+			Project: project, Branch: branch,
+			From: after, To: after, PeerHead: int(batch.To),
+		})
 		return zero, nil
 	}
 	res, err := s.ingestOps(project, branch, batch)
@@ -339,6 +371,13 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 		}
 		s.commitOpsLocal(project, branch, batch.Node, batch.Ops, res)
 	}
+	s.recordSync(syncRecord{
+		Dir: "pull", Peer: peerName, Node: batch.Node,
+		Project: project, Branch: branch,
+		From: after, To: batch.To, PeerHead: int(batch.To),
+		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
+		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
+	})
 	if serr := s.saveOpSyncState(); serr != nil {
 		s.logf("opsync: save watermark after pull: %v", serr)
 	}

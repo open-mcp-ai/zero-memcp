@@ -38,6 +38,13 @@ type opApplyResult struct {
 	// Kept 是权威整树里本地有未提交改动、因而拒绝被覆盖的路径。
 	// 它们既不在 Applied 也不在 Deleted 里——必须能被看见。
 	Kept []string `json:"kept,omitempty"`
+	// DeletedPaths 是权威整树（Replace）里被墓碑的具体路径。
+	//
+	// 为什么需要它：Replace 的删除不是 ops 里的 opDelete，而是
+	// applyTreeReplace 在运行时算出来的「本地有、批次没有」。
+	// changedPathsOf 只看 ops，看不到这些路径，于是它们的索引
+	// 永远不会被刷新——恢复出来的内容搜不到。
+	DeletedPaths []string `json:"deleted_paths,omitempty"`
 }
 
 // opContext 是一次应用所需要的本地上下文。
@@ -162,7 +169,11 @@ func (s *Server) applyTreeReplace(project, branch, peerNode string, ctx *opConte
 		tomb := treeOp{Seq: op.Seq, Node: op.Node, Ts: op.Ts, Kind: opDelete, Path: path}
 		if _, err := s.applyOp(project, branch, peerNode, ctx, tomb, res); err != nil {
 			res.Rejected = append(res.Rejected, fmt.Sprintf("tree delete %s: %v", path, err))
+			continue
 		}
+		// 记录被墓碑的路径，供 commitOpsLocal 刷新索引。
+		// 没有它，Replace 删除的路径在索引里永远是旧的。
+		res.DeletedPaths = append(res.DeletedPaths, path)
 	}
 	if len(res.Kept) > 0 {
 		s.logf("op-sync: TREE REPLACE %s@%s kept %d locally-modified path(s): %s",
@@ -304,6 +315,18 @@ func changedPathsOf(ops []treeOp) []string {
 	seen := map[string]bool{}
 	var out []string
 	for _, raw := range ops {
+		// opTree + Replace 的整树命令不展开成 opSet，但 Batch 里每条
+		// 条目都是真实变更的路径。忽略它们会导致「恢复出来的内容
+		// 在索引里看不见」——恢复节点的 docs_indexed 恒为 0。
+		if raw.Kind == opTree && raw.Replace {
+			for _, e := range raw.Batch {
+				if e.Path != "" && !seen[e.Path] {
+					seen[e.Path] = true
+					out = append(out, e.Path)
+				}
+			}
+			continue
+		}
 		for _, op := range expandOp(raw) {
 			for _, p := range []string{op.Path, op.From} {
 				if p != "" && !seen[p] {
@@ -327,6 +350,13 @@ func (s *Server) commitOpsLocal(project, branch, peerNode string, ops []treeOp, 
 		s.recordWorkConflict(project, branch, cf.Path, cf.LocalSHA, cf.RemoteSHA, cf.Peer)
 	}
 	paths := changedPathsOf(ops)
+	// Replace 整树算出来的墓碑不在 ops 里，但也必须刷新索引。
+	for _, p := range res.DeletedPaths {
+		if !containsStr(paths, p) {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
 	for _, p := range paths {
 		if err := s.refreshPath(project, branch, p, true); err != nil {
 			s.logf("op-sync: refresh %s@%s:%s failed: %v", project, branch, p, err)

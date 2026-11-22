@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
@@ -479,6 +480,183 @@ func (s *Server) handleWorkPutBlob(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "sha": sha})
 }
 
+// pullWorkFromPeer 主动从对端拉取某分支的工作层增量并应用到本地。
+//
+// 这是 pushWorkToPeer 的对偶：没有它，「工作层是同步主体」只成立一半。
+// 上游一条未 commit 的写入，下游就只能等它 commit 后再靠传统 Git fetch
+// 补上——那就退回到「必须提交才能同步」了，等于把工作层白做。
+//
+// 拓扑不对称：上游（常开节点）不回头连下游（IP 会变、经常离线），
+// 所以「拉」必须由下游自己发起。
+//
+// 执行顺序与 push 对称，同样是「先 tree 后 blob」：
+//
+//  1. 取回改动清单。墓碑在这一趟就落地（被删路径立即消失，防复活），
+//     缺正文的条目进 Missing。
+//  2. 对 Missing 里的每个 blob 去对端取，本地自算 SHA-1 验真后落盘。
+//  3. 第二趟应用：正文已就位，把路径登记进工作层并热插拔索引。
+//  4. 每条落地路径广播 resources/updated，本机订阅者立刻看见。
+func (s *Server) pullWorkFromPeer(client *http.Client, baseURL, token, peerName, project, branch string) (workApplyResult, error) {
+	var zero workApplyResult
+	delta, err := postWorkPull(client, baseURL, token, project, branch, s.instanceID())
+	if err != nil {
+		return zero, err
+	}
+	if len(delta.Changes) == 0 {
+		return zero, nil
+	}
+
+	// 上游在 commit 之前，同一批改动会一直挂在它的工作层里，
+	// 每个同步周期都会被重复列出。先剔掉本地已经一致的部分：
+	// 不然下游会周期性地重写同样的 blob、重刷索引、重复广播事件。
+	delta.Changes = s.dropAlreadyInSync(project, branch, delta.Changes)
+	if len(delta.Changes) == 0 {
+		return zero, nil
+	}
+
+	res, err := s.importWorkDelta(project, branch, &delta)
+	if err != nil {
+		return res, fmt.Errorf("import delta (first pass): %w", err)
+	}
+
+	if len(res.Missing) > 0 {
+		seen := map[string]bool{}
+		for _, sha := range res.Missing {
+			if seen[sha] || sha == "" {
+				continue
+			}
+			seen[sha] = true
+			body, berr := getWorkBlob(client, baseURL, token, project, branch, sha)
+			if berr != nil {
+				return res, fmt.Errorf("fetch blob %s: %w", sha, berr)
+			}
+			if aerr := s.applyWorkBlob(project, sha, body); aerr != nil {
+				return res, fmt.Errorf("apply blob %s: %w", sha, aerr)
+			}
+			res.Verified++
+		}
+		// 第二趟：正文到齐，登记路径并热插拔索引。
+		res2, ierr := s.importWorkDelta(project, branch, &delta)
+		if ierr != nil {
+			return res, fmt.Errorf("import delta (second pass): %w", ierr)
+		}
+		res.Applied = res2.Applied
+		res.Deleted = res2.Deleted
+		res.Missing = res2.Missing
+		res.Conflicted = res2.Conflicted
+		if len(res.Missing) > 0 {
+			return res, fmt.Errorf("still missing %d blob(s) after fetch", len(res.Missing))
+		}
+	}
+
+	// 落地即广播：与 handleWorkPush 走同一套动作，
+	// 否则拉下来的内容只在磁盘上，索引与订阅者都看不见。
+	conflicted := make(map[string]bool, len(res.Conflicted))
+	for _, cf := range res.Conflicted {
+		conflicted[cf.Path] = true
+	}
+	for _, ch := range delta.Changes {
+		if conflicted[ch.Path] {
+			continue
+		}
+		exists := !ch.Deleted && s.repoHas(project, branch, ch.Path)
+		_ = s.refreshPath(project, branch, ch.Path, exists)
+		s.publishTreeChange(project, branch, ch.Path, "", "",
+			EventOrigin{Identity: "peer:" + delta.Node, Endpoint: s.instanceID()})
+	}
+	if res.Applied > 0 || res.Deleted > 0 {
+		s.workSync.noteIn(project, branch, peerName, time.Now().UnixNano())
+	}
+	return res, nil
+}
+
+// dropAlreadyInSync 剔除本地已经与该改动完全一致的条目。
+//
+// 为什么需要：上游在 commit 之前，改动会一直挂在它的工作层里。
+// 下游每 30 秒轮询一次，如果不做判重，就会把相同的改动重复应用
+// 几百次——每次都在解链、重写脏文件、重刷索引。
+func (s *Server) dropAlreadyInSync(project, branch string, changes []workChange) []workChange {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return changes
+	}
+	out := make([]workChange, 0, len(changes))
+	for _, ch := range changes {
+		entry, found, serr := repo.Stat(branch, ch.Path)
+		if serr != nil {
+			out = append(out, ch)
+			continue
+		}
+		if ch.Deleted {
+			if found {
+				out = append(out, ch)
+			}
+			continue
+		}
+		if !found || entry.Hash != ch.SHA {
+			out = append(out, ch)
+		}
+	}
+	return out
+}
+
+func postWorkPull(client *http.Client, baseURL, token, project, branch, node string) (workDelta, error) {
+	var delta workDelta
+	raw, err := json.Marshal(map[string]any{
+		"project": project,
+		"branch":  branch,
+		"node":    node,
+	})
+	if err != nil {
+		return delta, err
+	}
+	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(baseURL, "/")+"/sync/work/pull", bytes.NewReader(raw))
+	if err != nil {
+		return delta, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return delta, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return delta, fmt.Errorf("work-pull HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&delta); err != nil {
+		return delta, err
+	}
+	return delta, nil
+}
+
+// getWorkBlob 从对端取一个 blob 的正文。上限 50MB：
+// 超过这个体积的单个切片不可能是记忆，多半是配置写错或对端异常。
+func getWorkBlob(client *http.Client, baseURL, token, project, branch, sha string) ([]byte, error) {
+	u := fmt.Sprintf("%s/sync/work/blob?project=%s&branch=%s&sha=%s",
+		strings.TrimRight(baseURL, "/"), url.QueryEscape(project), url.QueryEscape(branch), url.QueryEscape(sha))
+	req, err := http.NewRequest(http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, fmt.Errorf("work-blob HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(msg)))
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, 50<<20))
+}
+
 // pushWorkToPeer 把本节点某分支的工作层推送给对等体。
 //
 // 严格执行「先 tree，后 blob，最后落水位」三步：
@@ -636,10 +814,21 @@ func (s *Server) workSyncLines(c Caller) []string {
 		if !rm.AutoSync {
 			continue
 		}
-		for _, br := range rm.Push {
-			if br == "*" {
+		// Push 与 Pull 取并集：只拉不推的远端也必须被报出来。
+		//
+		// 早先这里只遍历 Push，于是一条「只配了 pull」的下游远端
+		// 在 status 里完全不出现——看起来没在同步，实际在默默拉，
+		// 或者反过来根本没跑。两种都无从区分。
+		branches := make([]string, 0, len(rm.Push)+len(rm.Pull))
+		seen := map[string]bool{}
+		for _, br := range append(append([]string{}, rm.Push...), rm.Pull...) {
+			if br == "*" || seen[br] {
 				continue
 			}
+			seen[br] = true
+			branches = append(branches, br)
+		}
+		for _, br := range branches {
 			o, i := s.workSync.cursors(rm.Project, br, rm.Name)
 			if o == 0 && i == 0 {
 				continue

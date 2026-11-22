@@ -310,8 +310,17 @@ type watchStatus struct {
 	TreeWatch
 	// Head 是当前分支头。
 	Head string
-	// Changed 表示当前头与 Since 不同（即锚定之后有推进）。
+	// Changed 表示自锚定之后确实有新内容。
+	//
+	// 判据不再只看头 SHA：工作层是同步主体，一条未提交的写入
+	// 也是真实变化，否则「对端推来一条未提交记忆」会被当成没事发生。
 	Changed bool
+	// WorkLayer 是该分支当前未提交改动的条数。
+	//
+	// 为什么要报它：工作层同步不移动分支头。只报头 SHA 的话，
+	// 一条从未 commit 的分支会被报成「branch not found」——
+	// 数据明明在、read 读得到、索引也建了，却在 status 里像不存在。
+	WorkLayer int
 	// Error 非空说明这棵树查不了（被删、无权限等）。
 	Error string
 }
@@ -337,14 +346,26 @@ func (s *Server) watchReport(c Caller) []watchStatus {
 			out = append(out, st)
 			continue
 		}
+		// 工作层先算：它可能在一个还没 commit 过的分支上。
+		// 未提交改动是真实数据，不能因为 refs/heads 里没有这个名字
+		// 就当作「分支不存在」。
+		st.WorkLayer = repo.Pending(w.Branch)
+
 		head, err := repo.Resolve(w.Branch)
 		if err != nil || head == "" {
+			if st.WorkLayer > 0 {
+				// 分支只存在于工作层：能读、能搜，只是还没封箱。
+				// 基线是空的，所以只要工作层有条目就算「有变化」。
+				st.Changed = true
+				out = append(out, st)
+				continue
+			}
 			st.Error = "branch not found"
 			out = append(out, st)
 			continue
 		}
 		st.Head = head
-		st.Changed = w.Since != "" && head != w.Since
+		st.Changed = (w.Since != "" && head != w.Since) || st.WorkLayer > 0
 		out = append(out, st)
 	}
 	return out
@@ -364,12 +385,25 @@ func formatWatchReport(rows []watchStatus) []string {
 		switch {
 		case r.Error != "":
 			out = append(out, fmt.Sprintf("%s  [%s]", where, r.Error))
+		case r.Head == "" && r.WorkLayer > 0:
+			// 只在工作层里存在的分支：能读、能搜，还没封箱。
+			out = append(out, fmt.Sprintf("%s  work layer only (%d uncommitted; nothing sealed yet)",
+				where, r.WorkLayer))
 		case r.Head == "":
 			out = append(out, where+"  (empty branch)")
-		case r.Changed:
+		case r.Changed && r.Head != r.Since && r.Since != "":
 			// 明确给出行之有效的下一步：拿 since 取差量。
-			out = append(out, fmt.Sprintf("%s  MOVED %s -> %s  (use: since %s %s)",
-				where, shortSHA(r.Since), shortSHA(r.Head), where, r.Since))
+			line := fmt.Sprintf("%s  MOVED %s -> %s  (use: since %s %s)",
+				where, shortSHA(r.Since), shortSHA(r.Head), where, r.Since)
+			if r.WorkLayer > 0 {
+				line += fmt.Sprintf("  + %d uncommitted", r.WorkLayer)
+			}
+			out = append(out, line)
+		case r.WorkLayer > 0:
+			// 头没动，但工作层进了新内容——这同样是一次变化，
+			// 而且正是工作层同步的工作方式（不依赖 commit）。
+			out = append(out, fmt.Sprintf("%s  work layer modified (%d uncommitted; head %s unchanged)",
+				where, r.WorkLayer, shortSHA(r.Head)))
 		default:
 			out = append(out, fmt.Sprintf("%s  unchanged (%s)", where, shortSHA(r.Head)))
 		}

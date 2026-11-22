@@ -355,6 +355,59 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 	}, nil
 }
 
+// execWorkPeerSync 对手动 `sync` 做一次真实的工作层双向同步。
+//
+// 与后台循环走的同步函数完全一致，不另开一条实现：
+// 两条路径一旦分叉，就一定会出现「手动能拉、后台不能」这种诡异现象。
+func (s *Server) execWorkPeerSync(project string, rm config.Remote, repo *gitstore.Repo, c Caller) (TermResult, error) {
+	if err := s.syncWorkWithRemote(project, rm, repo); err != nil {
+		return TermResult{}, fmt.Errorf("sync %s@%s failed: %w", project, rm.Name, err)
+	}
+
+	// 如实报出每条分支的水位：out 追上去了就说明推到了，
+	// in 追上去了就说明拉到了。两个都是 0 就是「没事可做」。
+	branches := make([]string, 0, len(rm.Push)+len(rm.Pull))
+	seen := map[string]bool{}
+	for _, br := range append(append([]string{}, rm.Push...), rm.Pull...) {
+		if br == "*" || seen[br] {
+			continue
+		}
+		seen[br] = true
+		branches = append(branches, br)
+	}
+	sort.Strings(branches)
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "%s <-> %s (work-layer peer %s)\n", project, rm.Name, gitremote.Redact(rm.URL))
+	rows := make([]map[string]any, 0, len(branches))
+	for _, br := range branches {
+		if !s.allowed(c, project, br, configBitRead) {
+			continue
+		}
+		o, i := s.workSync.cursors(project, br, rm.Name)
+		state := "in sync"
+		switch {
+		case i == 0 && o == 0:
+			state = "no work-layer change"
+		case o > 0 && i == 0:
+			state = "pushed"
+		case i > 0 && o == 0:
+			state = "pulled"
+		}
+		fmt.Fprintf(&sb, "  %-20s %s (out seq %d, in seq %d)\n", br, state, o, i)
+		rows = append(rows, map[string]any{"branch": br, "state": state, "out_seq": o, "in_seq": i})
+	}
+	if len(branches) == 0 {
+		sb.WriteString("  (no branches declared in push/pull; nothing to sync)\n")
+	}
+	return TermResult{
+		Text: strings.TrimRight(sb.String(), "\n"),
+		Structured: map[string]any{
+			"project": project, "remote": rm.Name, "branches": rows,
+		},
+	}, nil
+}
+
 // execSync 处理 sync <project> [remote]：报告本地与远端的位置关系。
 //
 // 只读广告，不下载对象：比对「谁领先谁落后」不需要内容。
@@ -374,6 +427,16 @@ func (s *Server) execSync(rest string, c Caller) (TermResult, error) {
 	repo, err := s.projects.Get(project)
 	if err != nil {
 		return TermResult{}, err
+	}
+
+	// 工作层对端（URL 不以 .git 结尾）：不是 Git 仓库，没有 ref 广告可比。
+	// 手动 sync 在这里的含义就是「现在就跑一次双向同步」，而不是报位置。
+	//
+	// 之前它直接落到下面的 listRemote（git 协议探测），对这种 URL
+	// 只能报 unsupported remote transport——也就是说手动触发根本拉不动
+	// 工作层，只能等后台循环。那让「我很急，现在就同步」变成不可能。
+	if isWorkPeerURL(rm.URL) {
+		return s.execWorkPeerSync(project, rm, repo, c)
 	}
 
 	remoteRefs, err := s.listRemote(rm)

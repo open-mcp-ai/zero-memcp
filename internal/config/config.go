@@ -224,6 +224,9 @@ type Remote struct {
 	FetchOnly bool
 	// Push 是允许推送的分支白名单；空表示不推任何分支。
 	Push []string
+	// Pull 是允许拉取的分支白名单；空表示不主动拉任何分支。
+	// 下游节点把上游配成 remote 并声明 pull，就能实现「他多了你拉」。
+	Pull []string
 	// SSHKey 是服务端 system/sshkeys 下的私钥名；不包含私钥内容。
 	SSHKey string
 	// HostKey 是 SSH server 的 SHA256 host-key fingerprint，必须显式 pin。
@@ -311,7 +314,7 @@ var knownKeys = map[string]map[string]bool{
 	"access":   {"user": true, "project": true, "branch": true, "perm": true},
 	"auth.key": {"name": true, "public_key": true, "caps": true, "root": true},
 	"listen":   {"addr": true, "allow": true, "require": true, "mount": true, "webui": true, "tls_cert": true, "tls_key": true},
-	"remote":   {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
+	"remote":   {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "pull": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
 }
 
 // checkKeys 拒绝未知分节与未知键。
@@ -522,6 +525,9 @@ func ParseFile(raw []byte) (*File, error) {
 		if rm.Push, err = list(sec, "[[remote]]", "push"); err != nil {
 			return nil, err
 		}
+		if rm.Pull, err = list(sec, "[[remote]]", "pull"); err != nil {
+			return nil, err
+		}
 		if rm.SSHKey, err = str(sec, "[[remote]]", "ssh_key"); err != nil {
 			return nil, err
 		}
@@ -550,6 +556,17 @@ func ParseFile(raw []byte) (*File, error) {
 		}
 		if rm.OnReceive && !rm.AutoSync {
 			return nil, fmt.Errorf("[[remote]] on_receive requires auto_sync = true")
+		}
+		// pull 只在后台同步循环里执行。没开 auto_sync 就等于写了一条
+		// 永远不会被执行的配置——看起来配了，实际一次都不会拉。
+		// 静默不生效比报错更贵：人会以为下游在跟着上游。
+		if len(rm.Pull) > 0 && !rm.AutoSync {
+			return nil, fmt.Errorf("[[remote]] %q pull requires auto_sync = true (pull only runs in the background sync loop)", rm.Name)
+		}
+		// 传统 Git 远端的拉取由 fetch 完成，工作层 pull 对它们没有意义。
+		// 写了必须当场报错，否则它会安静地被忽略。
+		if len(rm.Pull) > 0 && strings.HasSuffix(strings.ToLower(strings.TrimRight(rm.URL, "/")), ".git") {
+			return nil, fmt.Errorf("[[remote]] %q pull is only for work-layer peers (URL without .git suffix); a Git remote already pulls via fetch", rm.Name)
 		}
 		if rm.HTTPToken != "" {
 			if err := ValidateSSHKeyName(rm.HTTPToken); err != nil {

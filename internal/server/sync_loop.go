@@ -380,10 +380,15 @@ func isWorkPeerURL(rawURL string) bool {
 	return !strings.HasSuffix(u, ".git")
 }
 
+// syncWorkWithRemote 与对等节点做工作层双向同步（无需 commit）。
+//
+// 他多了你拉、你多了你推：
+//
+//	① 遍历 rm.Push：本地工作层有改动就推给对端；
+//	② 遍历 rm.Pull：主动向对端 pull 工作层改动落地。
+//	  若配置没写 Pull，但写了 Push，默认把同一批分支也纳入拉取——
+//	  因为通常对等节点的意图就是「这几条分支实时对齐」。
 func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gitstore.Repo) error {
-	if rm.FetchOnly {
-		return nil
-	}
 	client, err := gittransport.NewTLSClient(gittransport.TLSConfig{
 		CAPath: rm.TLSCA,
 		Pin:    rm.TLSPin,
@@ -395,17 +400,37 @@ func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gits
 	if err != nil {
 		return err
 	}
-	for _, br := range rm.Push {
+
+	// 1. 推：本地工作层有改动就推给对端
+	if !rm.FetchOnly {
+		for _, br := range rm.Push {
+			if br == "*" {
+				continue
+			}
+			changes, derr := repo.DirtyChanges(br)
+			if derr != nil || len(changes) == 0 {
+				continue
+			}
+			seq := time.Now().UnixNano()
+			if _, perr := s.pushWorkToPeer(client, rm.URL, token, rm.Name, project, br, seq); perr != nil {
+				return fmt.Errorf("push %s: %w", br, perr)
+			}
+		}
+	}
+
+	// 2. 拉：对端工作层有改动就主动拉取落地（下游盯上游）
+	pullBranches := rm.Pull
+	if len(pullBranches) == 0 {
+		// 没显式配 pull 时复用 push 列表：大多数对等配置只写一次 push 分支列表，
+		// 意图就是这几条分支保持双向一致，不该逼人把同一组名字抄两遍。
+		pullBranches = rm.Push
+	}
+	for _, br := range pullBranches {
 		if br == "*" {
 			continue
 		}
-		changes, derr := repo.DirtyChanges(br)
-		if derr != nil || len(changes) == 0 {
-			continue
-		}
-		seq := time.Now().UnixNano()
-		if _, perr := s.pushWorkToPeer(client, rm.URL, token, rm.Name, project, br, seq); perr != nil {
-			return perr
+		if _, perr := s.pullWorkFromPeer(client, rm.URL, token, rm.Name, project, br); perr != nil {
+			return fmt.Errorf("pull %s: %w", br, perr)
 		}
 	}
 	return nil

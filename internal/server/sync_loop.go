@@ -101,47 +101,38 @@ func (s *Server) syncOnce(project string, rm config.Remote) {
 		return
 	}
 
-	// ── 1. fetch ──
-	if _, ferr := s.fetchRemote(root, project, rm, repo); ferr != nil {
-		s.recordSyncErr(key, "fetch: "+ferr.Error())
-		return
-	}
-
-	// ── 2. 逐分支 merge ──
-	refs, err := repo.Refs("refs/remotes/" + rm.Name + "/")
-	if err != nil {
-		s.recordSyncErr(key, "list remote refs: "+err.Error())
-		return
-	}
+	// push_only 的 Git 远端：不 fetch、不 merge，只把白名单里本地存在的
+	// 分支推上去。语义必须与工作层对端一致，否则这个键在两种远端上
+	// 意味着两件不同的事——那是「配了却没生效」的另一种形态。
+	//
+	// 备份目标常这么配：它只接受推送，永远不该把内容写回来。
 	var toPush []string
 	var conflicts []string
-	for _, ref := range refs {
-		branch := strings.TrimPrefix(ref, "refs/remotes/"+rm.Name+"/")
-		if branch == "" || strings.Contains(branch, "/") {
-			// 只处理一级分支名；带斜杠的是跟踪引用的子层级，跳过
-			continue
+	var refs []string
+	if rm.PushOnly {
+		for _, br := range rm.Push {
+			if br == "*" {
+				continue
+			}
+			if sha, rerr := repo.Resolve(br); rerr == nil && sha != "" {
+				toPush = append(toPush, br)
+			}
 		}
-		res, merr := repo.MergeInto(branch, ref)
-		if merr != nil {
-			s.logf("sync %s: merge %s failed: %v", key, branch, merr)
-			continue
+	} else {
+		// ── 1. fetch ──
+		if _, ferr := s.fetchRemote(root, project, rm, repo); ferr != nil {
+			s.recordSyncErr(key, "fetch: "+ferr.Error())
+			return
 		}
-		switch res.Kind {
-		case "ahead", "fast-forward", "merged":
-			// ahead（本地新写的）、fast-forward（远端有更新本地快进）、
-			// merged（两边各写了新内容、正交合并成功）：这三类都该推到远端，
-			// 让中枢 GitHub 拿到最新真相。
-			toPush = append(toPush, branch)
-			s.logf("sync %s: %s %s (%s)", key, branch, res.Kind, shortSHA(res.Commit))
-		case "conflict":
-			conflicts = append(conflicts, branch)
-			s.addSyncConflict(syncConflict{
-				Project: project, Branch: branch, Remote: rm.Name,
-				Paths: res.Conflicts, At: time.Now(),
-			})
-			s.logf("sync %s: %s CONFLICT on %d path(s): %s",
-				key, branch, len(res.Conflicts), strings.Join(res.Conflicts, ", "))
+
+		// ── 2. 逐分支 merge ──
+		var rerr error
+		refs, rerr = repo.Refs("refs/remotes/" + rm.Name + "/")
+		if rerr != nil {
+			s.recordSyncErr(key, "list remote refs: "+rerr.Error())
+			return
 		}
+		toPush, conflicts = s.mergeRemoteRefs(key, project, rm, repo, refs)
 	}
 
 	// ── 2.5 远端尚不存在的白名单分支（首次建分支）──
@@ -333,6 +324,42 @@ func (s *Server) runSyncPass(reason string) {
 	_ = reason
 }
 
+// mergeRemoteRefs 把 refs/remotes/<rm>/* 逐分支合进本地，返回该推的分支与冲突分支。
+//
+// 抽出来的理由：push_only 远端要跳过它，而不是在一个 if 里再抄一遍循环。
+// 复制的循环会在下一次改动时只改一半，两份行为悄悄分叉。
+func (s *Server) mergeRemoteRefs(key, project string, rm config.Remote, repo *gitstore.Repo, refs []string) (toPush, conflicts []string) {
+	for _, ref := range refs {
+		branch := strings.TrimPrefix(ref, "refs/remotes/"+rm.Name+"/")
+		if branch == "" || strings.Contains(branch, "/") {
+			// 只处理一级分支名；带斜杠的是跟踪引用的子层级，跳过
+			continue
+		}
+		res, merr := repo.MergeInto(branch, ref)
+		if merr != nil {
+			s.logf("sync %s: merge %s failed: %v", key, branch, merr)
+			continue
+		}
+		switch res.Kind {
+		case "ahead", "fast-forward", "merged":
+			// ahead（本地新写的）、fast-forward（远端有更新本地快进）、
+			// merged（两边各写了新内容、正交合并成功）：这三类都该推到远端，
+			// 让中枢 GitHub 拿到最新真相。
+			toPush = append(toPush, branch)
+			s.logf("sync %s: %s %s (%s)", key, branch, res.Kind, shortSHA(res.Commit))
+		case "conflict":
+			conflicts = append(conflicts, branch)
+			s.addSyncConflict(syncConflict{
+				Project: project, Branch: branch, Remote: rm.Name,
+				Paths: res.Conflicts, At: time.Now(),
+			})
+			s.logf("sync %s: %s CONFLICT on %d path(s): %s",
+				key, branch, len(res.Conflicts), strings.Join(res.Conflicts, ", "))
+		}
+	}
+	return toPush, conflicts
+}
+
 // syncStatusLines 给 status 动词报告同步现场。
 //
 // 只对全命名空间的调用者返回：远端列表和冲突路径都是跨项目信息，
@@ -421,5 +448,6 @@ func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gits
 		Push:      rm.Push,
 		Pull:      rm.Pull,
 		FetchOnly: rm.FetchOnly,
+		PushOnly:  rm.PushOnly,
 	}, project)
 }

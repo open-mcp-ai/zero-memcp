@@ -401,7 +401,7 @@ func (s *Server) syncOpsWithRemote(client *http.Client, rm configRemote, project
 		}
 	}
 	pullBranches := rm.Pull
-	if len(pullBranches) == 0 {
+	if len(pullBranches) == 0 && !rm.PushOnly {
 		pullBranches = rm.Push
 	}
 	for _, br := range pullBranches {
@@ -423,6 +423,12 @@ type configRemote struct {
 	Push      []string
 	Pull      []string
 	FetchOnly bool
+	// PushOnly 为真时只推不拉。
+	//
+	// 备份节点必须这么配：从备份回头拉，一旦对方某分支只落地了一半
+	// （blob 缺失留下的 Missing），它播种的权威整树就是残缺的，
+	// 接收端会把「批次里没有」的路径全部墓碑。
+	PushOnly bool
 }
 
 // opSyncLines 是 status 里的命令流水位报告。

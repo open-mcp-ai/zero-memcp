@@ -220,8 +220,16 @@ type Remote struct {
 	Name string
 	// URL 是远端地址，禁止内嵌凭证。
 	URL string
-	// FetchOnly 为真时禁止推送。
+	// FetchOnly 为真时禁止推送（只拉）。
 	FetchOnly bool
+	// PushOnly 为真时禁止拉取（只推）。
+	//
+	// 为什么需要它（2026-11-22 配备份节点时发现）：Pull 为空会回落到
+	// Push 列表，所以「只推不拉」在配置层无法表达。而备份节点必须只推——
+	// 一旦从备份回头拉，备份某分支只落地了一半（blob 缺失留下的 Missing），
+	// 它播种出的权威整树就是残缺的，接收端会把「批次里没有」的路径全部
+	// 墓碑，等于用半个备份删掉主机上的记忆。
+	PushOnly bool
 	// Push 是允许推送的分支白名单；空表示不推任何分支。
 	Push []string
 	// Pull 是允许拉取的分支白名单；空表示不主动拉任何分支。
@@ -314,7 +322,7 @@ var knownKeys = map[string]map[string]bool{
 	"access":   {"user": true, "project": true, "branch": true, "perm": true},
 	"auth.key": {"name": true, "public_key": true, "caps": true, "root": true},
 	"listen":   {"addr": true, "allow": true, "require": true, "mount": true, "webui": true, "tls_cert": true, "tls_key": true},
-	"remote":   {"project": true, "name": true, "url": true, "fetch_only": true, "push": true, "pull": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
+	"remote":   {"project": true, "name": true, "url": true, "fetch_only": true, "push_only": true, "push": true, "pull": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
 }
 
 // checkKeys 拒绝未知分节与未知键。
@@ -519,6 +527,9 @@ func ParseFile(raw []byte) (*File, error) {
 		if rm.URL, err = str(sec, "[[remote]]", "url"); err != nil {
 			return nil, err
 		}
+		if rm.PushOnly, err = boolean(sec, "[[remote]]", "push_only"); err != nil {
+			return nil, err
+		}
 		if rm.FetchOnly, err = boolean(sec, "[[remote]]", "fetch_only"); err != nil {
 			return nil, err
 		}
@@ -567,6 +578,15 @@ func ParseFile(raw []byte) (*File, error) {
 		// 写了必须当场报错，否则它会安静地被忽略。
 		if len(rm.Pull) > 0 && strings.HasSuffix(strings.ToLower(strings.TrimRight(rm.URL, "/")), ".git") {
 			return nil, fmt.Errorf("[[remote]] %q pull is only for work-layer peers (URL without .git suffix); a Git remote already pulls via fetch", rm.Name)
+		}
+		// push_only 与 pull 互斥：前者说「绝不从这个对端拉」，
+		// 后者说「要从这个对端拉这些分支」。
+		if rm.PushOnly && len(rm.Pull) > 0 {
+			return nil, fmt.Errorf("[[remote]] %q push_only = true conflicts with pull = [...]; drop one (push_only is for backup targets that must never write back)", rm.Name)
+		}
+		// push_only 与 fetch_only 一起写等于两边都不做，这条远端没有任何作用。
+		if rm.PushOnly && rm.FetchOnly {
+			return nil, fmt.Errorf("[[remote]] %q push_only = true conflicts with fetch_only = true; the remote would neither push nor pull", rm.Name)
 		}
 		if rm.HTTPToken != "" {
 			if err := ValidateSSHKeyName(rm.HTTPToken); err != nil {

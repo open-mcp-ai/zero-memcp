@@ -102,17 +102,17 @@ func (s *Server) syncOnce(project string, rm config.Remote) {
 	// Git 仓库看」时随手折出来的书签。所以这里不再要求调用方先手动
 	// commit——有脏层就当场折叠，折完接着推。
 	//
-	// 折叠所有脏分支而不只是待推分支：快照的意义是完整反映此刻，
-	// 留几条分支永远脏着，Git 仓库里的世界就永远缺一角。
+	// 必须走 commitRepo 而不是直接 repo.Commit：它会把新 head 记进
+	// lastCommits。不记的话，下一轮 checkExternalUpdates 会把**自己**
+	// 的折叠当成「外部 push」，触发全分支重扫（17k 路径、数十秒），
+	// 而这期间写入请求全被堵住——实测写一条 25 字节的记忆卡 30 秒。
 	if pending := repo.Pending(); pending > 0 {
-		for _, br := range repo.PendingRefs() {
-			sha, cerr := repo.Commit(br, "sync: snapshot work layer for push")
-			if cerr != nil {
-				s.recordSyncErr(key, fmt.Sprintf("snapshot %s before push: %v", br, cerr))
-				return
-			}
-			s.logf("sync %s: folded work layer of %s into %s for push", key, br, shortSHA(sha))
+		n, cerr := s.commitRepo(repo, project, pending)
+		if cerr != nil {
+			s.recordSyncErr(key, fmt.Sprintf("snapshot work layer before push: %v", cerr))
+			return
 		}
+		s.logf("sync %s: folded work layer of %d branch(es) into commits for push", key, n)
 	}
 
 	// push_only 的 Git 远端：不 fetch、不 merge，只把白名单里本地存在的

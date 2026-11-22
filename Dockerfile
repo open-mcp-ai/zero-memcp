@@ -24,7 +24,8 @@ ENV GOPROXY=${GOPROXY}
 WORKDIR /src
 COPY . .
 RUN CGO_ENABLED=0 go build -trimpath \
-    -ldflags="-s -w -X main.version=$VERSION" \
+    -ldflags="-s -w -X main.version=$VERSION \
+              -X github.com/open-mcp-ai/zero-memcp/internal/server.Version=$VERSION" \
     -o /out/zero-memcp ./cmd/zero-memcp
 
 FROM alpine:3.21

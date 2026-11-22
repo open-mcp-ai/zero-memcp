@@ -293,7 +293,8 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:   "sync",
 		Detail: detail_remote,
 		Kind:   term.KindFlags,
-		Usage:  "sync <project> [<remote>]",
+		// 两种形态：无参 = 本节点的上下游拓扑；带项目 = 对某个远端跑一次同步。
+		Usage: "sync [<project> [<remote>]]",
 	},
 	{
 		Name:  "conflict",

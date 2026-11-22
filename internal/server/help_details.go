@@ -122,7 +122,9 @@ merge <project> <branch> from <remote>
                                      fast-forward and disjoint changes merge automatically;
                                      same-path-different-content is refused as a conflict
 push <project> [<remote>] <branch>   push one branch (built-in SSH transport; no batches)
-sync <project> [<remote>]             report ahead/behind/diverged state
+sync                                  this node's position: upstream, peers, downstreams
+                                      each with its own watermark and how far behind it is
+sync <project> [<remote>]             run one sync round against that remote and report
 remote-key list | put | delete       root manages SSH private keys
 
 Configure in TOML:

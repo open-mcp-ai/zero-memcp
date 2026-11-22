@@ -50,6 +50,57 @@
 | 缺口不静默 | 日志里位点不推进 → `Load` 报错并指出行号 | 已实现 | `TestOpLogRejectsCorruptSeq` |
 | 对端身份学习 | peerName ↔ 日志属主名映射 | 已实现 | 修掉「每轮从头拉、重复应用」的键不一致 |
 | 对象验真 | 收到的 blob 重算 sha1，不符即拒绝 | 已实现 | 沿用 `applyWorkBlob` |
+| **升级前历史自动播种** | 日志为空时把当前整树登记成一条 `opTree` | 已实现 | `TestOpLogSeedsExistingTreeOnInitialPull` |
+| **权威整树能删** | `opTree` 带 `replace`：批次里没有的已提交路径一律墓碑 | 已实现 | `TestTreeReplaceDeletesPathsMissingFromAuthoritativeTree` |
+| 未提交内容不被整树覆盖 | 有本地未提交改动的路径计入 `Kept` 并点名 | 已实现 | `TestTreeReplaceKeepsLocallyModifiedPaths` |
+| 水位 + 对端别名跨重启 | `<data>/system/opsync.json` | 已实现 | `TestOpSyncWatermarksSurviveRestart` |
+| 推 / 拉水位互不共用 | `out` 与 `in` 分别读写 | 已实现 | `TestOpsSyncBidirectionalUsesIndependentWatermarks` |
+| **节点拓扑视图** | `sync` 无参 → 上游 / peers / 下游，各自水位与落后条数 | 已实现 | `TestNodeKnowsUpstreamStatus`、`TestNodeKnowsDownstreamStatus` |
+| **多上游** | 一个项目可挂多个 `[[remote]]`，水位按 peer 分别记 | 已实现 | `TestTopologyShowsMultipleUpstreams`、`TestTwoUpstreamsOnSameBranch` |
+| 同步流水 | `<data>/system/synclog.ndjson`，空轮询不写流水 | 已实现 | `TestSyncJournalRecordsBothDirections`、`TestSyncJournalSurvivesRestart` |
+| **上游视角** | 被拉取时记 `served`，可答「哪个下游追到哪了」 | 已实现 | `TestSyncJournalUpstreamSeesDownstreamProgress` |
+
+### 节点拓扑：`sync` 无参读什么
+
+上下游各问同一个动词，答案不同但都完整——这是「作为节点必须知道
+自己位置」的落点：
+
+```
+# 在下游问：我落后上游多少
+node: laptop (this instance)
+
+upstream:
+  hub-3060 (3060)  BlackEggAI/zero@main.record
+    behind 12 (local 4953, peer 4965), last seen 5s ago
+
+# 在上游问：哪些下游追到哪了
+node: hub-3060 (this instance)
+
+downstreams (2):
+  laptop        BlackEggAI/weft@main.record  caught up at seq 106
+  phone         BlackEggAI/weft@main.record  behind 40 (local 106, peer 66)
+```
+
+判定规则：
+
+- 配置 `pull` 含该分支 → 上游；`push` → 下游；两者都有 → `peers`（不重复列）
+- 流水里的 `pull` 记录也算上游（手工 `sync`、临时对端同样成立）
+- 流水里的 `served` / `received` 算下游
+- 下游进度比的是**本地日志头**，不是它自己的位点
+
+### 多上游挂同一分支的真实行为
+
+配置结构支持多个 `[[remote]]`（实测 `TestTwoUpstreamsOnSameBranch`）：
+
+| 场景 | 行为 |
+|---|---|
+| A 独有、B 没有的路径 | 保留（未提交内容合流，不互相清场） |
+| B 独有、A 没有的路径 | 合入 |
+| 两边都有且内容不同 | **先到的胜出**，后到的记冲突并在 `status` 点名 |
+
+**注意**：权威整树（`replace`）在语义上只能有一个来源。多个上游同时
+对同一分支发权威整树时，只有对其一执行过 `commit` 的已提交路径会被
+判定删除；未提交内容不会被清场。
 
 **落地顺序是硬约束：先 tree，后 blob。** 缺对象的命令不落地，
 记进 Missing——写一条指向空气的条目，会在一次毫不相干的 recall 上炸开。

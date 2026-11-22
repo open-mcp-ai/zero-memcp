@@ -25,7 +25,9 @@ func (s *Server) noteWriteOp(project, branch, path, mode, sha string) {
 		// 登记失败必须出声：静默失败意味着这次改动永远不会被同步，
 		// 而本地看起来一切正常。
 		s.logf("oplog: record set %s@%s:%s failed: %v", project, branch, path, err)
+		return
 	}
+	s.kickSync()
 }
 
 // noteDeleteOp 记录一次删除。删除是一条命令，不是特例。
@@ -35,7 +37,9 @@ func (s *Server) noteDeleteOp(project, branch, path string) {
 	}
 	if _, err := s.recordTreeOp(project, branch, opDelete, path, "", "", ""); err != nil {
 		s.logf("oplog: record delete %s@%s:%s failed: %v", project, branch, path, err)
+		return
 	}
+	s.kickSync()
 }
 
 // noteMoveOp 记录一次原子改名。
@@ -45,7 +49,9 @@ func (s *Server) noteMoveOp(project, branch, from, to string) {
 	}
 	if _, err := s.recordTreeOp(project, branch, opRename, to, from, "", ""); err != nil {
 		s.logf("oplog: record rename %s@%s:%s -> %s failed: %v", project, branch, from, to, err)
+		return
 	}
+	s.kickSync()
 }
 
 // noteCopyOp 记录一次原子复制。
@@ -55,7 +61,9 @@ func (s *Server) noteCopyOp(project, branch, from, to, mode, sha string) {
 	}
 	if _, err := s.recordTreeOp(project, branch, opCopy, to, from, mode, sha); err != nil {
 		s.logf("oplog: record copy %s@%s:%s -> %s failed: %v", project, branch, from, to, err)
+		return
 	}
+	s.kickSync()
 }
 
 // noteTreeOp 把一棵完整的树登记成一条批量命令。

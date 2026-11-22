@@ -95,10 +95,24 @@ func (s *Server) syncOnce(project string, rm config.Remote) {
 		return
 	}
 
-	// 传统 Git 远端（GitHub 等）：不隐式提交。有脏层就跳过历史同步。
+	// 传统 Git 远端：commit 只在推送这一刻生成。
+	//
+	// 架构定位：节点间流动的是命令流，工作层是唯一日常状态；
+	// Git commit 不是本地要维护的对象，而是「把当前工作层快照给外部
+	// Git 仓库看」时随手折出来的书签。所以这里不再要求调用方先手动
+	// commit——有脏层就当场折叠，折完接着推。
+	//
+	// 折叠所有脏分支而不只是待推分支：快照的意义是完整反映此刻，
+	// 留几条分支永远脏着，Git 仓库里的世界就永远缺一角。
 	if pending := repo.Pending(); pending > 0 {
-		s.recordSyncErr(key, fmt.Sprintf("%d uncommitted change(s); commit before syncing", pending))
-		return
+		for _, br := range repo.PendingRefs() {
+			sha, cerr := repo.Commit(br, "sync: snapshot work layer for push")
+			if cerr != nil {
+				s.recordSyncErr(key, fmt.Sprintf("snapshot %s before push: %v", br, cerr))
+				return
+			}
+			s.logf("sync %s: folded work layer of %s into %s for push", key, br, shortSHA(sha))
+		}
 	}
 
 	// push_only 的 Git 远端：不 fetch、不 merge，只把白名单里本地存在的

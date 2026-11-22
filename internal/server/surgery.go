@@ -389,6 +389,27 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 			}
 		}
 
+		// 世界树操作也是命令流里的一条命令。
+		//
+		// 早先 cp/mv 只当场 commit、走历史层同步，于是「不 commit 也能
+		// 跨机可见」对世界树操作不成立。现在它们与 write 共用同一份日志：
+		// 同分支时记一条 rename/copy；跨分支时在目标分支记一条 set，
+		// 源分支（mv 时）记一条 delete——两边的位点各自单调。
+		if srcBranch == dstBranch {
+			if isMove {
+				s.noteMoveOp(dstProj, dstBranch, srcPath, target)
+			} else if e, ok, serr := repo.ReadPathSHA(dstBranch, target); serr == nil && ok {
+				s.noteCopyOp(dstProj, dstBranch, srcPath, target, string(e.Mode), e.SHA)
+			}
+		} else {
+			if e, ok, serr := repo.ReadPathSHA(dstBranch, target); serr == nil && ok {
+				s.noteWriteOp(dstProj, dstBranch, target, string(e.Mode), e.SHA)
+			}
+			if isMove {
+				s.noteDeleteOp(srcProj, srcBranch, srcPath)
+			}
+		}
+
 		// 立刻提交两端，让这次手术当场生效
 		if isMove {
 			if _, cerr := repo.Commit(srcBranch, fmt.Sprintf("mem: %s removed %s", verbName(isMove), srcPath)); cerr != nil {
@@ -792,6 +813,8 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 		if err := repo.Delete(branch, p); err != nil {
 			return "", err
 		}
+		// 删除也是一条命令，与写入同一条流。不是特例分支。
+		s.noteDeleteOp(proj, branch, p)
 		removed = append(removed, p)
 	}
 

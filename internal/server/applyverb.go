@@ -121,12 +121,16 @@ func (s *Server) execApply(rest string, c Caller, defaultBranch string) (string,
 					i+1, len(patches), pid, err)
 			}
 			written++
+			if e, ok, serr := repo.ReadPathSHA(branch, pid); serr == nil && ok {
+				s.noteWriteOp(proj, branch, pid, string(e.Mode), e.SHA)
+			}
 		case "delete":
 			if err := repo.Delete(branch, pid); err != nil {
 				return "", fmt.Errorf("patch #%d/%d (%s): %w — earlier patches in this batch are already applied",
 					i+1, len(patches), pid, err)
 			}
 			deleted++
+			s.noteDeleteOp(proj, branch, pid)
 		}
 	}
 

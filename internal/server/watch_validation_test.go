@@ -65,7 +65,7 @@ func TestTreeWatchRejectsMalformedBranch(t *testing.T) {
 		{"", "main", ""}, // 必须指明项目
 	}
 	for _, b := range bad {
-		if err := hub.Add("zero", TreeWatch{Project: b[0], Branch: b[1], Path: b[2]}); err == nil {
+		if err := hub.Add("zero", TreeWatch{Project: b[0], Branch: b[1], Path: b[2]}, false); err == nil {
 			t.Fatalf("非法关注目标 %v 应当被拒绝", b)
 		}
 	}
@@ -76,7 +76,7 @@ func TestTreeWatchRejectsMalformedBranch(t *testing.T) {
 		{"BlackEggAI/zero", "main", "some/sub"},
 	}
 	for _, g := range good {
-		if err := hub.Add("zero", TreeWatch{Project: g[0], Branch: g[1], Path: g[2]}); err != nil {
+		if err := hub.Add("zero", TreeWatch{Project: g[0], Branch: g[1], Path: g[2]}, false); err != nil {
 			t.Fatalf("合法关注目标 %v 不应被拒绝：%v", g, err)
 		}
 	}

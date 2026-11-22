@@ -4,7 +4,7 @@
 > 每条能力都标注「入口」与「验证」：验证写的是"靠什么证明它能用"，
 > 没有证据的一律标为未验证，不写成"已支持"。
 >
-> 最后核对：2026-11-21（`main` @ `717e393`）
+> 最后核对：2026-11-22（命令流同步 + remind 幂等落地之后）
 
 ---
 
@@ -22,6 +22,48 @@
 
 **CLI 不是数据入口**：终端读写记忆会绕过凭证体系，`Caller` 会退化成写死的 root。
 凭证签发、临时授权、打包都在管理台做，CLI 只负责起服务与诊断。
+
+---
+
+## 一之五、跨机器一致性：命令流（op log）
+
+**这是唯一的内部同步抽象。** 工作层的增量改动与历史层的整树同步，
+都是同一份命令流里的命令，区别只是粒度。
+
+```
+第 0 层  内容寻址对象库：HasObject / BlobBody / sha1 验真
+第 1 层  树的命令流：set / delete / rename / copy / tree（批量）
+          每条带单调位点 seq，可增量、可去重、可重放
+第 2 层  blob 按需补齐：由 Missing 驱动，验真后重放被卡住的命令
+第 3 层  对外 Git 适配器：仅在对接普通 Git 仓库时启用
+```
+
+| 能力 | 入口 | 状态 | 验证 |
+|---|---|---|---|
+| 单条写入登记位点 | `write` / `put` / `apply` 自动落日志 | 已实现 | `TestOpLogAssignsMonotonicSeqAndPersists` |
+| 删除是命令而非特例 | `delete` 记 `opDelete` | 已实现 | `TestOpsSyncDeleteIsACommand` |
+| 世界树操作进命令流 | `mv` → `opRename`，`cp` → `opCopy`（同分支）；跨分支记 set+delete | 已实现 | 见 `surgery.go` 注释；rename 在一条命令内原子生效 |
+| 增量导出 | `/sync/ops/pull` 带 `after` 位点 | 已实现 | `TestOpLogIncrementalExport` |
+| 推 / 拉共用落地路径 | `applyOps` + `commitOpsLocal` | 已实现 | `TestOpsSyncUncommittedAcrossNodes` |
+| **整树同步 = 批量命令** | `opTree` 携带整棵树的条目 | 已实现 | `TestTreeSyncAsBatchOp`（空节点收一棵树） |
+| 位点持久化 | `<data>/system/oplog/<node>/<project>/<branch>.ndjson` | 已实现 | 重启后续编号，位点回退即报错 |
+| 缺口不静默 | 日志里位点不推进 → `Load` 报错并指出行号 | 已实现 | `TestOpLogRejectsCorruptSeq` |
+| 对端身份学习 | peerName ↔ 日志属主名映射 | 已实现 | 修掉「每轮从头拉、重复应用」的键不一致 |
+| 对象验真 | 收到的 blob 重算 sha1，不符即拒绝 | 已实现 | 沿用 `applyWorkBlob` |
+
+**落地顺序是硬约束：先 tree，后 blob。** 缺对象的命令不落地，
+记进 Missing——写一条指向空气的条目，会在一次毫不相干的 recall 上炸开。
+
+实测（2026-11-22，本机双实例 17311/17312）：
+
+```
+A 写入不 commit → B 日志：
+  applied 0, missing 1     ← 第一趟：命令到，对象缺，不落地
+  applied 1, missing 0     ← 第二趟：对象补齐验真，重放成功
+位点序列：1 set hello.md / 2 set second.md / 3 set third.md / 4 delete second.md
+B 端：hello.md 与 third.md 可读，second.md 已被删除
+反向 B 写 → A 可读；全程 commit 数为 0
+```
 
 ---
 
@@ -90,7 +132,14 @@
 | 工作层导出/导入 | `POST /sync/work/pull`、`/sync/work/push` | 已实现 |
 | 按需取正文 | `GET /sync/work/blob`、`POST /sync/work/blob/put` | 已实现，接收端自算 SHA-1 验真 |
 | 先 tree 后 blob | `importWorkDelta` 先落墓碑与登记，再回头取缺失 blob | 已实现 |
-| 水位 | `out` 仅在对端回执后推进；`status` 显示 | 已实现 |
+| **推（本地 → 对端）** | `[[remote]] push = [...]` → `syncWorkWithRemote` | 已实现 |
+| **拉（对端 → 本地）** | `[[remote]] pull = [...]` → `pullWorkFromPeer` | 已实现（2026-11-22 补） |
+| **未提交内容的判重** | `dropAlreadyInSync` 剔除已一致条目 | 已实现，避免每轮重复应用 |
+| **手动触发双向同步** | `sync <project> [remote]` | 已实现，工作层对端直接跑一次真实推拉 |
+| 水位 | `out` 仅在对端回执后推进；`in` 记录拉取；`status` 显示 | 已实现 |
+| **`remind` 看得见工作层** | 未提交分支报 `work layer only`；已提交分支有新条目报 `work layer modified` | 已实现（2026-11-22 补） |
+| **`remind` 幂等** | 重复登记保留原基线；`--reanchor` 才推到当前头 | 已实现，`TestRemindKeepsBaselineOnRepeat` / `TestRemindReanchorResetsBaseline` |
+| **关注表跨重启** | `<data>/system/watches.json` 落盘 + 启动加载 | 已实现，`TestWatchesSurviveServerRestart` |
 | 同路径并发改写 | 保留本地、记录冲突、`status` 点名 | 已实现，`TestWorkLayerConcurrentRewriteReportsConflict` |
 | 对端删除 vs 本地改写 | **删除优先**（防复活），但记录被解链的本地 SHA 并点名 | 已实现，`TestWorkLayerDeleteOverLocalWriteIsReportedNotSilent` |
 | 落地即广播 | 写入/删除立即 `notifications/resources/updated` | 已实现 |
@@ -98,8 +147,16 @@
 
 ### 真实边界
 
+- **`remind` 没有「收件人」字段**：关注表的键是凭证身份，「谁关心什么」由身份决定，不在地址里写 `@某人`。身份即收件人，这是设计而非缺漏。
+- **重复 `remind` 不再重置基线**：agent 每次启动都会重登配置里的 watch，若每次都把基线推到「此刻」，停机期间对端写的东西会被当场抹平。要「我处理完了，从现在开始算」，用 `remind <tree> --reanchor`。
+- **清空关注只认精确写法**：`remind -` / `remind --clear` / `remind -c`。早先用 `HasPrefix(rest, "-")` 判断，结果 `remind --reanchor`（无地址）被当成清空，把一个身份的关注表抹平。
+
+
 - **自动同步是显式选择**：远端要写 `auto_sync = true` 才会进后台循环。
 - **对端判定靠 URL 形状**：`http(s)://` 且不以 `.git` 结尾才当作工作层对端。
+- **`pull` 只对工作层对端有意义**：写在 `.git` 远端上会在配置解析期报错（那边靠 fetch）。
+- **`pull` 依赖 `auto_sync`**：只写 `pull` 不写 `auto_sync` 会在配置解析期报错，避免永不执行且静默。
+- **`pull` 缺省时回落到 `push`**：只写 `push` 的对等配置，默认按同一批分支双向对齐。
 - **`on_receive` 依赖 `auto_sync`**：只写 `on_receive` 会在配置解析期直接报错。
 - **冲突需要人裁决**：冲突只记录与上报，不自动合并；`conflict clear` 清理。
 - **水位是进程内状态**：重启后从 0 重新累计，语义是"本轮推进到哪"而非持久账本。

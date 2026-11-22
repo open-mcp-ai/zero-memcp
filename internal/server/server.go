@@ -186,6 +186,14 @@ type Server struct {
 	syncState syncState
 	// workSync 是工作层同步的水位记录。
 	workSync *workSyncState
+	// opLogs 是本节点的命令流日志库（跨机器一致性的唯一内部抽象）。
+	//
+	// 工作层的增量改动与历史层的整树同步都是它里面的命令，
+	// 区别只是粒度：单条 set/delete/rename，或一条携带整棵树的批量命令。
+	opLogs *opLogStore
+	// peerAliases 记录「配置里的对端别名 → 对端自报的日志属主名」。
+	// 水位键必须用属主名，否则同一台机器换个别名就从头重拉。
+	peerAliases sync.Map
 	// patrol 是对象回读巡检状态（见 patrol_loop.go）。
 	patrol patrolState
 	// bodies 是按 blob 哈希的正文缓存（见 bodycache.go）。
@@ -470,6 +478,7 @@ func New(cfg Config) (*Server, error) {
 		fanouts:    newFanoutHub(),
 		resources:  newResourceHub(),
 		workSync:   newWorkSyncState(),
+		opLogs:     newOpLogStore(cfg.DataDir, nodeIdentity(cfg)),
 		liveIdx:    &liveIndexes{},
 		masterKeys: &masterKeyring{},
 		bodies:     newBodyCache(searchBodyBudget(cfgFile)),
@@ -770,6 +779,11 @@ func (s *Server) muxFor(blk ListenBlock) http.Handler {
 	mux.HandleFunc("/recall", s.handleRecall)
 	mux.HandleFunc("/mcp", s.handleMCP)
 	mux.HandleFunc("/repos/", s.handleGitHTTP)
+	// 命令流同步端点：跨机器一致性的主通道。
+	mux.HandleFunc("/sync/ops/pull", s.handleOpPull)
+	mux.HandleFunc("/sync/ops/push", s.handleOpPush)
+	// 旧的工作层快照端点保留：blob 按需取/推仍然用它，
+	// 命令流只搬「树的事实」，对象搬运复用同一套验真规则。
 	mux.HandleFunc("/sync/work/pull", s.handleWorkPull)
 	mux.HandleFunc("/sync/work/blob", s.handleWorkBlob)
 	mux.HandleFunc("/sync/work/blob/put", s.handleWorkPutBlob)
@@ -2215,6 +2229,13 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		}
 		if wl := s.workSyncLines(c); len(wl) > 0 {
 			text += "\nwork-sync:\n  " + strings.Join(wl, "\n  ")
+		}
+		// 命令流水位：每条分支的日志长度与最新位点。
+		//
+		// 这是同步是否健康的直接证据——位点不涨而内容在变，说明
+		// 有写入没进命令流（我们曾经因此漏掉了整个 write 动词）。
+		if ol := s.opSyncLines(c); len(ol) > 0 {
+			text += "\noplog:\n  " + strings.Join(ol, "\n  ")
 		}
 		if cl := s.workConflictLines(c); len(cl) > 0 {
 			text += "\n" + strings.Join(cl, "\n")

@@ -45,7 +45,7 @@ mode  = "rwx------"
 		DataDir:     dataDir,
 		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
 		Listen:      "127.0.0.1:0",
-			EnforceAuth: true,
+		EnforceAuth: true,
 	})
 	if err != nil {
 		t.Fatal(err)

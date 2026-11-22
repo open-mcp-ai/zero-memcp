@@ -127,8 +127,9 @@ perm    = "r"
 # name       = "hub"
 # url        = "http://10.10.10.12:1729"
 # push       = ["zero", "main.shared"]
-# auto_sync  = true
-# http_token = "hub-token"   # 用 remote-secret put 写入服务端的 token 名
+# pull       = ["zero", "main.shared"]  # 下游主动拉上游；不写则默认与 push 一致
+# auto_sync  = true                     # 必须为 true 才会进后台推拉循环
+# http_token = "hub-token"              # 用 remote-secret put 写入服务端的 token 名
 
 # 传统 Git 远端（例：GitHub 备份）
 # [[remote]]

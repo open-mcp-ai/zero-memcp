@@ -401,37 +401,17 @@ func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gits
 		return err
 	}
 
-	// 1. 推：本地工作层有改动就推给对端
-	if !rm.FetchOnly {
-		for _, br := range rm.Push {
-			if br == "*" {
-				continue
-			}
-			changes, derr := repo.DirtyChanges(br)
-			if derr != nil || len(changes) == 0 {
-				continue
-			}
-			seq := time.Now().UnixNano()
-			if _, perr := s.pushWorkToPeer(client, rm.URL, token, rm.Name, project, br, seq); perr != nil {
-				return fmt.Errorf("push %s: %w", br, perr)
-			}
-		}
-	}
-
-	// 2. 拉：对端工作层有改动就主动拉取落地（下游盯上游）
-	pullBranches := rm.Pull
-	if len(pullBranches) == 0 {
-		// 没显式配 pull 时复用 push 列表：大多数对等配置只写一次 push 分支列表，
-		// 意图就是这几条分支保持双向一致，不该逼人把同一组名字抄两遍。
-		pullBranches = rm.Push
-	}
-	for _, br := range pullBranches {
-		if br == "*" {
-			continue
-		}
-		if _, perr := s.pullWorkFromPeer(client, rm.URL, token, rm.Name, project, br); perr != nil {
-			return fmt.Errorf("pull %s: %w", br, perr)
-		}
-	}
-	return nil
+	// 同步走命令流：推与拉都是「位点之后的命令 + 按需补对象」。
+	//
+	// 这里不再读取脏层快照——脏层只是命令流在本机的一种落点，
+	// 不是同步的数据源。两个方向共用 applyOps / commitOpsLocal，
+	// 因此「对端推给我」和「我主动拉」的落地行为完全一致。
+	return s.syncOpsWithRemote(client, configRemote{
+		Name:      rm.Name,
+		URL:       rm.URL,
+		Token:     token,
+		Push:      rm.Push,
+		Pull:      rm.Pull,
+		FetchOnly: rm.FetchOnly,
+	}, project)
 }

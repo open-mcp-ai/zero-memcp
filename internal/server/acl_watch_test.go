@@ -98,8 +98,8 @@ func TestTreeWatchPersistsAcrossRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.Add("zero", TreeWatch{Project: "BlackEggAI/zero", Branch: "main.shared", Since: "abc123"})
-	h.Add("zero-dev", TreeWatch{Project: "BlackEggAI/zero", Branch: "main.shared", Since: "abc123"})
+	h.Add("zero", TreeWatch{Project: "BlackEggAI/zero", Branch: "main.shared", Since: "abc123"}, false)
+	h.Add("zero-dev", TreeWatch{Project: "BlackEggAI/zero", Branch: "main.shared", Since: "abc123"}, false)
 
 	// 模拟进程重启
 	h2, err := newPersistentTreeWatchHub(path)
@@ -117,7 +117,7 @@ func TestTreeWatchPersistsAcrossRestart(t *testing.T) {
 	}
 
 	// 重新锚定同一棵树不该产生第二条
-	h2.Add("zero", TreeWatch{Project: "BlackEggAI/zero", Branch: "main.shared", Since: "def456"})
+	h2.Add("zero", TreeWatch{Project: "BlackEggAI/zero", Branch: "main.shared", Since: "def456"}, false)
 	if got := len(h2.List("zero")); got != 1 {
 		t.Fatalf("re-anchor should replace, got %d watches", got)
 	}
@@ -138,7 +138,7 @@ func TestTreeWatchPersistsAcrossRestart(t *testing.T) {
 
 func TestTreeWatchHubWithoutPathDoesNotTouchDisk(t *testing.T) {
 	h := newTreeWatchHub()
-	h.Add("x", TreeWatch{Project: "p", Branch: "b"})
+	h.Add("x", TreeWatch{Project: "p", Branch: "b"}, false)
 	if got := len(h.List("x")); got != 1 {
 		t.Fatalf("in-memory hub should still work, got %d", got)
 	}

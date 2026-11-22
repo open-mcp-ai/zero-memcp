@@ -189,6 +189,16 @@ func (s *Server) putBody(target, body, session string, c Caller) (TermResult, er
 	commitSHA, _ := repo.Resolve(branch)
 	virtPath := s.virtualPath(c, proj, branch, rel)
 
+	// 登记进命令流：这次写入从此有一个位点，对端按位点增量取走。
+	//
+	// 放在回读校验之后：只有确认真的落进脏层的写入才配拥有位点，
+	// 否则日志里会出现一条指向不存在内容的命令。
+	if e, ok, serr := repo.ReadPathSHA(branch, rel); serr == nil && ok {
+		s.noteWriteOp(proj, branch, rel, string(e.Mode), e.SHA)
+	} else if serr != nil {
+		s.logf("oplog: cannot resolve written blob for %s@%s:%s: %v", proj, branch, rel, serr)
+	}
+
 	text := "ok " + virtPath
 	if commitSHA != "" {
 		text += " (base " + shortSHA(commitSHA) + ")"
@@ -293,7 +303,14 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		}, nil
 	}
 
-	if strings.HasPrefix(rest, "-") {
+	// 清空全部关注：`remind --clear`（也接受单独的 -），但**不能**
+	// 把任意一个 flag 都当成清空。
+	//
+	// 踩过的坑（2026-11-22）：语法层把 flag 还原成 `--reanchor` 追加在
+	// 地址后面，当地址为空时就只剩 `--reanchor`——旧判据 HasPrefix("-")
+	// 把它当成「清空全部」，于是一次重新锤定把一个身份的关注表抹平。
+	// 破坏性操作的判据必须是精确匹配，不能是前缀。
+	if rest == "-" || rest == "--clear" || rest == "-c" {
 		if err := s.treeWatch.Clear(c.Identity); err != nil {
 			return TermResult{}, err
 		}
@@ -303,16 +320,32 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		}, nil
 	}
 
-	// 只接受一个地址。多出来的参数一定是把 `since <tree> <commit>`
-	// 的写法用在了这里——整段塞进分支名会产生一条永远不生效的订阅
-	// （3060 hub 上真的出现过 branch = "main.shared e8103f18..."）。
+	// 只接受一个地址（可带 --reanchor）。多出来的参数一定是把
+	// `since <tree> <commit>` 的写法用在了这里——整段塞进分支名会产生一条
+	// 永远不生效的订阅（3060 hub 上真的出现过 branch = "main.shared e8103f18..."）。
 	// 与其静默吞掉，不如当场告诉他该用哪个动词。
-	if len(strings.Fields(rest)) > 1 {
-		return TermResult{}, fmt.Errorf("remind takes a single tree address, got %q; "+
-			"to fetch changes from a known commit use `since <tree> <commit>`", rest)
+	reanchor := false
+	addr := rest
+	if fields := strings.Fields(rest); len(fields) > 1 {
+		kept := make([]string, 0, len(fields))
+		for _, f := range fields {
+			switch f {
+			case "--reanchor":
+				reanchor = true
+			case "-r":
+				reanchor = true
+			default:
+				kept = append(kept, f)
+			}
+		}
+		if len(kept) > 1 {
+			return TermResult{}, fmt.Errorf("remind takes a single tree address, got %q; "+
+				"to fetch changes from a known commit use `since <tree> <commit>`", rest)
+		}
+		addr = strings.Join(kept, " ")
 	}
 
-	proj, branch, treePath, err := s.parseBranchAddr(rest)
+	proj, branch, treePath, err := s.parseBranchAddr(addr)
 	if err != nil {
 		return TermResult{}, err
 	}
@@ -334,25 +367,45 @@ func (s *Server) execRemind(rest string, c Caller) (TermResult, error) {
 		}
 	}
 
-	if err := s.treeWatch.Add(c.Identity, TreeWatch{Project: proj, Branch: branch, Path: treePath, Since: since}); err != nil {
+	if err := s.treeWatch.Add(c.Identity, TreeWatch{Project: proj, Branch: branch, Path: treePath, Since: since}, reanchor); err != nil {
 		return TermResult{}, err
+	}
+	// 报出**实际生效的**基线，而不是刚刚算出的当前头。
+	//
+	// 幂等登记时服务端保留旧基线，若此处照旧报 since，调用方会以为
+	// 基线已经推到新头，而实际没有——两边理解不一致比不报还坏。
+	effective := since
+	keptBaseline := false
+	for _, w := range s.treeWatch.List(c.Identity) {
+		if w.Project == proj && w.Branch == branch && w.Path == treePath {
+			effective = w.Since
+			keptBaseline = !reanchor && effective != "" && effective != since
+			break
+		}
 	}
 	where := proj + "@" + branch
 	if treePath != "" {
 		where += "/" + treePath
 	}
-	msg := "watching " + where + " from " + shortSHA(since)
-	if since == "" {
+	msg := "watching " + where + " from " + shortSHA(effective)
+	if reanchor {
+		msg = "re-anchored " + where + " at " + shortSHA(effective)
+	}
+	if keptBaseline {
+		msg += " (baseline kept; use --reanchor to reset it)"
+	}
+	if effective == "" {
 		msg = "watching " + where + " (branch is empty; baseline will be set on next remind)"
 	}
 	return TermResult{
 		Text: msg + " — check it with `status`, fetch changes with `since`",
 		Structured: map[string]any{
-			"ok":      true,
-			"project": proj,
-			"branch":  branch,
-			"path":    treePath,
-			"since":   since,
+			"ok":            true,
+			"project":       proj,
+			"branch":        branch,
+			"path":          treePath,
+			"since":         effective,
+			"baseline_kept": keptBaseline,
 		},
 	}, nil
 }

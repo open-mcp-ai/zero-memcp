@@ -238,7 +238,17 @@ func validateWatchAddr(project, branch, path string) error {
 }
 
 // Add 为某个身份增加或更新一条关注标记（同 project+branch+path 视为同一条）。
-func (h *TreeWatchHub) Add(identity string, w TreeWatch) error {
+//
+// reanchor 决定重复登记时怎么处理已有基线：
+//
+//   - false（默认）：保留原基线，幂等。
+//   - true：把基线推到当前头，重新开始计时。
+//
+// 为什么默认不重推（2026-11-22 实测）：agent 扩展每次启动都会把配置里
+// watch 的树重新 remind 一遍。若每次 remind 都把 Since 重置到「此刻」，
+// agent 停机期间对端写进来的东西会被当场抹平——status 永远报「没变化」，
+// 唤醒链就断在最需要它的那一刻。
+func (h *TreeWatchHub) Add(identity string, w TreeWatch, reanchor bool) error {
 	// 兜底校验放在唯一入口：不管哪个动词写关注，都不可能落下脏记录。
 	if err := validateWatchAddr(w.Project, w.Branch, w.Path); err != nil {
 		return err
@@ -260,8 +270,16 @@ func (h *TreeWatchHub) Add(identity string, w TreeWatch) error {
 	replaced := false
 	for i, c := range list {
 		if c.Project == w.Project && c.Branch == w.Branch && c.Path == w.Path {
-			// 重新锚定：把基线推到当前头。
-			list[i] = w
+			switch {
+			case reanchor:
+				// 显式重新锚定：把基线推到当前头。
+				list[i] = w
+			case c.Since == "" && w.Since != "":
+				// 幂等，但补上当初还空着的基线：
+				// 「当时分支还不存在」→ 现在存在了，这次该把基线算上，
+				// 否则永远答不了「变了没」。
+				list[i].Since = w.Since
+			}
 			replaced = true
 			break
 		}

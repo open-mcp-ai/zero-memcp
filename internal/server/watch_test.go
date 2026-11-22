@@ -134,8 +134,13 @@ func TestStatusReportsWatchedTreeMoved(t *testing.T) {
 		t.Fatalf("status 应给出取差量的命令，实际:\n%s", st)
 	}
 
-	// 重新锚定后回到 unchanged
-	if _, err := callMCP(t, srv, tok, "remind daily@zero"); err != nil {
+	// 重新锚定后回到 unchanged。
+	//
+	// 2026-11-22 语义变更：重复 remind 现在是**幂等**的（保留基线），
+	// 因为 agent 每次启动都会重登 watch，若每次都重置基线，停机期间的
+	// 变化就被静默抹平。「我处理完了，从现在开始算」必须显式表达：
+	// --reanchor。这里改测的是新语义，不是放松断言。
+	if _, err := callMCP(t, srv, tok, "remind daily@zero --reanchor"); err != nil {
 		t.Fatal(err)
 	}
 	st, err = callMCP(t, srv, tok, "status")

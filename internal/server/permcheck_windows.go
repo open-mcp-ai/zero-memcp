@@ -24,4 +24,6 @@ func permsVerifiable() bool { return false }
 func permTooOpen(m os.FileMode) bool { return false }
 
 // permHint 在 Windows 上指向真正的机制，而不是 chmod。
-func permHint() string { return "restrict via NTFS ACL (icacls) — Unix mode bits are not meaningful on Windows" }
+func permHint() string {
+	return "restrict via NTFS ACL (icacls) — Unix mode bits are not meaningful on Windows"
+}

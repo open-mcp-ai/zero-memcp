@@ -95,7 +95,12 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:   "remind",
 		Detail: detail_remind,
 		Kind:   term.KindFlags,
-		Usage:  "remind [<tree>]",
+		// --reanchor：显式把基线推到当前头。
+		//
+		// 缺省（不带 flag）时必须幂等，否则 agent 每次启动重登 watch
+		// 都会把停机期间的变化抹平（见 watch_restart_test.go）。
+		Flags: []string{"reanchor"},
+		Usage: "remind [<tree>] [--reanchor]",
 	},
 	{
 		Name:   "since",

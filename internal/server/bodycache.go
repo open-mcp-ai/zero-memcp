@@ -159,6 +159,11 @@ func (c *bodyCache) hitCount() int64 {
 // 缓存键是 blob 哈希，内容变了旧条目自然不再命中，所以预热不会
 // 「把过期内容写进缓存」——它写进去的就是当下正确的内容。
 func (s *Server) warmBodyCache() {
+	// 冷备份节点不预热：正文缓存服务的是 grep，而 grep 在
+	// 索引关闭时本来就拒绝执行。预热只会白占内存。
+	if !s.indexEnabled {
+		return
+	}
 	if s.bodies == nil || s.bodies.budget <= 0 {
 		return
 	}

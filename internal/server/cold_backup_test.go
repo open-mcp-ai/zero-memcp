@@ -6,6 +6,7 @@ import (
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
+	"github.com/open-mcp-ai/zero-memcp/internal/index"
 )
 
 // 索引必须配置才生效。没有配置 [index] 时作为冷备份节点运行：
@@ -66,6 +67,48 @@ enabled = false
 	}
 	if cfgDisabled.Index.Enabled {
 		t.Fatalf("配了 [index] enabled = false 时不应启用索引")
+	}
+}
+
+// 索引关闭时，落到本机的每一条路径都不许再进索引。
+//
+// 踩过的坑（2026-11-24 实测，rock64）：启动路径上拦住了索引，
+// 但 refreshPath 没有守卫——接收命令流时逐条路径建索引，
+// 容器内存从 3.97 MiB 涨到 1.547 GiB，CPU 95%，
+// 而 status 上明明白白写着 "index: disabled"。
+// 「配置说不建、代码还在建」比完全不建更坏：人以为省了。
+func TestIndexDisabledSkipsRefreshPath(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	srv.indexEnabled = false
+	// 换一个空索引，确保后续计数只反映新增
+	srv.treesPtr.Store(&treeSet{trees: nil, idx: index.New()})
+
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Cap: "rwx"})
+
+	// 写一篇记忆：Git 必须落盘，索引必须一动不动
+	if _, err := callMCPRaw(t, srv, tok, map[string]any{
+		"name": "term",
+		"arguments": map[string]any{
+			"cmd":  "write blackegg/me@zero:cold.md $BODY",
+			"vars": map[string]string{"BODY": "冷备份也要落盘"},
+		},
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// 内容必须真的进了 Git（冷备份的唯一职责）
+	repo, err := srv.projects.Get("blackegg/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, found, _ := repo.Stat("zero", "cold.md"); !found {
+		t.Fatalf("索引关闭不影响落盘：Git 里必须有 cold.md")
+	}
+
+	// 索引必须仍然是空的
+	if got := srv.idxNow().Docs(); got != 0 {
+		t.Fatalf("索引已关闭，不该有任何文档进索引，实际 %d 篇——"+
+			"refreshPath 漏了守卫，会让冷备份节点悄悄建回全量索引", got)
 	}
 }
 

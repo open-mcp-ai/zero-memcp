@@ -377,6 +377,15 @@ func classifyContent(project, path string, data []byte, mode gitstore.Mode) (pol
 //
 // exists=false 表示这个文件已经从树里消失（delete）。
 func (s *Server) refreshPath(project, branch, path string, exists bool) error {
+	// 索引关闭时这条路径没有意义：Git 已经写完了，只是不建倒排表。
+	//
+	// 这行漏掉的后果（2026-11-24 实测）：rock64 的 status 明明写着
+	// index: disabled，容器却在接收命令流时逐个路径建索引，
+	// 内存从 3.97 MiB 涨到 1.547 GiB、CPU 95%，整机只剩几百 MB。
+	// 「配置说不建、代码还在建」比完全不建更坏——人以为省了。
+	if !s.indexEnabled {
+		return nil
+	}
 	repo, err := s.projects.Get(project)
 	if err != nil {
 		return fmt.Errorf("open project %s: %w", project, err)

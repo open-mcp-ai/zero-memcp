@@ -36,7 +36,7 @@ const maxPackResponse = 512 << 20
 // 与 SSH 版共用同一套判定：非快进拒绝、必须拿到 report-status 才算成功。
 // 认证只走 HTTP Basic，凭证由调用方从服务端密钥库取出后传入，
 // 绝不拼进 URL——URL 会出现在日志和错误信息里。
-func PushHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, user, token string, timeout time.Duration) (PushResult, error) {
+func PushHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, user, token string, timeout time.Duration, opts ...PushOptions) (PushResult, error) {
 	if timeout <= 0 {
 		timeout = 90 * time.Second
 	}
@@ -61,7 +61,7 @@ func PushHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, user,
 		return PushResult{}, errors.New("remote receive-pack does not support report-status; refusing to push without verifying the result")
 	}
 
-	plan, err := planPush(repo, branch, refs)
+	plan, err := planPush(repo, branch, refs, optsOf(opts))
 	if err != nil {
 		return PushResult{}, err
 	}

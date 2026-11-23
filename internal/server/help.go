@@ -26,6 +26,7 @@ Memory sync (remotes are declared in the config):
 remote [<project>]                    list configured memory remotes
 fetch <project> [<remote>]            fetch history from a remote without automatically overwriting local branches
 push <project> [<remote>] <branch>   explicitly push one branch (one at a time; see README for external git push)
+                                     --snapshot = orphan commit, no history; --force = allow rewrite
 sync <project> [<remote>]             compare local and remote state
 remote-key list | put | delete       root manages SSH private keys (for external push)
 remote-secret list | put | delete    root manages HTTP tokens (for external push)

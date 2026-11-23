@@ -287,7 +287,8 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:   "push",
 		Detail: detail_remote,
 		Kind:   term.KindFlags,
-		Usage:  "push <project> [<remote>] <branch>",
+		Flags:  []string{"snapshot", "force"},
+		Usage:  "push <project> [<remote>] <branch> [--snapshot] [--force]",
 	},
 	{
 		Name:   "sync",

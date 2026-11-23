@@ -121,7 +121,14 @@ merge <project> <branch> from <remote>
                                      merge fetched remote branch into the local branch
                                      fast-forward and disjoint changes merge automatically;
                                      same-path-different-content is refused as a conflict
-push <project> [<remote>] <branch>   push one branch (built-in SSH transport; no batches)
+push <project> [<remote>] <branch>   push one branch (built-in transport; no batches)
+         --snapshot                   push an orphan commit: one commit, no history
+         --force                      allow rewriting the remote branch (needed when
+                                      the remote already has a different head)
+
+  A snapshot is how you get a destination repo with the current content and
+  no history. Local history is untouched. Without --force the remote branch
+  must be new or already point at this snapshot.
 sync                                  this node's position: upstream, peers, downstreams
                                       each with its own watermark and how far behind it is
 sync <project> [<remote>]             run one sync round against that remote and report

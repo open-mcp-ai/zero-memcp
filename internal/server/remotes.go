@@ -253,6 +253,28 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 		return TermResult{}, fmt.Errorf("push requires <project> [<remote>] <branch...>\n" +
 			"  specifying no branch is rejected: pushing all by default could publish everything by mistake")
 	}
+	// 快照导出开关。--snapshot 把当前树打成一个孤儿提交再推；
+	// --force 才允许改写远端已有的历史（快照永远不是快进）。
+	snapshot, force := false, false
+	{
+		kept := make([]string, 0, len(fields))
+		for _, f := range fields {
+			switch f {
+			case "--snapshot":
+				snapshot = true
+			case "--force", "-f", "--force-snapshot":
+				force = true
+			default:
+				kept = append(kept, f)
+			}
+		}
+		fields = kept
+	}
+	if len(fields) < 2 {
+		return TermResult{}, fmt.Errorf("push requires <project> [<remote>] <branch...>\n" +
+			"  specifying no branch is rejected: pushing all by default could publish everything by mistake")
+	}
+
 	project := fields[0]
 	rmName := ""
 	branches := fields[1:]
@@ -308,6 +330,21 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 		return TermResult{}, fmt.Errorf("remote %s does not authorize pushing branch %q", rm.Name, branch)
 	}
 
+	// 快照导出：把当前树打成一个没有父提交的孤儿提交。
+	//
+	// 它不改本地任何引用——本地历史原样保留，只有推出去的那一份是
+	// 单提交快照。这正是「只浅拷贝去其他仓库，历史都不要」。
+	pushOpts := gittransport.PushOptions{AllowNonFastForward: force}
+	snapshotSHA := ""
+	if snapshot {
+		orphan, _, oerr := repo.CreateOrphanCommit(branch, "")
+		if oerr != nil {
+			return TermResult{}, fmt.Errorf("create snapshot commit for %s@%s: %w", project, branch, oerr)
+		}
+		snapshotSHA = orphan
+		pushOpts.SourceSHA = orphan
+	}
+
 	var res gittransport.PushResult
 	switch {
 	case gitremote.IsSSH(rm.URL):
@@ -318,7 +355,7 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 		if err != nil {
 			return TermResult{}, fmt.Errorf("read SSH private key %q: %w", rm.SSHKey, err)
 		}
-		res, err = gittransport.Push(context.Background(), repo, rm.URL, branch, string(key), rm.HostKey, 90*time.Second)
+		res, err = gittransport.Push(context.Background(), repo, rm.URL, branch, string(key), rm.HostKey, 90*time.Second, pushOpts)
 		if err != nil {
 			return TermResult{}, fmt.Errorf("push %s@%s -> %s failed: %w", project, branch, rm.Name, err)
 		}
@@ -330,7 +367,7 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 		if err != nil {
 			return TermResult{}, fmt.Errorf("read token %q: %w", rm.HTTPToken, err)
 		}
-		res, err = gittransport.PushHTTP(context.Background(), repo, rm.URL, branch, rm.HTTPUser, token, 90*time.Second)
+		res, err = gittransport.PushHTTP(context.Background(), repo, rm.URL, branch, rm.HTTPUser, token, 90*time.Second, pushOpts)
 		if err != nil {
 			return TermResult{}, fmt.Errorf("push %s@%s -> %s failed: %w", project, branch, rm.Name, err)
 		}
@@ -338,14 +375,19 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 		if _, ok := gittransport.LocalPath(rm.URL); !ok {
 			return TermResult{}, fmt.Errorf("unsupported remote transport: %s (supported: ssh:// user@host:path, http(s)://, and local bare repository paths)", gitremote.Redact(rm.URL))
 		}
-		res, err = gittransport.PushLocal(repo, rm.URL, branch)
+		res, err = gittransport.PushLocal(repo, rm.URL, branch, pushOpts)
 		if err != nil {
 			return TermResult{}, fmt.Errorf("push %s@%s -> %s failed: %w", project, branch, rm.Name, err)
 		}
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "pushed %s -> %s (built-in transport; does not invoke system git)\n", project, rm.Name)
+	if snapshotSHA != "" {
+		fmt.Fprintf(&sb, "pushed %s@%s -> %s as a SNAPSHOT (single orphan commit, no history)\n", project, branch, rm.Name)
+		fmt.Fprintf(&sb, "  snapshot commit %s (local history untouched)\n", shortSHA(snapshotSHA))
+	} else {
+		fmt.Fprintf(&sb, "pushed %s -> %s (built-in transport; does not invoke system git)\n", project, rm.Name)
+	}
 	fmt.Fprintf(&sb, "  %s %s -> %s\n", res.Branch, shortSHA(res.Old), shortSHA(res.New))
 	return TermResult{
 		Text: strings.TrimRight(sb.String(), "\n"),

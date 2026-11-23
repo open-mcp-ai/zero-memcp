@@ -7,6 +7,28 @@ import (
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
+// PushOptions 是推送的可选项。零值等于「常规分支推送」：
+// 本地分支推到同名远端分支，且必须快进。
+type PushOptions struct {
+	// SourceSHA 非空时，推送的本地端是这个提交，而不是分支当前头。
+	//
+	// 快照导出用它：孤儿提交没有分支指向它，也不该为了推它去动本地分支。
+	SourceSHA string
+	// AllowNonFastForward 允许改写远端历史。
+	//
+	// 只有**显式的快照导出**才会打开它。常规推送永远不改写别人——
+	// 那会让对方的克隆静默失效。
+	AllowNonFastForward bool
+}
+
+// optsOf 取第一个可选项；没给就是零值。
+func optsOf(opts []PushOptions) PushOptions {
+	if len(opts) == 0 {
+		return PushOptions{}
+	}
+	return opts[0]
+}
+
 // pushPlan 是一次 push 的判定结果：从哪个 sha 推进到哪个 sha。
 type pushPlan struct {
 	Branch   string
@@ -26,10 +48,14 @@ func (p pushPlan) Result() PushResult {
 //  1. 本地分支必须存在——推一个不存在的分支只会得到远端的模糊报错；
 //  2. 远端已存在该分支时，那边的 sha 必须是本地新 sha 的祖先（快进）；
 //  3. 完全相同就什么都不做，但也要如实报告「已是最新」。
-func planPush(repo *gitstore.Repo, branch string, refs map[string]string) (pushPlan, error) {
-	newSHA, err := repo.Resolve(branch)
-	if err != nil || newSHA == "" {
-		return pushPlan{}, fmt.Errorf("local branch %q does not exist or has no commits", branch)
+func planPush(repo *gitstore.Repo, branch string, refs map[string]string, opts PushOptions) (pushPlan, error) {
+	newSHA := opts.SourceSHA
+	if newSHA == "" {
+		var err error
+		newSHA, err = repo.Resolve(branch)
+		if err != nil || newSHA == "" {
+			return pushPlan{}, fmt.Errorf("local branch %q does not exist or has no commits", branch)
+		}
 	}
 	oldSHA := refs["refs/heads/"+branch]
 	if oldSHA == "" {
@@ -41,6 +67,11 @@ func planPush(repo *gitstore.Repo, branch string, refs map[string]string) (pushP
 		return plan, nil
 	}
 	if oldSHA == zeroSHA {
+		return plan, nil
+	}
+	// 快照导出：整条历史都被换掉，远端那个 sha 本地可能根本没有
+	// （所以连 IsAncestor 都查不了）。这是**被显式要求**的改写，放行。
+	if opts.AllowNonFastForward {
 		return plan, nil
 	}
 	ok, err := repo.IsAncestor(oldSHA, newSHA)

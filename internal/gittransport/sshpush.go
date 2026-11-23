@@ -25,7 +25,7 @@ type PushResult struct {
 
 // Push sends one fast-forward branch update through SSH to git-receive-pack.
 // Host-key verification is mandatory; hostKey must be an OpenSSH SHA256 fingerprint.
-func Push(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, privateKeyPEM, hostKey string, timeout time.Duration) (PushResult, error) {
+func Push(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, privateKeyPEM, hostKey string, timeout time.Duration, opts ...PushOptions) (PushResult, error) {
 	if err := validateBranch(branch); err != nil {
 		return PushResult{}, err
 	}
@@ -49,7 +49,7 @@ func Push(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, privateKe
 		return PushResult{}, errors.New("remote receive-pack does not support report-status; refusing to push without verifying the result")
 	}
 
-	plan, err := planPush(repo, branch, refs)
+	plan, err := planPush(repo, branch, refs, optsOf(opts))
 	if err != nil {
 		return PushResult{}, err
 	}

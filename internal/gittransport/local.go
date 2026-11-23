@@ -117,7 +117,7 @@ func ListLocal(remoteURL string) (map[string]string, error) {
 }
 
 // PushLocal 把一个分支推进本地裸仓库。
-func PushLocal(repo *gitstore.Repo, remoteURL, branch string) (PushResult, error) {
+func PushLocal(repo *gitstore.Repo, remoteURL, branch string, opts ...PushOptions) (PushResult, error) {
 	if err := validateBranch(branch); err != nil {
 		return PushResult{}, err
 	}
@@ -138,7 +138,7 @@ func PushLocal(repo *gitstore.Repo, remoteURL, branch string) (PushResult, error
 	if sha, err := dst.Resolve(branch); err == nil && sha != "" {
 		refs["refs/heads/"+branch] = sha
 	}
-	plan, err := planPush(repo, branch, refs)
+	plan, err := planPush(repo, branch, refs, optsOf(opts))
 	if err != nil {
 		return PushResult{}, err
 	}

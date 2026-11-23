@@ -538,6 +538,32 @@ func (r *Repo) commitOf(ref string) (commitObj, error) {
 	return parseCommit(body), nil
 }
 
+// CreateOrphanCommit 基于当前分支的最新树创建一个没有父提交的孤儿 Commit。
+//
+// 这是「浅拷贝导出」的核心原语：历史链被彻底斩断，只保留这棵树的快照。
+// 它不会推进本地现有分支的引用——只写出 Commit 对象并返回其 SHA，
+// 供调用方按需推送到外部远端或临时命名。
+func (r *Repo) CreateOrphanCommit(ref, message string) (commitSHA, treeSHA string, err error) {
+	normRef := normalizeRef(ref)
+	headSHA, err := r.Resolve(normRef)
+	if err != nil || headSHA == "" {
+		return "", "", fmt.Errorf("branch %q does not exist or has no commits", ref)
+	}
+	treeSHA, err = r.TreeOfCommit(headSHA)
+	if err != nil {
+		return "", "", fmt.Errorf("tree of commit %s: %w", headSHA[:min(8, len(headSHA))], err)
+	}
+	if message == "" {
+		message = fmt.Sprintf("mem: snapshot of %s at %s", ref, time.Now().Format(time.RFC3339))
+	}
+	// 没有 parents：纯孤儿提交
+	commitSHA, err = r.writeCommit(treeSHA, nil, message, time.Now())
+	if err != nil {
+		return "", "", fmt.Errorf("write orphan commit: %w", err)
+	}
+	return commitSHA, treeSHA, nil
+}
+
 // TreeOfCommit 返回某个提交指向的树 SHA。
 //
 // 传入空串（分支还没有任何提交）时返回空树 SHA，而不是报错：

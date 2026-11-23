@@ -98,7 +98,7 @@ func TestSemanticLongDocDoesNotFailItsBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	s1, err := New(Config{DataDir: dataDir, DefaultBranch: "main.record", Listen: "127.0.0.1:0"})
+	s1, err := New(Config{DataDir: dataDir, DefaultBranch: "main.record", Listen: "127.0.0.1:0", IndexEnabled: true})
 	if err != nil {
 		t.Fatal(err)
 	}

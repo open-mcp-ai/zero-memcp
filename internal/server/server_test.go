@@ -72,8 +72,24 @@ mode = "rwxr-xr-x"
 func osWrite(path, content string) error {
 	if strings.HasSuffix(path, ".toml") {
 		content = strings.ReplaceAll(content, `\`, "/")
+		content = withIndex(content)
 	}
 	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+// withIndex 给测试配置补上 [index] enabled = true。
+//
+// 索引现在是「配置才生效」：没有 [index] 节的实例按冷备份运行，
+// 不建倒排表、不预热正文缓存，recall/grep 直接报错。
+//
+// 绝大多数测试要的是一个**可搜索**的节点（那才是生产形态），
+// 所以在这里统一声明，而不是让每个测试各自记着写一节。
+// 需要冷备份形态的测试自己构造配置、不要走这个 helper。
+func withIndex(cfg string) string {
+	if strings.Contains(cfg, "[index]") {
+		return cfg
+	}
+	return cfg + "\n[index]\nenabled = true\n"
 }
 
 func mintToken(t *testing.T, dataDir, sub string) string {
@@ -253,6 +269,7 @@ func TestRuleBitInjectedIntoSystem(t *testing.T) {
 		DataDir:       dataDir,
 		DefaultBranch: "zero",
 		Listen:        "127.0.0.1:0",
+		IndexEnabled:  true,
 	})
 	if err != nil {
 		t.Fatal(err)

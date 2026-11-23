@@ -29,6 +29,9 @@ root = true
 name  = "daily"
 owner = "zero"
 mode  = "rwx------"
+
+[index]
+enabled = true
 `
 
 // newCore 造一个最小可用的记忆引擎。

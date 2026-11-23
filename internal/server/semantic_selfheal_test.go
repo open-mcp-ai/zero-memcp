@@ -118,6 +118,7 @@ func TestSemanticSelfHealsAfterOutage(t *testing.T) {
 				// 测试里把巡检周期压到 150ms
 				MaintainInterval: 150 * time.Millisecond,
 			},
+			IndexEnabled: true,
 		})
 		if err != nil {
 			t.Fatalf("New: %v", err)
@@ -230,6 +231,7 @@ func TestSemanticStartsDownThenRecovers(t *testing.T) {
 			},
 			MaintainInterval: 150 * time.Millisecond,
 		},
+		IndexEnabled:  true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

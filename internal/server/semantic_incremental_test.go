@@ -74,6 +74,7 @@ func TestSemanticIncremental(t *testing.T) {
 		DataDir:       dataDir,
 		DefaultBranch: "main.record",
 		Listen:        "127.0.0.1:0",
+		IndexEnabled:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -101,6 +102,7 @@ func TestSemanticIncremental(t *testing.T) {
 		DataDir:       dataDir,
 		DefaultBranch: "main.record",
 		Listen:        "127.0.0.1:0",
+		IndexEnabled:  true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -138,6 +140,7 @@ func TestSemanticIncremental(t *testing.T) {
 		DataDir:       dataDir,
 		DefaultBranch: "main.record",
 		Listen:        "127.0.0.1:0",
+		IndexEnabled:  true,
 	})
 	if err != nil {
 		t.Fatal(err)

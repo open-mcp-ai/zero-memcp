@@ -82,6 +82,15 @@ type Config struct {
 	// ConfigFile 是配置文件路径。
 	ConfigFile string
 
+	// IndexEnabled 显式启用倒排索引、正文缓存与语义向量。
+	//
+	// 零值（false）= 冷备份形态：不扫描、不建倒排表、不预热正文缓存，
+	// recall/grep 直接报错，status 打 index: disabled。
+	//
+	// 从配置文件构造时由 [index] enabled 决定；直接用 Config 构造的
+	// 调用方（库用户、测试）必须自己声明它为 true，否则拿到的是冷备份。
+	IndexEnabled bool
+
 	// Listen 监听地址，缺省 "127.0.0.1:1729"。
 	Listen string
 
@@ -147,6 +156,12 @@ type Server struct {
 	// 现在：读路径一次 Load 拿到底，写路径取 treeTok 令牌后
 	// 造新快照再 Store。Index 自身也已无锁（见 internal/index）。
 	treesPtr atomic.Pointer[treeSet]
+	// indexEnabled 控制本实例是否构建倒排索引、正文缓存和向量索引。
+	//
+	// 由配置文件的 [index] enabled 控制；默认 false（冷备份节点安全默认）。
+	// 没启用时：不扫描、不建倒排表、不预热正文缓存、不开语义；
+	// 被 recall/grep 命中时明确报错出声，禁止静默返回空。
+	indexEnabled bool
 	// branchToks 按 (project@branch) 分段串行化记忆库写者。
 	//
 	// 早先这里是全库唯一的一把令牌。那把令牌让「写一条记忆」必须排队
@@ -540,17 +555,25 @@ func New(cfg Config) (*Server, error) {
 		startupStage("acl: %d rule(s)", len(store.Rules()))
 	}
 	// 会话表：改口令时清空全部会话，所以它必须能看到口令状态。
+	s.indexEnabled = cfg.IndexEnabled
 	s.sessions = auth.NewSessionStore(12*time.Hour, s.passwords.MustChange)
 
 	if cfgFile != nil {
 		rems := cfgFile.Remotes
 		s.remotes.Store(&rems)
+		s.indexEnabled = s.indexEnabled || cfgFile.Index.Enabled
 	}
-	startupStage("building initial index (reading every branch of every project)")
-	if err := s.Reload(); err != nil {
-		return nil, fmt.Errorf("build initial index: %w", err)
+	if s.indexEnabled {
+		startupStage("building initial index (reading every branch of every project)")
+		if err := s.Reload(); err != nil {
+			return nil, fmt.Errorf("build initial index: %w", err)
+		}
+		startupStage("initial index ready")
+	} else {
+		startupStage("index: disabled by configuration (cold backup mode; configure [index] enabled = true to enable)")
+		// 挂载一个空的不可变快照，保证并发读不会 panic
+		s.treesPtr.Store(&treeSet{trees: nil, idx: index.New()})
 	}
-	startupStage("initial index ready")
 
 	// 后台预热正文缓存。
 	//
@@ -593,6 +616,10 @@ func New(cfg Config) (*Server, error) {
 //
 // 这里没有「身份」这个概念：分支名只是这份记忆的版本线。
 func (s *Server) Reload() error {
+	if !s.indexEnabled {
+		s.treesPtr.Store(&treeSet{trees: nil, idx: index.New()})
+		return nil
+	}
 	// 优雅热重载：先试着重新解析配置文件。
 	//
 	// 黄金规则（用户指定的）：reload 语法失败或校验不通过时，
@@ -1751,6 +1778,10 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		return TermResult{}, fmt.Errorf("unknown verb %q\n\n%s", strings.Fields(arg)[0], helpOverview())
 
 	case "recall":
+		if !s.indexEnabled {
+			return TermResult{}, fmt.Errorf("index is disabled on this instance (cold backup node); " +
+				"configure [index] enabled = true in zero-memcp.toml to enable search")
+		}
 		// recall <text>
 		//
 		// 计时起点放在最前面：tookMs 要覆盖解析、检索、取摘要的全过程，
@@ -2232,9 +2263,17 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// semanticStatus 早先写了却全仓无人调用，等于没写。
 		sem := s.semanticStatus()
 
-		text := fmt.Sprintf("docs: %d", docs)
-		if c.Mount.Empty() {
+		// 索引关掉时第一行必须直说。
+		//
+		// 不说的后果：docs 恒为 0，读的人会以为「库是空的」而不是
+		// 「这台机器不建索引」——两件事的处置完全不同。
+		var text string
+		if !s.indexEnabled {
+			text = "index: disabled (cold backup node; configure [index] enabled = true to enable)"
+		} else if c.Mount.Empty() {
 			text = fmt.Sprintf("docs: %d, terms: %d", docs, terms)
+		} else {
+			text = fmt.Sprintf("docs: %d", docs)
 		}
 		text += "\nsemantic: " + sem
 		if c.Mount.Empty() {
@@ -2294,6 +2333,10 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		}, nil
 
 	case "grep":
+		if !s.indexEnabled {
+			return TermResult{}, fmt.Errorf("index is disabled on this instance (cold backup node); " +
+				"configure [index] enabled = true in zero-memcp.toml to enable search")
+		}
 		// grep [-i] <pattern> [--scope <tree>]
 		//
 		// 正则匹配全文，带上下文。

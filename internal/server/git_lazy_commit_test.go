@@ -55,7 +55,7 @@ url       = %q
 push      = ["main.record"]
 auto_sync = true
 `, dataDir, hubDir)
-	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(cfg), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(withIndex(cfg)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -160,7 +160,7 @@ url       = %q
 push      = ["main.record"]
 auto_sync = true
 `, dataDir, hubDir)
-	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(cfg), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(withIndex(cfg)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 

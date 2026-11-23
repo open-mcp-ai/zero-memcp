@@ -79,6 +79,7 @@ func TestSemanticReuseAcrossRenamedPath(t *testing.T) {
 			DataDir:       dataDir,
 			DefaultBranch: "main.record",
 			Listen:        "127.0.0.1:0",
+			IndexEnabled:  true,
 		})
 		if nerr != nil {
 			t.Fatal(nerr)

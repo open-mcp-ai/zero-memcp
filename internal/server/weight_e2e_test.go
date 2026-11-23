@@ -43,6 +43,7 @@ func TestReadReinforcesRecall(t *testing.T) {
 		DefaultBranch: "zero",
 		Listen:        "127.0.0.1:0",
 		WeightsDir:    stateDir,
+		IndexEnabled:  true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

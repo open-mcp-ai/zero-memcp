@@ -26,6 +26,7 @@ type File struct {
 	Remotes  []Remote
 	Erase    EraseConfig
 	Search   SearchConfig
+	Index    IndexConfig
 	AuthKeys []AuthKey
 
 	// Path 是它被读出来的位置，仅用于错误信息与日志。
@@ -39,6 +40,25 @@ type File struct {
 type EraseConfig struct {
 	PublicKey     string
 	RequireTicket bool
+}
+
+// IndexConfig 控制这台实例要不要建索引。
+//
+// 为什么默认关闭：索引（倒排表 + 树快照 + 正文缓存 + 向量）服务的是
+// read/grep/recall，而这些只有一个「活节点」才需要。冷备份节点的职责
+// 只有一条——收下命令流、落进 Git、定时折成 commit。给它建索引是在
+// 4GB 的板子上白烧 2.3GB 内存和 20 秒启动，实测宿主只剩 154MB 可用。
+//
+// 默认关闭还有一层：不配置就不做重活，比「配置错了才发现」安全。
+// 要搜索的实例必须显式声明：[index] enabled = true。
+//
+// 未启用时绝不静默：recall/grep 直接报错，status 明写 index: disabled。
+// 「返回空结果」会被当成「库里没有」，那是最坏的一种误导。
+type IndexConfig struct {
+	Enabled bool
+	// enabledSet 记录 [index] 节里是否显式写了 enabled。
+	// 未写时按关闭处理——「不配置不会生效」是这条设定的全部意义。
+	enabledSet bool
 }
 
 // Semantic 是本地语义向量检索配置。
@@ -315,6 +335,7 @@ var knownKeys = map[string]map[string]bool{
 	"gc":       {"interval": true},
 	"sync":     {"interval": true, "disabled": true},
 	"search":   {"body_cache_mb": true},
+	"index":    {"enabled": true},
 	"erase":    {"public_key": true, "require_ticket": true},
 	"user":     {"name": true, "groups": true, "root": true, "pwd": true},
 	"group":    {"name": true, "members": true},
@@ -616,6 +637,14 @@ func ParseFile(raw []byte) (*File, error) {
 		} else {
 			f.Search.BodyCacheMB = int(v)
 			f.Search.bodyCacheSet = true
+		}
+	}
+	if sec, ok := doc.Sections["index"]; ok {
+		if v, err := boolean(sec, "[index]", "enabled"); err != nil {
+			return nil, err
+		} else {
+			f.Index.Enabled = v
+			f.Index.enabledSet = true
 		}
 	}
 	if sec, ok := doc.Sections["erase"]; ok {

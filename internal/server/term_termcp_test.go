@@ -115,8 +115,14 @@ func TestTermcpPutWithTreeAndSession(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read 回写切片失败: %v", err)
 	}
-	if !strings.Contains(read.Text, "session: real-session-uuid") {
-		t.Fatalf("@session 应出现在 front-matter: %s", read.Text)
+	// --session 只参与「这一轮是谁写的」这个头部解析，**不落盘**。
+	//
+	// 2026-11-23 改动：front-matter 里不再写 session: 行，落盘就是纯对话。
+	// 起因是 Pi 的压缩分支机制——每次压缩产生新会话文件、新文件带着
+	// 完整逐字历史，session 一旦进入判重指纹，同一段对话就会被按会话
+	// 数重写 N 遍（实测 28 个会话、80,290 轮里 91.9% 是重复）。
+	if strings.Contains(read.Text, "session:") {
+		t.Fatalf("落盘内容不该含 session: 行（落盘是纯对话，不带会话溯源）: %s", read.Text)
 	}
 	if !strings.Contains(read.Text, "双位置参数的正文; 含分号 && 逻辑符") {
 		t.Fatalf("正文应逐字保留: %s", read.Text)

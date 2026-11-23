@@ -139,18 +139,22 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	if source == "" {
 		source = "mcp"
 	}
-	sessionLine := ""
-	if session != "" {
-		sessionLine = fmt.Sprintf("session: %s\n", session)
-	}
 	// 类型由落点决定：显式给了 kind 才写进 frontmatter。
 	// 写一条记忆还要先声明「我是哪种」，是多出来的一步自我分类。
 	kindLine := ""
 	if !implicitKind {
 		kindLine = fmt.Sprintf("kind: %s\n", kind)
 	}
-	content := fmt.Sprintf("---\n%ssource: %s\nendpoint: %s\ncreated: %s\n%s---\n\n%s\n",
-		kindLine, source, endpoint, now.Format(time.RFC3339), sessionLine, text)
+	// 落盘内容不带 session。
+	//
+	// 早先写 `session: <id>`，目的是「这条记忆从哪个会话来」的溯源。
+	// 但它把 Pi 的压缩分支机制变成了重复源：每次压缩产生新 sessionId，
+	// 而新会话文件里带着完整逐字历史（实测子文件首条消息与父文件
+	// 同时间戳、同内容），重放时同一段对话被算成 N 条不同记录。
+	//
+	// 落盘就是对话本身。要问「这条从哪来」时，created 加内容已经够定位。
+	content := fmt.Sprintf("---\n%ssource: %s\nendpoint: %s\ncreated: %s\n---\n\n%s\n",
+		kindLine, source, endpoint, now.Format(time.RFC3339), text)
 
 	// 幂等判重：按「语义内容」而不是整份文件。
 	//
@@ -159,8 +163,8 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// 判重分支从未执行过。症状是「插件以为服务端会去重，服务端其实不会」，
 	// 水位文件一丢就整段重复落盘。
 	//
-	// 现在的指纹 = kind + session + 正文。这是「这条记忆是什么」，
-	// 而不是「它被写在哪份文件里」。
+	// 现在的指纹 = kind + 正文（不含 session）。这是「这条记忆是什么」，
+	// 而不是「它从哪个会话、哪个文件来」。详细论据见 dedupKey 注释。
 	// SKILL.md 可以为整个项目声明默认写入树。
 	if treePrefix == "" && pol.Tree != "" {
 		treePrefix = pol.Tree
@@ -173,10 +177,23 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	if implicitKind {
 		storedKind = ""
 	}
-	dedupKey := s.dedupKey(targetProject, writeBranch, treePrefix+"/"+storedKind, session, text)
+	dedupKey := s.dedupKey(targetProject, writeBranch, treePrefix+"/"+storedKind, text)
 	if prev, ok := s.dedup.Load(dedupKey); ok {
 		if p, _ := prev.(string); p != "" {
-			return targetProject + "/" + p, targetProject, writeBranch, nil
+			// 幽灵判重防护（2026-11-23 实测）：
+			// 刚刚 delete 掉一批切片后，dedup 表里还缓存着它们的路径。
+			// 如果此时写入一模一样的正文，直接返回那个已删路径，紧接着的
+			// 回读校验（repo.Read）就会报：
+			//   "write reported success but … cannot be read back"
+			// 并把一次正常写入判失败。
+			//
+			// 命中时必须确认文件「真的还在」；已经没了的陈旧记录当场淘汰，
+			// 穿透去真正写一份新的。
+			rel := strings.TrimPrefix(p, targetProject+"/")
+			if _, rerr := repo.Read(writeBranch, rel); rerr == nil {
+				return targetProject + "/" + p, targetProject, writeBranch, nil
+			}
+			s.dedup.Delete(dedupKey)
 		}
 	}
 
@@ -503,17 +520,30 @@ func capOf(c Caller) string {
 // dedupKey 计算一条记忆的语义指纹。
 //
 // 不含 created 时间戳、不含 endpoint：同一段对话从两台机器写入，
-// 或在不同的秒写入，都应该被认成同一条。session 参与计算是因为
-// 同一个问题在不同会话里问两次，是两条独立的记录。
-func (s *Server) dedupKey(project, branch, kind, session, text string) string {
+// 或在不同的秒写入，都应该被认成同一条。
+//
+// 也不含 session。这一条是走了一大圈才改对的（2026-11-23）：
+//
+// 早先的注释写的是「session 参与计算是因为同一个问题在不同会话里
+// 问两次，是两条独立的记录」。单看这句话合理，但它遇上了 Pi 的
+// 压缩分支机制就变成灾难：压缩会写出新会话文件，新文件里带着
+// **完整逐字历史**（实测子文件首条消息与父文件同时间戳、同内容，
+// 两份文件内容重合 99.3%）。重放这份历史时 session 一换，
+// 指纹就全变了，于是同一段对话被当成全新记录再写一遍。
+//
+// 实测一条链 28 个会话：累计回答 80,290 轮，去重后只有 6,498 轮，
+// 重复占 91.9%。存储里同一句「读一下这个项目」出现过 24 份。
+//
+// 根因不是重放，而是「同一段内容因为出处不同而被当成两条」。
+// 两条记录问的是同一句话、写的是同一个答案，它就是同一条记忆。
+// 出处（哪个会话、哪台机器）不属于这条记忆的身份。
+func (s *Server) dedupKey(project, branch, kind, text string) string {
 	h := sha256.New()
 	h.Write([]byte(project))
 	h.Write([]byte{0})
 	h.Write([]byte(branch))
 	h.Write([]byte{0})
 	h.Write([]byte(kind))
-	h.Write([]byte{0})
-	h.Write([]byte(session))
 	h.Write([]byte{0})
 	h.Write([]byte(strings.TrimSpace(text)))
 	return project + "@" + branch + ":" + hex.EncodeToString(h.Sum(nil))[:16]
@@ -583,12 +613,12 @@ func (s *Server) seedDedup(trees []*memory.Tree) {
 				if err != nil {
 					continue
 				}
-				kind, session, text := parseSliceMeta(string(data))
+				kind, text := parseSliceMeta(string(data))
 				if text == "" {
 					continue
 				}
 				out[i] = seeded{
-					key:  s.dedupKey(b.Project, b.Branch, treePrefixOfPath(b.Path)+"/"+kind, session, text),
+					key:  s.dedupKey(b.Project, b.Branch, treePrefixOfPath(b.Path)+"/"+kind, text),
 					path: b.Path,
 				}
 			}
@@ -632,18 +662,22 @@ func dateInPath(p string) string {
 	return ""
 }
 
-// parseSliceMeta 从切片正文里取回 kind / session / 正文。
+// parseSliceMeta 从切片正文里取回 kind / 正文。
 //
 // 只认我们自己的格式（frontmatter 后空行接正文）。不是这个格式的
 // 文件（README、SKILL.md、人写的叙事）一律返回空 text，不参与判重——
 // 它们本来就不会被 put 重复写入。
-func parseSliceMeta(content string) (kind, session, text string) {
+//
+// 早先还额外返回 session，供指纹使用。现在指纹不看 session，
+// 也就不必从历史切片里把它读回来——旧切片里可能还带着 session 行，
+// 没有任何影响，就当普通 frontmatter 跳过。
+func parseSliceMeta(content string) (kind, text string) {
 	if !strings.HasPrefix(content, "---\n") {
-		return "", "", ""
+		return "", ""
 	}
 	end := strings.Index(content[4:], "\n---\n")
 	if end < 0 {
-		return "", "", ""
+		return "", ""
 	}
 	fm := content[4 : 4+end]
 	body := content[4+end+5:]
@@ -655,15 +689,13 @@ func parseSliceMeta(content string) (kind, session, text string) {
 		switch strings.TrimSpace(k) {
 		case "kind":
 			kind = strings.TrimSpace(v)
-		case "session":
-			session = strings.TrimSpace(v)
 		}
 	}
 	text = strings.TrimSpace(body)
 	if text == "" {
-		return "", "", ""
+		return "", ""
 	}
-	return kind, session, text
+	return kind, text
 }
 
 // treePrefixOfPath 从切片路径反推它所在的子树。

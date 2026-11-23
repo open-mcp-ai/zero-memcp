@@ -44,14 +44,22 @@ root = true
 		t.Fatalf("幂等失效：第二次写生成了新路径 %q，而期望返回已有路径 %q", path2, path1)
 	}
 
-	// 换个 session 应该作为新记录
+	// 换个 session、同一段正文 —— 按 2026-11-23 的新语义，这仍然
+	// 是**同一条记忆**，必须返回已有路径。
+	//
+	// 早先这里断言的是反面（「不同 session 应该产生新文件」）。
+	// 那条断言在 Pi 的压缩分支机制下是灾难：压缩产生新会话文件、
+	// 新文件里带着完整逐字历史，重放时每个会话都把全部历史重写一遍。
+	// 实测一条链 28 个会话累计 80,290 轮回答，去重后只有 6,498 轮，
+	// 重复占 91.9%。出处（哪个会话）不属于这条记忆的身份。
 	res3, err := s.ExecLineVars(context.Background(), "put --session sess-2 $1", nil, []string{"太阳从东边升起"})
 	if err != nil {
 		t.Fatalf("第三次写入失败: %v", err)
 	}
 	path3 := strings.TrimPrefix(strings.TrimSpace(res3), "ok ")
-	if path3 == path1 {
-		t.Fatalf("不同 session 应该产生新文件，却返回了相同的路径: %q", path3)
+	if path3 != path1 {
+		t.Fatalf("同一段正文换了 session 仍是同一条记忆，应返回已有路径 %q，实际拿到 %q（会话压缩后重放历史会因此写出海量重复）",
+			path1, path3)
 	}
 }
 

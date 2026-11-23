@@ -7,6 +7,9 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"time"
+
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
 // 命令流同步引擎：推与拉都走同一份日志。
@@ -29,15 +32,14 @@ func (s *Server) exportOps(project, branch string, after int64) (opBatch, error)
 	return s.exportOpsFrom(project, branch, after, "")
 }
 
-// exportOpsFrom 在 exportOps 之上支持「以某个提交为基准」。
+// exportOpsFrom 在 exportOps 之上支持「以某个基准树为准」。
 //
-// baseCommit 回答的是位点水位回答不了的问题：对端已经通过 Git 拿到了
-// 某个提交，但它本地这份日志的位点是 0——按位点它要整棵树（几百 MB），
-// 而它真正缺的只是那个提交之后的那几条命令。
+// 命令流的位点只在**同一段流**里可比：基准树一变，所有位点都要重新
+// 解释。所以基准先于位点——对端报的基准与本端不同，位点就毫无意义。
 //
-// 找不到基准时不报错，而是退化为整树：报错会让老客户端永远同步不了，
-// 而整树恰好是「没有基准」时唯一正确的答案。
-func (s *Server) exportOpsFrom(project, branch string, after int64, baseCommit string) (opBatch, error) {
+// 对不上时不发明细，而是告诉对端「我现在的基准是这棵树，它对应的提交
+// 是这一个」。对端去浅拷贝那个提交，然后带着新基准再来。
+func (s *Server) exportOpsFrom(project, branch string, after int64, baseTree string) (opBatch, error) {
 	batch := opBatch{Project: project, Branch: branch, Node: s.instanceID(), From: after}
 	if s.opLogs == nil {
 		return batch, fmt.Errorf("oplog is not initialised")
@@ -47,20 +49,30 @@ func (s *Server) exportOpsFrom(project, branch string, after int64, baseCommit s
 		return batch, err
 	}
 
-	// 对端给了基准提交：能定位到位点就只发那之后的命令。
-	// 位点只进不退：对端自报的水位更新时，以它为准。
-	if baseCommit != "" {
-		if seq, ok := l.SeqForCommit(baseCommit); ok {
-			if seq > after {
-				after = seq
-				batch.From = seq
-			}
-			batch.BaseCommit = baseCommit
-		} else {
-			// 出声：静默退化会让对端以为拿到了增量，而实际收到整树。
-			s.logf("op-sync: %s@%s: peer asked from commit %s, no anchor here; sending full tree",
-				project, branch, shortSHA(baseCommit))
+	cur := l.BaseTree()
+	batch.BaseTree = cur
+	batch.BaseCommit = s.commitForTree(project, branch, cur)
+
+	// 基准对不上：位点在这里没有意义，只能发整树快照。
+	//
+	// 这不是异常——两个节点各自提交过，基准必然不同。整树快照带
+	// Replace 语义，对端落地后自己的基准就变成这棵树，下一轮就能
+	// 走增量。想省掉这一趟大传输，对端先浅拷贝 BaseCommit 再来。
+	if baseTree != "" && baseTree != cur {
+		entries, ferr := s.flattenTreeToOps(project, branch)
+		if ferr != nil {
+			return batch, ferr
 		}
+		batch.Ops = []treeOp{{
+			Kind:    opTree,
+			Replace: true,
+			Batch:   entries,
+			Ts:      time.Now().Unix(),
+		}}
+		batch.To = l.Last()
+		s.logf("op-sync: %s@%s: peer base %s != local base %s; sending full tree snapshot",
+			project, branch, shortSHA(baseTree), shortSHA(cur))
+		return batch, nil
 	}
 
 	// 读侧播种：对端从位点 0 开始拉、而本地日志尚为空时，
@@ -70,32 +82,53 @@ func (s *Server) exportOpsFrom(project, branch string, after int64, baseCommit s
 		if serr := l.seedIfEmpty(); serr != nil {
 			s.logf("oplog: seed initial tree for %s@%s: %v", project, branch, serr)
 		}
+		// 播种不改变基准（它记的就是当前基准下的内容），但 To 会变。
+		batch.To = l.Last()
 	}
 	batch.Ops = l.Since(after)
 	batch.To = l.Last()
-	// 整树批次带上本节点最近的锚点：对端据此知道「这棵树对应哪个提交」，
-	// 下次就能拿着这个提交来要增量，不必再要一遍整树。
-	if batch.BaseCommit == "" && after == 0 {
-		if c, _, ok := l.LatestAnchor(); ok {
-			batch.BaseCommit = c
-		}
-	}
 	return batch, nil
+}
+
+// commitForTree 返回当前分支上「树等于 tree」的那个提交（没有则空）。
+//
+// 用途只有一个：告诉对端该浅拷贝哪个提交。基准是空树时返回空——
+// 分支还没有任何提交，对端不需要拉任何东西。
+func (s *Server) commitForTree(project, branch, tree string) string {
+	if tree == "" || tree == gitstore.EmptyTreeSHA {
+		return ""
+	}
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return ""
+	}
+	head, err := repo.Resolve(branch)
+	if err != nil || head == "" {
+		return ""
+	}
+	headTree, err := repo.TreeOfCommit(head)
+	if err != nil || headTree != tree {
+		// 头部不是这个树：说明基准落后于头部，那就不给提交，
+		// 让对端走「整树重发」这条老路。宁可贵一点，不要给错的提交。
+		return ""
+	}
+	return head
 }
 
 // ingestOps 把对端推来的一批命令接进本地：应用 → 补 blob → 重放。
 //
 // 这是 server 端 handleOpPush 与本端 pull 落地共用的入口。
 func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult, error) {
-	// 基准提交校验：对端声称这批命令是基于某个提交的增量。
-	// 若本端根本没有这个提交对象，说明双方基准错位，不能闭着眼睛重放。
-	// 失败必须出声：静默吞掉会导致「命令看似都 apply 了，但树基准错了，
-	// 结果是一棵拼接出来的坏树」。
-	if batch.BaseCommit != "" {
-		if repo, err := s.projects.Get(project); err == nil {
-			if !repo.HasObject(batch.BaseCommit) {
-				s.logf("op-sync: %s@%s: received ops based on commit %s, but local repo lacks it; applying ops anyway (missing objects will be pulled)",
-					project, branch, shortSHA(batch.BaseCommit))
+	// 基准树校验：整树快照会重设基准（Replace 语义），允许；
+	// 增量命令只在基准相同时才成立——不同就是位点错位，拼出来的是
+	// 一棵既不是这里也不是那里的树，必须出声拒绝。
+	if batch.BaseTree != "" && s.opLogs != nil && !isSnapshotBatch(batch) {
+		if l, lerr := s.opLogs.For(project, branch); lerr == nil {
+			if cur := l.BaseTree(); cur != batch.BaseTree {
+				var zero opApplyResult
+				return zero, fmt.Errorf(
+					"op-sync %s@%s: base tree mismatch (local %s, peer %s); ask the peer for a full snapshot",
+					project, branch, shortSHA(cur), shortSHA(batch.BaseTree))
 			}
 		}
 	}
@@ -173,9 +206,9 @@ func (s *Server) handleOpPull(w http.ResponseWriter, r *http.Request) {
 		Branch  string `json:"branch"`
 		Node    string `json:"node"`
 		After   int64  `json:"after"`
-		// BaseCommit 是可选基准：对端已经持有的提交。
-		// 给了它，就只发该提交之后的命令；给不出就退化为整树。
-		BaseCommit string `json:"base_commit,omitempty"`
+		// BaseTree 是对端当前的基准树。
+		// 双方基准相同才发增量命令；不同就返回 NeedRebase 让对端先浅拉。
+		BaseTree string `json:"base_tree,omitempty"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, "bad op-pull request: "+err.Error(), http.StatusBadRequest)
@@ -185,7 +218,7 @@ func (s *Server) handleOpPull(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, s.denyReason(c, req.Project, req.Branch, configBitRead), http.StatusForbidden)
 		return
 	}
-	batch, err := s.exportOpsFrom(req.Project, req.Branch, req.After, req.BaseCommit)
+	batch, err := s.exportOpsFrom(req.Project, req.Branch, req.After, req.BaseTree)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -247,11 +280,11 @@ func postOpPull(client *http.Client, baseURL, token, project, branch, node strin
 //
 // baseCommit 非空时告诉对端「我已经有这棵树了，只要它之后的命令」。
 // 对端认不出这个提交时会自动退化为整树，不会报错。
-func postOpPullFrom(client *http.Client, baseURL, token, project, branch, node string, after int64, baseCommit string) (opBatch, error) {
+func postOpPullFrom(client *http.Client, baseURL, token, project, branch, node string, after int64, baseTree string) (opBatch, error) {
 	var batch opBatch
 	payload := map[string]any{"project": project, "branch": branch, "node": node, "after": after}
-	if baseCommit != "" {
-		payload["base_commit"] = baseCommit
+	if baseTree != "" {
+		payload["base_tree"] = baseTree
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(baseURL, "/")+"/sync/ops/pull", bytes.NewReader(body))
@@ -304,7 +337,8 @@ func postOpPush(client *http.Client, baseURL, token string, batch opBatch) (opAp
 		return res, err
 	}
 	if resp.StatusCode != http.StatusOK {
-		return res, fmt.Errorf("op-push %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		var zero opApplyResult
+				return zero, fmt.Errorf("op-push %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
 	if err := json.Unmarshal(data, &res); err != nil {
 		return res, err
@@ -351,10 +385,12 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 			seen[sha] = true
 			body, berr := repo.BlobBody(sha)
 			if berr != nil {
-				return res, fmt.Errorf("read local blob %s: %w", sha, berr)
+				var zero opApplyResult
+				return zero, fmt.Errorf("read local blob %s: %w", sha, berr)
 			}
 			if perr := postWorkBlob(client, baseURL, token, project, branch, sha, body); perr != nil {
-				return res, fmt.Errorf("push blob %s: %w", sha, perr)
+				var zero opApplyResult
+				return zero, fmt.Errorf("push blob %s: %w", sha, perr)
 			}
 		}
 		// 第二趟：对象已到对面并验真，现在重放同一批命令。
@@ -363,7 +399,8 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 			return res, err
 		}
 		if len(res.Missing) > 0 {
-			return res, fmt.Errorf("peer still reports %d missing blob(s) after upload", len(res.Missing))
+			var zero opApplyResult
+				return zero, fmt.Errorf("peer still reports %d missing blob(s) after upload", len(res.Missing))
 		}
 	}
 	// 只有对端确认之后才推进本地水位。
@@ -393,19 +430,15 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	// 于是每轮都从头拉、每轮都重复应用。键必须用日志属主名。
 	after := s.peerSeq(project, branch, s.resolvePeer(peerName))
 
-	// 若本端从来没从该对端拉过（after=0），但本地这条分支已经有一个提交
-	// （比如通过 Git 浅拷贝或 fetch 刚拉下来的），把这个提交带过去：
-	// 对端如果也认得这个提交，就只发该提交之后的增量，不必把整棵树重发一遍。
-	baseCommit := ""
-	if after == 0 {
-		if repo, err := s.projects.Get(project); err == nil {
-			if head, herr := repo.Resolve(branch); herr == nil && head != "" {
-				baseCommit = head
-			}
+	// 带上本地当前这段流的基准树：对端据此判断我们的流是不是挂在
+	// 同一棵树上。不是同一棵树就发 NeedRebase，不瞎发增量。
+	baseTree := ""
+	if s.opLogs != nil {
+		if l, lerr := s.opLogs.For(project, branch); lerr == nil {
+			baseTree = l.BaseTree()
 		}
 	}
-
-	batch, err := postOpPullFrom(client, baseURL, token, project, branch, s.instanceID(), after, baseCommit)
+	batch, err := postOpPullFrom(client, baseURL, token, project, branch, s.instanceID(), after, baseTree)
 	if err != nil {
 		return zero, err
 	}
@@ -434,7 +467,8 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 			seen[sha] = true
 			body, berr := getWorkBlob(client, baseURL, token, project, branch, sha)
 			if berr != nil {
-				return res, fmt.Errorf("fetch blob %s: %w", sha, berr)
+				var zero opApplyResult
+				return zero, fmt.Errorf("fetch blob %s: %w", sha, berr)
 			}
 			if aerr := s.applyWorkBlob(project, sha, body); aerr != nil {
 				return res, aerr
@@ -527,11 +561,19 @@ func (s *Server) opSyncLines(c Caller) []string {
 		line := fmt.Sprintf("oplog %s@%s: %d op(s), head seq %d", project, branch, l.Len(), l.Last())
 		// 锚点水位必须可见：它是「从某个提交增量同步」能不能成立的前提。
 		// 看不到它，就分不出「没增量」和「没有基准」这两种完全不同的状态。
-		if c, seq, ok := l.LatestAnchor(); ok {
-			line += fmt.Sprintf(", anchor %s @seq %d", shortSHA(c), seq)
+		if bt := l.BaseTree(); bt != "" && bt != gitstore.EmptyTreeSHA {
+			line += fmt.Sprintf(", base tree %s", shortSHA(bt))
 		}
 		out = append(out, line)
 		return true
 	})
 	return out
+}
+
+// isSnapshotBatch 判断一批命令是不是权威整树快照。
+//
+// 快照带 Replace 语义：本地有、而批次里没有的路径都会被墓碑。所以它
+// 自带「重设基准」的能力，不要求两边基准先对齐。
+func isSnapshotBatch(batch opBatch) bool {
+	return len(batch.Ops) == 1 && batch.Ops[0].Kind == opTree && batch.Ops[0].Replace
 }

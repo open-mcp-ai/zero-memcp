@@ -283,17 +283,18 @@ func (s *Server) syncDirtyAll() {
 	}
 }
 
-// commitBranch 在单个仓库的单个分支上执行提交，并原子登记锚点。
+// commitBranch 在单个仓库的单个分支上执行提交，并把命令流归零到新树。
 //
 // 这是所有单分支提交的收敛处：execCommit / commitRepo / 树手术
-// 都走这里，保证「产生新 commit」和「记下命令流锚点」永远成对发生。
+// 都走这里，保证「产生新 commit」和「命令流归零」永远成对发生。
+// 漏了后一半的后果不是数据错，而是命令流无限增长、对端基准永远对不上。
 func (s *Server) commitBranch(proj string, repo *gitstore.Repo, branch, msg string) (string, error) {
-	baseSeq := s.opLogCurrentSeq(proj, branch)
 	sha, err := repo.Commit(branch, msg)
 	if err != nil {
 		return "", err
 	}
-	s.recordCommitAnchor(proj, branch, sha, baseSeq)
+	// 提交把工作层的命令折进了树，命令流随即归零到新基准。
+	s.resetOpLogToCommit(proj, branch, repo, sha)
 	return sha, nil
 }
 

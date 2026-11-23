@@ -538,6 +538,21 @@ func (r *Repo) commitOf(ref string) (commitObj, error) {
 	return parseCommit(body), nil
 }
 
+// TreeOfCommit 返回某个提交指向的树 SHA。
+//
+// 传入空串（分支还没有任何提交）时返回空树 SHA，而不是报错：
+// 「没有提交」是有确定答案的状态，它不是「未知」。
+func (r *Repo) TreeOfCommit(sha string) (string, error) {
+	if sha == "" {
+		return EmptyTreeSHA, nil
+	}
+	c, err := r.commitOf(sha)
+	if err != nil {
+		return "", err
+	}
+	return c.Tree, nil
+}
+
 // List 列出某个分支下的全部条目（干净树 + 脏层覆盖）。
 func (r *Repo) List(ref string) ([]Entry, error) {
 	if err := r.syncDirtyWriter(); err != nil {

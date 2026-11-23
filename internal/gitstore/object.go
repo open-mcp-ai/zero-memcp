@@ -328,6 +328,13 @@ func parseCommit(body []byte) commitObj {
 
 // identity 是写进 commit 的作者与提交者。固定值，不读环境变量——
 // 谁写的记在切片的 frontmatter 里（source 字段），不靠 git 的作者字段。
+// EmptyTreeSHA 是 Git 官方的空树对象 SHA。
+//
+// 它不是一个特殊值，而是一个真实存在的对象（任何仓库都能写出来）。
+// 命令流的基准用它表达「分支还没有任何提交」：基准永远是已知的，
+// 不会出现「不知道基准是什么」这个第三种状态。
+const EmptyTreeSHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+
 const identity = "zero-memcp <zero-memcp@local>"
 
 // writeCommit 生成一个 commit 对象，返回它的 SHA。

@@ -11,6 +11,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
 // 命令流（tree op log）——跨机器一致性的唯一内部抽象。
@@ -85,6 +87,13 @@ type treeOp struct {
 	// 「整树同步」只能加不能减。对端删掉的内容会在接收端活下来——
 	// 正是「离线节点复活已删内容」那个不变量被破。
 	Replace bool `json:"replace,omitempty"`
+	// Reset 为真表示这一行是「流归零」标记：它之前的命令全部作废。
+	//
+	// 提交发生时写入一条。之前的命令已经把内容折进了那棵树，留着它们
+	// 只会让日志无限增长；而它们记的东西已经在树上，不需要重放。
+	Reset bool `json:"reset,omitempty"`
+	// BaseTree 仅 Reset 行使用：归零之后的流基于这棵树。
+	BaseTree string `json:"base_tree,omitempty"`
 }
 
 // opEntry 是批量命令里的一项。
@@ -94,25 +103,10 @@ type opEntry struct {
 	SHA  string `json:"sha,omitempty"`
 }
 
-// opAnchor 记录「一次提交对应的命令流位点」。
-//
-// 为什么需要它：提交是树上某一刻的快照，位点是命令流的序号——两者
-// 本是同一件事的两种表述，但此前没有任何地方把它们对应起来。于是
-// 「先传提交、再传该提交之后的命令流」这条路走不通：接收端手里有一个
-// 提交，却无从知道自己该从哪一位开始要，只能退回「把整棵树重发一遍」。
-//
-// Seq 取的是**提交开始之前**的位点，不是之后。这个方向是故意的：
-// 提交期间到达的写入若也被折进了这棵树，按锚点重放只会把它们再应用
-// 一遍（set 到同一个 sha，幂等）；反过来若记录提交之后的位点，这些
-// 写入会被永久跳过——幂等无害，跳过是数据丢失。
-type opAnchor struct {
-	// Seq 是这条提交对应（或覆盖到）的命令流位点。
-	Seq int64 `json:"seq"`
-	// Commit 是那次提交的 SHA。
-	Commit string `json:"commit"`
-}
-
 // opBatch 是一次同步交换的载荷。
+//
+// 基准用**树**而不是提交：空树是一个真实的 SHA，于是「分支还没有任何
+// 提交」也有了确定的基准，不存在「不知道基准」这个第三种状态。
 type opBatch struct {
 	Project string   `json:"project"`
 	Branch  string   `json:"branch"`
@@ -122,12 +116,20 @@ type opBatch struct {
 	From int64 `json:"from"`
 	// To 是这批命令的最后一个位点。
 	To int64 `json:"to"`
-	// BaseCommit 是这批命令所基于的提交。
+	// BaseTree 是这批命令所基于的树：Ops 的第 1 条就叠在它上面。
 	//
-	// 空值表示「没有可比对的基准」——对端只能按位点信任这批命令。
-	// 非空则表示：这些命令假定接收端已经拥有该提交的树。接收端没有
-	// 这个对象时必须出声，不能装作位点连续就一定对得上。
+	// 接收端的基准不是这棵树时，Ops 一律不成立——位点只在同一段流里
+	// 可比，基准一变，所有位点都要重新解释。
+	BaseTree string `json:"base_tree,omitempty"`
+	// BaseCommit 是 BaseTree 对应的提交（供对端浅拷贝用）。
+	//
+	// 基准是空树时它为空：分支还没有任何提交，对端不需要拉任何东西。
 	BaseCommit string `json:"base_commit,omitempty"`
+	// NeedRebase 为真表示对端报的基准与本端对不上，Ops 为空。
+	//
+	// 对端收到它就去浅拷贝 BaseCommit；BaseCommit 也为空则说明两边
+	// 已分叉（一边有提交一边没有），必须人工裁决。
+	NeedRebase bool `json:"need_rebase,omitempty"`
 }
 
 // opLog 是一条 (node, project, branch) 的追加式命令日志。
@@ -137,13 +139,6 @@ type opBatch struct {
 type opLog struct {
 	dir  string // <data>/system/oplog/<node>/<project>/
 	file string // <dir>/<branch>.ndjson
-
-	// anchorFile 是锚点表：<branch>.anchors.ndjson。
-	//
-	// 单独一个文件，不与命令流混写：命令流是重放依据，锚点是索引。
-	// 混在一起会让「某条命令没落地」和「某条锚点没写上」共用同一条
-	// 损坏诊断路径——而那两件事的后果完全不同。
-	anchorFile string
 
 	state atomic.Pointer[opLogState]
 	wmu   chan struct{}
@@ -158,23 +153,21 @@ type opLog struct {
 
 // opLogState 是日志的不可变快照。
 type opLogState struct {
-	// ops 是全部命令，按 Seq 升序。
+	// ops 是当前这段流的全部命令，按 Seq 升序，Seq 从 1 开始。
 	ops []treeOp
 	// last 是最后一条的位点。
 	last int64
-	// anchors 按 Seq 升序，记录哪些提交对应哪些位点。
-	anchors []opAnchor
+	// baseTree 是这段流所基于的树。
+	//
+	// 每次提交后归零：提交把命令折进树，流从新的基准重新从 seq 1 开始。
+	// 不归零的话流会无限增长，而它记的大部分内容已经变成历史。
+	baseTree string
 }
 
 func newOpLog(dir, file string) *opLog {
-	l := &opLog{dir: dir, file: file, anchorFile: anchorPathOf(file), wmu: make(chan struct{}, 1)}
-	l.state.Store(&opLogState{})
+	l := &opLog{dir: dir, file: file, wmu: make(chan struct{}, 1)}
+	l.state.Store(&opLogState{baseTree: gitstore.EmptyTreeSHA})
 	return l
-}
-
-// anchorPathOf 由命令流文件名推出锚点文件名。
-func anchorPathOf(file string) string {
-	return strings.TrimSuffix(file, ".ndjson") + ".anchors.ndjson"
 }
 
 func (l *opLog) snapshot() *opLogState { return l.state.Load() }
@@ -231,6 +224,7 @@ func (l *opLog) Load() error {
 
 	var ops []treeOp
 	var last int64
+	baseTree := gitstore.EmptyTreeSHA
 	sc := bufio.NewScanner(f)
 	sc.Buffer(make([]byte, 64*1024), 16*1024*1024)
 	line := 0
@@ -244,6 +238,16 @@ func (l *opLog) Load() error {
 		if err := json.Unmarshal([]byte(txt), &op); err != nil {
 			return fmt.Errorf("oplog %s line %d: %w", l.file, line, err)
 		}
+		// 归零行：之前的命令全部作废，之后的命令基于 BaseTree 重新编号。
+		if op.Reset {
+			if op.BaseTree == "" {
+				return fmt.Errorf("oplog %s line %d: reset without base_tree", l.file, line)
+			}
+			ops = nil
+			last = 0
+			baseTree = op.BaseTree
+			continue
+		}
 		if op.Seq <= last {
 			return fmt.Errorf("oplog %s line %d: seq %d does not advance past %d (log is corrupt)",
 				l.file, line, op.Seq, last)
@@ -254,49 +258,8 @@ func (l *opLog) Load() error {
 	if err := sc.Err(); err != nil {
 		return err
 	}
-	anchors, err := loadAnchors(l.anchorFile)
-	if err != nil {
-		return err
-	}
-	l.state.Store(&opLogState{ops: ops, last: last, anchors: anchors})
+	l.state.Store(&opLogState{ops: ops, last: last, baseTree: baseTree})
 	return nil
-}
-
-// loadAnchors 读锚点表。文件不存在不算错：锚点是升级之后才有的东西，
-// 老库天然没有它。
-func loadAnchors(path string) ([]opAnchor, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-	defer f.Close()
-
-	var out []opAnchor
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 16*1024), 1*1024*1024)
-	line := 0
-	for sc.Scan() {
-		line++
-		txt := strings.TrimSpace(sc.Text())
-		if txt == "" {
-			continue
-		}
-		var a opAnchor
-		if err := json.Unmarshal([]byte(txt), &a); err != nil {
-			return nil, fmt.Errorf("oplog anchors %s line %d: %w", path, line, err)
-		}
-		if a.Commit == "" {
-			return nil, fmt.Errorf("oplog anchors %s line %d: empty commit", path, line)
-		}
-		out = append(out, a)
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	return out, nil
 }
 
 // Append 追加一条命令：分配位点、落盘、推进快照。
@@ -348,13 +311,21 @@ func (l *opLog) Append(op treeOp) (treeOp, error) {
 	next := make([]treeOp, len(st.ops)+1)
 	copy(next, st.ops)
 	next[len(st.ops)] = op
-	l.state.Store(&opLogState{ops: next, last: op.Seq, anchors: st.anchors})
+	l.state.Store(&opLogState{ops: next, last: op.Seq, baseTree: st.baseTree})
 	return op, nil
 }
 
 // seedLocked 在日志为空时登记一条整树批量命令。调用方必须已持有令牌。
+//
+// 只在「基准是空树」时播种：基准非空说明内容已经在基准里（那是上一次
+// 提交留下的树），再播一次等于把整棵树当成一条命令重复塞进新流。
+// 这是 2026-11-23 归零模型落地时踩到的坑——提交后第一次写入变成了
+// 「整树 + 新写入」两条命令，而不是一条。
 func (l *opLog) seedLocked() error {
 	if l.seed == nil || l.snapshot().last > 0 {
+		return nil
+	}
+	if bt := l.snapshot().baseTree; bt != "" && bt != gitstore.EmptyTreeSHA {
 		return nil
 	}
 	entries, err := l.seed()
@@ -412,16 +383,22 @@ func (l *opLog) appendLocked(op treeOp) (treeOp, error) {
 	next := make([]treeOp, len(st.ops)+1)
 	copy(next, st.ops)
 	next[len(st.ops)] = op
-	l.state.Store(&opLogState{ops: next, last: op.Seq, anchors: st.anchors})
+	l.state.Store(&opLogState{ops: next, last: op.Seq, baseTree: st.baseTree})
 	return op, nil
 }
 
-// RecordAnchorAt 登记「这条提交对应的树 = 位点 seq 时的树」。
+// Reset 把命令流归零到一条基准树。
 //
-// 提交成功后调用，seq 传入**提交开始之前**的位点（见 commitBranch）。
-func (l *opLog) RecordAnchorAt(commitSHA string, seq int64) error {
-	if commitSHA == "" {
-		return nil
+// 提交发生时调用：提交把流里的命令全部折进了那棵树，这些命令不再需要
+// 重放，留着只会让日志无限增长。归零后流从 seq 1 重新开始，基准变成
+// 刚提交出来的那棵树。
+//
+// 落盘是**原子重写**而不是追加一条标记：追加的话旧命令永远留在文件里，
+// 文件只增不减，与「归零」的初衷相反。先写临时文件再 rename，中途崩溃
+// 时旧文件完好——它记的是上一段流，内容已经在树上，重放幂等。
+func (l *opLog) Reset(baseTree string) error {
+	if baseTree == "" {
+		return fmt.Errorf("oplog reset %s: empty base tree", l.file)
 	}
 	done, err := l.acquire()
 	if err != nil {
@@ -429,22 +406,15 @@ func (l *opLog) RecordAnchorAt(commitSHA string, seq int64) error {
 	}
 	defer done()
 
-	st := l.snapshot()
-	// 同一个提交重记一次不报错也不重复写：与 commit 幂等对齐。
-	for _, old := range st.anchors {
-		if old.Commit == commitSHA {
-			return nil
-		}
-	}
-	a := opAnchor{Seq: seq, Commit: commitSHA}
-	line, err := json.Marshal(a)
+	line, err := json.Marshal(treeOp{Reset: true, BaseTree: baseTree, Ts: time.Now().Unix()})
 	if err != nil {
 		return err
 	}
 	if err := os.MkdirAll(l.dir, 0o755); err != nil {
 		return err
 	}
-	f, err := os.OpenFile(l.anchorFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	tmp := l.file + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o644)
 	if err != nil {
 		return err
 	}
@@ -459,74 +429,28 @@ func (l *opLog) RecordAnchorAt(commitSHA string, seq int64) error {
 	if err := f.Close(); err != nil {
 		return err
 	}
+	if err := os.Rename(tmp, l.file); err != nil {
+		return err
+	}
+	// 目录项也要刷：rename 本身不保证目录项已落盘。
+	if err := syncDirectory(l.dir); err != nil {
+		return fmt.Errorf("sync oplog dir %s: %w", l.dir, err)
+	}
 
-	next := make([]opAnchor, len(st.anchors)+1)
-	copy(next, st.anchors)
-	next[len(st.anchors)] = a
-	l.state.Store(&opLogState{ops: st.ops, last: st.last, anchors: next})
+	l.state.Store(&opLogState{baseTree: baseTree})
 	return nil
 }
 
-// SeqForCommit 找某次提交对应的命令流位点。
+// BaseTree 返回当前这段流所基于的树。
 //
-// 命中时返回 (seq, true)；没有记录则返回 (0, false)。
-// 调用方拿它判断：这个提交之后的命令流能不能做增量；不能就整树重发。
-func (l *opLog) SeqForCommit(commitSHA string) (int64, bool) {
-	if commitSHA == "" {
-		return 0, false
+// 空值等于空树：分支还没有任何提交。基准永远是确定的，不存在
+// 「不知道基准是什么」这个第三种状态。
+func (l *opLog) BaseTree() string {
+	bt := l.snapshot().baseTree
+	if bt == "" {
+		return gitstore.EmptyTreeSHA
 	}
-	st := l.snapshot()
-	// 从后往前找：同一个提交多次记录时，取最近的那条。
-	// 支持短 SHA 前缀，但前缀有歧义时宁可返回 false——
-	// 返回错位点会让对端漏掉一批命令；退化为整树只是多传一次。
-	var seq int64
-	var hit string
-	for i := len(st.anchors) - 1; i >= 0; i-- {
-		a := st.anchors[i]
-		if a.Commit == commitSHA {
-			return a.Seq, true
-		}
-		if strings.HasPrefix(a.Commit, commitSHA) {
-			if hit != "" && hit != a.Commit {
-				return 0, false
-			}
-			hit, seq = a.Commit, a.Seq
-		}
-	}
-	if hit == "" {
-		return 0, false
-	}
-	return seq, true
-}
-
-// Anchors 返回锚点表的副本。
-func (l *opLog) Anchors() []opAnchor {
-	st := l.snapshot()
-	out := make([]opAnchor, len(st.anchors))
-	copy(out, st.anchors)
-	return out
-}
-
-// LatestAnchor 返回最近记录的一次提交锚点，没有则 ("", 0, false)。
-func (l *opLog) LatestAnchor() (commit string, seq int64, ok bool) {
-	st := l.snapshot()
-	if len(st.anchors) == 0 {
-		return "", 0, false
-	}
-	a := st.anchors[len(st.anchors)-1]
-	return a.Commit, a.Seq, true
-}
-
-// SinceCommit 取出某次提交之后的全部命令。
-//
-// 命中锚点时：返回 (ops, seq, true)。
-// 找不到该提交时：返回 (nil, 0, false)——调用方据此退化为「发整树」。
-func (l *opLog) SinceCommit(commitSHA string) ([]treeOp, int64, bool) {
-	seq, ok := l.SeqForCommit(commitSHA)
-	if !ok {
-		return nil, 0, false
-	}
-	return l.Since(seq), seq, true
+	return bt
 }
 
 // opLogStore 管理本节点全部 (project, branch) 的命令日志。
@@ -627,36 +551,38 @@ func (s *Server) flattenTreeToOps(project, branch string) ([]opEntry, error) {
 	return out, nil
 }
 
-// recordCommitAnchor 把一次成功的提交登记进命令流的锚点表。
+// resetOpLogToCommit 把命令流归零到刚提交出来的那棵树。
 //
-// 为什么必须出声：登记锚点失败若静默吞掉，下次从该 commit 拉命令流
-// 就会查不到位点，退化成「发整树」——本来可以几个字节搞定的增量
-// 变成了几百兆的全量重发。
-func (s *Server) recordCommitAnchor(project, branch, commitSHA string, baseSeq int64) {
+// 这是提交的收尾：提交把流里的命令全部折进了树，流随即从这条新基准
+// 重新从 seq 1 开始。不做这一步的话命令流会一直追加下去——它记的
+// 大部分内容已经是历史，而每一条都还要跟着同步给对端。
+//
+// 取**树**而不是取提交：树是内容，提交只是「谁在何时把这个内容包了
+// 一层」。两边树相同就是同一份内容，不管提交是不是同一个。
+func (s *Server) resetOpLogToCommit(project, branch string, repo *gitstore.Repo, commitSHA string) {
 	if s.opLogs == nil || commitSHA == "" {
 		return
 	}
-	l, err := s.opLogs.For(project, branch)
+	tree, err := repo.TreeOfCommit(commitSHA)
 	if err != nil {
-		s.logf("oplog: get log for %s@%s to anchor %s: %v", project, branch, shortSHA(commitSHA), err)
+		s.logf("oplog: tree of commit %s for %s@%s: %v", shortSHA(commitSHA), project, branch, err)
 		return
 	}
-	if err := l.RecordAnchorAt(commitSHA, baseSeq); err != nil {
-		s.logf("oplog: record anchor %s@%s at %s (seq %d) failed: %v",
-			project, branch, shortSHA(commitSHA), baseSeq, err)
-	}
-}
-
-// opLogCurrentSeq 读出当前最后一条命令的位点，没有则 0。
-func (s *Server) opLogCurrentSeq(project, branch string) int64 {
-	if s.opLogs == nil {
-		return 0
-	}
 	l, err := s.opLogs.For(project, branch)
 	if err != nil {
-		return 0
+		s.logf("oplog: get log for %s@%s to reset at %s: %v", project, branch, shortSHA(commitSHA), err)
+		return
 	}
-	return l.Last()
+	// 树没动就是空提交（没有内容变化）。此时流里的命令还没进树，
+	// 归零会把它们丢掉——所以只在树真的前进时才归零。
+	if l.BaseTree() == tree {
+		return
+	}
+	if err := l.Reset(tree); err != nil {
+		// 出声：归零失败不会破坏数据（命令还在，重放幂等），
+		// 但会让命令流继续增长，而且对端的基准迟迟对不上。
+		s.logf("oplog: reset %s@%s to tree %s failed: %v", project, branch, shortSHA(tree), err)
+	}
 }
 
 // opSeqFrom 解析对端报来的位点。

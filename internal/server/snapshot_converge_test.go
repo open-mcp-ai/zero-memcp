@@ -79,6 +79,60 @@ func TestSnapshotSentOnceThenConverges(t *testing.T) {
 	}
 }
 
+// 快照成功之后，下一轮必须能发增量而不是报 base tree mismatch。
+//
+// 这一条覆盖的是「记账」那一环：快照落地后对端手上的树是内容树，
+// 如果发送端还是按自己的 oplog 原点声明增量，接收端按内容树校验，
+// 两边永远对不上——实测症状是每轮 500:
+//   op-sync: base tree mismatch (local <内容树>, peer <原点>)
+func TestSnapshotThenDeltaKeepsAligning(t *testing.T) {
+	up, upData := newWatchTestServer(t)
+	upTok := mintRestricted(t, upData, auth.Claims{Sub: "zero", Name: "up", Cap: "rwx"})
+
+	down, downData := newWatchTestServer(t)
+	downTok := mintRestricted(t, downData, auth.Claims{Sub: "zero", Name: "down", Cap: "rwx"})
+
+	ts := httptest.NewServer(down.muxFor(ListenBlock{Addr: "127.0.0.1:0"}))
+	defer ts.Close()
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	// 先写并提交 → 命令流归零、基准前进
+	writeDaily(t, up, upTok, "a.md", "A")
+	upRepo, err := up.projects.Get("daily")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := up.commitBranch("daily", upRepo, "zero", "seed"); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	// 提交之后再写一条**不提交**：这一步是关键。
+	//
+	// 不写它的话，快照的内容树恰好等于 oplog 原点（工作层与提交一致），
+	// 「对端基准记成内容树」和「记成原点」两种写法算出同一个值，
+	// 测试就抓不住记账错误——实测确认过它照样通过。
+	writeDaily(t, up, upTok, "a2.md", "A2")
+	if _, err := up.pushOpsToPeer(client, ts.URL, downTok, "down", "daily", "zero"); err != nil {
+		t.Fatalf("首轮快照: %v", err)
+	}
+
+	// 之后连续写两轮、推两轮：每一轮都必须是增量，且不能报基准不匹配
+	for i, name := range []string{"b.md", "c.md"} {
+		writeDaily(t, up, upTok, name, name)
+		res, err := up.pushOpsToPeer(client, ts.URL, downTok, "down", "daily", "zero")
+		if err != nil {
+			t.Fatalf("第 %d 轮增量推送失败（基准记账错了就会这样）: %v", i+2, err)
+		}
+		if res.Applied != 1 {
+			t.Fatalf("第 %d 轮应只同步 1 篇，实际 applied=%d —— 快照成功后的记账没跟上", i+2, res.Applied)
+		}
+	}
+	for _, name := range []string{"a.md", "b.md", "c.md"} {
+		if !down.repoHas("daily", "zero", name) {
+			t.Fatalf("对端缺少 %s", name)
+		}
+	}
+}
+
 // 空树快照会把对端墓碑成空。对着还有内容的对端刷一棵空树 = 误删。
 func TestRefusesToWipePeerWithEmptySnapshot(t *testing.T) {
 	up, _ := newWatchTestServer(t)
@@ -109,9 +163,9 @@ func TestRefusesToWipePeerWithEmptySnapshot(t *testing.T) {
 	if err := upRepo.Delete("zero", "seed.md"); err != nil {
 		t.Fatal(err)
 	}
-	// 让本端记下「对端基准是 X（非空）」
+	// 让本端记下「对端手上有一棵非空的树」
 	if s := up.workSync; s != nil {
-		s.noteBase("daily", "zero", "down", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
+		s.notePeerTree("daily", "zero", "down", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 	}
 
 	// 本端树是空的，对端基准非空 → 必须拒绝，不许把它清空

@@ -39,6 +39,9 @@ type opSyncState struct {
 	// 对齐：旧流 seq 1 与新流 seq 1 数字相同、含义不同，Since(1) 返回空，
 	// 同步静默停摆。所以水位必须连基准一起存。
 	Bases map[string]string `json:"bases,omitempty"`
+	// PeerTrees 记录各对端手上的内容树。重启后不能丢：
+	// 丢了下一轮就会判成「不知道对端有什么」而重发整棵树。
+	PeerTrees map[string]string `json:"peer_trees,omitempty"`
 }
 
 // opSyncStatePath 返回水位文件的路径。
@@ -76,6 +79,9 @@ func (s *Server) loadOpSyncState() error {
 	for k, v := range st.Bases {
 		s.workSync.bases.Store(k, v)
 	}
+	for k, v := range st.PeerTrees {
+		s.workSync.peerTrees.Store(k, v)
+	}
 	// 别名先于水位生效：水位查询要靠它把配置别名翻成属主名。
 	for alias, node := range st.Aliases {
 		s.learnPeerIdentity(alias, node)
@@ -112,6 +118,11 @@ func (s *Server) saveOpSyncState() error {
 		return true
 	})
 
+	st.PeerTrees = map[string]string{}
+	s.workSync.peerTrees.Range(func(k, v any) bool {
+		st.PeerTrees[k.(string)] = v.(string)
+		return true
+	})
 	s.workSync.bases.Range(func(k, v any) bool {
 		st.Bases[k.(string)] = v.(string)
 		return true

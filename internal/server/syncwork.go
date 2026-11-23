@@ -119,7 +119,20 @@ type workSyncState struct {
 	// 命令流每次提交都归零、seq 从 1 重来，所以位点只在同一段流内部
 	// 可比。只记数字会出现最坏的那种对齐：旧流的 seq 1 和新流的 seq 1
 	// 数字相同、含义完全不同，于是 Since(1) 返回空，同步静默停摆。
+	// bases 记录「该对端的水位属于哪一段命令流」（本端 oplog 的基准）。
+	//
+	// 它决定水位还有没有意义：基准一变，旧位点在新流里不可比，必须抹零。
 	bases sync.Map // string -> string
+	// peerTrees 记录「该对端手上现在长着哪棵树」。
+	//
+	// 与 bases 必须分开，虽然两者常常相等：
+	//   bases     —— 我这条流挂在哪棵树上（本端事实，变了水位就作废）
+	//   peerTrees —— 对端手上的内容底座（对端事实，变了只影响发增量还是发快照）
+	//
+	// 混成一个字段的实测后果（2026-11-24）：快照落地后对端基准跑到内容树，
+	// 与我的原点不同，于是下一轮判成「基准变了」→ 抹掉水位 → 重发整棵树，
+	// 永远收敛不了。对端收下快照并不意味着我的流换了原点。
+	peerTrees sync.Map // string -> string
 	// sentTrees 是「上次发给该对端的整树快照，对应的内容树 SHA」。
 	//
 	// 内容寻址保证同一份内容必然算出同一棵树，所以这个 SHA 既是
@@ -159,6 +172,19 @@ func noteWatermark(m *sync.Map, key string, seq int64) {
 			return
 		}
 	}
+}
+
+// notePeerTree 记住该对端手上现在长着哪棵树。
+func (w *workSyncState) notePeerTree(project, branch, peer, tree string) {
+	w.peerTrees.Store(workKey(project, branch, peer), tree)
+}
+
+// peerTreeOf 返回该对端手上的树；不知道则为空。
+func (w *workSyncState) peerTreeOf(project, branch, peer string) string {
+	if v, ok := w.peerTrees.Load(workKey(project, branch, peer)); ok {
+		return v.(string)
+	}
+	return ""
 }
 
 // noteBase 记住某个对端的水位是哪段流的。

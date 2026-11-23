@@ -71,8 +71,17 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 		}
 	}
 	// 声明给对端的基准就是它手上那棵：它据此校验，也据此记录。
-	batch.BaseTree = cur
-	batch.BaseCommit = s.commitForTree(project, branch, cur)
+	// 声明给对端的基准必须是**它手上那棵树**，因为接收端拿它校验。
+	//
+	// 对端可能在流的原点上（cur），也可能在我们上次发的快照内容树上。
+	// 两种情况下这些命令都是「铺在它现有内容之上」——命令本身一样，
+	// 只是底座不同。声明成 cur 会让刚收过快照的对端报 base tree mismatch。
+	declared := cur
+	if aligned && baseTree != "" {
+		declared = baseTree
+	}
+	batch.BaseTree = declared
+	batch.BaseCommit = s.commitForTree(project, branch, declared)
 
 	// 基准对不上：位点在这里没有意义，只能发整树快照。
 	//
@@ -417,9 +426,10 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	// 推方向由本端记，因为对端不会主动告诉我它收到哪了。
 	peerKey := s.resolvePeer(peerName)
 	curBase := l.BaseTree()
+	// 对端手上是哪棵树——用 peerTrees，不是 bases（见 syncwork.go 的说明）。
 	peerBase := ""
 	if s.workSync != nil {
-		peerBase = s.workSync.baseOf(project, branch, peerKey)
+		peerBase = s.workSync.peerTreeOf(project, branch, peerKey)
 	}
 	// 要不要发权威整树快照，判据是「对端记得的基准与本端不同」。
 	//
@@ -441,8 +451,12 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	// 基准变了，水位就没有意义：旧位点在新流里不可比。
 	// 最坏情况是恰好「对得上」（旧流 seq 1 与新流 seq 1 数字相同），
 	// Since(1) 返回空，于是这条备份再也不会前进，而且一声不响。
-	if effectivePeerBase != curBase && s.workSync != nil {
-		s.workSync.dropWatermarks(project, branch, peerKey)
+	// 水位是否作废，只看**本端流换没换原点**，与对端手上是哪棵树无关。
+	// 对端收下快照不等于我的流换了原点；混在一起会把水位无谓地抹掉。
+	if s.workSync != nil {
+		if sb := s.workSync.baseOf(project, branch, peerKey); sb != "" && sb != curBase {
+			s.workSync.dropWatermarks(project, branch, peerKey)
+		}
 	}
 	after := s.peerOutSeq(project, branch, peerKey)
 	if after > l.Last() {
@@ -508,7 +522,16 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	}
 	// 只有对端确认之后才推进本地水位，并记下这个水位属于哪段流。
 	s.workSync.noteOut(project, branch, peerName, l.Last())
-	s.workSync.noteBase(project, branch, peerKey, batch.BaseTree)
+	// 记给对端的基准：快照落地后对端手上的树是内容树，不是本端原点。
+	// 记错了下一轮就会按原点声明增量，对端按内容树校验，永远对不上。
+	newPeerTree := batch.BaseTree
+	if isSnapshotBatch(batch) {
+		if st := s.workSync.sentTreeOf(project, branch, peerKey); st != "" {
+			newPeerTree = st
+		}
+	}
+	s.workSync.notePeerTree(project, branch, peerKey, newPeerTree)
+	s.workSync.noteBase(project, branch, peerKey, curBase)
 	s.recordSync(syncRecord{
 		Dir: "push", Peer: peerName, Node: s.resolvePeer(peerName),
 		Project: project, Branch: branch,
@@ -556,7 +579,7 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	// 去问，对端会以为我落后，于是每轮重发整树。
 	baseTree := ""
 	if s.workSync != nil {
-		baseTree = s.workSync.baseOf(project, branch, peerKey)
+		baseTree = s.workSync.peerTreeOf(project, branch, peerKey)
 	}
 	if baseTree == "" && s.opLogs != nil {
 		if l, lerr := s.opLogs.For(project, branch); lerr == nil {

@@ -120,6 +120,13 @@ type workSyncState struct {
 	// 可比。只记数字会出现最坏的那种对齐：旧流的 seq 1 和新流的 seq 1
 	// 数字相同、含义完全不同，于是 Since(1) 返回空，同步静默停摆。
 	bases sync.Map // string -> string
+	// sentTrees 是「上次发给该对端的整树快照，对应的内容树 SHA」。
+	//
+	// 内容寻址保证同一份内容必然算出同一棵树，所以这个 SHA 既是
+	// 发送方的计算值，也是接收方重设基准后的值——两边天然一致。
+	// 有了它，发送方才能判断「对端手上的树是我流的某个前缀」，
+	// 从而发增量而不是每轮重发整棵树。
+	sentTrees sync.Map // string -> string
 	// conflicts 是 project\x00branch\x00path -> workConflict。
 	conflicts sync.Map
 }
@@ -157,6 +164,19 @@ func noteWatermark(m *sync.Map, key string, seq int64) {
 // noteBase 记住某个对端的水位是哪段流的。
 func (w *workSyncState) noteBase(project, branch, peer, base string) {
 	w.bases.Store(workKey(project, branch, peer), base)
+}
+
+// noteSentTree 记住「上次发给该对端的整树快照是哪棵树」。
+func (w *workSyncState) noteSentTree(project, branch, peer, tree string) {
+	w.sentTrees.Store(workKey(project, branch, peer), tree)
+}
+
+// sentTreeOf 返回上次发给该对端的快照树；没发过则为空。
+func (w *workSyncState) sentTreeOf(project, branch, peer string) string {
+	if v, ok := w.sentTrees.Load(workKey(project, branch, peer)); ok {
+		return v.(string)
+	}
+	return ""
 }
 
 // baseOf 返回该对端水位所属的基准树；从未同步过则为空。

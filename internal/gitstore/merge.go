@@ -202,6 +202,15 @@ func (r *Repo) MergeInto(branch, other string) (MergeResult, error) {
 	return MergeResult{Kind: "merged", Commit: commitSHA, Added: len(merged)}, nil
 }
 
+// WriteTreeFromPaths 是 writeTreeFromPaths 的对外包装。
+//
+// 用途：把「一批路径 + blob SHA」写成一棵真实的 tree 对象，拿到它的 SHA。
+// 命令流接收端要用它把整树快照的基准固定下来——基准是树 SHA，
+// 不是一个口头承诺，对端之后每次增量校验都拿它比对。
+func (r *Repo) WriteTreeFromPaths(paths map[string]Entry) (string, error) {
+	return r.writeTreeFromPaths(paths)
+}
+
 // writeTreeFromPaths 把「路径 → Entry」的扁平 map 重建成完整的树对象图。
 //
 // 做法：按目录分组，自底向上逐层写 tree。深度降序保证子目录先于父目录

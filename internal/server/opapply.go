@@ -179,6 +179,33 @@ func (s *Server) applyTreeReplace(project, branch, peerNode string, ctx *opConte
 		s.logf("op-sync: TREE REPLACE %s@%s kept %d locally-modified path(s): %s",
 			project, branch, len(res.Kept), strings.Join(res.Kept, ", "))
 	}
+
+	// 整树快照落地后，把「这批内容对应的树」记成该对端的基准。
+	//
+	// 记账记在对端那一侧（peerBases），不动本端 oplog 的 baseTree：
+	// 本端 oplog 的基准是「我这条命令流挂在哪棵树上」，是本地事实；
+	// 对端手上有什么，是另一件事。混成一个字段会让接收方基准跑在
+	// 发送方前面，于是发送方每轮都以为要重发整树（实测抓到的真 bug：
+	// TestOpsSyncUncommittedAcrossNodes 追平后又 applied=1）。
+	//
+	// 两边各算各的同一棵树（内容寻址天然保证一致），增量才有共同的坐标原点。
+	if op.Rebase && s.workSync != nil && len(op.Batch) > 0 {
+		pathMap := make(map[string]gitstore.Entry, len(op.Batch))
+		for _, e := range op.Batch {
+			pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: gitstore.Mode(e.Mode), Hash: e.SHA}
+		}
+		if tree, werr := ctx.repo.WriteTreeFromPaths(pathMap); werr == nil && tree != "" {
+			s.workSync.noteBase(project, branch, peerNode, tree)
+			// 本端此后也以这棵树为准：快照把工作层对齐到了它。
+			if s.opLogs != nil {
+				if l, lerr := s.opLogs.For(project, branch); lerr == nil {
+					if rerr := l.Reset(tree); rerr != nil {
+						s.logf("op-sync: reset oplog base to %s for %s@%s: %v", shortSHA(tree), project, branch, rerr)
+					}
+				}
+			}
+		}
+	}
 	return nil
 }
 

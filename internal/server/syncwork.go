@@ -96,6 +96,12 @@ type workConflict struct {
 type workSyncState struct {
 	out sync.Map // string -> *atomic.Int64
 	in  sync.Map // string -> *atomic.Int64
+	// bases 是「那个水位属于哪段命令流」。
+	//
+	// 命令流每次提交都归零、seq 从 1 重来，所以位点只在同一段流内部
+	// 可比。只记数字会出现最坏的那种对齐：旧流的 seq 1 和新流的 seq 1
+	// 数字相同、含义完全不同，于是 Since(1) 返回空，同步静默停摆。
+	bases sync.Map // string -> string
 	// conflicts 是 project\x00branch\x00path -> workConflict。
 	conflicts sync.Map
 }
@@ -127,6 +133,33 @@ func noteWatermark(m *sync.Map, key string, seq int64) {
 		if cur.CompareAndSwap(old, seq) {
 			return
 		}
+	}
+}
+
+// noteBase 记住某个对端的水位是哪段流的。
+func (w *workSyncState) noteBase(project, branch, peer, base string) {
+	w.bases.Store(workKey(project, branch, peer), base)
+}
+
+// baseOf 返回该对端水位所属的基准树；从未同步过则为空。
+func (w *workSyncState) baseOf(project, branch, peer string) string {
+	if v, ok := w.bases.Load(workKey(project, branch, peer)); ok {
+		return v.(string)
+	}
+	return ""
+}
+
+// dropWatermarks 抹掉某对端的双向水位。
+//
+// 基准变了就必须抹：旧位点在新流里没有意义，留着会让「看起来对得上」
+// 的数字把同步卡死。
+func (w *workSyncState) dropWatermarks(project, branch, peer string) {
+	k := workKey(project, branch, peer)
+	if v, ok := w.in.Load(k); ok {
+		v.(*atomic.Int64).Store(0)
+	}
+	if v, ok := w.out.Load(k); ok {
+		v.(*atomic.Int64).Store(0)
 	}
 }
 

@@ -144,6 +144,13 @@ func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult
 	if batch.To > 0 {
 		s.notePeerSeq(project, branch, batch.Node, batch.To)
 	}
+	// 记下「这个水位属于哪段流」：对端流归零后位点会重来，
+	// 不绑基准就会出现「数字对得上、含义完全不同」的静默停摆。
+	if s.workSync != nil && s.opLogs != nil {
+		if l, lerr := s.opLogs.For(project, branch); lerr == nil {
+			s.workSync.noteBase(project, branch, batch.Node, l.BaseTree())
+		}
+	}
 	return res, nil
 }
 
@@ -265,6 +272,7 @@ func (s *Server) handleOpPush(w http.ResponseWriter, r *http.Request) {
 		From: batch.From, To: batch.To,
 		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
 		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
+		Rejected: len(res.Rejected),
 	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
@@ -360,8 +368,40 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	}
 	// 推的水位：我作为日志属主，对端（peerName）确认到哪一位。
 	// 推方向由本端记，因为对端不会主动告诉我它收到哪了。
-	after := s.peerOutSeq(project, branch, s.resolvePeer(peerName))
-	batch, err := s.exportOps(project, branch, after)
+	peerKey := s.resolvePeer(peerName)
+	curBase := l.BaseTree()
+	// 水位只在同一段命令流里可比。
+	//
+	// 命令流每次提交都归零、seq 从 1 重来。若本地已经提交过（基准变了），
+	// 而水位还记着上一段流的位点，那个数字在新流里毫无意义——最坏情况是
+	// 恰好「对得上」：旧流 seq 1 与新流 seq 1 数字相同，Since(1) 返回空，
+	// 于是这条备份再也不会前进，而且一声不响。
+	if s.workSync != nil && s.workSync.baseOf(project, branch, peerKey) != curBase {
+		s.workSync.dropWatermarks(project, branch, peerKey)
+	}
+	after := s.peerOutSeq(project, branch, peerKey)
+	if after > l.Last() {
+		after = 0
+	}
+	batch, err := s.exportOpsFrom(project, branch, after, "")
+	if err != nil {
+		return zero, err
+	}
+	if after == 0 && l.BaseTree() != gitstore.EmptyTreeSHA {
+		// 本端已有提交、对端水位归零：发整树快照（Replace 语义），
+		// 让对端基准对齐到本端，下一轮就走增量。
+		entries, ferr := s.flattenTreeToOps(project, branch)
+		if ferr != nil {
+			return zero, ferr
+		}
+		batch.Ops = []treeOp{{
+			Kind:    opTree,
+			Replace: true,
+			Batch:   entries,
+			Ts:      time.Now().Unix(),
+		}}
+		batch.To = l.Last()
+	}
 	if err != nil {
 		return zero, err
 	}
@@ -403,14 +443,30 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 				return zero, fmt.Errorf("peer still reports %d missing blob(s) after upload", len(res.Missing))
 		}
 	}
-	// 只有对端确认之后才推进本地水位。
+	// 对端拒收的命令必须出声。
+	//
+	// 记录里只写 applied 是不够的：拒收的命令既不会被重传（不在 Missing 里），
+	// 也不会保留本地（不是冲突），它们就是没到。不点名的话发送方看到
+	// "applied N" 会以为同步成功——备份静默地只到一半。
+	if len(res.Rejected) > 0 {
+		s.logf("op-sync: peer %s REJECTED %d op(s) for %s@%s — these did NOT land: %s",
+			peerName, len(res.Rejected), project, branch, func() string {
+			if len(res.Rejected) <= 3 {
+				return strings.Join(res.Rejected, "; ")
+			}
+			return strings.Join(res.Rejected[:3], "; ") + fmt.Sprintf(" ... (+%d more)", len(res.Rejected)-3)
+		}())
+	}
+	// 只有对端确认之后才推进本地水位，并记下这个水位属于哪段流。
 	s.workSync.noteOut(project, branch, peerName, l.Last())
+	s.workSync.noteBase(project, branch, peerKey, curBase)
 	s.recordSync(syncRecord{
 		Dir: "push", Peer: peerName, Node: s.resolvePeer(peerName),
 		Project: project, Branch: branch,
 		From: after, To: l.Last(), PeerHead: len(batch.Ops),
 		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
 		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
+		Rejected: len(res.Rejected),
 	})
 	// 每轮推进后立即落盘：进程被 kill 不会走 Close，
 	// 水位留在内存就等于下次重启全量重拉。
@@ -428,7 +484,17 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	// 踩过的坑（测试抓到）：这里曾用配置里的对端别名 peerName 查水位，
 	// 而 ingestOps 用对端自报的 instanceID 记水位——两个键不同，
 	// 于是每轮都从头拉、每轮都重复应用。键必须用日志属主名。
-	after := s.peerSeq(project, branch, s.resolvePeer(peerName))
+	peerKey := s.resolvePeer(peerName)
+	// 与推方向同理：基准一变，旧位点在新流里没有意义。
+	// 不抹会让「数字恰好对得上」的那种错位把拉取永久卡住。
+	if s.workSync != nil && s.opLogs != nil {
+		if l, lerr := s.opLogs.For(project, branch); lerr == nil {
+			if s.workSync.baseOf(project, branch, peerKey) != l.BaseTree() {
+				s.workSync.dropWatermarks(project, branch, peerKey)
+			}
+		}
+	}
+	after := s.peerSeq(project, branch, peerKey)
 
 	// 带上本地当前这段流的基准树：对端据此判断我们的流是不是挂在
 	// 同一棵树上。不是同一棵树就发 NeedRebase，不瞎发增量。
@@ -487,6 +553,7 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 		From: after, To: batch.To, PeerHead: int(batch.To),
 		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
 		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
+		Rejected: len(res.Rejected),
 	})
 	if serr := s.saveOpSyncState(); serr != nil {
 		s.logf("opsync: save watermark after pull: %v", serr)

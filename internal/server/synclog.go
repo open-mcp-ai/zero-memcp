@@ -58,6 +58,7 @@ type syncRecord struct {
 	Kept       int `json:"kept"`
 	Conflicted int `json:"conflicted"`
 	Missing    int `json:"missing"`
+	Rejected   int `json:"rejected,omitempty"`
 	// Err 非空表示这一轮失败。失败必须留痕：静默失败是最贵的故障。
 	Err        string `json:"err,omitempty"`
 	DurationMs int64  `json:"duration_ms"`

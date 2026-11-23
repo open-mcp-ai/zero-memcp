@@ -33,6 +33,12 @@ type opSyncState struct {
 	// 不存这张表，重启后按别名查水位会得 0，于是又从位点 0 拉一遍——
 	// 正是这个文件要消灭的行为（2026-11-22 测试抓到的第二层坑）。
 	Aliases map[string]string `json:"aliases,omitempty"`
+	// Bases 是「该对端的水位属于哪段命令流」。
+	//
+	// 命令流提交即归零，位点只在同一段流内可比。只存数字会出现最坏的
+	// 对齐：旧流 seq 1 与新流 seq 1 数字相同、含义不同，Since(1) 返回空，
+	// 同步静默停摆。所以水位必须连基准一起存。
+	Bases map[string]string `json:"bases,omitempty"`
 }
 
 // opSyncStatePath 返回水位文件的路径。
@@ -67,6 +73,9 @@ func (s *Server) loadOpSyncState() error {
 	for k, v := range st.In {
 		noteWatermark(&s.workSync.in, k, v)
 	}
+	for k, v := range st.Bases {
+		s.workSync.bases.Store(k, v)
+	}
 	// 别名先于水位生效：水位查询要靠它把配置别名翻成属主名。
 	for alias, node := range st.Aliases {
 		s.learnPeerIdentity(alias, node)
@@ -88,7 +97,7 @@ func (s *Server) saveOpSyncState() error {
 	}
 	defer done()
 
-	st := opSyncState{Out: map[string]int64{}, In: map[string]int64{}, Aliases: map[string]string{}}
+	st := opSyncState{Out: map[string]int64{}, In: map[string]int64{}, Aliases: map[string]string{}, Bases: map[string]string{}}
 	s.workSync.out.Range(func(k, v any) bool {
 		st.Out[k.(string)] = v.(*atomic.Int64).Load()
 		return true
@@ -100,6 +109,11 @@ func (s *Server) saveOpSyncState() error {
 
 	s.peerAliases.Range(func(k, v any) bool {
 		st.Aliases[k.(string)] = v.(string)
+		return true
+	})
+
+	s.workSync.bases.Range(func(k, v any) bool {
+		st.Bases[k.(string)] = v.(string)
 		return true
 	})
 

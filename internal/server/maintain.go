@@ -283,20 +283,35 @@ func (s *Server) syncDirtyAll() {
 	}
 }
 
+// commitBranch 在单个仓库的单个分支上执行提交，并原子登记锚点。
+//
+// 这是所有单分支提交的收敛处：execCommit / commitRepo / 树手术
+// 都走这里，保证「产生新 commit」和「记下命令流锚点」永远成对发生。
+func (s *Server) commitBranch(proj string, repo *gitstore.Repo, branch, msg string) (string, error) {
+	baseSeq := s.opLogCurrentSeq(proj, branch)
+	sha, err := repo.Commit(branch, msg)
+	if err != nil {
+		return "", err
+	}
+	s.recordCommitAnchor(proj, branch, sha, baseSeq)
+	return sha, nil
+}
+
 // commitRepo 提交单个仓库的全部脏分支。
 func (s *Server) commitRepo(repo *gitstore.Repo, proj string, n int) (int, error) {
 	refs := repo.PendingRefs()
 	committed := 0
 	var firstErr error
 	for _, ref := range refs {
-		if _, err := repo.Commit(ref, fmt.Sprintf("mem: %s batch of %d", proj, n)); err != nil {
+		sha, err := s.commitBranch(proj, repo, ref, fmt.Sprintf("mem: %s batch of %d", proj, n))
+		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			continue
 		}
 		committed++
-		if sha, err := repo.Resolve(ref); err == nil && sha != "" {
+		if sha != "" {
 			s.lastCommits.Store(treeHeadKey(proj, ref), sha)
 		}
 	}

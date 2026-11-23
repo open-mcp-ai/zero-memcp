@@ -26,6 +26,18 @@ import (
 // 用它来记水位。不能用本地配置里的对端别名——同一台机器在不同
 // 配置里可能叫不同名字，而日志属主只有一个。
 func (s *Server) exportOps(project, branch string, after int64) (opBatch, error) {
+	return s.exportOpsFrom(project, branch, after, "")
+}
+
+// exportOpsFrom 在 exportOps 之上支持「以某个提交为基准」。
+//
+// baseCommit 回答的是位点水位回答不了的问题：对端已经通过 Git 拿到了
+// 某个提交，但它本地这份日志的位点是 0——按位点它要整棵树（几百 MB），
+// 而它真正缺的只是那个提交之后的那几条命令。
+//
+// 找不到基准时不报错，而是退化为整树：报错会让老客户端永远同步不了，
+// 而整树恰好是「没有基准」时唯一正确的答案。
+func (s *Server) exportOpsFrom(project, branch string, after int64, baseCommit string) (opBatch, error) {
 	batch := opBatch{Project: project, Branch: branch, Node: s.instanceID(), From: after}
 	if s.opLogs == nil {
 		return batch, fmt.Errorf("oplog is not initialised")
@@ -34,6 +46,23 @@ func (s *Server) exportOps(project, branch string, after int64) (opBatch, error)
 	if err != nil {
 		return batch, err
 	}
+
+	// 对端给了基准提交：能定位到位点就只发那之后的命令。
+	// 位点只进不退：对端自报的水位更新时，以它为准。
+	if baseCommit != "" {
+		if seq, ok := l.SeqForCommit(baseCommit); ok {
+			if seq > after {
+				after = seq
+				batch.From = seq
+			}
+			batch.BaseCommit = baseCommit
+		} else {
+			// 出声：静默退化会让对端以为拿到了增量，而实际收到整树。
+			s.logf("op-sync: %s@%s: peer asked from commit %s, no anchor here; sending full tree",
+				project, branch, shortSHA(baseCommit))
+		}
+	}
+
 	// 读侧播种：对端从位点 0 开始拉、而本地日志尚为空时，
 	// 先把当前整棵树作为第一条批量命令播进日志。
 	// 这保证了升级到命令流之前的所有历史能完整同步给对端。
@@ -44,6 +73,13 @@ func (s *Server) exportOps(project, branch string, after int64) (opBatch, error)
 	}
 	batch.Ops = l.Since(after)
 	batch.To = l.Last()
+	// 整树批次带上本节点最近的锚点：对端据此知道「这棵树对应哪个提交」，
+	// 下次就能拿着这个提交来要增量，不必再要一遍整树。
+	if batch.BaseCommit == "" && after == 0 {
+		if c, _, ok := l.LatestAnchor(); ok {
+			batch.BaseCommit = c
+		}
+	}
 	return batch, nil
 }
 
@@ -51,6 +87,19 @@ func (s *Server) exportOps(project, branch string, after int64) (opBatch, error)
 //
 // 这是 server 端 handleOpPush 与本端 pull 落地共用的入口。
 func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult, error) {
+	// 基准提交校验：对端声称这批命令是基于某个提交的增量。
+	// 若本端根本没有这个提交对象，说明双方基准错位，不能闭着眼睛重放。
+	// 失败必须出声：静默吞掉会导致「命令看似都 apply 了，但树基准错了，
+	// 结果是一棵拼接出来的坏树」。
+	if batch.BaseCommit != "" {
+		if repo, err := s.projects.Get(project); err == nil {
+			if !repo.HasObject(batch.BaseCommit) {
+				s.logf("op-sync: %s@%s: received ops based on commit %s, but local repo lacks it; applying ops anyway (missing objects will be pulled)",
+					project, branch, shortSHA(batch.BaseCommit))
+			}
+		}
+	}
+
 	res, err := s.applyOps(project, branch, batch.Node, batch.Ops)
 	if err != nil {
 		return res, err
@@ -124,6 +173,9 @@ func (s *Server) handleOpPull(w http.ResponseWriter, r *http.Request) {
 		Branch  string `json:"branch"`
 		Node    string `json:"node"`
 		After   int64  `json:"after"`
+		// BaseCommit 是可选基准：对端已经持有的提交。
+		// 给了它，就只发该提交之后的命令；给不出就退化为整树。
+		BaseCommit string `json:"base_commit,omitempty"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, "bad op-pull request: "+err.Error(), http.StatusBadRequest)
@@ -133,7 +185,7 @@ func (s *Server) handleOpPull(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, s.denyReason(c, req.Project, req.Branch, configBitRead), http.StatusForbidden)
 		return
 	}
-	batch, err := s.exportOps(req.Project, req.Branch, req.After)
+	batch, err := s.exportOpsFrom(req.Project, req.Branch, req.After, req.BaseCommit)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -188,8 +240,19 @@ func (s *Server) handleOpPush(w http.ResponseWriter, r *http.Request) {
 // ── 客户端：向对端要 / 推 ────────────────────────────────────
 
 func postOpPull(client *http.Client, baseURL, token, project, branch, node string, after int64) (opBatch, error) {
+	return postOpPullFrom(client, baseURL, token, project, branch, node, after, "")
+}
+
+// postOpPullFrom 带基准提交的拉取。
+//
+// baseCommit 非空时告诉对端「我已经有这棵树了，只要它之后的命令」。
+// 对端认不出这个提交时会自动退化为整树，不会报错。
+func postOpPullFrom(client *http.Client, baseURL, token, project, branch, node string, after int64, baseCommit string) (opBatch, error) {
 	var batch opBatch
 	payload := map[string]any{"project": project, "branch": branch, "node": node, "after": after}
+	if baseCommit != "" {
+		payload["base_commit"] = baseCommit
+	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(baseURL, "/")+"/sync/ops/pull", bytes.NewReader(body))
 	if err != nil {
@@ -329,7 +392,20 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	// 而 ingestOps 用对端自报的 instanceID 记水位——两个键不同，
 	// 于是每轮都从头拉、每轮都重复应用。键必须用日志属主名。
 	after := s.peerSeq(project, branch, s.resolvePeer(peerName))
-	batch, err := postOpPull(client, baseURL, token, project, branch, s.instanceID(), after)
+
+	// 若本端从来没从该对端拉过（after=0），但本地这条分支已经有一个提交
+	// （比如通过 Git 浅拷贝或 fetch 刚拉下来的），把这个提交带过去：
+	// 对端如果也认得这个提交，就只发该提交之后的增量，不必把整棵树重发一遍。
+	baseCommit := ""
+	if after == 0 {
+		if repo, err := s.projects.Get(project); err == nil {
+			if head, herr := repo.Resolve(branch); herr == nil && head != "" {
+				baseCommit = head
+			}
+		}
+	}
+
+	batch, err := postOpPullFrom(client, baseURL, token, project, branch, s.instanceID(), after, baseCommit)
 	if err != nil {
 		return zero, err
 	}
@@ -448,7 +524,13 @@ func (s *Server) opSyncLines(c Caller) []string {
 			return true
 		}
 		l := v.(*opLog)
-		out = append(out, fmt.Sprintf("oplog %s@%s: %d op(s), head seq %d", project, branch, l.Len(), l.Last()))
+		line := fmt.Sprintf("oplog %s@%s: %d op(s), head seq %d", project, branch, l.Len(), l.Last())
+		// 锚点水位必须可见：它是「从某个提交增量同步」能不能成立的前提。
+		// 看不到它，就分不出「没增量」和「没有基准」这两种完全不同的状态。
+		if c, seq, ok := l.LatestAnchor(); ok {
+			line += fmt.Sprintf(", anchor %s @seq %d", shortSHA(c), seq)
+		}
+		out = append(out, line)
 		return true
 	})
 	return out

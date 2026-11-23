@@ -410,14 +410,16 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 			}
 		}
 
-		// 立刻提交两端，让这次手术当场生效
+		// 立刻提交两端，让这次手术当场生效。
+		// 走 commitBranch：提交成功要同时登记命令流锚点，
+		// 否则「以这个提交为基准做增量同步」就查不到位点。
 		if isMove {
-			if _, cerr := repo.Commit(srcBranch, fmt.Sprintf("mem: %s removed %s", verbName(isMove), srcPath)); cerr != nil {
+			if _, cerr := s.commitBranch(srcProj, repo, srcBranch, fmt.Sprintf("mem: %s removed %s", verbName(isMove), srcPath)); cerr != nil {
 				return "", fmt.Errorf("commit source branch: %w", cerr)
 			}
 		}
 		if srcBranch != dstBranch {
-			if _, cerr := repo.Commit(dstBranch, fmt.Sprintf("mem: %s received %s", verbName(isMove), target)); cerr != nil {
+			if _, cerr := s.commitBranch(dstProj, repo, dstBranch, fmt.Sprintf("mem: %s received %s", verbName(isMove), target)); cerr != nil {
 				return "", fmt.Errorf("commit destination branch: %w", cerr)
 			}
 		}
@@ -561,16 +563,31 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 		if err := s.requireRoot(c); err != nil {
 			return "", err
 		}
-		n, err := s.projects.CommitAll(defaultBranch, "mem: manual commit")
-		if err != nil {
-			return "", err
+		// 提交所有仓库时，遍历单仓登记锚点，保持对齐。
+		projects, perr := s.projects.Projects()
+		if perr != nil {
+			return "", perr
+		}
+		committed := 0
+		for _, p := range projects {
+			repo, rerr := s.projects.Get(p)
+			if rerr != nil {
+				continue
+			}
+			if repo.Pending() == 0 {
+				continue
+			}
+			if _, cerr := s.commitBranch(p, repo, defaultBranch, "mem: manual commit"); cerr != nil {
+				return "", fmt.Errorf("%s: %w", p, cerr)
+			}
+			committed++
 		}
 		// 同单分支提交：折叠脏层不改内容，不重建索引。
 		// 这里要补的是水位——每提交一个分支，就推进它对应的基线，
 		// 否则下一轮 checkExternalUpdates 会把「自己的提交」误判为
 		// 外部推进，反而触发一次全量 Reload，绕了一圈又回到原问题。
 		s.rememberTreeHeads()
-		return fmt.Sprintf("committed pending changes for %d projects", n), nil
+		return fmt.Sprintf("committed pending changes for %d projects", committed), nil
 	}
 
 	// 2. 指定了项目（可能带 @branch）
@@ -609,7 +626,7 @@ func (s *Server) execCommit(rest string, c Caller, defaultBranch string) (string
 	// 记下推进前的头，供事件携带（客户端拿它当 since 起点）。
 	prev, _ := repo.Resolve(branch)
 
-	sha, err := repo.Commit(branch, msg)
+	sha, err := s.commitBranch(proj, repo, branch, msg)
 	if err != nil {
 		return "", fmt.Errorf("commit failed: %w", err)
 	}

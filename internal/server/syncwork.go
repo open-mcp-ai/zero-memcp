@@ -87,7 +87,25 @@ type workConflict struct {
 	LocalSHA  string `json:"local_sha"`
 	RemoteSHA string `json:"remote_sha"`
 	Peer      string `json:"peer"`
+	// Kind 区分两种完全不同的处境：
+	//
+	//	ConflictSet    —— 双方内容不同，本地版本被保留，等人裁决。
+	//	                  「未解决」这个词对它成立。
+	//	ConflictDelete —— 对端删了它，本地未提交的那份已被解链（删除优先）。
+	//	                  这件事**已经决定**了，没有待裁决的东西；
+	//	                  留着只是为了留证（blob 还在对象库里可捞回来）。
+	//
+	// 不分开的后果（2026-11-23 实测）：status 把 222 条删除全部报成
+	// 「unresolved conflict, local copy kept」——与事实完全相反：
+	// 本地那份其实已经被删掉了。人看到这句会以为内容还在。
+	Kind string `json:"kind,omitempty"`
 }
+
+// 冲突种类。
+const (
+	ConflictSet    = "set"
+	ConflictDelete = "delete"
+)
 
 // workSyncState 保存每个 (project@branch -> peer) 的水位。
 //
@@ -175,9 +193,43 @@ func (w *workSyncState) cursors(project, branch, peer string) (out, in int64) {
 }
 
 // recordWorkConflict 记下一条冲突。
-func (s *Server) recordWorkConflict(project, branch, path, localSHA, remoteSHA, peer string) {
+func (s *Server) recordWorkConflict(project, branch, path, localSHA, remoteSHA, peer, kind string) {
+	// 删除留证不是待办事项：事情已经决定了（删除优先），没有需要人去
+	// 「解决」的东西，完整证据在 daemon.log 的 DELETE WINS 行里。
+	// 但它会一直累积——实测 222 条就是这么来的，数字越来越大，
+	// 却永远不会有任何一条变少。留最近 workDeleteConflictKeep 条够说明问题。
+	if kind == ConflictDelete {
+		s.evictOldDeleteConflict()
+	}
 	s.workSync.conflicts.Store(project+"\x00"+branch+"\x00"+path, workConflict{
-		Path: path, LocalSHA: localSHA, RemoteSHA: remoteSHA, Peer: peer,
+		Path: path, LocalSHA: localSHA, RemoteSHA: remoteSHA, Peer: peer, Kind: kind,
+	})
+}
+
+// workDeleteConflictKeep 是内存里保留的删除留证条数上限。
+const workDeleteConflictKeep = 100
+
+// evictOldDeleteConflict 在删除留证超过上限时丢掉一条最旧的。
+//
+// 用 sync.Map 没有顺序，所以丢哪条不确定——这里要的是「数量有界、
+// 证据不断流」，不是严格 FIFO。daemon.log 才是完整账本。
+func (s *Server) evictOldDeleteConflict() {
+	n := 0
+	s.workSync.conflicts.Range(func(_, v any) bool {
+		if c, ok := v.(workConflict); ok && c.Kind == ConflictDelete {
+			n++
+		}
+		return true
+	})
+	if n < workDeleteConflictKeep {
+		return
+	}
+	s.workSync.conflicts.Range(func(k, v any) bool {
+		if c, ok := v.(workConflict); ok && c.Kind == ConflictDelete {
+			s.workSync.conflicts.Delete(k)
+			return false
+		}
+		return true
 	})
 }
 
@@ -279,7 +331,7 @@ func (s *Server) importWorkDelta(project, branch string, d *workDelta) (workAppl
 					RemoteSHA: "",
 					Peer:      d.Node,
 				})
-				s.recordWorkConflict(project, branch, ch.Path, lch.SHA, "", d.Node)
+				s.recordWorkConflict(project, branch, ch.Path, lch.SHA, "", d.Node, ConflictDelete)
 				s.logf("work-sync: DELETE WINS %s@%s:%s (peer %s deleted it; local uncommitted %s was unlinked — "+
 					"blob still exists in the object store if you need to recover it)",
 					project, branch, ch.Path, d.Node, shortSHA(lch.SHA))
@@ -309,7 +361,7 @@ func (s *Server) importWorkDelta(project, branch string, d *workDelta) (workAppl
 				RemoteSHA: ch.SHA,
 				Peer:      d.Node,
 			})
-			s.recordWorkConflict(project, branch, ch.Path, lch.SHA, ch.SHA, d.Node)
+			s.recordWorkConflict(project, branch, ch.Path, lch.SHA, ch.SHA, d.Node, ConflictSet)
 			s.logf("work-sync: CONFLICT %s@%s:%s (local %s vs peer %s from %s) — kept local copy",
 				project, branch, ch.Path, shortSHA(lch.SHA), shortSHA(ch.SHA), d.Node)
 			continue
@@ -830,15 +882,39 @@ func (s *Server) workConflictLines(c Caller) []string {
 	if len(cs) == 0 {
 		return nil
 	}
-	out := make([]string, 0, len(cs)+1)
-	out = append(out, fmt.Sprintf("%d unresolved work-layer conflict(s), local copy kept:", len(cs)))
-	for i, cf := range cs {
-		if i >= 10 {
-			out = append(out, fmt.Sprintf("  ... (%d more)", len(cs)-i))
-			break
+	// 两种处境必须分开说，否则 status 会在最关键的地方说反话：
+	// 「删除已胜出、本地那份被解链」被报成「保留本地」，
+	// 人就会以为内容还在，从而不去对象库里把它捞回来。
+	var sets, dels []workConflict
+	for _, cf := range cs {
+		if cf.Kind == ConflictDelete {
+			dels = append(dels, cf)
+			continue
 		}
-		out = append(out, fmt.Sprintf("  %s: kept local %s, peer %s offered %s",
-			cf.Path, shortSHA(cf.LocalSHA), cf.Peer, shortSHA(cf.RemoteSHA)))
+		sets = append(sets, cf)
+	}
+	var out []string
+	if len(sets) > 0 {
+		out = append(out, fmt.Sprintf("%d unresolved work-layer conflict(s), local copy kept:", len(sets)))
+		for i, cf := range sets {
+			if i >= 10 {
+				out = append(out, fmt.Sprintf("  ... (%d more)", len(sets)-i))
+				break
+			}
+			out = append(out, fmt.Sprintf("  %s: kept local %s, peer %s offered %s",
+				cf.Path, shortSHA(cf.LocalSHA), cf.Peer, shortSHA(cf.RemoteSHA)))
+		}
+	}
+	if len(dels) > 0 {
+		out = append(out, fmt.Sprintf("%d path(s) unlinked by a peer delete (nothing to resolve; blob kept, recoverable):", len(dels)))
+		for i, cf := range dels {
+			if i >= 10 {
+				out = append(out, fmt.Sprintf("  ... (%d more)", len(dels)-i))
+				break
+			}
+			out = append(out, fmt.Sprintf("  %s: local %s was unlinked by peer %s",
+				cf.Path, shortSHA(cf.LocalSHA), cf.Peer))
+		}
 	}
 	return out
 }

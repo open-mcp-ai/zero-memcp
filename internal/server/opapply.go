@@ -195,7 +195,7 @@ func (s *Server) applyOp(project, branch, peerNode string, ctx *opContext, op tr
 		// 内容时，墓碑仍然落地（防复活不变量不可破），同时把被解链的
 		// 本地 SHA 记进冲突表并在日志点名——用户必须知道有东西被删了。
 		if lch, ok := ctx.local[op.Path]; ok && !lch.Deleted {
-			s.recordWorkConflict(project, branch, op.Path, lch.SHA, "", peerNode)
+			s.recordWorkConflict(project, branch, op.Path, lch.SHA, "", peerNode, ConflictDelete)
 			s.logf("op-sync: DELETE WINS %s@%s:%s (local uncommitted %s was unlinked)",
 				project, branch, op.Path, shortSHA(lch.SHA))
 		}
@@ -219,7 +219,7 @@ func (s *Server) applyOp(project, branch, peerNode string, ctx *opContext, op tr
 			res.Conflicted = append(res.Conflicted, workConflict{
 				Path: op.Path, LocalSHA: lch.SHA, RemoteSHA: op.SHA, Peer: peerNode,
 			})
-			s.recordWorkConflict(project, branch, op.Path, lch.SHA, op.SHA, peerNode)
+			s.recordWorkConflict(project, branch, op.Path, lch.SHA, op.SHA, peerNode, ConflictSet)
 			s.logf("op-sync: CONFLICT %s@%s:%s (local %s vs peer %s from %s) — kept local copy",
 				project, branch, op.Path, shortSHA(lch.SHA), shortSHA(op.SHA), peerNode)
 			return "", nil
@@ -253,7 +253,7 @@ func (s *Server) applyOp(project, branch, peerNode string, ctx *opContext, op tr
 			res.Conflicted = append(res.Conflicted, workConflict{
 				Path: op.Path, LocalSHA: lch.SHA, RemoteSHA: src, Peer: peerNode,
 			})
-			s.recordWorkConflict(project, branch, op.Path, lch.SHA, src, peerNode)
+			s.recordWorkConflict(project, branch, op.Path, lch.SHA, src, peerNode, ConflictSet)
 			return "", nil
 		}
 		mode := op.Mode
@@ -347,7 +347,11 @@ func changedPathsOf(ops []treeOp) []string {
 // 会让「磁盘有数据但搜不到」这种故障在一侧复发而另一侧正常。
 func (s *Server) commitOpsLocal(project, branch, peerNode string, ops []treeOp, res opApplyResult) {
 	for _, cf := range res.Conflicted {
-		s.recordWorkConflict(project, branch, cf.Path, cf.LocalSHA, cf.RemoteSHA, cf.Peer)
+		kind := cf.Kind
+		if kind == "" {
+			kind = ConflictSet
+		}
+		s.recordWorkConflict(project, branch, cf.Path, cf.LocalSHA, cf.RemoteSHA, cf.Peer, kind)
 	}
 	paths := changedPathsOf(ops)
 	// Replace 整树算出来的墓碑不在 ops 里，但也必须刷新索引。

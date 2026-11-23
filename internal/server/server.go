@@ -2048,7 +2048,11 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		if !c.canWrite() {
 			return TermResult{}, fmt.Errorf("push requires w capability")
 		}
-		if err := s.requireBranchWide(rest, c); err != nil {
+		// push 的地址不是 <project>@<branch>，而是 <project> [<remote>] <branch>。
+		// 直接把 rest 交给 requireBranchWide 会把 "<project>" 当地址解析，
+		// 分支回落到默认分支——凭证没挂那条分支时就被判成「子树受限」，
+		// 报错与实际原因完全无关。
+		if err := s.requireBranchWideForPush(rest, c); err != nil {
 			return TermResult{}, err
 		}
 		return s.execPush(rest, c)
@@ -2889,7 +2893,39 @@ func (s *Server) ReposMux() http.Handler {
 // 等于用自己的门钥匙拆整栋楼。
 //
 // 全命名空间（空挂载表）与整分支挂载直接放行。
+// requireBranchWideForPush 对 push 的语法做整分支检查。
+//
+// push 的地址形态是 <project> [<remote>] <branch>，不是 <project>@<branch>。
+// 拿它去喂 requireBranchWide 会把项目名当地址、分支回落到默认分支，
+// 于是「凭证没挂默认分支」被误报成「子树受限」——两件完全无关的事。
+func (s *Server) requireBranchWideForPush(rest string, c Caller) error {
+	fields := strings.Fields(stripFlags(rest, "--snapshot", "--force", "-f", "--force-snapshot", "--json"))
+	if len(fields) < 2 {
+		// 参数不全，交给 execPush 报它自己的错。
+		return nil
+	}
+	project := fields[0]
+	branch := fields[len(fields)-1]
+	if i := strings.Index(branch, ":"); i >= 0 {
+		branch = branch[:i]
+	}
+	branch = strings.TrimPrefix(branch, "refs/heads/")
+	if branch == "" {
+		return nil
+	}
+	if !c.Mount.BranchWide(project, branch) && s.branchVisible(c, project, branch) {
+		return nil
+	}
+	if !c.Mount.BranchWide(project, branch) {
+		return fmt.Errorf("%s@%s is mounted with a path subtree (%q); this operation acts on the whole branch and is not available to this credential",
+			project, branch, c.Mount.rootOf(project, branch))
+	}
+	return nil
+}
+
 func (s *Server) requireBranchWide(rest string, c Caller) error {
+	// 先剥离通用旗标，避免把 --snapshot / --force / --json 当成项目地址
+	rest = stripFlags(rest, "--snapshot", "--force", "-f", "--force-snapshot", "--json")
 	fields := strings.Fields(rest)
 	if len(fields) == 0 {
 		return nil

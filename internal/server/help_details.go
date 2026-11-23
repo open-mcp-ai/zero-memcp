@@ -158,7 +158,9 @@ For HTTP remotes (HTTPS), use a token:
 Four rules:
   - no automatic push: writes stay local; push must be called explicitly
   - no implicit commit: push is rejected with a count when there are uncommitted changes
-  - no force push: +refspec is always rejected (memory history is append-only)
+  - no force push by default: +refspec is always rejected, and memory history is
+    append-only. The one exception is "push --snapshot --force", which replaces a
+    remote branch with a single orphan commit — and it only happens when you say so
   - conflicts are not silent: preserve both sides and report divergence; do not auto-merge/rebase
 
 fetch / push / sync use the built-in transports and do not invoke system git:

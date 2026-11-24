@@ -522,3 +522,101 @@ func quoteList(xs []string) string {
 	}
 	return strings.Join(parts, ", ")
 }
+
+// sync 报告必须区分「本该拉却没拉」与「刻意不同步」。
+//
+// 为什么（2026-11-24）：meta.index 是每台机器各自重建的索引快照，配置里
+// 从没声明要取它。报成 not-fetched 会让人以为「本该拉却没拉」，于是去查
+// 一个根本不存在的故障。它真正的关系是 out-of-scope。
+func TestSyncReportMarksOutOfScopeBranches(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dataDir := t.TempDir()
+	remoteDir := filepath.Join(t.TempDir(), "remote.git")
+	runGit(t, t.TempDir(), "init", "--bare", remoteDir)
+
+	work := filepath.Join(t.TempDir(), "work")
+	runGit(t, t.TempDir(), "init", work)
+	runGit(t, work, "checkout", "-b", "main.record")
+	if err := os.WriteFile(filepath.Join(work, "a.md"), []byte("甲\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, work, "add", ".")
+	runGit(t, work, "commit", "-m", "a")
+	runGit(t, work, "push", remoteDir, "main.record")
+
+	runGit(t, work, "checkout", "-b", "meta.index")
+	if err := os.WriteFile(filepath.Join(work, "b.md"), []byte("乙\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, work, "add", ".")
+	runGit(t, work, "commit", "-m", "b")
+	runGit(t, work, "push", remoteDir, "meta.index")
+
+	hs := newUploadHTTP(t, remoteDir, "deploy", "ghp_token_value")
+	defer hs.Close()
+
+	cfg := fmt.Sprintf(`
+[server]
+data = %q
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name  = "daily"
+owner = "zero"
+mode  = "rwx------"
+
+[[remote]]
+project    = "daily"
+name       = "github"
+url        = %q
+push       = ["main.record"]
+http_user  = "deploy"
+http_token = "gh"
+`, dataDir, hs.URL+"/repo.git")
+	if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := gitstore.Init(filepath.Join(dataDir, "repos", "daily.git")); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{
+		DataDir:     dataDir,
+		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
+		Listen:      "127.0.0.1:0",
+		EnforceAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	rootTok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "owner", Cap: "rwx"})
+	if _, err := callMCPWithVars(t, srv, rootTok, "remote-secret put gh -- $TOKEN", map[string]string{"TOKEN": "ghp_token_value"}); err != nil {
+		t.Fatalf("remote-secret put 失败: %v", err)
+	}
+	out, err := callMCP(t, srv, rootTok, "sync daily github")
+	if err != nil {
+		t.Fatalf("sync 失败: %v", err)
+	}
+
+	var metaLine string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "meta.index") {
+			metaLine = line
+		}
+	}
+	if metaLine == "" {
+		t.Fatalf("sync 输出里应有 meta.index 一行:\n%s", out)
+	}
+	if !strings.Contains(metaLine, "out-of-scope") {
+		t.Fatalf("meta.index 不在取回范围里，应标 out-of-scope，实际: %q", metaLine)
+	}
+	if strings.Contains(metaLine, "not-fetched") {
+		t.Fatalf("不该再说 not-fetched（会把「刻意不同步」误导成「漏拉」）: %q", metaLine)
+	}
+}

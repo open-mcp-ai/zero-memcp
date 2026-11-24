@@ -339,9 +339,23 @@ func ListSSH(ctx context.Context, remoteURL, privateKeyPEM, hostKey string, time
 	if err := sess.start("git-upload-pack"); err != nil {
 		return nil, err
 	}
-	adv, err := readAdvertisement(bufio.NewReader(sess.stdout))
+	reader := bufio.NewReader(sess.stdout)
+	adv, err := readAdvertisement(reader)
 	if err != nil {
 		return nil, fmt.Errorf("read upload-pack advertisement: %w", err)
+	}
+	// v2 的广告里没有 refs，要另发 ls-refs（同 ListHTTP 的理由）。
+	if adv.Version == 2 {
+		if _, err := sess.stdin.Write(v2LsRefsRequest()); err != nil {
+			return nil, fmt.Errorf("send ls-refs: %w", err)
+		}
+		refs, err := parseV2LsRefs(reader)
+		if err != nil {
+			return nil, err
+		}
+		_ = sess.stdin.Close()
+		_ = sess.wait()
+		return refs, nil
 	}
 	return adv.Refs, nil
 }
@@ -382,6 +396,17 @@ func ListHTTP(ctx context.Context, remoteURL, user, token string, timeout time.D
 	adv, err := discoverHTTPFor(ctx, client, base, "git-upload-pack", user, token, true)
 	if err != nil {
 		return nil, err
+	}
+	// v2 的广告里没有 refs——它把「有哪些 ref」拆成独立的 ls-refs 命令。
+	// 直接返回 adv.Refs 会得到一张空表，于是 sync 对任何支持 v2 的服务端
+	// 都报 "(no readable branches)"（2026-11-24 测试当场抓到；3060 只回 v0，
+	// 所以生产上一直没暴露）。要拿 refs 就得再发一次 ls-refs。
+	if adv.Version == 2 {
+		body, err := postService(ctx, client, base, user, token, "git-upload-pack", v2LsRefsRequest(), true)
+		if err != nil {
+			return nil, err
+		}
+		return parseV2LsRefs(bufio.NewReader(bytes.NewReader(body)))
 	}
 	return adv.Refs, nil
 }

@@ -578,6 +578,9 @@ func (s *Server) execSync(rest string, c Caller) (TermResult, error) {
 		return TermResult{}, fmt.Errorf("read remote advertisement from %s: %w", rm.Name, err)
 	}
 
+	// 取回范围：本报告要能区分「本该拉却没拉」与「刻意不同步」。
+	scope := fetchBranches(rm.Pull, rm.Push, rm.PushOnly)
+
 	localRefs, _ := repo.Refs("refs/heads/")
 	seen := map[string]bool{}
 	var branches []string
@@ -621,6 +624,14 @@ func (s *Server) execSync(rest string, c Caller) (TermResult, error) {
 		local, _ := repo.Resolve(b)
 		remote := remoteRefs["refs/heads/"+b]
 		state := classifySync(repo, local, remote)
+		// 不在取回范围里的分支要单独标，不能叫 not-fetched。
+		//
+		// 为什么（2026-11-24）：meta.index 是每台机器各自重建的索引快照，
+		// 配置里从没声明要取它。报成 not-fetched 会让人以为「本该拉却没拉」，
+		// 于是去查一个根本不存在的故障；而它真正的关系是「刻意不同步」。
+		if state != "synced" && !branchAllowed(scope, b) {
+			state = "out-of-scope"
+		}
 		rows = append(rows, row{Branch: b, Local: local, Remote: remote, State: state})
 		fmt.Fprintf(&sb, "  %-16s %-12s local %s remote %s\n", b, state, shortSHA(local), shortSHA(remote))
 	}

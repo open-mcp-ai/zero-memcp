@@ -38,7 +38,7 @@ const maxPackResponse = 512 << 20
 // 绝不拼进 URL——URL 会出现在日志和错误信息里。
 func PushHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, user, token string, timeout time.Duration, opts ...PushOptions) (PushResult, error) {
 	if timeout <= 0 {
-		timeout = 90 * time.Second
+		timeout = DefaultStallTimeout
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -110,10 +110,16 @@ func PushHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, branch, user,
 }
 
 // httpClientFor 校验远端并造出客户端。
-func httpClientFor(remoteURL, user, token string, timeout time.Duration) (string, *http.Client, error) {
-	if timeout <= 0 {
-		timeout = 90 * time.Second
-	}
+//
+// idle 的语义是**允许对端安静多久**，不是整轮预算：只要还有字节在流动，
+// 请求就能一直跑下去；连续 idle 时长没有任何读/写才判死。
+//
+// 为什么把参数从「总预算」改成「静默窗口」（2026-11-24 实测）：3060 两端
+// 已对齐时仍然要遍历整棵历史才能发现差集为空，冷页缓存下 90 秒不够；
+// 但它一直在流动（响应头、pack 字节），从来不是死连接。用总预算判会把
+// 「慢」和「死」混成一件事，而真正常见的故障恰恰是后者——那才是需要被
+// 准时发现的。语义细节见 idle.go。
+func httpClientFor(remoteURL, user, token string, idle time.Duration) (string, *http.Client, error) {
 	base, err := parseHTTPRemote(remoteURL)
 	if err != nil {
 		return "", nil, err
@@ -121,7 +127,8 @@ func httpClientFor(remoteURL, user, token string, timeout time.Duration) (string
 	// 允许匿名：公开仓库不需要凭证，硬要一个 token 会让「读一个开源仓库」
 	// 变成做不到的事。私有仓库缺凭证会由服务端 401 说话，那时的错误更准确。
 	return base, &http.Client{
-		Timeout: timeout,
+		// 不设 Timeout：那是整请求预算，对「把一整段历史算完再发」没有合理的常数。
+		Transport: stallTransport(idle),
 		// 不跟随重定向：把 Authorization 带去别的主机等于泄漏凭证。
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}, nil

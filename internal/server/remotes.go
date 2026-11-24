@@ -143,8 +143,13 @@ func renderRemote(project string, r config.Remote) string {
 	return fmt.Sprintf("%-20s %-10s %-28s %s %s", project, r.Name, gitremote.Redact(r.URL), mode, push)
 }
 
-// remoteTimeout 是内置传输单次操作的上限。
-const remoteTimeout = 90 * time.Second
+// remoteStallTimeout 是内置传输的静默窗口：允许对端安静多久。
+//
+// 它**不是**单次操作的总预算（2026-11-24 改）。旧值 90 秒当总预算用时，
+// 3060 冷页缓存下算一次「结果为空」的全量闭包就把它耗尽，报出来的是一行
+// 「读响应超时」——看起来像网络故障，实际是判据选错了：对端一直在活着，
+// 只是算得慢。语义与默认值见 gittransport 的 idle.go。
+const remoteStallTimeout = gittransport.DefaultStallTimeout
 
 // execFetch 处理 fetch <project> [remote]：把远端历史取回本地。
 //
@@ -230,7 +235,7 @@ func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *g
 		if err != nil {
 			return gittransport.FetchResult{}, fmt.Errorf("read SSH private key %q: %w", rm.SSHKey, err)
 		}
-		res, err := gittransport.FetchSSH(ctx, repo, rm.URL, rm.Name, string(key), rm.HostKey, branches, remoteTimeout)
+		res, err := gittransport.FetchSSH(ctx, repo, rm.URL, rm.Name, string(key), rm.HostKey, branches, remoteStallTimeout)
 		if err != nil {
 			return res, err
 		}
@@ -240,7 +245,7 @@ func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *g
 		if err != nil {
 			return gittransport.FetchResult{}, err
 		}
-		res, err := gittransport.FetchHTTP(ctx, repo, rm.URL, rm.Name, rm.HTTPUser, token, branches, remoteTimeout)
+		res, err := gittransport.FetchHTTP(ctx, repo, rm.URL, rm.Name, rm.HTTPUser, token, branches, remoteStallTimeout)
 		if err != nil {
 			return res, err
 		}
@@ -383,7 +388,7 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 		if err != nil {
 			return TermResult{}, fmt.Errorf("read SSH private key %q: %w", rm.SSHKey, err)
 		}
-		res, err = gittransport.Push(context.Background(), repo, rm.URL, branch, string(key), rm.HostKey, 90*time.Second, pushOpts)
+		res, err = gittransport.Push(context.Background(), repo, rm.URL, branch, string(key), rm.HostKey, remoteStallTimeout, pushOpts)
 		if err != nil {
 			return TermResult{}, fmt.Errorf("push %s@%s -> %s failed: %w", project, branch, rm.Name, err)
 		}
@@ -395,7 +400,7 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 		if err != nil {
 			return TermResult{}, fmt.Errorf("read token %q: %w", rm.HTTPToken, err)
 		}
-		res, err = gittransport.PushHTTP(context.Background(), repo, rm.URL, branch, rm.HTTPUser, token, 90*time.Second, pushOpts)
+		res, err = gittransport.PushHTTP(context.Background(), repo, rm.URL, branch, rm.HTTPUser, token, remoteStallTimeout, pushOpts)
 		if err != nil {
 			return TermResult{}, fmt.Errorf("push %s@%s -> %s failed: %w", project, branch, rm.Name, err)
 		}
@@ -648,13 +653,13 @@ func (s *Server) listRemote(rm config.Remote) (map[string]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("read SSH private key %q: %w", rm.SSHKey, err)
 		}
-		return gittransport.ListSSH(ctx, rm.URL, string(key), rm.HostKey, remoteTimeout)
+		return gittransport.ListSSH(ctx, rm.URL, string(key), rm.HostKey, remoteStallTimeout)
 	case strings.HasPrefix(rm.URL, "http://"), strings.HasPrefix(rm.URL, "https://"):
 		token, err := s.optionalSecret(rm.HTTPToken, "http_token")
 		if err != nil {
 			return nil, err
 		}
-		return gittransport.ListHTTP(ctx, rm.URL, rm.HTTPUser, token, remoteTimeout)
+		return gittransport.ListHTTP(ctx, rm.URL, rm.HTTPUser, token, remoteStallTimeout)
 	}
 	if _, ok := gittransport.LocalPath(rm.URL); ok {
 		return gittransport.ListLocal(rm.URL)

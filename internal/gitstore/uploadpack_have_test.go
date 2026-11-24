@@ -333,3 +333,64 @@ func TestUploadPackFinalRoundAlwaysEmitsACKOrNAK(t *testing.T) {
 		t.Errorf("final round emitted neither ACK nor NAK: %q", body[:min(len(body), 40)])
 	}
 }
+
+
+// 短路：当 want 的每个 tip 都在 have 里时，服务端绝不去读对象。
+//
+// 为什么需要这一条（2026-11-24 实测）：已对齐时，两端历史完全一样，
+// want 闭包减去 have 闭包结果必然为空。但全量遍历要读几万个松散/打包对象，
+// 冷页缓存下直接耗尽 90 秒预算。短路使对齐时的响应从 10~13 秒降为 0 秒。
+//
+// 证明「绝不读对象」的手段：构造一个 tip 指向合法 SHA，但在库里根本没有对应
+// 对象；同时声明该 tip 也在 have 里。未短路的实现会立刻报
+// "open object ...: no such file"，只有短路成功的实现才会静默通过并回 ACK。
+func TestUploadPackShortCircuitsWhenWantsAlreadyInHaves(t *testing.T) {
+	dir := t.TempDir()
+	r, err := Init(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 真实提交 c1（在库里真实存在，作为共同基点被 ACK）
+	if err := r.Write("main", "f.md", []byte("base"), ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	c1, err := r.Commit("main", "c1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 伪造一个库里根本不存在的 SHA：
+	phantom := "1111111111111111111111111111111111111111"
+
+	// 场景 A：want 包含 phantom，且 phantom 也在 have 里 → 必须短路，不读对象
+	var bodyShort bytes.Buffer
+	bodyShort.Write(PktLine("want " + c1 + "\n"))
+	bodyShort.Write(PktLine("want " + phantom + "\n"))
+	bodyShort.Write(PktFlush())
+	bodyShort.Write(PktLine("have " + c1 + "\n"))
+	bodyShort.Write(PktLine("have " + phantom + "\n"))
+	bodyShort.Write(PktLine("done\n"))
+
+	resp, err := r.UploadPackResponse(&bodyShort)
+	if err != nil {
+		t.Fatalf("want 全部在 have 里时应短路通过，实际失败: %v", err)
+	}
+	if !strings.Contains(string(resp), "ACK") {
+		t.Fatalf("应回 ACK，实际: %q", string(resp))
+	}
+	if strings.Contains(string(resp), "PACK") {
+		t.Fatalf("短路时不应生成 PACK，实际包含: %q", string(resp))
+	}
+
+	// 场景 B（反向对照）：同一个 phantom 不在 have 里时，必须真正去读它并失败。
+	// 没有这一条，上面那个断言在「永远不读对象」的假实现下也会通过。
+	var bodyFail bytes.Buffer
+	bodyFail.Write(PktLine("want " + phantom + "\n"))
+	bodyFail.Write(PktFlush())
+	bodyFail.Write(PktLine("have " + c1 + "\n"))
+	bodyFail.Write(PktLine("done\n"))
+	if _, err := r.UploadPackResponse(&bodyFail); err == nil {
+		t.Fatal("phantom 不在 have 里时必须因为读不到对象而报错")
+	}
+}

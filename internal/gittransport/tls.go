@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -94,27 +93,17 @@ func NewTLSClient(cfg TLSConfig, timeout time.Duration) (*http.Client, error) {
 //	"context deadline exceeded"，而重试只等下一轮轮询——
 //	远端永远追不上，且失败原因只有一行超时。
 //
-// 所以这里不设 Client.Timeout（那是**整请求**预算，对批量同步
-// 没有合理的常数），改设：
-//
-//	ResponseHeaderTimeout —— 卡住等响应头的时间，有界
-//	DialContextTimeout    —— 连不上要快速失败，而不是挂满
-//	TLSHandshakeTimeout   —— 同上
-//
-// 体流不设上限：对端算完才开始写响应，写出来之后就是纯传输。
+// 所以这里既不用 Client.Timeout（整请求预算），也不用
+// ResponseHeaderTimeout（它会在对端安静的整个算包期把连接掐掉，
+// 而那段安静完全正常）：统一改成「连续多久没有字节流动」判死，
+// 见 idle.go。连不上仍然要快速失败，所以拨号超时保留得很短。
 func NewSyncClient(cfg TLSConfig) (*http.Client, error) {
 	base, err := NewTLSClient(cfg, time.Minute)
 	if err != nil {
 		return nil, err
 	}
 	base.Timeout = 0
-	if tr, ok := base.Transport.(*http.Transport); ok {
-		tr.DialContext = (&net.Dialer{
-			Timeout:   15 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext
-		tr.ResponseHeaderTimeout = 5 * time.Minute
-	}
+	base.Transport = stallTransport(DefaultStallTimeout)
 	return base, nil
 }
 

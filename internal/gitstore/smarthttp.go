@@ -368,6 +368,33 @@ func (r *Repo) WriteUploadPack(out io.Writer, req *uploadPackRequest) error {
 		}
 	}
 
+	// 短路：客户端要的每一个 tip 它自己都已经有了。
+	//
+	// 为什么要单独判（2026-11-24 实测）：两端已经对齐时，客户端仍然会发
+	// want（它不知道对端走到了哪里）+ have。这时全量闭包算完再减去 have 闭包，
+	// 结果必然是空——但这个「必然」要花掉 10~13 秒真实磁盘读（3060 冷页缓存下
+	// 直接撞 90 秒超时）。而「want 的 sha 就在 haves 里」这一个判断就等价于
+	// 「可达集已被 have 覆盖」：want 是一个 tip，have 是同一个 sha，两者闭包
+	// 完全相同，差集为空。
+	//
+	// 这一判必须在遍历**之前**：放在后面就只能省下 have 闭包那一轮，
+	// 而 want 闭包本身就是那次 90 秒。
+	//
+	// 不发空 pack 而直接 return：pack 头里写 0 个对象是合法但没必要的往返，
+	// 而 ACK 已经在上面发出去了，客户端会把它读成「什么都没有，收工」。
+	if len(req.wants) > 0 && len(req.haves) > 0 {
+		covered := true
+		for sha := range req.wants {
+			if !req.haves[sha] {
+				covered = false
+				break
+			}
+		}
+		if covered {
+			return nil
+		}
+	}
+
 	objects := map[string]bool{}
 	for sha := range req.wants {
 		if err := r.collectReachable(sha, objects); err != nil {

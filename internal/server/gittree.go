@@ -493,6 +493,18 @@ func (s *Server) refreshPath(project, branch, path string, exists bool) error {
 //
 // 出错时返回错误，调用方应当退回 Reload()——安全的那条路永远留着。
 func (s *Server) refreshBranch(project, branch string) error {
+	// 索引关闭时不重扫分支。
+	//
+	// 「分支头移动 → 增量刷新」是外部推进（另一台机器同步、agent 提交）
+	// 的常态路径，不是启动路径——只拦启动那一次根本不够。
+	// 实测（2026-11-24，rock64）：启动日志老实写着 index: disabled，
+	// 300 秒后一次 head movement 触发全量重扫，17 分钟 + 61 MB 索引，
+	// 随后每 30 秒存一次 61 MB 快照，8 小时烧掉 359 分钟 CPU、
+	// 常驻 1.6 GiB 内存，而 status 上还写着 disabled。
+	// 冷备份节点不上报这种人——它连 grep/recall 都拒绝执行。
+	if !s.indexEnabled {
+		return nil
+	}
 	repo, err := s.projects.Get(project)
 	if err != nil {
 		return fmt.Errorf("open project %s: %w", project, err)

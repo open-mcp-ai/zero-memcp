@@ -6,6 +6,10 @@ import (
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
+	"path/filepath"
+	"os"
+
 	"github.com/open-mcp-ai/zero-memcp/internal/index"
 )
 
@@ -109,6 +113,149 @@ func TestIndexDisabledSkipsRefreshPath(t *testing.T) {
 	if got := srv.idxNow().Docs(); got != 0 {
 		t.Fatalf("索引已关闭，不该有任何文档进索引，实际 %d 篇——"+
 			"refreshPath 漏了守卫，会让冷备份节点悄悄建回全量索引", got)
+	}
+}
+
+// 分支头移动是外部推进的常态路径，冷备份节点也不许在这里建索引。
+//
+// 踩过的坑（2026-11-24，rock64 实测 8 小时）：
+// 启动时老实跳过索引，300 秒后一次 head movement 走 refreshBranches →
+// refreshBranch → scanGitProject 全量重扫，17 分钟建出 26,502 篇索引，
+// 然后每 30 秒存一次 61 MB 快照，烧掉 359 分钟 CPU、常驻 1.6 GiB，
+// 而 status 上始终写着 "index: disabled"。只拦启动路径是不够的。
+// 外部提交与磁盘快照双重守卫：冷备份节点既不许读旧快照，也不许在提交时建索引。
+//
+// 踩过的坑（2026-11-24，rock64 实测 8 小时 359 分钟 CPU）：
+// 历史上建过索引，磁盘上残留了快照文件。新版本启动虽然跳过了全量扫描，
+// 但 tryLoadIndexSnapshot 却把这几万篇文档读了回来挂上，维护线程随后把
+// 这批树当活物监视；外部一有提交就触发全量重扫，随后每 30 秒存一次 61 MB 快照，
+// 常驻 1.6 GiB 内存，而 status 上始终写着 "index: disabled"。
+func TestIndexDisabledSkipsBranchRefresh(t *testing.T) {
+	// 第一阶段：用一个【开启了索引】的实例制造真实的磁盘快照
+	dataDir := t.TempDir()
+	cfgWithIndex := `
+[server]
+data = "` + dataDir + `"
+
+[index]
+enabled = true
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name  = "blackegg/me"
+owner = "zero"
+mode  = "rwxr-xr-x"
+`
+	// 用原生 os.WriteFile 而不是测试辅助 osWrite：
+	// 后者会自动追加 [index] enabled = true（让老测试保持开启），
+	// 在这里会把「冷备份配置」偷偷改回开启，测试就假通过了。
+	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(cfgWithIndex), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s1, err := New(Config{
+		DataDir:     dataDir,
+		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
+		Listen:      "127.0.0.1:0",
+		EnforceAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 写一篇文档并存下快照（先走一次写入把仓库创建出来）
+	tok1 := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Cap: "rwx"})
+	if _, err := callMCPRaw(t, s1, tok1, map[string]any{
+		"name": "term",
+		"arguments": map[string]any{
+			"cmd":  "write blackegg/me@zero:doc.md $BODY",
+			"vars": map[string]string{"BODY": "真实文档"},
+		},
+	}); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	repo1, err := s1.projects.Get("blackegg/me")
+	if err != nil {
+		t.Fatalf("open project: %v", err)
+	}
+	if _, err := repo1.Commit("zero", "init"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.Reload(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s1.saveIndexSnapshot(); err != nil {
+		t.Fatalf("生成测试快照: %v", err)
+	}
+	s1.Close()
+
+	// 确认快照确实落盘了
+	if _, serr := os.Stat(s1.indexSnapshotDir()); serr != nil {
+		t.Fatalf("前提不成立：快照文件没落盘: %v", serr)
+	}
+
+	// 第二阶段：在同一个 dataDir 上启动【冷备份】实例（未配置 [index]）
+	cfgCold := `
+[server]
+data = "` + dataDir + `"
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name  = "blackegg/me"
+owner = "zero"
+mode  = "rwxr-xr-x"
+`
+	if err := os.WriteFile(filepath.Join(dataDir, "zero-memcp.toml"), []byte(cfgCold), 0600); err != nil {
+		t.Fatal(err)
+	}
+	s2, err := New(Config{
+		DataDir:     dataDir,
+		ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
+		Listen:      "127.0.0.1:0",
+		EnforceAuth: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s2.Close() })
+
+	// 1. 启动后：磁盘快照绝不许被读回来
+	if got := s2.idxNow().Docs(); got != 0 {
+		t.Fatalf("冷备份实例启动时误读了磁盘上的旧快照：实际读了 %d 篇——"+
+			"这是 rock64 8 小时 1.6GB 的直接根因", got)
+	}
+
+	// 2. 外部推进后：绝不许扫描并建索引。
+	//
+	// 这里直接打 refreshBranch——它是「外部 head 移动」的落点，
+	// 也是 rock64 上真正烧掉 8 小时 CPU 的那条路径。
+	repo2, err := s2.projects.Get("blackegg/me")
+	if err != nil {
+		t.Fatalf("open project: %v", err)
+	}
+	if err := repo2.Write("zero", "doc2.md", []byte("第二篇"), gitstore.ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo2.Commit("zero", "push"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s2.refreshBranch("blackegg/me", "zero"); err != nil {
+		t.Fatalf("索引关闭时 refreshBranch 应静默跳过: %v", err)
+	}
+	if got := s2.idxNow().Docs(); got != 0 {
+		t.Fatalf("refreshBranch 在冷备份节点误建了索引：实际 %d 篇", got)
+	}
+	if got := len(s2.treeList()); got != 0 {
+		t.Fatalf("refreshBranch 在冷备份节点误扫了内存树：实际 %d 棵", got)
+	}
+
+	// 3. 快照保存器绝不写盘
+	if err := s2.saveIndexSnapshot(); err != nil {
+		t.Fatalf("saveIndexSnapshot 应静默跳过: %v", err)
 	}
 }
 

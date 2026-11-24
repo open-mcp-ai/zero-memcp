@@ -35,6 +35,18 @@ func (s *Server) indexSnapshotDir() string {
 // 只会让「写了但搜不到」，那种故障比启动慢难查一百倍。
 // 所以治愈的方式是「与树逐条对齐」，而不是「假装没看见」。
 func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
+	// 索引关闭时绝不加载快照。
+	//
+	// 根因分析（2026-11-24，rock64 实测 8 小时 359 分钟 CPU）：
+	// 如果节点历史上曾经构建过索引，磁盘上会残留快照文件（index-data.bin 等）。
+	// 启动路径上虽然跳过了全量扫描，但 tryLoadIndexSnapshot 却把这几万篇
+	// 文档读了回来挂上，维护线程随即启动并把它们当成活物监视。
+	// 一旦有外部提交，维护线程就触发 refreshBranches 全量重扫，随后
+	// 每 30 秒存一次 61 MB 快照，把一个冷备份节点活活拖垮。
+	// 冷备份节点即使磁盘上有快照也绝不读，必须彻底静止。
+	if !s.indexEnabled {
+		return false
+	}
 	dir := s.indexSnapshotDir()
 	if dir == "" || os.Getenv("ZERO_MEMCP_NO_INDEX_SNAPSHOT") != "" {
 		return false
@@ -255,6 +267,11 @@ func indexSubsetOf(idx *index.Index, live map[string]bool) bool {
 // 不放在每次写入上——快照是「启动加速」，不是「持久化」，
 // 丢一次最多是下次启动慢，不会丢数据（Git 才是真相源）。
 func (s *Server) saveIndexSnapshot() error {
+	// 索引关闭时没有快照可存。这里漏掉守卫的后果是每 30 秒写一个
+	// 数十 MB 的文件（实测 61 MB / 次），在一张 SD 卡上等于持续磨损。
+	if !s.indexEnabled {
+		return nil
+	}
 	dir := s.indexSnapshotDir()
 	if dir == "" || os.Getenv("ZERO_MEMCP_NO_INDEX_SNAPSHOT") != "" {
 		return nil

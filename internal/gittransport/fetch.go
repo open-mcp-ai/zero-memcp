@@ -27,13 +27,64 @@ type FetchResult struct {
 // 「知道远端有什么」和「把远端变成我的」是两件事，混在一起就再也
 // 分不清一次误操作到底改了本地还是只改了认知。
 
-// fetchTips 从广告里挑出要取的分支。
-func fetchTips(refs map[string]string) []string {
+// branchScope 把「配置里声明取回哪些分支」编译成一次查询。
+//
+// wanted 是 [[remote]] 声明的分支白名单（工作层对端的 pull，或回落到 Git
+// 远端的 push 列表）。**空表示一个都不取**：取回哪些分支必须是显式配置的，
+// 不能由「对端广告了什么」决定。
+//
+// 为什么这条边界必须画在这里而不是取回之后再裁（2026-11-24 3060 链路卡死
+// 的真因）：对象层面无法按分支隔离，want 一发出去，对端就会把整条历史的
+// pack 打好发过来。meta.index 那种分支每次提交都是整份索引快照（本机 98
+// 个 blob / 246 MB），混进 want 会让一次 fetch 在 90 秒里打不完包，表现为
+// 「读响应超时」——看起来像网络问题，实际是自己在拉一份根本不该同步的缓存。
+//
+// "*" 是唯一的通配，用来显式表达「这个远端就是要全取」。
+//
+// 组装 want（fetchTips）与落地引用（applyFetch）必须共用这一个判据：
+// 两份名单一旦漂移，要么多拉一整个分支，要么留下一个「没要过却存在」的
+// 跟踪引用，下一轮 merge 拿它当真值。
+func newBranchScope(wanted []string) branchScope {
+	s := branchScope{match: make(map[string]bool, len(wanted))}
+	for _, w := range wanted {
+		if w == "*" {
+			s.all = true
+			return s
+		}
+		s.match[w] = true
+	}
+	return s
+}
+
+type branchScope struct {
+	all   bool
+	match map[string]bool
+}
+
+func (s branchScope) empty() bool { return !s.all && len(s.match) == 0 }
+
+func (s branchScope) allows(branch string) bool {
+	if s.all {
+		return true
+	}
+	return s.match[branch]
+}
+
+// fetchTips 从广告里挑出要取的分支。scope 为空时一条都不取。
+func fetchTips(refs map[string]string, wanted []string) []string {
+	scope := newBranchScope(wanted)
+	if scope.empty() {
+		return nil
+	}
 	tips := make([]string, 0, len(refs))
 	for ref, sha := range refs {
-		if strings.HasPrefix(ref, "refs/heads/") && validSHA(sha) {
-			tips = append(tips, sha)
+		if !strings.HasPrefix(ref, "refs/heads/") || !validSHA(sha) {
+			continue
 		}
+		if !scope.allows(strings.TrimPrefix(ref, "refs/heads/")) {
+			continue
+		}
+		tips = append(tips, sha)
 	}
 	return tips
 }
@@ -185,7 +236,12 @@ func localHaves(repo *gitstore.Repo) []string {
 const maxHaves = 64
 
 // applyFetch 把收到的 pack 落盘，并更新远端跟踪引用。
-func applyFetch(repo *gitstore.Repo, remote string, refs map[string]string, pack []byte) (FetchResult, error) {
+//
+// wanted 与 fetchTips 用同一个 branchScope：没要的分支即便被广告了也不写
+// refs/remotes/*。这一道不是重复：对象是内容寻址的，一个没要的分支的
+// tip 可能因为别的分支引用过它而已经在库里，单靠 HasObject 拦不住——
+// 那时就会凭空多出一个从没请求过的跟踪引用。
+func applyFetch(repo *gitstore.Repo, remote string, refs map[string]string, pack []byte, wanted []string) (FetchResult, error) {
 	res := FetchResult{Branches: map[string]string{}}
 	ingested, err := repo.IngestPack(pack)
 	if err != nil {
@@ -194,11 +250,16 @@ func applyFetch(repo *gitstore.Repo, remote string, refs map[string]string, pack
 	res.Objects = ingested.Objects
 	res.Written = ingested.Written
 
+	scope := newBranchScope(wanted)
+
 	for ref, sha := range refs {
 		if !strings.HasPrefix(ref, "refs/heads/") || !validSHA(sha) {
 			continue
 		}
 		branch := strings.TrimPrefix(ref, "refs/heads/")
+		if !scope.allows(branch) {
+			continue
+		}
 		if !repo.HasObject(sha) {
 			// 只广告了没要的东西（比如浅克隆边界）：不写指针，
 			// 因为没有对象的 ref 是一个悬空引用。
@@ -209,14 +270,11 @@ func applyFetch(repo *gitstore.Repo, remote string, refs map[string]string, pack
 		}
 		res.Branches[branch] = sha
 	}
-	if len(res.Branches) == 0 && len(refs) > 0 {
-		return res, errors.New("remote advertised branches, but fetch produced no usable refs")
-	}
 	return res, nil
 }
 
 // FetchSSH 通过 SSH 取回远端历史。
-func FetchSSH(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, privateKeyPEM, hostKey string, timeout time.Duration) (FetchResult, error) {
+func FetchSSH(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, privateKeyPEM, hostKey string, branches []string, timeout time.Duration) (FetchResult, error) {
 	sess, err := dialSSH(ctx, remoteURL, privateKeyPEM, hostKey, timeout)
 	if err != nil {
 		return FetchResult{}, err
@@ -235,10 +293,10 @@ func FetchSSH(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, priva
 		return FetchResult{}, fmt.Errorf("read upload-pack advertisement: %w", err)
 	}
 	if adv.Version == 2 {
-		return fetchV2SSH(repo, remote, sess, reader, adv)
+		return fetchV2SSH(repo, remote, sess, reader, adv, branches)
 	}
 	refs := adv.Refs
-	tips := fetchTips(refs)
+	tips := fetchTips(refs, branches)
 	if len(tips) == 0 {
 		return FetchResult{Branches: map[string]string{}}, nil
 	}
@@ -255,7 +313,7 @@ func FetchSSH(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, priva
 	if err := sess.wait(); err != nil {
 		return FetchResult{}, err
 	}
-	return applyFetch(repo, remote, refs, pack)
+	return applyFetch(repo, remote, refs, pack, branches)
 }
 
 // ListSSH 只读广告，不取对象。sync 用它，避免为了比对而下载整段历史。
@@ -276,7 +334,7 @@ func ListSSH(ctx context.Context, remoteURL, privateKeyPEM, hostKey string, time
 }
 
 // FetchHTTP 通过 smart HTTP 取回远端历史。
-func FetchHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, user, token string, timeout time.Duration) (FetchResult, error) {
+func FetchHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, user, token string, branches []string, timeout time.Duration) (FetchResult, error) {
 	base, client, err := httpClientFor(remoteURL, user, token, timeout)
 	if err != nil {
 		return FetchResult{}, err
@@ -287,10 +345,10 @@ func FetchHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, user
 		return FetchResult{}, err
 	}
 	if adv.Version == 2 {
-		return fetchV2HTTP(ctx, client, base, user, token, repo, remote)
+		return fetchV2HTTP(ctx, client, base, user, token, repo, remote, branches)
 	}
 	refs := adv.Refs
-	tips := fetchTips(refs)
+	tips := fetchTips(refs, branches)
 	if len(tips) == 0 {
 		return FetchResult{Branches: map[string]string{}}, nil
 	}
@@ -298,7 +356,7 @@ func FetchHTTP(ctx context.Context, repo *gitstore.Repo, remoteURL, remote, user
 	if err != nil {
 		return FetchResult{}, err
 	}
-	return applyFetch(repo, remote, refs, pack)
+	return applyFetch(repo, remote, refs, pack, branches)
 }
 
 // ListHTTP 只读广告，不取对象。
@@ -366,7 +424,7 @@ func v0PackHTTP(ctx context.Context, client *http.Client, base, user, token stri
 //
 // v2 把「有哪些 ref」和「取哪些对象」拆成两个命令，
 // 好处是两次之间可以只针对需要的分支发 want，不必被整份广告牵着走。
-func fetchV2SSH(repo *gitstore.Repo, remote string, sess *sshSession, reader *bufio.Reader, adv advertisement) (FetchResult, error) {
+func fetchV2SSH(repo *gitstore.Repo, remote string, sess *sshSession, reader *bufio.Reader, adv advertisement, branches []string) (FetchResult, error) {
 	if _, ok := adv.Caps["fetch"]; !ok {
 		return FetchResult{}, errors.New("server claims protocol v2 but does not support fetch")
 	}
@@ -377,7 +435,7 @@ func fetchV2SSH(repo *gitstore.Repo, remote string, sess *sshSession, reader *bu
 	if err != nil {
 		return FetchResult{}, err
 	}
-	tips := fetchTips(refs)
+	tips := fetchTips(refs, branches)
 	if len(tips) == 0 {
 		_ = sess.stdin.Close()
 		_ = sess.wait()
@@ -396,11 +454,11 @@ func fetchV2SSH(repo *gitstore.Repo, remote string, sess *sshSession, reader *bu
 	if err := sess.wait(); err != nil {
 		return FetchResult{}, err
 	}
-	return applyFetch(repo, remote, refs, pack)
+	return applyFetch(repo, remote, refs, pack, branches)
 }
 
 // fetchV2HTTP 走协议 v2 over stateless HTTP：ls-refs 与 fetch 各一次 POST。
-func fetchV2HTTP(ctx context.Context, client *http.Client, base, user, token string, repo *gitstore.Repo, remote string) (FetchResult, error) {
+func fetchV2HTTP(ctx context.Context, client *http.Client, base, user, token string, repo *gitstore.Repo, remote string, branches []string) (FetchResult, error) {
 	refsBody, err := postService(ctx, client, base, user, token, "git-upload-pack", v2LsRefsRequest(), true)
 	if err != nil {
 		return FetchResult{}, err
@@ -409,7 +467,7 @@ func fetchV2HTTP(ctx context.Context, client *http.Client, base, user, token str
 	if err != nil {
 		return FetchResult{}, err
 	}
-	tips := fetchTips(refs)
+	tips := fetchTips(refs, branches)
 	if len(tips) == 0 {
 		return FetchResult{Branches: map[string]string{}}, nil
 	}
@@ -421,5 +479,5 @@ func fetchV2HTTP(ctx context.Context, client *http.Client, base, user, token str
 	if err != nil {
 		return FetchResult{}, err
 	}
-	return applyFetch(repo, remote, refs, pack)
+	return applyFetch(repo, remote, refs, pack, branches)
 }

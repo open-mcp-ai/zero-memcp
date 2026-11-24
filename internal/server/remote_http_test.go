@@ -264,7 +264,7 @@ push    = ["zero"]
 	if err != nil {
 		t.Fatal(err)
 	}
-	res, err := gittransport.FetchLocal(otherRepo, remoteDir, "backup")
+	res, err := gittransport.FetchLocal(otherRepo, remoteDir, "backup", []string{"*"})
 	if err != nil {
 		t.Fatalf("本地 fetch 失败: %v", err)
 	}
@@ -273,5 +273,24 @@ push    = ["zero"]
 	}
 	if !otherRepo.HasObject(head) {
 		t.Fatal("取回后对象应可读")
+	}
+}
+
+func TestFetchBranchesDeterminesScope(t *testing.T) {
+	// 1. pull 优先
+	if got := fetchBranches([]string{"custom"}, []string{"fallback"}, false); len(got) != 1 || got[0] != "custom" {
+		t.Fatalf("pull 存在时必须优先使用: got %v", got)
+	}
+	// 2. pull 为空回落 push
+	if got := fetchBranches(nil, []string{"fallback"}, false); len(got) != 1 || got[0] != "fallback" {
+		t.Fatalf("pull 为空时应回落 push: got %v", got)
+	}
+	// 3. push_only 绝对不拉
+	if got := fetchBranches([]string{"custom"}, []string{"fallback"}, true); got != nil {
+		t.Fatalf("push_only 为真必须返回 nil: got %v", got)
+	}
+	// 4. 两者皆空返回 nil
+	if got := fetchBranches(nil, nil, false); got != nil {
+		t.Fatalf("两者皆空必须返回 nil: got %v", got)
 	}
 }

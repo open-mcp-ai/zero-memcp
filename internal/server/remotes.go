@@ -193,16 +193,44 @@ func (s *Server) execRemoteFetch(rest string, c Caller) (TermResult, error) {
 	}, nil
 }
 
+// fetchBranches 回答「这个远端允许取回哪些分支」。
+//
+// 取回哪些分支必须是显式配置的：[[remote]] 的 pull 优先，为空则回落到 push
+// （「只推不拉」由 push_only 单独表达，不靠列表为空来暗示）。两边都没写
+// 就是这个远端没有任何取回意图，此时去取任何东西都是猜的。
+//
+// 为什么不让「空」等于「全取」（2026-11-24 3060 链路）：对端广告什么就取
+// 什么，等于把「同步范围」交给对端单方面决定。weft 的 meta.index 是每台
+// 机器各自重建的索引快照（98 个 blob / 246 MB），一旦被 advertisement 带进
+// want，一次 fetch 就在打包上耗尽 90 秒预算，表现为「读响应超时」。
+// "*" 是唯一的通配，用来显式表达「这个远端就是要全取」。
+func fetchBranches(pull, push []string, pushOnly bool) []string {
+	if pushOnly {
+		return nil
+	}
+	if len(pull) > 0 {
+		return pull
+	}
+	return push
+}
+
 // fetchRemote 按远端类型分派取回。凭证只从服务端密钥库读。
 func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *gitstore.Repo) (gittransport.FetchResult, error) {
 	ctx := context.Background()
+	branches := fetchBranches(rm.Pull, rm.Push, rm.PushOnly)
+	if len(branches) == 0 {
+		if rm.PushOnly {
+			return gittransport.FetchResult{}, fmt.Errorf("remote %q is push_only: it never fetches anything back", rm.Name)
+		}
+		return gittransport.FetchResult{}, fmt.Errorf("remote %q declares no pull branches: add pull = [\"...\"] (or push, for a remote that pushes and pulls the same branches) to [[remote]]", rm.Name)
+	}
 	switch {
 	case gitremote.IsSSH(rm.URL):
 		key, err := s.readSSHKey(rm.SSHKey)
 		if err != nil {
 			return gittransport.FetchResult{}, fmt.Errorf("read SSH private key %q: %w", rm.SSHKey, err)
 		}
-		res, err := gittransport.FetchSSH(ctx, repo, rm.URL, rm.Name, string(key), rm.HostKey, remoteTimeout)
+		res, err := gittransport.FetchSSH(ctx, repo, rm.URL, rm.Name, string(key), rm.HostKey, branches, remoteTimeout)
 		if err != nil {
 			return res, err
 		}
@@ -212,14 +240,14 @@ func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *g
 		if err != nil {
 			return gittransport.FetchResult{}, err
 		}
-		res, err := gittransport.FetchHTTP(ctx, repo, rm.URL, rm.Name, rm.HTTPUser, token, remoteTimeout)
+		res, err := gittransport.FetchHTTP(ctx, repo, rm.URL, rm.Name, rm.HTTPUser, token, branches, remoteTimeout)
 		if err != nil {
 			return res, err
 		}
 		return res, s.keepReadableBranches(c, project, repo, rm.Name, res)
 	}
 	if _, ok := gittransport.LocalPath(rm.URL); ok {
-		res, err := gittransport.FetchLocal(repo, rm.URL, rm.Name)
+		res, err := gittransport.FetchLocal(repo, rm.URL, rm.Name, branches)
 		if err != nil {
 			return gittransport.FetchResult{}, err
 		}

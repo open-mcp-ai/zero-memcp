@@ -58,8 +58,9 @@ func localRepoPath(remoteURL string) (string, bool) {
 	return "", false
 }
 
-// FetchLocal 从本地裸仓库取回历史。
-func FetchLocal(repo *gitstore.Repo, remoteURL, remote string) (FetchResult, error) {
+// FetchLocal 从本地裸仓库取回历史。branches 语义与 FetchHTTP 一致：
+// 空表示不取任何分支，"*" 表示全取。
+func FetchLocal(repo *gitstore.Repo, remoteURL, remote string, branches []string) (FetchResult, error) {
 	path, ok := localRepoPath(remoteURL)
 	if !ok {
 		return FetchResult{}, fmt.Errorf("not a local-path remote: %s", remoteURL)
@@ -69,7 +70,6 @@ func FetchLocal(repo *gitstore.Repo, remoteURL, remote string) (FetchResult, err
 		return FetchResult{}, fmt.Errorf("open local remote repository: %w", err)
 	}
 	refs := map[string]string{}
-	var tips []string
 	list, err := src.Refs("refs/heads/")
 	if err != nil {
 		return FetchResult{}, err
@@ -80,8 +80,8 @@ func FetchLocal(repo *gitstore.Repo, remoteURL, remote string) (FetchResult, err
 			continue
 		}
 		refs[ref] = sha
-		tips = append(tips, sha)
 	}
+	tips := fetchTips(refs, branches)
 	res := FetchResult{Branches: map[string]string{}}
 	if len(tips) == 0 {
 		return res, nil
@@ -90,7 +90,7 @@ func FetchLocal(repo *gitstore.Repo, remoteURL, remote string) (FetchResult, err
 	if err != nil {
 		return res, fmt.Errorf("pack local remote objects: %w", err)
 	}
-	return applyFetch(repo, remote, refs, pack)
+	return applyFetch(repo, remote, refs, pack, branches)
 }
 
 // ListLocal 只读本地裸仓库的分支表。

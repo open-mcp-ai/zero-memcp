@@ -796,11 +796,8 @@ func (s *Server) syncOpsWithRemote(client *http.Client, rm configRemote, project
 			}
 		}
 	}
-	pullBranches := rm.Pull
-	if len(pullBranches) == 0 && !rm.PushOnly {
-		pullBranches = rm.Push
-	}
-	for _, br := range pullBranches {
+	// 取回哪些分支与 Git 层同一判据，不再各自算一份。
+	for _, br := range fetchBranches(rm.Pull, rm.Push, rm.PushOnly) {
 		if br == "*" {
 			continue
 		}

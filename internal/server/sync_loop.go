@@ -71,6 +71,13 @@ type syncState struct {
 //
 // 它不返回 error 给调用方决定流程：后台循环里单个项目的失败
 // 不该影响其他项目，失败原因记进 state 供状态输出查。
+// workSyncBudget 是一轮工作层同步的总时间预算。
+//
+// 给得足够宽：18,000 条命令 + 缺失 blob 的补传在慢速链路上也能走完
+// （实测 rock64 全量快照约 2 分钟）。它防的不是正常大传输，
+// 而是「对端不回了、连接半死」这种会把整条同步链永久堵住的形状。
+const workSyncBudget = 15 * time.Minute
+
 func (s *Server) syncOnce(project string, rm config.Remote) {
 	key := project + "@" + rm.Name
 	root := s.rootCaller()
@@ -462,6 +469,18 @@ func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gits
 	if err != nil {
 		return err
 	}
+	// 整轮同步必须有总预算。
+	//
+	// NewSyncClient 故意把 Timeout 设成 0（批量推送要等对端应用完整批，
+	// 20 秒的 Git 预算会误杀大批次），只留「连接 15s / 响应头 5min」。
+	// 但 runSyncPass 是**串行**跑所有目标的：一个对端卡在读 body 或补
+	// blob 上，后面每个目标都永远轮不到——而且一声不响。
+	//
+	// 实测（2026-11-24）：rock64 那一轮在 01:10 发出 18,444 条快照后再
+	// 也没有任何同步日志，直到 09:10 重启才恢复，中间 8 小时备份停摆，
+	// status 上却看不出任何异常。有限的时间预算换来的是一句能看见的
+	// 错误，比无声的无限等待强。
+	client.Timeout = workSyncBudget
 	token, err := s.optionalSecret(rm.HTTPToken, "http_token")
 	if err != nil {
 		return err

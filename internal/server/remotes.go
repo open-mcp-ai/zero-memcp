@@ -219,6 +219,48 @@ func fetchBranches(pull, push []string, pushOnly bool) []string {
 	return push
 }
 
+// branchAllowed 回答「这串白名单里是否允许某个分支」，"*" 是通配。
+func branchAllowed(scope []string, branch string) bool {
+	for _, s := range scope {
+		if s == "*" || s == branch {
+			return true
+		}
+	}
+	return false
+}
+
+// pruneRemoteRefs 把 refs/remotes/<remote>/* 对齐到配置声明的取回范围。
+//
+// 为什么必须剪（2026-11-24 3060 链路）：取回范围缩小之后，上一次按旧范围
+// 取回来的跟踪引用还留着；而 mergeRemoteRefs 只看 refs/remotes/<rm>/，
+// 于是那些「已经不在配置里」的分支每轮仍然被合并进本地分支，
+// 冲突也永远解不掉（现场表现：meta.index 一条 bge-m3.json 冲突挂在那里）。
+// 配置说不要，就必须真的不要——否则「显式声明范围」只是一句闲话。
+//
+// 返回被剪掉的分支名，供调用方出声。
+func pruneRemoteRefs(repo *gitstore.Repo, remote string, scope []string) ([]string, error) {
+	prefix := "refs/remotes/" + remote + "/"
+	refs, err := repo.Refs(prefix)
+	if err != nil {
+		return nil, err
+	}
+	var dropped []string
+	for _, ref := range refs {
+		branch := strings.TrimPrefix(ref, prefix)
+		if branch == "" || branch == ref {
+			continue
+		}
+		if branchAllowed(scope, branch) {
+			continue
+		}
+		if err := repo.DeleteRemoteRef(remote, branch); err != nil {
+			return dropped, err
+		}
+		dropped = append(dropped, branch)
+	}
+	return dropped, nil
+}
+
 // fetchRemote 按远端类型分派取回。凭证只从服务端密钥库读。
 func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *gitstore.Repo) (gittransport.FetchResult, error) {
 	ctx := context.Background()
@@ -239,7 +281,7 @@ func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *g
 		if err != nil {
 			return res, err
 		}
-		return res, s.keepReadableBranches(c, project, repo, rm.Name, res)
+		return res, s.keepReadableBranches(c, project, repo, rm.Name, branches, res)
 	case strings.HasPrefix(rm.URL, "http://"), strings.HasPrefix(rm.URL, "https://"):
 		token, err := s.optionalSecret(rm.HTTPToken, "http_token")
 		if err != nil {
@@ -249,14 +291,14 @@ func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *g
 		if err != nil {
 			return res, err
 		}
-		return res, s.keepReadableBranches(c, project, repo, rm.Name, res)
+		return res, s.keepReadableBranches(c, project, repo, rm.Name, branches, res)
 	}
 	if _, ok := gittransport.LocalPath(rm.URL); ok {
 		res, err := gittransport.FetchLocal(repo, rm.URL, rm.Name, branches)
 		if err != nil {
 			return gittransport.FetchResult{}, err
 		}
-		return res, s.keepReadableBranches(c, project, repo, rm.Name, res)
+		return res, s.keepReadableBranches(c, project, repo, rm.Name, branches, res)
 	}
 	return gittransport.FetchResult{}, fmt.Errorf("unsupported remote transport: %s", gitremote.Redact(rm.URL))
 }
@@ -266,7 +308,19 @@ func (s *Server) fetchRemote(c Caller, project string, rm config.Remote, repo *g
 // 取回发生在服务端：一次 fetch 会把远端**所有**分支的对象写进本地对象库。
 // 对象层面无法按分支隔离（内容寻址），所以边界只能画在「返回什么」上，
 // 并且不写回调用者读不到的分支指针。
-func (s *Server) keepReadableBranches(c Caller, project string, repo *gitstore.Repo, remote string, res gittransport.FetchResult) error {
+//
+// 同时把跟踪引用剪到配置声明的取回范围（scope）之内：两者都是「哪些
+// 分支不算数」的判据，分开写一定会漂移。
+func (s *Server) keepReadableBranches(c Caller, project string, repo *gitstore.Repo, remote string, scope []string, res gittransport.FetchResult) error {
+	dropped, err := pruneRemoteRefs(repo, remote, scope)
+	if err != nil {
+		return err
+	}
+	if len(dropped) > 0 {
+		sort.Strings(dropped)
+		s.logf("fetch %s <- %s: dropped %d tracking ref(s) outside the configured scope: %s",
+			project, remote, len(dropped), strings.Join(dropped, ", "))
+	}
 	for branch := range res.Branches {
 		if s.allowed(c, project, branch, configBitRead) {
 			continue

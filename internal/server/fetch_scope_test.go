@@ -396,3 +396,129 @@ func forwardUpload(t *testing.T, repoDir, action string, r *http.Request) []byte
 	}
 	return out
 }
+
+// 取回范围收窄之后，旧的跟踪引用必须被剪掉。
+//
+// 为什么这条必须单独钉住（2026-11-24 3060 链路）：范围收窄后，上一次按旧
+// 范围取回的 refs/remotes/<rm>/* 还留着，而 mergeRemoteRefs 只看
+// refs/remotes/<rm>/ —— 于是「已经不在配置里」的分支每轮仍然被合并进本地，
+// 冲突也永远解不掉（现场就是 meta.index 一条 bge-m3.json 冲突挂在那里）。
+//
+// 两阶段：先按宽范围取一次（两条都落地），再把配置收窄成一条重新取，
+// 第二条的跟踪引用必须消失。
+func TestFetchPrunesTrackingRefsOutsideScope(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	dataDir := t.TempDir()
+	remoteDir := filepath.Join(t.TempDir(), "remote.git")
+	runGit(t, t.TempDir(), "init", "--bare", remoteDir)
+
+	work := filepath.Join(t.TempDir(), "work")
+	runGit(t, t.TempDir(), "init", work)
+	runGit(t, work, "checkout", "-b", "main.record")
+	if err := os.WriteFile(filepath.Join(work, "a.md"), []byte("甲\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, work, "add", ".")
+	runGit(t, work, "commit", "-m", "a")
+	runGit(t, work, "push", remoteDir, "main.record")
+
+	runGit(t, work, "checkout", "-b", "meta.index")
+	if err := os.WriteFile(filepath.Join(work, "b.md"), []byte("乙\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, work, "add", ".")
+	runGit(t, work, "commit", "-m", "b")
+	runGit(t, work, "push", remoteDir, "meta.index")
+
+	hs := newUploadHTTP(t, remoteDir, "deploy", "ghp_token_value")
+	defer hs.Close()
+
+	localDir := filepath.Join(dataDir, "repos", "daily.git")
+	if _, err := gitstore.Init(localDir); err != nil {
+		t.Fatal(err)
+	}
+
+	// 起一个服务端，按给定的 push 列表跑一次 fetch
+	fetchWith := func(branches []string) {
+		t.Helper()
+		cfg := fmt.Sprintf(`
+[server]
+data = %q
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name  = "daily"
+owner = "zero"
+mode  = "rwx------"
+
+[[remote]]
+project    = "daily"
+name       = "github"
+url        = %q
+push       = [%s]
+http_user  = "deploy"
+http_token = "gh"
+`, dataDir, hs.URL+"/repo.git", quoteList(branches))
+		if err := osWrite(filepath.Join(dataDir, "zero-memcp.toml"), cfg); err != nil {
+			t.Fatal(err)
+		}
+		srv, err := New(Config{
+			DataDir:     dataDir,
+			ConfigFile:  filepath.Join(dataDir, "zero-memcp.toml"),
+			Listen:      "127.0.0.1:0",
+			EnforceAuth: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer srv.Close()
+
+		rootTok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "owner", Cap: "rwx"})
+		// token 落在 dataDir 下，第二阶段已经存在，不能再 put（写入即拒绝轮换）。
+		if _, err := os.Stat(filepath.Join(dataDir, "system", "secrets", "gh")); err != nil {
+			if _, perr := callMCPWithVars(t, srv, rootTok, "remote-secret put gh -- $TOKEN", map[string]string{"TOKEN": "ghp_token_value"}); perr != nil {
+				t.Fatalf("remote-secret put 失败: %v", perr)
+			}
+		}
+		if _, err := callMCP(t, srv, rootTok, "fetch daily github"); err != nil {
+			t.Fatalf("fetch 失败: %v", err)
+		}
+	}
+
+	// 第一阶段：两条都要
+	fetchWith([]string{"main.record", "meta.index"})
+	repo1, err := gitstore.Open(localDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo1.RemoteRef("github", "meta.index") == "" {
+		t.Fatal("前置条件：第一阶段应留下 origin/meta.index")
+	}
+
+	// 第二阶段：收窄成只剩 main.record
+	fetchWith([]string{"main.record"})
+	repo2, err := gitstore.Open(localDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := repo2.RemoteRef("github", "meta.index"); got != "" {
+		t.Fatalf("范围收窄后 origin/meta.index 必须被剪掉，实际还留着 %q", got)
+	}
+	if repo2.RemoteRef("github", "main.record") == "" {
+		t.Fatal("范围内的小分支不该被剪掉")
+	}
+}
+
+// quoteList 把分支名列表拼成 TOML 数组字面量。
+func quoteList(xs []string) string {
+	parts := make([]string, 0, len(xs))
+	for _, x := range xs {
+		parts = append(parts, fmt.Sprintf("%q", x))
+	}
+	return strings.Join(parts, ", ")
+}

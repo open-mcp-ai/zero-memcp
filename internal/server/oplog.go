@@ -138,6 +138,15 @@ type opBatch struct {
 	//
 	// 基准是空树时它为空：分支还没有任何提交，对端不需要拉任何东西。
 	BaseCommit string `json:"base_commit,omitempty"`
+	// Rebase 为真表示：这批命令落地之后，接收端要把自己的命令流基准
+	// 重设到「落地后的内容树」上。
+	//
+	// 两种批次会带它：整树快照、树到树差分。共同点是——它们描述的差异
+	// 是**相对对端手上那棵树**算出来的，落地后对端的内容就跑到本端的
+	// 位置上了，旧位点、旧基准全部作废。不带这个标记，接收端会一直停在
+	// 旧基准上，下一轮差分就会因为「基准对不上」被拒（实测报
+	// base tree mismatch (local 1ed2dc54, peer 3cdcb72d)）。
+	Rebase bool `json:"rebase,omitempty"`
 	// NeedRebase 为真表示对端报的基准与本端对不上，Ops 为空。
 	//
 	// 对端收到它就去浅拷贝 BaseCommit；BaseCommit 也为空则说明两边

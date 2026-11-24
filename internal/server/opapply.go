@@ -189,23 +189,6 @@ func (s *Server) applyTreeReplace(project, branch, peerNode string, ctx *opConte
 	// TestOpsSyncUncommittedAcrossNodes 追平后又 applied=1）。
 	//
 	// 两边各算各的同一棵树（内容寻址天然保证一致），增量才有共同的坐标原点。
-	if op.Rebase && s.workSync != nil && len(op.Batch) > 0 {
-		pathMap := make(map[string]gitstore.Entry, len(op.Batch))
-		for _, e := range op.Batch {
-			pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: gitstore.Mode(e.Mode), Hash: e.SHA}
-		}
-		if tree, werr := ctx.repo.WriteTreeFromPaths(pathMap); werr == nil && tree != "" {
-			s.workSync.noteBase(project, branch, peerNode, tree)
-			// 本端此后也以这棵树为准：快照把工作层对齐到了它。
-			if s.opLogs != nil {
-				if l, lerr := s.opLogs.For(project, branch); lerr == nil {
-					if rerr := l.Reset(tree); rerr != nil {
-						s.logf("op-sync: reset oplog base to %s for %s@%s: %v", shortSHA(tree), project, branch, rerr)
-					}
-				}
-			}
-		}
-	}
 	return nil
 }
 

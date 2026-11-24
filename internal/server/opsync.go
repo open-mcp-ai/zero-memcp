@@ -28,6 +28,57 @@ import (
 // batch.Node 是本节点的名字：它是这份日志的**真实属主**，对端必须
 // 用它来记水位。不能用本地配置里的对端别名——同一台机器在不同
 // 配置里可能叫不同名字，而日志属主只有一个。
+
+// diffTreesToOps 比对两棵树，把差异编码成一组普通的 set/delete 命令。
+//
+// 为什么必须有它（2026-11-24 根治整树重发）：
+// commit 发生后，本端命令流归零、基准前进。对端手上还停在
+// 上一次同步后的内容树上——两边基准对不上。
+// 早先遇到基准对不上就无脑发「整树快照（Replace=true）」，
+// 导致即使只改了 1 篇文档，也要每轮把 18,446 个条目全部序列化、
+// 网络传输、对端逐个比对。不仅浪费带宽和 CPU，还在日志里造成
+// 「永不收敛」的假象。
+//
+// 现在：先看本地对象库里认不认得对端手上的 baseTree。
+// 认得就直接 Diff 出增量命令（几十字节），声明 BaseTree = baseTree。
+// 接收端校验通过，只应用这几条增量。认不得才退回整树快照。
+func (s *Server) diffTreesToOps(project, branch, fromTree, toTree string) ([]treeOp, error) {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return nil, err
+	}
+	changes, err := repo.Diff(fromTree, toTree)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().Unix()
+	node := s.instanceID()
+	ops := make([]treeOp, 0, len(changes))
+	for i, c := range changes {
+		seq := int64(i + 1)
+		switch c.Kind {
+		case "added", "modified":
+			ops = append(ops, treeOp{
+				Seq:  seq,
+				Node: node,
+				Ts:   now,
+				Kind: opSet,
+				Path: c.Path,
+				Mode: string(c.Mode),
+				SHA:  c.Hash,
+			})
+		case "deleted":
+			ops = append(ops, treeOp{
+				Seq:  seq,
+				Node: node,
+				Ts:   now,
+				Kind: opDelete,
+				Path: c.Path,
+			})
+		}
+	}
+	return ops, nil
+}
 func (s *Server) exportOps(project, branch string, after int64) (opBatch, error) {
 	return s.exportOpsFrom(project, branch, after, "")
 }
@@ -58,88 +109,121 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	if err != nil {
 		return batch, err
 	}
-
 	cur := l.BaseTree()
-	// 对端基准可能是：
-	//   cur        —— 它跟上了本端命令流的原点
-	//   sentTree   —— 它收下了我们上次发的整树快照（内容树）
-	// 两者都表示「它手上的内容是本端流的某个前缀」，可以发增量。
-	aligned := baseTree == cur
-	if !aligned && baseTree != "" && peerNode != "" && s.workSync != nil {
-		if st := s.workSync.sentTreeOf(project, branch, peerNode); st != "" && st == baseTree {
-			aligned = true
-		}
-	}
-	// 声明给对端的基准就是它手上那棵：它据此校验，也据此记录。
-	// 声明给对端的基准必须是**它手上那棵树**，因为接收端拿它校验。
-	//
-	// 对端可能在流的原点上（cur），也可能在我们上次发的快照内容树上。
-	// 两种情况下这些命令都是「铺在它现有内容之上」——命令本身一样，
-	// 只是底座不同。声明成 cur 会让刚收过快照的对端报 base tree mismatch。
-	declared := cur
-	if aligned && baseTree != "" {
-		declared = baseTree
-	}
-	batch.BaseTree = declared
-	batch.BaseCommit = s.commitForTree(project, branch, declared)
 
-	// 基准对不上：位点在这里没有意义，只能发整树快照。
+	// 判据只用**内容树**，不用「我记得发过什么」。
 	//
-	// 这不是异常——两个节点各自提交过，基准必然不同。整树快照带
-	// Replace 语义，对端落地后自己的基准就变成这棵树，下一轮就能
-	// 走增量。想省掉这一趟大传输，对端先浅拷贝 BaseCommit 再来。
-	// baseTree 为空 = 对端手上什么都没有。这种对端同样需要整树快照，
-	// 除非本端自己也是空的（那就没什么可给）。
-	// 只有当对端**明确给出了基准**且对不上时，才发整树快照。
-	// baseTree 为空表示调用方只是在查增量命令（如 exportOps），
-	// 或者第一次同步、基准尚未建立——此时走普通命令流，不盲发整树。
-	if baseTree != "" && !aligned {
-		entries, ferr := s.flattenTreeToOps(project, branch)
-		if ferr != nil {
-			return batch, ferr
+	// 早先这里有一条捷径：对端报的基准等于上次发给它的内容树，就当成
+	// 「已对齐」发位点增量。它错在忽略了一件事——本端一提交，命令流就
+	// 归零，那批增量命令已经被折进新基准里，位点增量是空的。于是
+	// 「对端明明落后，我们却回了 0 条命令」，备份静默停摆。
+	// 内容树是确定的：相等就是真的相等，不等就必须算出差多少。
+	if baseTree == "" {
+		// 调用方只是要增量命令（exportOps），不关心基准。
+		batch.BaseTree = cur
+		batch.BaseCommit = s.commitForTree(project, branch, cur)
+		return s.exportOpsTail(batch, l, after, cur)
+	}
+
+	if baseTree == cur {
+		// 对端就在本端命令流的原点上：位点增量就是全部差异。
+		batch.BaseTree = cur
+		batch.BaseCommit = s.commitForTree(project, branch, cur)
+		return s.exportOpsTail(batch, l, after, cur)
+	}
+
+	// 基准不同：把两边都算成内容树，用内容判断差多少。
+	entries, ferr := s.flattenTreeToOps(project, branch)
+	if ferr != nil {
+		return batch, ferr
+	}
+	// 本端一棵空树、对端却有内容：这是唯一会把对端清空的形状，必须拒绝。
+	if len(entries) == 0 && baseTree != gitstore.EmptyTreeSHA {
+		return batch, fmt.Errorf(
+			"refusing to send an empty-tree snapshot for %s@%s: peer base %s is not empty, "+
+				"this would erase everything on the peer", project, branch, shortSHA(baseTree))
+	}
+	var curContentTree string
+	if repo, rerr := s.projects.Get(project); rerr == nil && len(entries) > 0 {
+		pathMap := make(map[string]gitstore.Entry, len(entries))
+		for _, e := range entries {
+			pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: gitstore.Mode(e.Mode), Hash: e.SHA}
 		}
-		// 本端一棵空树、对端却有内容：这是唯一会把对端清空的形状，
-		// 必须拒绝并点名，而不是安静地发一棵空树过去。
-		if len(entries) == 0 && baseTree != "" && baseTree != gitstore.EmptyTreeSHA {
-			return batch, fmt.Errorf(
-				"refusing to send an empty-tree snapshot for %s@%s: peer base %s is not empty, "+
-					"this would erase everything on the peer", project, branch, shortSHA(baseTree))
+		if tree, werr := repo.WriteTreeFromPaths(pathMap); werr == nil {
+			curContentTree = tree
 		}
-		// 内容树：对端落地后会算出同一个 SHA，并据此重设自己的基准。
-		if repo, rerr := s.projects.Get(project); rerr == nil && len(entries) > 0 && s.workSync != nil && peerNode != "" {
-			pathMap := make(map[string]gitstore.Entry, len(entries))
-			for _, e := range entries {
-				pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: gitstore.Mode(e.Mode), Hash: e.SHA}
-			}
-			if tree, werr := repo.WriteTreeFromPaths(pathMap); werr == nil && tree != "" {
-				s.workSync.noteSentTree(project, branch, peerNode, tree)
-			}
+	}
+
+	// 对端手上的内容已经和本端一模一样：一个字节都不发。
+	//
+	// 这是提交之后最常见的一轮——对端上次收到的就是本端当前的内容，
+	// 只是本端基准又前进了一次。认不出这种情况就会每轮重发整棵树。
+	if curContentTree != "" && curContentTree == baseTree {
+		if s.workSync != nil && peerNode != "" {
+			s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
 		}
-		batch.Ops = []treeOp{{
-			Kind:    opTree,
-			Replace: true,
-			Rebase:  true,
-			Batch:   entries,
-			Ts:      time.Now().Unix(),
-		}}
 		batch.To = l.Last()
-		s.logf("op-sync: %s@%s: peer base %s != local base %s; sending full tree snapshot (%d entries)",
-			project, branch, shortSHA(baseTree), shortSHA(cur), len(entries))
 		return batch, nil
 	}
 
+	// 首选：树到树差分，只发变化的路径。
+	//
+	// 对端报的基准是一棵真实的树（不是空树），且本地对象库里存着它，
+	// 就能直接算出差异。18,446 篇里改 1 篇就只发 1 条命令。
+	if baseTree != gitstore.EmptyTreeSHA && curContentTree != "" {
+		if diffOps, derr := s.diffTreesToOps(project, branch, baseTree, curContentTree); derr == nil {
+			batch.BaseTree = baseTree
+			batch.BaseCommit = s.commitForTree(project, branch, baseTree)
+			batch.Rebase = true
+			batch.Ops = diffOps
+			batch.To = l.Last()
+			if s.workSync != nil && peerNode != "" {
+				s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
+			}
+			s.logf("op-sync: %s@%s: peer base %s -> content %s: %d delta op(s) (tree diff, no full snapshot)",
+				project, branch, shortSHA(baseTree), shortSHA(curContentTree), len(diffOps))
+			return batch, nil
+		}
+	}
+
+	// 回退：对端是空树，或本地没有对端那棵树（认不出差异只能整树给）。
+	batch.BaseTree = cur
+	batch.BaseCommit = s.commitForTree(project, branch, cur)
+	batch.Rebase = true
+	if s.workSync != nil && peerNode != "" && curContentTree != "" {
+		s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
+	}
+	batch.Ops = []treeOp{{
+		Kind:    opTree,
+		Replace: true,
+		Rebase:  true,
+		Batch:   entries,
+		Ts:      time.Now().Unix(),
+	}}
+	batch.To = l.Last()
+	s.logf("op-sync: %s@%s: peer base %s != local base %s; sending full tree snapshot (%d entries)",
+		project, branch, shortSHA(baseTree), shortSHA(cur), len(entries))
+	return batch, nil
+}
+
+// exportOpsTail 收尾两条「对端就在本端原点上」的路径：按位点发增量。
+//
+// 位点只在同一段流里可比：提交会让流归零，位点从 1 重来。对端报的位点
+// 超过本端流长，说明它记的是上一段流的位点——此时按 0 处理（从新流的
+// 开头发），而不是发空批次把对端晾在原地。
+func (s *Server) exportOpsTail(batch opBatch, l *opLog, after int64, cur string) (opBatch, error) {
 	// 读侧播种：对端从位点 0 开始拉、而本地日志尚为空且基准是空树时，
 	// 先把当前整棵树作为第一条批量命令播进日志。
 	//
-	// 注意它与上面的快照是互斥的：快照走的是 !aligned 分支（Rebase = true），
-	// 播种走的是普通日志（Rebase = false）。
-	// 有了 op.Rebase 区分，落地端知道这条只是普通命令，不会重设基准，
-	// 于是两边对齐后不会再出现「追平后又 applied」的打架。
-	if aligned && after == 0 && l.Last() == 0 && cur == gitstore.EmptyTreeSHA {
+	// 注意它与整树快照互斥：快照走 Rebase 分支，播种走普通日志。
+	// 有了 Rebase 区分，落地端知道这条只是普通命令，不会重设基准。
+	if after == 0 && l.Last() == 0 && cur == gitstore.EmptyTreeSHA {
 		if serr := l.seedIfEmpty(); serr != nil {
-			s.logf("oplog: seed initial tree for %s@%s: %v", project, branch, serr)
+			s.logf("oplog: seed initial tree for %s@%s: %v", batch.Project, batch.Branch, serr)
 		}
-		batch.To = l.Last()
+	}
+	if after > l.Last() {
+		after = 0
 	}
 	batch.Ops = l.Since(after)
 	batch.To = l.Last()
@@ -194,6 +278,20 @@ func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult
 		return res, err
 	}
 	s.commitOpsLocal(project, branch, batch.Node, batch.Ops, res)
+
+	// 批次级重设基准：整树快照与树到树差分都带这个标记。
+	//
+	// 它们的差异是**相对对端手上那棵树**算出来的，落地后本端内容就跑到
+	// 了发送端的位置上，旧位点、旧基准全部作废。必须把命令流基准重设到
+	// 「落地后的内容树」，否则下一轮发送端按新树算差分，本端还停在旧树上，
+	// 校验直接拒收：base tree mismatch。
+	//
+	// 放在批次级而不是单条 op 上，是因为差分批次里没有任何一条 op 是
+	// 「整树命令」——它只是一串普通的 set/delete，只有批次本身知道
+	// 「这批合起来等于一棵新树」。
+	if batch.Rebase {
+		s.rebaseLocalToContent(project, branch, batch.Node)
+	}
 	s.learnPeerIdentity(batch.Node, batch.Node)
 	// 只有在命令真正被处理之后才推进对端水位：
 	// 「收到了」不等于「落地了」，先推进水位会让丢命令变成永久丢失。
@@ -210,6 +308,39 @@ func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult
 	return res, nil
 }
 
+
+// rebaseLocalToContent 把本端命令流的基准重设到「当前工作层的完整内容树」。
+//
+// 只在收到带 Rebase 标记的批次后调用：那批命令已经把本端内容对齐到了
+// 发送端，于是本端的坐标原点也该跟着走。
+func (s *Server) rebaseLocalToContent(project, branch, peerNode string) {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return
+	}
+	flat, ferr := repo.FlattenBranch(branch)
+	if ferr != nil || len(flat) == 0 {
+		return
+	}
+	pathMap := make(map[string]gitstore.Entry, len(flat))
+	for _, e := range flat {
+		pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: e.Mode, Hash: e.SHA}
+	}
+	tree, werr := repo.WriteTreeFromPaths(pathMap)
+	if werr != nil || tree == "" {
+		return
+	}
+	if s.workSync != nil && peerNode != "" {
+		s.workSync.noteBase(project, branch, peerNode, tree)
+	}
+	if s.opLogs != nil {
+		if l, lerr := s.opLogs.For(project, branch); lerr == nil {
+			if rerr := l.Reset(tree); rerr != nil {
+				s.logf("op-sync: reset oplog base to %s for %s@%s: %v", shortSHA(tree), project, branch, rerr)
+			}
+		}
+	}
+}
 func (s *Server) notePeerSeq(project, branch, peerNode string, seq int64) {
 	noteWatermark(&s.workSync.in, workKey(project, branch, peerNode), seq)
 }
@@ -524,11 +655,17 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	s.workSync.noteOut(project, branch, peerName, l.Last())
 	// 记给对端的基准：快照落地后对端手上的树是内容树，不是本端原点。
 	// 记错了下一轮就会按原点声明增量，对端按内容树校验，永远对不上。
+	// 对端手上的内容推进到哪了：
+	//   整树快照 → 我们算出的那棵内容树
+	//   差分批次 → 也是那棵内容树（对端收下全部增量后内容就等于它）
+	//   普通增量 → 同上，内容跟着前进
+	// 三种情况其实一致：对端收下这批之后，内容就是本端当前的内容。
+	//
+	// 认错了的后果是每轮都判定「对端落后」→ 每轮重算并重发同一批差分，
+	// 备份永不收敛（这正是本轮要根治的形状）。
 	newPeerTree := batch.BaseTree
-	if isSnapshotBatch(batch) {
-		if st := s.workSync.sentTreeOf(project, branch, peerKey); st != "" {
-			newPeerTree = st
-		}
+	if st := s.workSync.sentTreeOf(project, branch, peerKey); st != "" {
+		newPeerTree = st
 	}
 	s.workSync.notePeerTree(project, branch, peerKey, newPeerTree)
 	s.workSync.noteBase(project, branch, peerKey, curBase)

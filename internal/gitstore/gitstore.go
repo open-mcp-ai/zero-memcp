@@ -1994,6 +1994,14 @@ type Change struct {
 	Path string
 	// Kind: "added" / "modified" / "deleted"
 	Kind string
+	// Hash 是 to 那边的 blob SHA；deleted 时为空。
+	//
+	// 命令流同步要用它：树到树的差分最终表示成一串 set/delete 命令，
+	// 没有目标 SHA 就只能退回「重发整棵树」。只给路径不给 SHA 的
+	// 差分对同步没有意义。
+	Hash string
+	// Mode 同理，set 命令要带文件模式。
+	Mode Mode
 }
 
 // Diff 比对两个分支的内容，返回相对 from 而言 to 有哪些变化。
@@ -2044,9 +2052,9 @@ func (r *Repo) Diff(from, to string) ([]Change, error) {
 		old, existed := oldEntries[e.Path]
 		switch {
 		case !existed:
-			out = append(out, Change{Path: e.Path, Kind: "added"})
+			out = append(out, Change{Path: e.Path, Kind: "added", Hash: e.Hash, Mode: e.Mode})
 		case old.Hash != e.Hash:
-			out = append(out, Change{Path: e.Path, Kind: "modified"})
+			out = append(out, Change{Path: e.Path, Kind: "modified", Hash: e.Hash, Mode: e.Mode})
 		}
 	}
 	for p := range oldEntries {
@@ -2132,8 +2140,26 @@ func (r *Repo) listAtCommit(sha string) ([]Entry, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 也接受树对象。
+	//
+	// 命令流同步要做「对端手上那棵树 → 我现在的树」的差分，两边都是
+	// 裸树 SHA（内容寻址算出来的，不对应任何提交）。只认 commit 的话
+	// 这条路直接断掉，只能退回重发整棵树——实测每次提交后 18,446 条
+	// 里只有 1 条真的变了。
+	if typ == "tree" {
+		out := map[string]Entry{}
+		if err := r.loadTree(sha, "", out); err != nil {
+			return nil, err
+		}
+		list := make([]Entry, 0, len(out))
+		for _, e := range out {
+			list = append(list, e)
+		}
+		sort.Slice(list, func(i, j int) bool { return list[i].Path < list[j].Path })
+		return list, nil
+	}
 	if typ != "commit" {
-		return nil, fmt.Errorf("%s is not a commit but %s", sha, typ)
+		return nil, fmt.Errorf("%s is not a commit or tree but %s", sha, typ)
 	}
 	c := parseCommit(body)
 	out := map[string]Entry{}

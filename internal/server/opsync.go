@@ -685,6 +685,46 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	return res, nil
 }
 
+// firstBlockedSeq 返回「缺正文的命令」里最小的那个 seq。
+//
+// 水位要钉在它之前：水位是「到这儿为止都落地了」的声明，而这条没落地。
+func firstBlockedSeq(ops []treeOp, missing []string) int64 {
+	want := make(map[string]bool, len(missing))
+	for _, sha := range missing {
+		want[sha] = true
+	}
+	var first int64
+	for _, op := range ops {
+		if op.SHA == "" || !want[op.SHA] {
+			continue
+		}
+		if first == 0 || op.Seq < first {
+			first = op.Seq
+		}
+	}
+	return first
+}
+
+// seqOfSHA 找出某份正文对应的命令位点（留证要能点名「卡在哪一条」）。
+func seqOfSHA(ops []treeOp, sha string) int64 {
+	for _, op := range ops {
+		if op.SHA == sha && op.Seq != 0 {
+			return op.Seq
+		}
+	}
+	return 0
+}
+
+// pathOfSHA 找出某份正文对应的路径（留证要能点名「哪个文件没取回来」）。
+func pathOfSHA(ops []treeOp, sha string) string {
+	for _, op := range ops {
+		if op.SHA == sha && op.Path != "" {
+			return op.Path
+		}
+	}
+	return ""
+}
+
 // pullOpsFromPeer 从对端拉命令，落地并补齐对象。
 func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, project, branch string) (opApplyResult, error) {
 	var zero opApplyResult
@@ -745,6 +785,7 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	}
 	if len(res.Missing) > 0 {
 		seen := map[string]bool{}
+		failed := map[string]string{} // sha -> 错误
 		for _, sha := range res.Missing {
 			if seen[sha] {
 				continue
@@ -752,19 +793,51 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 			seen[sha] = true
 			body, berr := getWorkBlob(client, baseURL, token, project, branch, sha)
 			if berr != nil {
-				var zero opApplyResult
-				return zero, fmt.Errorf("fetch blob %s: %w", sha, berr)
+				// 不再整批退出（2026-11-24 群内评审第 1 条）：
+				// 一个正文取不回来，其余路径不该被它拖住。
+				failed[sha] = berr.Error()
+				continue
 			}
 			if aerr := s.applyWorkBlob(project, sha, body); aerr != nil {
-				return res, aerr
+				failed[sha] = aerr.Error()
+				continue
 			}
 		}
-		// 对象补齐后重放：这次 Missing 应为空。
+		// 对象补齐后重放：这一遍应当把已补齐的那些路径落下去。
 		res, err = s.applyOps(project, branch, batch.Node, batch.Ops)
 		if err != nil {
 			return res, err
 		}
 		s.commitOpsLocal(project, branch, batch.Node, batch.Ops, res)
+
+		// 仍然缺的那些命令：留证，并把水位钉在它之前。
+		//
+		// 为什么必须钉（而不是直接推进到 batch.To）：水位一过，下一轮
+		// 就不会再拉这几条，丢的内容永远补不回来。回退的代价是尾部重拉
+		// 一遍，而 applyOp 对同内容已经幂等跳过（不重写、不重刷、不重广播）。
+		if len(res.Missing) > 0 {
+			pin := firstBlockedSeq(batch.Ops, res.Missing)
+			for _, sha := range res.Missing {
+				if seen[sha] && failed[sha] == "" {
+					continue // 已经补回来了，还在 Missing 里只是重放顺序问题
+				}
+				s.workSync.noteBlocked(blockedBlob{
+					Project: project, Branch: branch, Peer: batch.Node,
+					Path: pathOfSHA(batch.Ops, sha), SHA: sha,
+					Seq: seqOfSHA(batch.Ops, sha), At: time.Now(),
+					LastErr: failed[sha],
+				})
+			}
+			if pin > 0 {
+				forceWatermark(&s.workSync.in, workKey(project, branch, batch.Node), pin-1)
+				s.logf("op-sync: %s@%s: %d 条命令缺正文，已把水位钉在 seq %d（其余命令已落地）",
+					project, branch, len(res.Missing), pin-1)
+			}
+		} else {
+			if n := s.workSync.clearBlockedPeer(project, branch, batch.Node); n > 0 {
+				s.logf("op-sync: %s@%s: %d 条缺正文已补齐，留证已清除", project, branch, n)
+			}
+		}
 	}
 	s.recordSync(syncRecord{
 		Dir: "pull", Peer: peerName, Node: batch.Node,
@@ -850,6 +923,36 @@ func (s *Server) opSyncLines(c Caller) []string {
 		out = append(out, line)
 		return true
 	})
+	// 缺正文留证：这是「同步为什么没走完」的直接答案，必须能被看到。
+	//
+	// 为什么放在这里（2026-11-24 群内评审第 1 条）：早先它什么都不说——
+	// 一个 blob 取不回来，整批静默退回去，从外面只能看到「水位不动」。
+	// 那是一种最贵的故障：有人会在错误的前提上盖三层楼。
+	if s.workSync != nil {
+		blocked := s.workSync.blockedAll()
+		visible := blocked[:0:0]
+		for _, b := range blocked {
+			if s.allowed(c, b.Project, b.Branch, configBitRead) {
+				visible = append(visible, b)
+			}
+		}
+		if len(visible) > 0 {
+			out = append(out, fmt.Sprintf("op-sync: %d 条命令缺正文，同步已钉在它们之前", len(visible)))
+			const show = 5
+			for i, b := range visible {
+				if i >= show {
+					out = append(out, fmt.Sprintf("  … 还有 %d 条", len(visible)-show))
+					break
+				}
+				line := fmt.Sprintf("  BLOCKED %s@%s:%s (seq %d, sha %s, %d 次)",
+					b.Project, b.Branch, b.Path, b.Seq, shortSHA(b.SHA), b.Attempts)
+				if b.LastErr != "" {
+					line += " — " + b.LastErr
+				}
+				out = append(out, line)
+			}
+		}
+	}
 	return out
 }
 

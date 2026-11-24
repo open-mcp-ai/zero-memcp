@@ -244,7 +244,7 @@ func (s *Server) applyOp(project, branch, peerNode string, ctx *opContext, op tr
 			return "", fmt.Errorf("apply set %s: %w", op.Path, err)
 		}
 		ctx.local[op.Path] = gitstore.DirtyChange{Path: op.Path, Mode: gitstore.Mode(op.Mode), SHA: op.SHA}
-		s.clearWorkConflict(project, branch, op.Path)
+		s.clearWorkConflict(project, branch, peerNode, op.Path)
 		res.Applied++
 		return "", nil
 

@@ -415,6 +415,13 @@ func New(cfg Config) (*Server, error) {
 		return nil, errors.New("data directory required: pass -data or set [server] data in the config file")
 	}
 
+	// 安全红线：对外可达的监听面不许开「本机免签当 root」的后门。
+	//
+	// 放在拿实例锁之前：配置错就是配置错，不该先去动数据目录。
+	if err := checkAuthPosture(cfg.Listen, cfg.EnforceAuth, listenBlocks(cfgFile)); err != nil {
+		return nil, err
+	}
+
 	// 数据目录独占锁。必须在读 jwt.key / ui.passwd 之前拿到：
 	//
 	// 两个实例同时启动时会争着生成签名密钥与管理口令，
@@ -1130,6 +1137,12 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"service": "zero-memcp",
 		"version": Version,
 		"listen":  s.Addr(),
+		// 鉴权姿态必须一眼可见，而且不带凭证也要看得见。
+		//
+		// 为什么放在探活里：这是唯一一个不需要凭证就能问的入口。
+		// 排查「为什么本机能免证写」时，人应该在这儿看到答案，
+		// 而不是去翻配置文件猜 enforce_auth 到底是什么。
+		"auth": authPosture(s.Addr(), s.cfg.EnforceAuth),
 	}
 
 	// 健康检查是未鉴权入口（探活要用它），所以它只说「我活着」。

@@ -83,10 +83,11 @@ type workApplyResult struct {
 
 // workConflict 是一条工作层冲突。
 type workConflict struct {
-	Path      string `json:"path"`
-	LocalSHA  string `json:"local_sha"`
-	RemoteSHA string `json:"remote_sha"`
-	Peer      string `json:"peer"`
+	Path      string    `json:"path"`
+	LocalSHA  string    `json:"local_sha"`
+	RemoteSHA string    `json:"remote_sha"`
+	Peer      string    `json:"peer"`
+	At        time.Time `json:"at,omitempty"`
 	// Kind 区分两种完全不同的处境：
 	//
 	//	ConflictSet    —— 双方内容不同，本地版本被保留，等人裁决。
@@ -106,6 +107,51 @@ const (
 	ConflictSet    = "set"
 	ConflictDelete = "delete"
 )
+
+// workConflictRecord 是落盘用的冲突记录。
+//
+// 为什么要包一层：project/branch/peer 原本只存在于 sync.Map 的键里，
+// 而键不是数据。落盘必须把它们一起写下去，否则重启后认不出这条冲突
+// 属于哪个分支、哪个对端。
+type workConflictRecord struct {
+	Project string `json:"project"`
+	Branch  string `json:"branch"`
+	workConflict
+}
+
+// workConflictsRecorded 把内存里的冲突连同坐标一起取出来（供落盘）。
+func (s *Server) workConflictsRecorded() []workConflictRecord {
+	var out []workConflictRecord
+	s.workSync.conflicts.Range(func(k, v any) bool {
+		ks, ok := k.(string)
+		if !ok {
+			return true
+		}
+		parts := strings.SplitN(ks, "\x00", 4)
+		if len(parts) != 4 {
+			return true
+		}
+		c, ok := v.(workConflict)
+		if !ok {
+			return true
+		}
+		out = append(out, workConflictRecord{Project: parts[0], Branch: parts[1], workConflict: c})
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Project != out[j].Project {
+			return out[i].Project < out[j].Project
+		}
+		if out[i].Branch != out[j].Branch {
+			return out[i].Branch < out[j].Branch
+		}
+		if out[i].Peer != out[j].Peer {
+			return out[i].Peer < out[j].Peer
+		}
+		return out[i].Path < out[j].Path
+	})
+	return out
+}
 
 // workSyncState 保存每个 (project@branch -> peer) 的水位。
 //
@@ -142,6 +188,108 @@ type workSyncState struct {
 	sentTrees sync.Map // string -> string
 	// conflicts 是 project\x00branch\x00path -> workConflict。
 	conflicts sync.Map
+	// deleteEvicted 记录因为超过上限而被淘汰的删除留证总数。
+	deleteEvicted atomic.Int64
+	// blocked 是「正文在本地拿不到」的命令留证，键 project\x00branch\x00peer\x00sha。
+	//
+	// 为什么必须单独存（2026-11-24 群内评审第 1 条）：早先一个 blob 取不回来，
+	// pullOpsFromPeer 就直接整批 return——不写 synclog、不推进水位，下一轮
+	// 拉的是同一批、挂在同一个位置。对端若永久丢了那个对象，这条分支就永久停摆，
+	// 而且从头到尾没有任何一处看得出来。
+	//
+	// 现在的做法：其余命令照常落地，水位钉在缺正文那条之前（保序，重试安全），
+	// 同时把缺什么、缺了多久、缺了几次写在这里，并随 opsync.json 落盘。
+	blocked sync.Map
+}
+
+// blockedBlob 是一条「正文没拿到、因此没能落地」的命令。
+type blockedBlob struct {
+	Project  string    `json:"project"`
+	Branch   string    `json:"branch"`
+	Peer     string    `json:"peer"`
+	Path     string    `json:"path,omitempty"`
+	SHA      string    `json:"sha"`
+	Seq      int64     `json:"seq"`
+	At       time.Time `json:"at"`
+	Attempts int       `json:"attempts"`
+	LastErr  string    `json:"last_err,omitempty"`
+}
+
+func blockedKey(project, branch, peer, sha string) string {
+	return project + "\x00" + branch + "\x00" + peer + "\x00" + sha
+}
+
+// noteBlocked 记下（或更新）一条缺正文的命令。重复失败累加次数。
+func (w *workSyncState) noteBlocked(b blockedBlob) {
+	k := blockedKey(b.Project, b.Branch, b.Peer, b.SHA)
+	if prev, ok := w.blocked.Load(k); ok {
+		if old, ok := prev.(blockedBlob); ok {
+			b.At = old.At
+			b.Attempts = old.Attempts + 1
+		}
+	}
+	if b.Attempts == 0 {
+		b.Attempts = 1
+	}
+	w.blocked.Store(k, b)
+}
+
+// blockedFor 返回某条分支上被卡住的命令。
+func (w *workSyncState) blockedFor(project, branch string) []blockedBlob {
+	var out []blockedBlob
+	w.blocked.Range(func(_, v any) bool {
+		if b, ok := v.(blockedBlob); ok && b.Project == project && b.Branch == branch {
+			out = append(out, b)
+		}
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out
+}
+
+// blockedAll 返回全部留证（供 status 汇总）。
+func (w *workSyncState) blockedAll() []blockedBlob {
+	var out []blockedBlob
+	w.blocked.Range(func(_, v any) bool {
+		if b, ok := v.(blockedBlob); ok {
+			out = append(out, b)
+		}
+		return true
+	})
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Project != out[j].Project {
+			return out[i].Project < out[j].Project
+		}
+		if out[i].Branch != out[j].Branch {
+			return out[i].Branch < out[j].Branch
+		}
+		return out[i].Seq < out[j].Seq
+	})
+	return out
+}
+
+// clearBlockedPeer 在「这批已经没有缺正文的命令」时抹掉该对端该分支的留证。
+func (w *workSyncState) clearBlockedPeer(project, branch, peer string) int {
+	n := 0
+	w.blocked.Range(func(k, v any) bool {
+		if b, ok := v.(blockedBlob); ok && b.Project == project && b.Branch == branch && b.Peer == peer {
+			w.blocked.Delete(k)
+			n++
+		}
+		return true
+	})
+	return n
+}
+
+// forceWatermark 直接把水位写成某个值（可以回退）。
+//
+// 为什么需要回退（2026-11-24）：注入时把水位当成「已到这儿」，只升不降。
+// 但「有命令没能落地」时水位必须钉在它之前，否则下一轮不会再拉它，
+// 丢的内容永远补不回来。回退是有代价的（尾部会重拉一遍），所以只在留证
+// 存在时用，而且因为 applyOp 对同内容已经幂等，重拉不会重写不会重刷索引。
+func forceWatermark(m *sync.Map, key string, seq int64) {
+	actual, _ := m.LoadOrStore(key, new(atomic.Int64))
+	actual.(*atomic.Int64).Store(seq)
 }
 
 func newWorkSyncState() *workSyncState {
@@ -247,41 +395,80 @@ func (s *Server) recordWorkConflict(project, branch, path, localSHA, remoteSHA, 
 	if kind == ConflictDelete {
 		s.evictOldDeleteConflict()
 	}
-	s.workSync.conflicts.Store(project+"\x00"+branch+"\x00"+path, workConflict{
-		Path: path, LocalSHA: localSHA, RemoteSHA: remoteSHA, Peer: peer, Kind: kind,
+	s.workSync.conflicts.Store(workConflictKey(project, branch, peer, path), workConflict{
+		Path: path, LocalSHA: localSHA, RemoteSHA: remoteSHA, Peer: peer, Kind: kind, At: time.Now(),
 	})
 }
 
 // workDeleteConflictKeep 是内存里保留的删除留证条数上限。
-const workDeleteConflictKeep = 100
-
-// evictOldDeleteConflict 在删除留证超过上限时丢掉一条最旧的。
 //
-// 用 sync.Map 没有顺序，所以丢哪条不确定——这里要的是「数量有界、
-// 证据不断流」，不是严格 FIFO。daemon.log 才是完整账本。
+// 上限设为 1000（2026-11-24 群内评审第 4 条）：100 条在批量操作时
+// 眨眼就被冲刷掉。调大至 1000 条，配合严格 FIFO 淘汰与显式计数，
+// 保证账本不断流，哪怕达到上限淘汰的也是真正最旧的一批。
+const workDeleteConflictKeep = 1000
+
+type deleteEntryWithKey struct {
+	key string
+	at  time.Time
+}
+
+// evictOldDeleteConflict 在删除留证超过上限时丢掉最旧的一批。
+//
+// 为什么必须按时间严格排序（群内评审第 4 条）：早先直接取 sync.Map.Range
+// 碰到的第一条删掉，被丢的不一定是最旧的，甚至是刚进来的证据，
+// 造成留证完全随机丢失。这里收集所有删除留证，严格按 At 排序淘汰最旧的，
+// 并累加 deleteEvicted 计数，保证 status 能喊出来。
 func (s *Server) evictOldDeleteConflict() {
-	n := 0
-	s.workSync.conflicts.Range(func(_, v any) bool {
-		if c, ok := v.(workConflict); ok && c.Kind == ConflictDelete {
-			n++
-		}
-		return true
-	})
-	if n < workDeleteConflictKeep {
-		return
-	}
+	var dels []deleteEntryWithKey
 	s.workSync.conflicts.Range(func(k, v any) bool {
 		if c, ok := v.(workConflict); ok && c.Kind == ConflictDelete {
-			s.workSync.conflicts.Delete(k)
-			return false
+			dels = append(dels, deleteEntryWithKey{key: k.(string), at: c.At})
 		}
 		return true
 	})
+	if len(dels) < workDeleteConflictKeep {
+		return
+	}
+	sort.Slice(dels, func(i, j int) bool {
+		return dels[i].at.Before(dels[j].at)
+	})
+	// 每次淘汰超出的部分（至少 1 条），保持总量不超过上限
+	toRemove := len(dels) - workDeleteConflictKeep + 1
+	for i := 0; i < toRemove && i < len(dels); i++ {
+		s.workSync.conflicts.Delete(dels[i].key)
+		s.workSync.deleteEvicted.Add(1)
+	}
+}
+
+// workConflictKey 是工作层冲突的键。
+//
+// 为什么必须带 peer（2026-11-24 群内评审第 3 条）：早先键是
+// project\x00branch\x00path，三台机器同时改同一路径时，后到的记录把先到的
+// 盖掉——多方冲突只剩最后一次的裁决请求，前面的证据全丢。
+func workConflictKey(project, branch, peer, path string) string {
+	return project + "\x00" + branch + "\x00" + peer + "\x00" + path
 }
 
 // clearWorkConflict 在两端重新一致后清掉冲突。
-func (s *Server) clearWorkConflict(project, branch, path string) {
-	s.workSync.conflicts.Delete(project + "\x00" + branch + "\x00" + path)
+//
+// 只清这个对端的：别的对端对同一路径的冲突还没解决，替它销账等于
+// 把一条待裁决的事静默抹掉。
+func (s *Server) clearWorkConflict(project, branch, peer, path string) {
+	if peer == "" {
+		// 不知道对端时退化成「清掉这条路径的所有对端记录」——宁可多清
+		// 也不能留一条永远清不掉的幽灵冲突。
+		s.workSync.conflicts.Range(func(k, _ any) bool {
+			if ks, ok := k.(string); ok {
+				parts := strings.SplitN(ks, "\x00", 4)
+				if len(parts) == 4 && parts[0] == project && parts[1] == branch && parts[3] == path {
+					s.workSync.conflicts.Delete(k)
+				}
+			}
+			return true
+		})
+		return
+	}
+	s.workSync.conflicts.Delete(workConflictKey(project, branch, peer, path))
 }
 
 // workConflicts 列出当前未解决的冲突。
@@ -416,7 +603,7 @@ func (s *Server) importWorkDelta(project, branch string, d *workDelta) (workAppl
 			return res, fmt.Errorf("apply set %s: %w", ch.Path, err)
 		}
 		// 同路径再次达成一致：把这条冲突记录清掉。
-		s.clearWorkConflict(project, branch, ch.Path)
+		s.clearWorkConflict(project, branch, d.Node, ch.Path)
 		res.Applied++
 	}
 	return res, nil
@@ -952,7 +1139,12 @@ func (s *Server) workConflictLines(c Caller) []string {
 		}
 	}
 	if len(dels) > 0 {
-		out = append(out, fmt.Sprintf("%d path(s) unlinked by a peer delete (nothing to resolve; blob kept, recoverable):", len(dels)))
+		header := fmt.Sprintf("%d path(s) unlinked by a peer delete (nothing to resolve; blob kept, recoverable)", len(dels))
+		if ev := s.workSync.deleteEvicted.Load(); ev > 0 {
+			header += fmt.Sprintf(" [%d older historical evidence rotated to daemon.log]", ev)
+		}
+		header += ":"
+		out = append(out, header)
 		for i, cf := range dels {
 			if i >= 10 {
 				out = append(out, fmt.Sprintf("  ... (%d more)", len(dels)-i))

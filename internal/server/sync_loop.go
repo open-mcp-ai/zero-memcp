@@ -234,8 +234,41 @@ func (s *Server) recordSyncErr(key, msg string) {
 	s.syncState.lastErr.Store(key, msg)
 }
 
+// syncConflictKey 是 Git 层冲突的键。
+//
+// 为什么必须带 remote（2026-11-24 群内评审第 3 条）：早先键是
+// project@branch，同一分支对两个对端各有冲突时，后到的把先到的盖掉。
+func syncConflictKey(c syncConflict) string {
+	return c.Project + "\x00" + c.Branch + "\x00" + c.Remote
+}
+
 func (s *Server) addSyncConflict(c syncConflict) {
-	s.syncState.conflicts.Store(c.Project+"@"+c.Branch, c)
+	k := syncConflictKey(c)
+	// 同一个对端再次冲突：路径取并集，不要用后一次的清单覆盖前一次——
+	// 那会让「某个路径还欠裁决」凭空消失。
+	if prev, ok := s.syncState.conflicts.Load(k); ok {
+		if old, ok := prev.(syncConflict); ok {
+			seen := map[string]bool{}
+			for _, p := range old.Paths {
+				seen[p] = true
+			}
+			for _, p := range c.Paths {
+				if !seen[p] {
+					old.Paths = append(old.Paths, p)
+					seen[p] = true
+				}
+			}
+			old.At = c.At
+			old.Remote = c.Remote
+			c = old
+		}
+	}
+	s.syncState.conflicts.Store(k, c)
+	// 立即落盘：Git 层冲突出现在合并流程里，不经过 pull/push 的收尾保存点。
+	// 一次重启就把它忘掉，等于把「还欠一次裁决」变成不存在。
+	if err := s.saveOpSyncState(); err != nil {
+		s.logf("sync: persist conflict %s@%s: %v", c.Project, c.Branch, err)
+	}
 }
 
 // SyncConflicts 返回待决议冲突的副本（供状态输出与 WebUI）。
@@ -249,8 +282,16 @@ func (s *Server) SyncConflicts() []syncConflict {
 }
 
 // ClearSyncConflict 人工处理完冲突后清掉记录。
+//
+// 清掉该分支**所有对端**的记录：人工裁决是针对内容的，裁决完了
+// 不该因为对端名字不同而留下一条永远清不掉的幽灵。
 func (s *Server) ClearSyncConflict(project, branch string) {
-	s.syncState.conflicts.Delete(project + "@" + branch)
+	s.syncState.conflicts.Range(func(k, v any) bool {
+		if c, ok := v.(syncConflict); ok && c.Project == project && c.Branch == branch {
+			s.syncState.conflicts.Delete(k)
+		}
+		return true
+	})
 }
 
 // syncTargets 列出所有纳入自动同步的 (project, remote)。

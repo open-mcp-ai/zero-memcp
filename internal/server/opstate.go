@@ -42,6 +42,24 @@ type opSyncState struct {
 	// PeerTrees 记录各对端手上的内容树。重启后不能丢：
 	// 丢了下一轮就会判成「不知道对端有什么」而重发整棵树。
 	PeerTrees map[string]string `json:"peer_trees,omitempty"`
+	// Blocked 是「正文在本地拿不到」的命令留证。
+	//
+	// 必须落盘（群内评审第 2 条同类问题）：它是「同步为什么没走完」的唯一
+	// 证据，重启就失的话，一次重启就把一个正在挂着的故障变成不可见。
+	Blocked []blockedBlob `json:"blocked,omitempty"`
+	// WorkConflicts 是工作层的待裁决冲突。
+	//
+	// 必须落盘（群内评审第 2 条）：早先它只在内存里，重启后 status 不再报，
+	// 但冲突还躺在盘上——本地那份没被覆盖、远端那份也在对象库，就是没人
+	// 知道还欠着裁决。一次重启把一个待办事项变成不存在。
+	WorkConflicts []workConflictRecord `json:"work_conflicts,omitempty"`
+	// GitConflicts 是 Git 层（分支级）的待裁决冲突。
+	GitConflicts []syncConflict `json:"git_conflicts,omitempty"`
+	// DeleteEvicted 是累计被淘汰的删除留证条数。
+	//
+	// 这个数字必须落盘：它是对「有多少证据已经不在内存里」的唯一交代。
+	// 归零会让 status 假报「一条都没丢」。
+	DeleteEvicted int64 `json:"delete_evicted,omitempty"`
 }
 
 // opSyncStatePath 返回水位文件的路径。
@@ -81,6 +99,20 @@ func (s *Server) loadOpSyncState() error {
 	}
 	for k, v := range st.PeerTrees {
 		s.workSync.peerTrees.Store(k, v)
+	}
+	// 缺正文留证一并恢复：一次重启不能把一个正挂着的故障变成不可见。
+	for _, b := range st.Blocked {
+		s.workSync.blocked.Store(blockedKey(b.Project, b.Branch, b.Peer, b.SHA), b)
+	}
+	// 冲突一并恢复：重启不该让「还欠一次裁决」这件事消失。
+	for _, c := range st.WorkConflicts {
+		s.workSync.conflicts.Store(workConflictKey(c.Project, c.Branch, c.Peer, c.Path), c.workConflict)
+	}
+	for _, c := range st.GitConflicts {
+		s.syncState.conflicts.Store(syncConflictKey(c), c)
+	}
+	if st.DeleteEvicted > 0 {
+		s.workSync.deleteEvicted.Store(st.DeleteEvicted)
 	}
 	// 别名先于水位生效：水位查询要靠它把配置别名翻成属主名。
 	for alias, node := range st.Aliases {
@@ -127,6 +159,10 @@ func (s *Server) saveOpSyncState() error {
 		st.Bases[k.(string)] = v.(string)
 		return true
 	})
+	st.Blocked = s.workSync.blockedAll()
+	st.WorkConflicts = s.workConflictsRecorded()
+	st.GitConflicts = s.SyncConflicts()
+	st.DeleteEvicted = s.workSync.deleteEvicted.Load()
 
 	data, err := json.MarshalIndent(st, "", "  ")
 	if err != nil {

@@ -213,22 +213,35 @@ func readFramedPack(r io.Reader) ([]byte, error) {
 
 // localHaves 收集本地已有的 tip，交给远端做「这些我都有」的排除。
 //
-// 只取分支尖：给太多 have 并不会更省，反而拖长协商；
-// 而少给几个只会多收一点对象，不会出错。
+// 为什么必须同时收集 refs/heads/ 与 refs/remotes/（2026-11-24 实测）：
+// 一个纯下游节点（如备份节点、或只读客户端）根本没有本地分支，
+// 所有的历史都挂在 refs/remotes/<upstream>/* 下面。只看 heads 的实现
+// 会在第二轮 fetch 时声明「我没有任何 have」，导致对端把整条历史
+// 又打成一个 pack 发过来——已对齐时短路完全失效，每轮都在全量重传。
+//
+// 保持在 maxHaves 以内：给太多 have 并不会更省，反而拖长协商。
 func localHaves(repo *gitstore.Repo) []string {
-	refs, err := repo.Refs("refs/heads/")
-	if err != nil {
-		return nil
-	}
-	if len(refs) > maxHaves {
-		refs = refs[:maxHaves]
-	}
+	seen := map[string]bool{}
 	var out []string
-	for _, ref := range refs {
-		if sha, err := repo.Resolve(ref); err == nil && validSHA(sha) {
+	add := func(prefix string) {
+		refs, err := repo.Refs(prefix)
+		if err != nil {
+			return
+		}
+		for _, ref := range refs {
+			if len(out) >= maxHaves {
+				return
+			}
+			sha, err := repo.Resolve(ref)
+			if err != nil || !validSHA(sha) || seen[sha] {
+				continue
+			}
+			seen[sha] = true
 			out = append(out, sha)
 		}
 	}
+	add("refs/heads/")
+	add("refs/remotes/")
 	return out
 }
 

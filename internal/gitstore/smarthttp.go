@@ -380,44 +380,47 @@ func (r *Repo) WriteUploadPack(out io.Writer, req *uploadPackRequest) error {
 	// 这一判必须在遍历**之前**：放在后面就只能省下 have 闭包那一轮，
 	// 而 want 闭包本身就是那次 90 秒。
 	//
-	// 不发空 pack 而直接 return：pack 头里写 0 个对象是合法但没必要的往返，
-	// 而 ACK 已经在上面发出去了，客户端会把它读成「什么都没有，收工」。
+	// 注意仍然要发一个**空 pack**，不能直接 return（2026-11-24 部署到 3060
+	// 当场撞出来）：v0 协议里 ACK/NAK 之后必定跟一个 packfile，差集为空时
+	// git 发的是「0 个对象的 PACK」，而不是什么都不发。直接 return 会让客户端
+	// 在读完 ACK 去读 pack 头时拿到 EOF（现场错误：`read pack: EOF`），
+	// 真实 git 客户端则会报 "the remote end hung up unexpectedly"。
+	covered := false
 	if len(req.wants) > 0 && len(req.haves) > 0 {
-		covered := true
+		covered = true
 		for sha := range req.wants {
 			if !req.haves[sha] {
 				covered = false
 				break
 			}
 		}
-		if covered {
-			return nil
-		}
 	}
 
 	objects := map[string]bool{}
-	for sha := range req.wants {
-		if err := r.collectReachable(sha, objects); err != nil {
-			return fmt.Errorf("collect objects for %s: %w", sha, err)
-		}
-	}
-
-	// 差集：客户端已经有的对象不再发送。
-	//
-	// have 指向的对象在本仓库不存在时（对端历史、已 gc 掉的）忽略即可——
-	// 差集少减一点只会多发，不会发错。
-	//
-	// continuation 场景（最终轮不带 have）要把上一轮记住的共同基点也算进来，
-	// 否则「协商成功」只体现在 ACK 上，包里还是全量。
-	if len(req.haves) > 0 {
-		already := map[string]bool{}
-		for sha := range req.haves {
-			if err := r.collectReachable(sha, already); err != nil {
-				continue
+	if !covered {
+		for sha := range req.wants {
+			if err := r.collectReachable(sha, objects); err != nil {
+				return fmt.Errorf("collect objects for %s: %w", sha, err)
 			}
 		}
-		for sha := range already {
-			delete(objects, sha)
+
+		// 差集：客户端已经有的对象不再发送。
+		//
+		// have 指向的对象在本仓库不存在时（对端历史、已 gc 掉的）忽略即可——
+		// 差集少减一点只会多发，不会发错。
+		//
+		// continuation 场景（最终轮不带 have）要把上一轮记住的共同基点也算进来，
+		// 否则「协商成功」只体现在 ACK 上，包里还是全量。
+		if len(req.haves) > 0 {
+			already := map[string]bool{}
+			for sha := range req.haves {
+				if err := r.collectReachable(sha, already); err != nil {
+					continue
+				}
+			}
+			for sha := range already {
+				delete(objects, sha)
+			}
 		}
 	}
 

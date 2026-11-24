@@ -379,8 +379,16 @@ func TestUploadPackShortCircuitsWhenWantsAlreadyInHaves(t *testing.T) {
 	if !strings.Contains(string(resp), "ACK") {
 		t.Fatalf("应回 ACK，实际: %q", string(resp))
 	}
-	if strings.Contains(string(resp), "PACK") {
-		t.Fatalf("短路时不应生成 PACK，实际包含: %q", string(resp))
+	// 短路时仍然必须发一个合法的空 pack（0 个对象），不能什么都不发：
+	// v0 协议里 ACK/NAK 之后必定跟一个 packfile，缺失会让客户端读到 EOF
+	// （2026-11-24 部署到 3060 的现场错误：`read pack: EOF`）。
+	if !strings.Contains(string(resp), "PACK") {
+		t.Fatalf("ACK 之后必须跟一个空 pack，实际: %q", string(resp))
+	}
+	// 空 pack = PACK + 版本 + 0 个对象 + sha1 = 32 字节，外加 sideband 分帧。
+	// 总量应当很小；出现真实对象就说明短路没生效（phantom 还可能被读）。
+	if len(resp) > 200 {
+		t.Fatalf("短路时应是空 pack（<200 字节），实际 %d 字节", len(resp))
 	}
 
 	// 场景 B（反向对照）：同一个 phantom 不在 have 里时，必须真正去读它并失败。

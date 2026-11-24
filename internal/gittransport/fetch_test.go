@@ -608,3 +608,62 @@ func TestApplyFetchNeverWritesUnrequestedRemoteRef(t *testing.T) {
 		t.Fatalf("要的分支引用应保持 %s，实际 %q", headRecord, got)
 	}
 }
+
+// 已对齐时再取一次必须成功，而且不能带来任何新对象。
+//
+// 为什么这条必须单独钉住（2026-11-24 部署短路到 3060 当场撞出来）：
+// 差集为空时服务端发的是「0 个对象的 PACK」，客户端如果在读完 ACK/NAK 后
+// 直接撞上流末尾，就会报 `read pack: EOF`——把「本来就没有东西要传」
+// 误报成传输中断。auto-sync 每轮都会走这条路径，一旦它失败，
+// 同步永远停在「上一轮成功」那一刻，而且报出来的是一行看起来像网络问题的错。
+func TestHTTPFetchWhenAlreadyUpToDateSucceeds(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	root := t.TempDir()
+	remoteDir := filepath.Join(root, "remote.git")
+	runTestGit(t, "init", "--bare", remoteDir)
+
+	work := filepath.Join(root, "work")
+	runTestGit(t, "init", work)
+	runGitIn(t, work, "checkout", "-b", "main.record")
+	writeFileTest(t, filepath.Join(work, "a.md"), `甲
+`)
+	runGitIn(t, work, "add", ".")
+	runGitIn(t, work, "-c", "user.email=t@example.invalid", "-c", "user.name=t", "commit", "-m", "a")
+	runGitIn(t, work, "push", remoteDir, "main.record")
+	head := gitOutTest(t, work, "rev-parse", "HEAD")
+
+	srv := uploadPackHTTP(t, remoteDir, "reader", "tok")
+	defer srv.Close()
+
+	local, err := gitstore.Init(filepath.Join(root, "local.git"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 第一轮：真的取回对象
+	first, err := FetchHTTP(context.Background(), local, srv.URL+"/repo.git", "origin", "reader", "tok", fetchAllBranches, 20*time.Second)
+	if err != nil {
+		t.Fatalf("第一轮 fetch 失败: %v", err)
+	}
+	if first.Branches["main.record"] != head {
+		t.Fatalf("第一轮应取到 main.record=%s，实际 %v", head, first.Branches)
+	}
+
+	// 第二轮：两端已对齐，服务端会短路并发一个空 pack。
+	// 这一轮必须成功，不能报 `read pack: EOF`。
+	second, err := FetchHTTP(context.Background(), local, srv.URL+"/repo.git", "origin", "reader", "tok", fetchAllBranches, 20*time.Second)
+	if err != nil {
+		t.Fatalf("已对齐时再 fetch 必须成功，实际失败: %v", err)
+	}
+	if second.Branches["main.record"] != head {
+		t.Fatalf("已对齐时分支指针应保持不变: %v", second.Branches)
+	}
+	if second.Written != 0 {
+		t.Fatalf("已对齐时不该写入任何新对象，实际写了 %d 个", second.Written)
+	}
+	if got := local.RemoteRef("origin", "main.record"); got != head {
+		t.Fatalf("refs/remotes/origin/main.record 应保持 %s，实际 %q", head, got)
+	}
+}

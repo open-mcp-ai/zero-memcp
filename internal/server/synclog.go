@@ -462,8 +462,15 @@ func (s *Server) syncTopology(c Caller) (upstreams, peers, downstreams []syncPee
 		}
 	}
 	for _, v := range served {
-		// 已经由配置推导出来的不重复列。
-		if hasPeer(downstreams, v.Name, v.Project, v.Branch) {
+		// 已经由配置推导出来的不重复列——三个角色都要查。
+		//
+		// 只查 downstreams 会让同一条分支换个角色再出现一次：配置说
+		// 「我只推它」（downstream），而很久以前配过 pull、流水里留着
+		// 一条旧 pull 记录，于是 pulled 那边也把它列进 upstream，
+		// 用的是几小时前的数字。同一时刻两个角色两套说法。
+		if hasPeer(downstreams, v.Name, v.Project, v.Branch) ||
+			hasPeer(upstreams, v.Name, v.Project, v.Branch) ||
+			hasPeer(peers, v.Name, v.Project, v.Branch) {
 			continue
 		}
 		// 对端追到哪 = 流水里的 To；我这边到哪 = 本地日志头。
@@ -481,7 +488,12 @@ func (s *Server) syncTopology(c Caller) (upstreams, peers, downstreams []syncPee
 		downstreams = append(downstreams, v)
 	}
 	for _, v := range pulled {
-		if hasPeer(upstreams, v.Name, v.Project, v.Branch) {
+		// 同上：三个角色都查。实测 hub-3060 就是被这条漏掉的——
+		// 配置里只声明了 push，却被列进 upstream，报 never synced，
+		// 而 sync <project> <remote> 报的是 pushed out (out seq 1)。
+		if hasPeer(upstreams, v.Name, v.Project, v.Branch) ||
+			hasPeer(downstreams, v.Name, v.Project, v.Branch) ||
+			hasPeer(peers, v.Name, v.Project, v.Branch) {
 			continue
 		}
 		switch {

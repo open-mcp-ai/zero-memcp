@@ -1101,6 +1101,26 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 // 大多数对等配置只写一次分支名单，意图就是这几条保持双向一致，
 // 不该逼人把同一组名字抄两遍。
 func (s *Server) syncOpsWithRemote(client *http.Client, rm configRemote, project string) error {
+	// **先拉后推**，不能反过来。
+	//
+	// 推送要算差分，而差分的起点是「对端手上是哪棵树」——那个信息
+	// 只有拉取能带来。先推就成了鸡生蛋：记忆为空 → 按「对端是空的」
+	// 发整树快照 → 19064 条推给开着索引的对端，逐条 refreshPath 抢
+	// 分支写令牌，推送侧等不到字节超时 → 拉取永远轮不到 → 记忆永远
+	// 空着。实测卡了 180 秒以上，日志里同一行整树快照反复出现。
+	//
+	// 拉在前还有个好处：对端的新内容先落地，推送时能一并把双向差异
+	// 算干净，一轮就好。
+	if !rm.PushOnly {
+		for _, br := range fetchBranches(rm.Pull, rm.Push, rm.PushOnly) {
+			if br == "*" {
+				continue
+			}
+			if _, err := s.pullOpsFromPeer(client, rm.URL, rm.Token, rm.Name, project, br); err != nil {
+				return fmt.Errorf("pull %s: %w", br, err)
+			}
+		}
+	}
 	if !rm.FetchOnly {
 		for _, br := range rm.Push {
 			if br == "*" {
@@ -1109,15 +1129,6 @@ func (s *Server) syncOpsWithRemote(client *http.Client, rm configRemote, project
 			if _, err := s.pushOpsToPeer(client, rm.URL, rm.Token, rm.Name, project, br); err != nil {
 				return fmt.Errorf("push %s: %w", br, err)
 			}
-		}
-	}
-	// 取回哪些分支与 Git 层同一判据，不再各自算一份。
-	for _, br := range fetchBranches(rm.Pull, rm.Push, rm.PushOnly) {
-		if br == "*" {
-			continue
-		}
-		if _, err := s.pullOpsFromPeer(client, rm.URL, rm.Token, rm.Name, project, br); err != nil {
-			return fmt.Errorf("pull %s: %w", br, err)
 		}
 	}
 	return nil

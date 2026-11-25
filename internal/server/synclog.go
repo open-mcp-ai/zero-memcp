@@ -348,7 +348,12 @@ func writePeerLine(sb *strings.Builder, v syncPeerView, now time.Time) {
 	case "behind":
 		fmt.Fprintf(sb, "    behind %d (local %d, peer %d)%s\n", v.Behind, v.LocalSeq, v.PeerSeq, age)
 	case "never":
-		fmt.Fprintf(sb, "    never synced (peer is at seq %d)%s\n", v.PeerSeq, age)
+		// 不说 "never synced"：水位两边都是 0 只说明「这条分支上从没有
+		// 命令流经过」，不说明两边内容不一致。实测 zero@main.record 与
+		// main.chat 三端内容树完全相同，per-project 视图报 `in sync (0 op)`，
+		// 而这里报 never synced——同一时刻两个视图，一个说一致、一个说
+		// 从没同步过。内容一致却零命令是正常的：整树快照不产生命令。
+		fmt.Fprintf(sb, "    no command stream (peer at seq %d)%s\n", v.PeerSeq, age)
 	default:
 		fmt.Fprintf(sb, "    unknown position%s\n", age)
 	}

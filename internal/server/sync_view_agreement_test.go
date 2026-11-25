@@ -73,11 +73,11 @@ func TestSyncViewsAgreeOnPeerBranch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("sync（无参）: %v", err)
 	}
-	// 不能只查 "never synced"：键统一之后水位读得到 0，而 PeerHead 已经是
-	// 位点，于是同一条已对齐的分支会改报 "behind 1"——一样是错的。
-	// 要钉的是「它必须说 caught up」，不是「它别说不含某个词」。
-	if strings.Contains(out2.Text, "never synced") {
-		t.Fatalf("无参视图把已经对齐的分支报成「从未同步」——\n"+
+	// 不能只查某个否定词：键统一之后水位读得到 0，而 PeerHead 已经是位点，
+	// 于是同一条已对齐的分支会改报 "behind 1"——一样是错的。要钉的是
+	// 「它必须说 caught up」，不是「它别说不含某个词」。
+	if strings.Contains(out2.Text, "no command stream") {
+		t.Fatalf("无参视图把已经有命令流的分支报成没有——\n"+
 			"同一时刻 sync <project> <remote> 报的是 in sync。\n无参视图:\n%s", out2.Text)
 	}
 	if strings.Contains(out2.Text, "behind") {

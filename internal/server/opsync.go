@@ -393,7 +393,6 @@ func (s *Server) verifyBatchContent(project, branch string, batch opBatch, res o
 		res.Applied, res.Deleted, len(res.Rejected))
 }
 
-
 // rebaseLocalToContent 把本端命令流的基准重设到「当前工作层的完整内容树」。
 //
 // 只在收到带 Rebase 标记的批次后调用：那批命令已经把本端内容对齐到了
@@ -666,7 +665,7 @@ func postOpPush(client *http.Client, baseURL, token string, batch opBatch) (opAp
 	}
 	if resp.StatusCode != http.StatusOK {
 		var zero opApplyResult
-				return zero, fmt.Errorf("op-push %s: %s", resp.Status, strings.TrimSpace(string(data)))
+		return zero, fmt.Errorf("op-push %s: %s", resp.Status, strings.TrimSpace(string(data)))
 	}
 	if err := json.Unmarshal(data, &res); err != nil {
 		return res, err
@@ -768,7 +767,6 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 			if s.opLogs != nil {
 				if l, lerr := s.opLogs.For(project, branch); lerr == nil {
 					s.workSync.noteOut(project, branch, peerName, l.Last())
-	s.workSync.noteOutOps(project, branch, peerName, len(batch.Ops))
 				}
 			}
 		}
@@ -842,7 +840,7 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		}
 		if len(res.Missing) > 0 {
 			var zero opApplyResult
-				return zero, fmt.Errorf("peer still reports %d missing blob(s) after upload", len(res.Missing))
+			return zero, fmt.Errorf("peer still reports %d missing blob(s) after upload", len(res.Missing))
 		}
 	}
 	// 对端拒收的命令必须出声。
@@ -853,14 +851,19 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	if len(res.Rejected) > 0 {
 		s.logf("op-sync: peer %s REJECTED %d op(s) for %s@%s — these did NOT land: %s",
 			peerName, len(res.Rejected), project, branch, func() string {
-			if len(res.Rejected) <= 3 {
-				return strings.Join(res.Rejected, "; ")
-			}
-			return strings.Join(res.Rejected[:3], "; ") + fmt.Sprintf(" ... (+%d more)", len(res.Rejected)-3)
-		}())
+				if len(res.Rejected) <= 3 {
+					return strings.Join(res.Rejected, "; ")
+				}
+				return strings.Join(res.Rejected[:3], "; ") + fmt.Sprintf(" ... (+%d more)", len(res.Rejected)-3)
+			}())
 	}
 	// 只有对端确认之后才推进本地水位，并记下这个水位属于哪段流。
+	// 只有对端确认之后才推进本地水位，并记下这个水位属于哪段流。
 	s.workSync.noteOut(project, branch, peerName, l.Last())
+	// 这一轮实际传了几条。水位说「推到哪了」，它说「这一轮做了多少」，
+	// 两者只在一直有东西传时才一起前进；内容一致时传 0 条，status
+	// 只看水位就会把「一致」和「刚推过」混起来。
+	s.workSync.noteOutOps(project, branch, peerName, len(batch.Ops))
 	// 记给对端的基准：对端收下这批之后手上是哪棵树。
 	//
 	// 必须是**这批命令的终端内容树**（batch.ContentTree），不是

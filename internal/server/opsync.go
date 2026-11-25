@@ -973,6 +973,13 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 		}
 	}
 	haveTree := s.currentContentTree(project, branch)
+	if haveTree == "" && baseTree != gitstore.EmptyTreeSHA {
+		// 内容树算不出来是个**安静的失败**：对端只能退回按原点理解，
+		// 然后发来整树快照。必须点名，否则表现为「同步很慢」。
+		s.logf("op-sync: pull %s@%s to %s: cannot compute local content tree; "+
+			"peer will fall back to a full snapshot (base_tree=%s)",
+			project, branch, peerName, shortSHA(baseTree))
+	}
 	batch, err := postOpPullFrom(client, baseURL, token, project, branch, s.instanceID(), after, baseTree, haveTree)
 	if err != nil {
 		return zero, err

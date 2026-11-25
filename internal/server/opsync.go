@@ -313,6 +313,29 @@ func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult
 //
 // 只在收到带 Rebase 标记的批次后调用：那批命令已经把本端内容对齐到了
 // 发送端，于是本端的坐标原点也该跟着走。
+// currentContentTree 把一条分支当前的工作层内容算成一棵内容树。
+//
+// 「当前」= 含未折叠的脏层。对端快照落地后，本端内容就是这棵树。
+func (s *Server) currentContentTree(project, branch string) string {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return ""
+	}
+	flat, ferr := repo.FlattenBranch(branch)
+	if ferr != nil || len(flat) == 0 {
+		return ""
+	}
+	pathMap := make(map[string]gitstore.Entry, len(flat))
+	for _, e := range flat {
+		pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: e.Mode, Hash: e.SHA}
+	}
+	tree, werr := repo.WriteTreeFromPaths(pathMap)
+	if werr != nil {
+		return ""
+	}
+	return tree
+}
+
 func (s *Server) rebaseLocalToContent(project, branch, peerNode string) {
 	repo, err := s.projects.Get(project)
 	if err != nil {
@@ -332,6 +355,23 @@ func (s *Server) rebaseLocalToContent(project, branch, peerNode string) {
 	}
 	if s.workSync != nil && peerNode != "" {
 		s.workSync.noteBase(project, branch, peerNode, tree)
+		// 同时记下「对端手上是哪棵树」。
+		//
+		// 为什么这里能确定（2026-11-25 实测）：带 Rebase 的批次落地后，
+		// 本端内容**等于**发送端内容——这正是 Rebase 的语义。于是这棵树
+		// 既是我现在的基准，也是对端此刻的内容。
+		//
+		// 不记的后果很贵：推送侧不知道对端有什么，只能按「对端是空的」
+		// 发整树快照。实测把 18872 条路径的全量快照推给开着索引的 3060，
+		// 它逐条 refreshPath 抢分支写令牌，一个索引重建就把令牌占满，
+		// 随后满屏「分支写令牌等待超时（1m0s）」，推送侧 5 分钟等不到字节
+		// 直接超时。而这次内容两边其实一模一样，本该一条命令都不发。
+		//
+		// 只有 exact 才能这么记：整树 Replace 落地时会**保留**本地未提交
+		// 改动（那是「正在想、还没说出口」的内容，不能被覆盖）。只要留了
+		// 一条，本端内容就不再等于对端内容，记下去会让推送侧按错误的基准
+		// 算差分——比不记更糟。
+
 	}
 	if s.opLogs != nil {
 		if l, lerr := s.opLogs.For(project, branch); lerr == nil {
@@ -642,6 +682,15 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		res, err = postOpPush(client, baseURL, token, batch)
 	}
 	if err != nil {
+		// 推失败必须把「我记得发出过什么」一起作废。
+		//
+		// 导出器在**发送之前**就记了 sentTree（它只负责算批，不知道成败）。
+		// 失败却留着这条记忆，下一轮就会按「对端已经有了」算差分，
+		// 而对端其实没收到——被拒、回落、再发快照、再失败，死循环。
+		if s.workSync != nil {
+			s.workSync.forgetSentTree(project, branch, peerKey)
+			s.workSync.forgetPeerTree(project, branch, peerKey)
+		}
 		return res, err
 	}
 	if len(res.Missing) > 0 {
@@ -885,6 +934,24 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 			if n := s.workSync.clearBlockedPeer(project, branch, batch.Node); n > 0 {
 				s.logf("op-sync: %s@%s: %d 条缺正文已补齐，留证已清除", project, branch, n)
 			}
+		}
+	}
+	// 这一批是权威整树（Rebase）且完整落地时，记下「对端手上是哪棵树」。
+	//
+	// 为什么必须等补完 blob 再判：ingestOps 那一刻缺正文的命令还没补，
+	// Missing 必然非空，此刻判「完整落地」一定为假。
+	// 为什么只在无保留时判：整树 Replace 会保留本地未提交改动，只要留了
+	// 一条，本端内容就不再等于对端内容，记错基准比不记更糟。
+	if batch.Rebase && len(res.Missing) == 0 && len(res.Kept) == 0 && len(res.Conflicted) == 0 {
+		if tree := s.currentContentTree(project, branch); tree != "" && s.workSync != nil {
+			// 必须重算：ingestOps 里那次 rebase 发生在补正文之前，
+			// 那时缺正文的路径还不存在，算出来的树是不完整的。
+			s.workSync.noteBase(project, branch, batch.Node, tree)
+			// 不记的后果：推送侧只能按「对端是空的」发全量快照。
+			// 实测把 18872 条路径推给开着索引的 3060，逐条 refreshPath
+			// 抢分支写令牌，满屏「写令牌等待超时（1m0s）」，推送侧超时。
+			// 而那一刻两边内容其实完全一样，本该一条命令都不发。
+			s.workSync.notePeerTree(project, branch, batch.Node, tree)
 		}
 	}
 	s.recordSync(syncRecord{

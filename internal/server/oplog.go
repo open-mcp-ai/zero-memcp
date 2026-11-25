@@ -147,6 +147,18 @@ type opBatch struct {
 	// 旧基准上，下一轮差分就会因为「基准对不上」被拒（实测报
 	// base tree mismatch (local 1ed2dc54, peer 3cdcb72d)）。
 	Rebase bool `json:"rebase,omitempty"`
+	// ContentTree 是发送端在发出这批命令时的**完整内容树**：这批命令
+	// 全部落地之后，接收端的内容必须等于它。
+	//
+	// 为什么需要它：基准树只能证明「我们从同一个点出发」，证明不了
+	// 「我们到了同一个地方」。中间丢一条命令、某条被拒、正文没补齐，
+	// 基准都还是对的，内容却已经不一样——而且两边都不报错。有了
+	// ContentTree，接收端落地后自己算一遍就能比对：不等就出声、不记
+	// 对端水位，下一轮走树到树差分补齐，而不是把错误当成同步完成。
+	//
+	// 发送端本来就要算这棵树（树到树差分的输入），所以这里不新增开销。
+	// 只在 Rebase 批次上填：位点增量批次不带它，接收端跳过校验。
+	ContentTree string `json:"content_tree,omitempty"`
 	// NeedRebase 为真表示对端报的基准与本端对不上，Ops 为空。
 	//
 	// 对端收到它就去浅拷贝 BaseCommit；BaseCommit 也为空则说明两边

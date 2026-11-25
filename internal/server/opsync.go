@@ -175,6 +175,7 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 			batch.BaseTree = baseTree
 			batch.BaseCommit = s.commitForTree(project, branch, baseTree)
 			batch.Rebase = true
+			batch.ContentTree = curContentTree
 			batch.Ops = diffOps
 			batch.To = l.Last()
 			if s.workSync != nil && peerNode != "" {
@@ -190,6 +191,7 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	batch.BaseTree = cur
 	batch.BaseCommit = s.commitForTree(project, branch, cur)
 	batch.Rebase = true
+	batch.ContentTree = curContentTree
 	if s.workSync != nil && peerNode != "" && curContentTree != "" {
 		s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
 	}
@@ -305,7 +307,47 @@ func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult
 			s.workSync.noteBase(project, branch, batch.Node, l.BaseTree())
 		}
 	}
+	// 内容比对：发送端声明「这批落地后你应该等于 ContentTree」。
+	// 放在最后，是因为只有应用完才算得出本端内容。
+	if verr := s.verifyBatchContent(project, branch, batch, res); verr != nil {
+		return res, verr
+	}
 	return res, nil
+}
+
+// verifyBatchContent 校验「应用完这批命令，本端内容是否等于发送端声明的树」。
+//
+// 这是整个同步的正确性底线。水位、基准、位点都只是**效率**机制：它们
+// 决定发什么，不决定对不对。对不对由这一比决定——任何一条命令丢失、
+// 被拒、或正文没补齐，都会在这里现形，而不是变成两边的静默分歧。
+//
+// 三种情况跳过，因为它们都是「内容本就不该相等」的合法状态：
+//   - 批次没声明 ContentTree（位点增量批次不带它）；
+//   - 还有正文没到（Missing 非空）：缺正文的路径不存在，树必然不完整，
+//     等补完 blob 重放之后再校；
+//   - 保留了本地改动（Kept / Conflicted 非空）：整树 Replace 会保留本地
+//     未提交内容，此刻两端内容**本就应该不同**。
+//
+// Rejected 不在跳过之列：有命令被拒正是最需要比对的时候。若拒绝没有
+// 造成内容差异（例如幂等的重复投递），比对自然通过，不会误报。
+func (s *Server) verifyBatchContent(project, branch string, batch opBatch, res opApplyResult) error {
+	if batch.ContentTree == "" || !batch.Rebase {
+		return nil
+	}
+	if len(res.Missing) > 0 || len(res.Kept) > 0 || len(res.Conflicted) > 0 {
+		return nil
+	}
+	got := s.currentContentTree(project, branch)
+	if got == batch.ContentTree {
+		return nil
+	}
+	return fmt.Errorf(
+		"op-sync %s@%s: content tree mismatch after applying batch from %s: "+
+			"peer declared %s, local is %s (applied %d, deleted %d, rejected %d); "+
+			"will re-sync by tree diff",
+		project, branch, batch.Node,
+		shortSHA(batch.ContentTree), shortSHA(got),
+		res.Applied, res.Deleted, len(res.Rejected))
 }
 
 
@@ -943,7 +985,12 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	// 为什么只在无保留时判：整树 Replace 会保留本地未提交改动，只要留了
 	// 一条，本端内容就不再等于对端内容，记错基准比不记更糟。
 	if batch.Rebase && len(res.Missing) == 0 && len(res.Kept) == 0 && len(res.Conflicted) == 0 {
-		if tree := s.currentContentTree(project, branch); tree != "" && s.workSync != nil {
+		// 补齐正文之后再比一次：ingestOps 那一刻 Missing 非空，校验被
+		// 合法跳过，真正的完整性只有现在才能判定。比对不过就不记对端
+		// 水位——记了等于告诉发送端「对端已经有这棵树」，分歧就被封存。
+		if verr := s.verifyBatchContent(project, branch, batch, res); verr != nil {
+			s.logf("op-sync: %v", verr)
+		} else if tree := s.currentContentTree(project, branch); tree != "" && s.workSync != nil {
 			// 必须重算：ingestOps 里那次 rebase 发生在补正文之前，
 			// 那时缺正文的路径还不存在，算出来的树是不完整的。
 			s.workSync.noteBase(project, branch, batch.Node, tree)

@@ -757,6 +757,17 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		return zero, err
 	}
 	if len(batch.Ops) == 0 {
+		// 零传输也要记水位：内容已经对齐到 l.Last()，对端拥有全部内容。
+		//
+		// 不记的话 status 会显示 out seq 0，落进「no work-layer change」，
+		// 而「同步过、两边一致」显示成「pushed (out seq N)」。两条分支
+		// 内容都一致时一个显示 pushed 一个显示 no change，看着像一条在传
+		// 一条没传——实测就是这么被误导的，白查了一轮。
+		if s.workSync != nil && s.opLogs != nil {
+			if l, lerr := s.opLogs.For(project, branch); lerr == nil {
+				s.workSync.noteOut(project, branch, peerName, l.Last())
+			}
+		}
 		return zero, nil
 	}
 	res, err := postOpPush(client, baseURL, token, batch)

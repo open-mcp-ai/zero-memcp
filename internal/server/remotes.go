@@ -522,14 +522,19 @@ func (s *Server) execWorkPeerSync(project string, rm config.Remote, repo *gitsto
 			continue
 		}
 		o, i := s.workSync.cursors(project, br, rm.Name)
+		// 这三行说的是**方向**与**水位**，不是「本轮推了几个字节」。
+		// 曾经零传输的那一轮不记水位，于是「同步过、两边一致」显示成
+		// pushed、「从没同步过」显示成 no work-layer change——两条分支
+		// 内容完全相同时一个 pushed 一个 no change，看着像一条在传一条
+		// 没传。现在零传输也记水位，两种状态不再混在一起。
 		state := "in sync"
 		switch {
 		case i == 0 && o == 0:
-			state = "no work-layer change"
+			state = "never synced"
 		case o > 0 && i == 0:
-			state = "pushed"
+			state = "pushed out"
 		case i > 0 && o == 0:
-			state = "pulled"
+			state = "pulled in"
 		}
 		fmt.Fprintf(&sb, "  %-20s %s (out seq %d, in seq %d)\n", br, state, o, i)
 		rows = append(rows, map[string]any{"branch": br, "state": state, "out_seq": o, "in_seq": i})

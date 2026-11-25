@@ -139,9 +139,15 @@ mode = "rwx------"
 	if err := os.WriteFile(cfgPath, []byte(raw2), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := New(Config{DataDir: dataDir, ConfigFile: cfgPath}); err != nil {
-		if strings.Contains(err.Error(), "enforce_auth") {
-			t.Fatalf("开了 enforce_auth 后不该再报鉴权姿态问题: %v", err)
-		}
+	okSrv, err2 := New(Config{DataDir: dataDir, ConfigFile: cfgPath})
+	if err2 != nil && strings.Contains(err2.Error(), "enforce_auth") {
+		t.Fatalf("开了 enforce_auth 后不该再报鉴权姿态问题: %v", err2)
+	}
+	if okSrv != nil {
+		// 不 Close 会让实例锁的句柄一直开着——Linux 允许 unlink 打开的文件，
+		// 所以只有 windows runner 会炸：
+		//   TempDir RemoveAll cleanup: unlinkat ...\system\instance.lock:
+		//   The process cannot access the file because it is being used by another process
+		t.Cleanup(func() { _ = okSrv.Close() })
 	}
 }

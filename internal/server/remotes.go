@@ -395,10 +395,18 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 		return TermResult{}, err
 	}
 	// 不隐式提交：有未提交内容就明确告诉调用方，由它决定是否先 commit。
-	pending := s.pendingCount(project)
-	if pending > 0 {
-		return TermResult{}, fmt.Errorf(
-			"project %s has %d uncommitted changes: push does not commit for you. Commit first, then push", project, pending)
+	//
+	// 只数**这条分支**：别的分支脏不该拦住这一条（见 pendingOnBranch 的说明）。
+	for _, br := range branches {
+		branch := strings.TrimPrefix(br, "refs/heads/")
+		if i := strings.Index(branch, ":"); i >= 0 {
+			branch = branch[:i]
+		}
+		if n := s.pendingOnBranch(project, branch); n > 0 {
+			return TermResult{}, fmt.Errorf(
+				"%s@%s has %d uncommitted change(s): push does not commit for you. Commit first, then push",
+				project, branch, n)
+		}
 	}
 
 	if rm.FetchOnly {
@@ -760,6 +768,28 @@ func (s *Server) pendingCount(project string) int {
 		n += repo.Pending(ref) + len(repo.Deleted(ref))
 	}
 	return n
+}
+
+// pendingOnBranch 只统计**某一条分支**上未折叠的改动。
+//
+// 为什么推送要按分支数（2026-11-25 实测）：
+//
+//	pendingCount 数的是整个项目所有分支的脏改动，而推送只推一条分支。
+//	本机 meta.index（向量索引快照链，246MB，不在任何 remote 的推送范围里）
+//	长期挂着未折叠的改动，于是 main.chat 的每一次推送都被它拦下来：
+//
+//	  push main.chat failed: project BlackEggAI/zero has 1 uncommitted changes
+//
+//	那条脏分支根本没打算推，也没人打算提交它——结果是一条完全无关的
+//	分支把真正的同步永久卡住，日志里只有一句「1 个未提交改动」。
+//
+// 判据必须是「你要推的这条分支有没有未提交内容」，不是「这个项目脏不脏」。
+func (s *Server) pendingOnBranch(project, branch string) int {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return 0
+	}
+	return repo.Pending(branch) + len(repo.Deleted(branch))
 }
 
 // projectVisibleFor 报告凭证能否看到该项目（任意分支可读即可）。

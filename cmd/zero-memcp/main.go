@@ -11,6 +11,7 @@ import (
 	"os"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/embed"
+	"github.com/open-mcp-ai/zero-memcp/internal/server"
 )
 
 // version 由构建时注入：-ldflags "-X main.version=...".
@@ -21,7 +22,13 @@ func main() {
 	if len(args) > 0 {
 		switch args[0] {
 		case "version", "-V", "--version":
-			fmt.Printf("zero-memcp %s\n%s\n", version, embed.CapabilityLine())
+			// 两个版本变量分开报，因为它们是两个独立的 -X 注入点：
+			// main.version 是本命令打印的，server.Version 是 /health 报的。
+			// 只注入前者的后果实测过——`version` 显示 v0.2.1，/health 却报
+			// 0.1.0-dev，构建脚本漏了第二个 -X 而没人发现。放在同一行输出，
+			// CI 的版本自检就能一次覆盖两者。
+			fmt.Printf("zero-memcp %s\nserver %s\n%s\n",
+				version, server.Version, embed.CapabilityLine())
 			return
 		case "help", "-h", "--help":
 			usage(os.Stdout)

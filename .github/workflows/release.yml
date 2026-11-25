@@ -83,7 +83,9 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           OUT="zero-memcp-${{ matrix.os }}-${{ matrix.arch }}${{ matrix.ext }}"
           go build -trimpath \
-            -ldflags "-s -w -X main.version=${TAG}" \
+            -ldflags "-s -w \
+              -X main.version=${TAG} \
+              -X github.com/open-mcp-ai/zero-memcp/internal/server.Version=${TAG}" \
             -o "dist/${OUT}" \
             ./cmd/zero-memcp
 
@@ -122,12 +124,25 @@ jobs:
           TAG="${GITHUB_REF#refs/tags/}"
           BIN=all-dist/zero-memcp-linux-amd64
           chmod +x "$BIN"
-          GOT=$("$BIN" version | head -1)
-          echo "二进制自报版本: $GOT"
-          case "$GOT" in
-            *"$TAG"*) echo "::notice::版本号校验通过 ($TAG)";;
-            *) echo "::error::版本号没注进去：期望包含 $TAG，实际是 '$GOT'（检查 -X main.version 的包路径）"; exit 1;;
+          # 两个版本变量是**两个独立的 -X 注入点**，必须分别验：
+          #   main.version        —— `version` 命令打印的那个
+          #   internal/server.Version —— /health 报的那个
+          # 只注入前者的后果实测过：`version` 显示 v0.2.1，/health 报
+          # 0.1.0-dev，而没有任何一步会发现。
+          OUT=$("$BIN" version)
+          echo "$OUT"
+          CLI_V=$(printf '%s\n' "$OUT" | awk '/^zero-memcp /{print $2; exit}')
+          SRV_V=$(printf '%s\n' "$OUT" | awk '/^server /{print $2; exit}')
+          echo "cli=$CLI_V server=$SRV_V 期望=$TAG"
+          case "$CLI_V" in
+            *"$TAG"*) ;;
+            *) echo "::error::main.version 没注进去：期望 $TAG，实际 '$CLI_V'（检查 -X main.version）"; exit 1;;
           esac
+          case "$SRV_V" in
+            *"$TAG"*) ;;
+            *) echo "::error::server.Version 没注进去：期望 $TAG，实际 '$SRV_V'（检查 -X github.com/open-mcp-ai/zero-memcp/internal/server.Version）"; exit 1;;
+          esac
+          echo "::notice::两个版本变量都校验通过 ($TAG)"
 
       - name: 生成 SHA256SUMS
         run: |

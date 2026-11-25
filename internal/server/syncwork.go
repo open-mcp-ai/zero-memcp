@@ -1232,7 +1232,7 @@ func (s *Server) workSyncLines(c Caller) []string {
 			branches = append(branches, br)
 		}
 		for _, br := range branches {
-			o, i := s.workSync.cursors(rm.Project, br, rm.Name)
+			o, i := s.workSync.cursors(rm.Project, br, s.resolvePeer(rm.Name))
 			if o == 0 && i == 0 {
 				continue
 			}

@@ -521,7 +521,12 @@ func (s *Server) execWorkPeerSync(project string, rm config.Remote, repo *gitsto
 		if !s.allowed(c, project, br, configBitRead) {
 			continue
 		}
-		o, i := s.workSync.cursors(project, br, rm.Name)
+		// 键必须与写入端一致：pushOpsToPeer 记的是 resolvePeer(rm.Name)
+		// （对端自报的属主名）。这里若用配置别名，同一份水位会分成两个键，
+		// 读到的是改造之前的旧值——实测 main.record 就这样：别名键下留着
+		// out=1，属主名键下是 0，两个视图各读一个。
+		peerKey := s.resolvePeer(rm.Name)
+		o, i := s.workSync.cursors(project, br, peerKey)
 		// 状态先看「上一轮实际传了几条」，水位只是补注。
 		//
 		// 只看水位会把三种情况混成一种：「内容一致、这轮传了 0 条」
@@ -530,7 +535,7 @@ func (s *Server) execWorkPeerSync(project string, rm config.Remote, repo *gitsto
 		// pushed、一条 never synced，白查了一轮才确认两边都没在传。
 		state := "never synced"
 		detail := ""
-		if n, ran := s.workSync.lastOutOps(project, br, rm.Name); ran {
+		if n, ran := s.workSync.lastOutOps(project, br, peerKey); ran {
 			if n == 0 {
 				state = "in sync"
 				detail = "0 op"

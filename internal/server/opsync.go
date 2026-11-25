@@ -763,9 +763,13 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		// 而「同步过、两边一致」显示成「pushed (out seq N)」。两条分支
 		// 内容都一致时一个显示 pushed 一个显示 no change，看着像一条在传
 		// 一条没传——实测就是这么被误导的，白查了一轮。
-		if s.workSync != nil && s.opLogs != nil {
-			if l, lerr := s.opLogs.For(project, branch); lerr == nil {
-				s.workSync.noteOut(project, branch, peerName, l.Last())
+		if s.workSync != nil {
+			s.workSync.noteOutOps(project, branch, peerName, 0)
+			if s.opLogs != nil {
+				if l, lerr := s.opLogs.For(project, branch); lerr == nil {
+					s.workSync.noteOut(project, branch, peerName, l.Last())
+	s.workSync.noteOutOps(project, branch, peerName, len(batch.Ops))
+				}
 			}
 		}
 		return zero, nil

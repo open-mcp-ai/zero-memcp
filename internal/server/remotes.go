@@ -522,21 +522,38 @@ func (s *Server) execWorkPeerSync(project string, rm config.Remote, repo *gitsto
 			continue
 		}
 		o, i := s.workSync.cursors(project, br, rm.Name)
-		// 这三行说的是**方向**与**水位**，不是「本轮推了几个字节」。
-		// 曾经零传输的那一轮不记水位，于是「同步过、两边一致」显示成
-		// pushed、「从没同步过」显示成 no work-layer change——两条分支
-		// 内容完全相同时一个 pushed 一个 no change，看着像一条在传一条
-		// 没传。现在零传输也记水位，两种状态不再混在一起。
-		state := "in sync"
-		switch {
-		case i == 0 && o == 0:
-			state = "never synced"
-		case o > 0 && i == 0:
-			state = "pushed out"
-		case i > 0 && o == 0:
-			state = "pulled in"
+		// 状态先看「上一轮实际传了几条」，水位只是补注。
+		//
+		// 只看水位会把三种情况混成一种：「内容一致、这轮传了 0 条」
+		// 和「从没同步过」和「刚推过一批」都可能显示成 pushed 或
+		// never synced——实测两条分支内容树 SHA 完全相同，一条显示
+		// pushed、一条 never synced，白查了一轮才确认两边都没在传。
+		state := "never synced"
+		detail := ""
+		if n, ran := s.workSync.lastOutOps(project, br, rm.Name); ran {
+			if n == 0 {
+				state = "in sync"
+				detail = "0 op"
+			} else {
+				state = "pushed"
+				detail = fmt.Sprintf("%d op(s)", n)
+			}
+		} else if o > 0 || i > 0 {
+			// 有水位但没跑过本轮（重启后还没同步）：只报方向。
+			switch {
+			case o > 0 && i == 0:
+				state = "pushed out"
+			case i > 0 && o == 0:
+				state = "pulled in"
+			default:
+				state = "in sync"
+			}
 		}
-		fmt.Fprintf(&sb, "  %-20s %s (out seq %d, in seq %d)\n", br, state, o, i)
+		if detail != "" {
+			fmt.Fprintf(&sb, "  %-20s %s (%s; out seq %d, in seq %d)\n", br, state, detail, o, i)
+		} else {
+			fmt.Fprintf(&sb, "  %-20s %s (out seq %d, in seq %d)\n", br, state, o, i)
+		}
 		rows = append(rows, map[string]any{"branch": br, "state": state, "out_seq": o, "in_seq": i})
 	}
 	if len(branches) == 0 {

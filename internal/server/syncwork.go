@@ -179,6 +179,13 @@ type workSyncState struct {
 	// 与我的原点不同，于是下一轮判成「基准变了」→ 抹掉水位 → 重发整棵树，
 	// 永远收敛不了。对端收下快照并不意味着我的流换了原点。
 	peerTrees sync.Map // string -> string
+	// lastOps 记录「上一次与这个对端跑同步，实际传了几条命令」。
+	//
+	// 水位表达不了这件事：两端内容一致时传输是 0 条，而水位仍是上次
+	// 推到的位点；oplog 为空的分支水位干脆是 0。于是「一致」「从没
+	// 同步过」「刚推了东西」三种情况在 status 里长得很像，实测为此
+	// 白查了一轮。
+	lastOps sync.Map // string -> *atomic.Int64
 	// sentTrees 是「上次发给该对端的整树快照，对应的内容树 SHA」。
 	//
 	// 内容寻址保证同一份内容必然算出同一棵树，所以这个 SHA 既是
@@ -302,6 +309,26 @@ func workKey(project, branch, peer string) string {
 
 func (w *workSyncState) noteOut(project, branch, peer string, seq int64) {
 	noteWatermark(&w.out, workKey(project, branch, peer), seq)
+}
+
+// noteOutOps 记下这一轮往该对端实际传了几条命令。
+//
+// 与 noteOut（水位）分开：水位说「推到哪了」，这个说「这一轮传了多少」。
+// 两者只在「一直有东西传」时才同时前进；内容一致时会话传 0 条，水位
+// 却仍停在原处——status 只看水位就会把「一致」和「刚推过」混起来。
+func (w *workSyncState) noteOutOps(project, branch, peer string, ops int) {
+	k := workKey(project, branch, peer)
+	v, _ := w.lastOps.LoadOrStore(k, new(atomic.Int64))
+	v.(*atomic.Int64).Store(int64(ops))
+}
+
+// lastOutOps 返回上一轮往该对端传的命令数，以及有没有跑过。
+func (w *workSyncState) lastOutOps(project, branch, peer string) (int, bool) {
+	v, ok := w.lastOps.Load(workKey(project, branch, peer))
+	if !ok {
+		return 0, false
+	}
+	return int(v.(*atomic.Int64).Load()), true
 }
 
 func (w *workSyncState) noteIn(project, branch, peer string, seq int64) {

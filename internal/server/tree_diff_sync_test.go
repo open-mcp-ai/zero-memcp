@@ -84,7 +84,7 @@ func TestTreeDiffSendsOnlyChangedPaths(t *testing.T) {
 		t.Fatalf("前提不成立：对端树与该是本端基准不同（都等于 %s），否则没进差分分支",
 			shortSHA(peerTree))
 	}
-	batch, err := up.exportOpsFromPeer("daily", "zero", up.peerOutSeq("daily", "zero", "down"), peerTree, "down")
+	batch, err := up.exportOpsFromPeer("daily", "zero", up.peerOutSeq("daily", "zero", "down"), peerTree, "", "down")
 	if err != nil {
 		t.Fatalf("导出批次: %v", err)
 	}

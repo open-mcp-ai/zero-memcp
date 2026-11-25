@@ -285,7 +285,7 @@ func TestTwoNodesRebaseThenDelta(t *testing.T) {
 	}
 
 	// 第一趟：下游用空树当基准去拉 → 上游基准已经变成提交的树 → 快照
-	batch, err := postOpPullFrom(client, ts.URL, upTok, "daily", "zero", "down", 0, gitstore.EmptyTreeSHA)
+	batch, err := postOpPullFrom(client, ts.URL, upTok, "daily", "zero", "down", 0, gitstore.EmptyTreeSHA, "")
 	if err != nil {
 		t.Fatalf("拉取: %v", err)
 	}
@@ -297,7 +297,7 @@ func TestTwoNodesRebaseThenDelta(t *testing.T) {
 	}
 
 	// 第二趟：下游已经对齐基准 → 上游发增量
-	batch2, err := postOpPullFrom(client, ts.URL, upTok, "daily", "zero", "down", 0, batch.BaseTree)
+	batch2, err := postOpPullFrom(client, ts.URL, upTok, "daily", "zero", "down", 0, batch.BaseTree, "")
 	if err != nil {
 		t.Fatalf("第二次拉取: %v", err)
 	}

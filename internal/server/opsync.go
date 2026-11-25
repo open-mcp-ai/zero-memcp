@@ -91,7 +91,7 @@ func (s *Server) exportOps(project, branch string, after int64) (opBatch, error)
 // 对不上时不发明细，而是告诉对端「我现在的基准是这棵树，它对应的提交
 // 是这一个」。对端去浅拷贝那个提交，然后带着新基准再来。
 func (s *Server) exportOpsFrom(project, branch string, after int64, baseTree string) (opBatch, error) {
-	return s.exportOpsFromPeer(project, branch, after, baseTree, "")
+	return s.exportOpsFromPeer(project, branch, after, baseTree, "", "")
 }
 
 // exportOpsFromPeer 与 exportOpsFrom 相同，但知道对端是谁。
@@ -100,16 +100,37 @@ func (s *Server) exportOpsFrom(project, branch string, after int64, baseTree str
 // oplog 的原点（4b825dc6），而是我们上次发给它的那棵内容树。整树快照
 // 落地后对端会把自己的基准重设到那棵树，两边算出的 SHA 完全相同——
 // 内容寻址保证的。认不出这一种，就会每轮重发整棵树。
-func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree, peerNode string) (opBatch, error) {
+func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree, haveTree, peerNode string) (opBatch, error) {
 	batch := opBatch{Project: project, Branch: branch, Node: s.instanceID(), From: after}
 	if s.opLogs == nil {
 		return batch, fmt.Errorf("oplog is not initialised")
 	}
+	// 无论走哪条分支，都把本端内容树报回去。
+	//
+	// 为什么必须无条件报：推送侧算差分要的是「对端手上是哪棵树」，
+	// 而它只能从拉取里得知。如果对端从没写过这条分支，拉取永远拿不到
+	// 带 Rebase 的批次，那个值就永远为空——于是每轮都按「对端是空的」
+	// 发整树快照。实测 18990 条路径推给开着索引的 3060，逐条 refreshPath
+	// 抢分支写令牌，满屏「写令牌等待超时（1m0s）」，推送侧直接超时。
+	// 而那一刻两边内容可能只差一条。
+	batch.ContentTree = s.currentContentTree(project, branch)
 	l, err := s.opLogs.For(project, branch)
 	if err != nil {
 		return batch, err
 	}
 	cur := l.BaseTree()
+
+	// 差分的起点是对端**实际手上的内容**，不是它的命令流原点。
+	//
+	// 为什么要两个字段：base_tree 是**命令流原点**（位点只在这个原点
+	// 上可比，接收端会拿它校验），have_tree 是**工作层内容树**（含
+	// 未折叠的写入）。平时两者不等——工作层总是跑在原点前面。
+	// 早先只用一个字段，同一句话被两种意思用：拿内容树当原点交出去，
+	// 接收端校验必被拒；拿原点当内容树算差分，又总多传一截。
+	from := haveTree
+	if from == "" {
+		from = baseTree
+	}
 
 	// 判据只用**内容树**，不用「我记得发过什么」。
 	//
@@ -118,15 +139,23 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	// 归零，那批增量命令已经被折进新基准里，位点增量是空的。于是
 	// 「对端明明落后，我们却回了 0 条命令」，备份静默停摆。
 	// 内容树是确定的：相等就是真的相等，不等就必须算出差多少。
-	if baseTree == "" {
+	if from == "" {
 		// 调用方只是要增量命令（exportOps），不关心基准。
 		batch.BaseTree = cur
 		batch.BaseCommit = s.commitForTree(project, branch, cur)
 		return s.exportOpsTail(batch, l, after, cur)
 	}
 
-	if baseTree == cur {
-		// 对端就在本端命令流的原点上：位点增量就是全部差异。
+	// 位点增量只在一个条件下成立：**两边命令流原点相同**。
+	//
+	// 早先这里判的是「对端内容 == 本端原点」，那是另一件事。对端内容
+	// 可以恰好等于本端原点（它落地过我的推送，两边内容一致），但它的
+	// 命令流原点仍是自己的——发位点增量过去，它按自己的原点校验必被拒。
+	// 实测报 base tree mismatch (local 1733b46d, peer 4fd25cfa)，而那批
+	// 命令本该把两边拉到一致。
+	//
+	// 内容相等只说明「差多少」是零，不说明「位点可比」。
+	if baseTree != "" && baseTree == cur {
 		batch.BaseTree = cur
 		batch.BaseCommit = s.commitForTree(project, branch, cur)
 		return s.exportOpsTail(batch, l, after, cur)
@@ -138,10 +167,10 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 		return batch, ferr
 	}
 	// 本端一棵空树、对端却有内容：这是唯一会把对端清空的形状，必须拒绝。
-	if len(entries) == 0 && baseTree != gitstore.EmptyTreeSHA {
+	if len(entries) == 0 && from != gitstore.EmptyTreeSHA {
 		return batch, fmt.Errorf(
-			"refusing to send an empty-tree snapshot for %s@%s: peer base %s is not empty, "+
-				"this would erase everything on the peer", project, branch, shortSHA(baseTree))
+			"refusing to send an empty-tree snapshot for %s@%s: peer has %s which is not empty, "+
+				"this would erase everything on the peer", project, branch, shortSHA(from))
 	}
 	var curContentTree string
 	if repo, rerr := s.projects.Get(project); rerr == nil && len(entries) > 0 {
@@ -153,12 +182,15 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 			curContentTree = tree
 		}
 	}
+	// 算差分用的起点：对端报的内容树。比 base_tree 更准，
+	// 因为它含对端未折叠的写入。
+	diffFrom := from
 
 	// 对端手上的内容已经和本端一模一样：一个字节都不发。
 	//
 	// 这是提交之后最常见的一轮——对端上次收到的就是本端当前的内容，
 	// 只是本端基准又前进了一次。认不出这种情况就会每轮重发整棵树。
-	if curContentTree != "" && curContentTree == baseTree {
+	if curContentTree != "" && curContentTree == diffFrom {
 		if s.workSync != nil && peerNode != "" {
 			s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
 		}
@@ -170,10 +202,10 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	//
 	// 对端报的基准是一棵真实的树（不是空树），且本地对象库里存着它，
 	// 就能直接算出差异。18,446 篇里改 1 篇就只发 1 条命令。
-	if baseTree != gitstore.EmptyTreeSHA && curContentTree != "" {
-		if diffOps, derr := s.diffTreesToOps(project, branch, baseTree, curContentTree); derr == nil {
-			batch.BaseTree = baseTree
-			batch.BaseCommit = s.commitForTree(project, branch, baseTree)
+	if diffFrom != gitstore.EmptyTreeSHA && curContentTree != "" {
+		if diffOps, derr := s.diffTreesToOps(project, branch, diffFrom, curContentTree); derr == nil {
+			batch.BaseTree = diffFrom
+			batch.BaseCommit = s.commitForTree(project, branch, diffFrom)
 			batch.Rebase = true
 			batch.ContentTree = curContentTree
 			batch.Ops = diffOps
@@ -182,7 +214,7 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 				s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
 			}
 			s.logf("op-sync: %s@%s: peer base %s -> content %s: %d delta op(s) (tree diff, no full snapshot)",
-				project, branch, shortSHA(baseTree), shortSHA(curContentTree), len(diffOps))
+				project, branch, shortSHA(diffFrom), shortSHA(curContentTree), len(diffOps))
 			return batch, nil
 		}
 	}
@@ -261,16 +293,27 @@ func (s *Server) commitForTree(project, branch, tree string) string {
 //
 // 这是 server 端 handleOpPush 与本端 pull 落地共用的入口。
 func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult, error) {
-	// 基准树校验：整树快照会重设基准（Replace 语义），允许；
-	// 增量命令只在基准相同时才成立——不同就是位点错位，拼出来的是
-	// 一棵既不是这里也不是那里的树，必须出声拒绝。
-	if batch.BaseTree != "" && s.opLogs != nil && !isSnapshotBatch(batch) {
+	// 基准树校验：只对**位点增量**批次成立。
+	//
+	// 位点只在同一段流里可比，所以拿它当基准去应用一批增量，前提是
+	// 两边本来就挂在同一个原点上；不同就是位点错位，拼出来的是一棵
+	// 既不是这里也不是那里的树，必须出声拒绝。
+	//
+	// 带 Rebase 的批次不在此列：它们的差异是**相对接收端手上那棵树**
+	// 算出来的（整树快照、树到树差分都是），落地后接收端会把基准重设
+	// 到自己的内容树，旧原点就地作废。拿旧原点去校验只会把合法的差分
+	// 拒掉——实测报 base tree mismatch (local 4b825dc6, peer 1733b46d)，
+	// 而那批命令正是要把接收端从 4b825dc6 带到 1733b46d 的。
+	//
+	// 它们的不完整性由 ContentTree 比对兜底（见 verifyBatchContent）。
+	if batch.BaseTree != "" && s.opLogs != nil && !batch.Rebase {
 		if l, lerr := s.opLogs.For(project, branch); lerr == nil {
 			if cur := l.BaseTree(); cur != batch.BaseTree {
 				var zero opApplyResult
 				return zero, fmt.Errorf(
-					"op-sync %s@%s: base tree mismatch (local %s, peer %s); ask the peer for a full snapshot",
-					project, branch, shortSHA(cur), shortSHA(batch.BaseTree))
+					"op-sync %s@%s: base tree mismatch (local %s, peer %s, %d op(s), rebase=%v, content_tree=%s); ask the peer for a full snapshot",
+					project, branch, shortSHA(cur), shortSHA(batch.BaseTree),
+					len(batch.Ops), batch.Rebase, shortSHA(batch.ContentTree))
 			}
 		}
 	}
@@ -482,9 +525,14 @@ func (s *Server) handleOpPull(w http.ResponseWriter, r *http.Request) {
 		Branch  string `json:"branch"`
 		Node    string `json:"node"`
 		After   int64  `json:"after"`
-		// BaseTree 是对端当前的基准树。
-		// 双方基准相同才发增量命令；不同就返回 NeedRebase 让对端先浅拉。
+		// BaseTree 是请求方的**命令流原点**。位点只在同一原点上可比，
+		// 所以它相等才发位点增量。
 		BaseTree string `json:"base_tree,omitempty"`
+		// HaveTree 是请求方**工作层的实际内容树**（含未折叠的写入）。
+		//
+		// 与 BaseTree 分开的原因：工作层通常跑在原点前面，两者不等。
+		// 用它作差分的起点，只发真实差异；用原点作起点会多传一截。
+		HaveTree string `json:"have_tree,omitempty"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		http.Error(w, "bad op-pull request: "+err.Error(), http.StatusBadRequest)
@@ -494,7 +542,7 @@ func (s *Server) handleOpPull(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, s.denyReason(c, req.Project, req.Branch, configBitRead), http.StatusForbidden)
 		return
 	}
-	batch, err := s.exportOpsFromPeer(req.Project, req.Branch, req.After, req.BaseTree, req.Node)
+	batch, err := s.exportOpsFromPeer(req.Project, req.Branch, req.After, req.BaseTree, req.HaveTree, req.Node)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -550,18 +598,21 @@ func (s *Server) handleOpPush(w http.ResponseWriter, r *http.Request) {
 // ── 客户端：向对端要 / 推 ────────────────────────────────────
 
 func postOpPull(client *http.Client, baseURL, token, project, branch, node string, after int64) (opBatch, error) {
-	return postOpPullFrom(client, baseURL, token, project, branch, node, after, "")
+	return postOpPullFrom(client, baseURL, token, project, branch, node, after, "", "")
 }
 
 // postOpPullFrom 带基准提交的拉取。
 //
 // baseCommit 非空时告诉对端「我已经有这棵树了，只要它之后的命令」。
 // 对端认不出这个提交时会自动退化为整树，不会报错。
-func postOpPullFrom(client *http.Client, baseURL, token, project, branch, node string, after int64, baseTree string) (opBatch, error) {
+func postOpPullFrom(client *http.Client, baseURL, token, project, branch, node string, after int64, baseTree, haveTree string) (opBatch, error) {
 	var batch opBatch
 	payload := map[string]any{"project": project, "branch": branch, "node": node, "after": after}
 	if baseTree != "" {
 		payload["base_tree"] = baseTree
+	}
+	if haveTree != "" {
+		payload["have_tree"] = haveTree
 	}
 	body, _ := json.Marshal(payload)
 	req, err := http.NewRequest(http.MethodPost, strings.TrimRight(baseURL, "/")+"/sync/ops/pull", bytes.NewReader(body))
@@ -691,7 +742,9 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		if peerBase == "" {
 			peerBase = gitstore.EmptyTreeSHA
 		}
-		return s.exportOpsFromPeer(project, branch, after, peerBase, peerKey)
+		// 推方向不另报 have_tree：peerBase 本身就是「对端手上的内容」
+		// （peerTreeOf 记的是对端内容树），两个字段会是同一个值。
+		return s.exportOpsFromPeer(project, branch, after, peerBase, "", peerKey)
 	}
 	batch, err := exportBatch()
 	if err != nil {
@@ -884,25 +937,23 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	}
 	after := s.peerSeq(project, branch, peerKey)
 
-	// 带上本地当前这段流的基准树：对端据此判断我们的流是不是挂在
-	// 同一棵树上。不是同一棵树就发 NeedRebase，不瞎发增量。
-	// 告诉对端「我手上是哪棵树」。取值顺序：
-	//   1. 我为这个对端记下的基准（快照落地后记的就是内容树）
-	//   2. 本端 oplog 的基准
+	// 两个字段分开报，别混用：
 	//
-	// 用 1 的原因是：本端 oplog 的基准是「我这条流挂在哪棵树上」，
-	// 而快照落地后我手上的内容已经跑到那棵树前面去了；拿自己的原点
-	// 去问，对端会以为我落后，于是每轮重发整树。
+	//   base_tree = 本端命令流原点。位点只在这个原点上可比，对端据此
+	//               判断能不能发位点增量。
+	//   have_tree = 本端工作层实际内容树。对端据此算差分，只发真实差异。
+	//
+	// 合成一个字段试过，两头都不对：拿内容树当原点交出去，接收端校验
+	// 必被拒（实测 base tree mismatch）；拿原点当内容树算差分，又总
+	// 多传一截。
 	baseTree := ""
-	if s.workSync != nil {
-		baseTree = s.workSync.peerTreeOf(project, branch, peerKey)
-	}
-	if baseTree == "" && s.opLogs != nil {
+	if s.opLogs != nil {
 		if l, lerr := s.opLogs.For(project, branch); lerr == nil {
 			baseTree = l.BaseTree()
 		}
 	}
-	batch, err := postOpPullFrom(client, baseURL, token, project, branch, s.instanceID(), after, baseTree)
+	haveTree := s.currentContentTree(project, branch)
+	batch, err := postOpPullFrom(client, baseURL, token, project, branch, s.instanceID(), after, baseTree, haveTree)
 	if err != nil {
 		return zero, err
 	}
@@ -911,6 +962,15 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	if len(batch.Ops) == 0 {
 		// 空批次也要留痕：否则「下游问上游有没有新东西」时，
 		// 流水里看不到任何证据，容易误判成同步没在跑。
+		//
+		// 同时把对端的内容树记下来：这一批没有命令，但响应里带了
+		// 「对端手上是哪棵树」。不记的话推送侧只能按「对端是空的」
+		// 发全量——而这种情况（对端从未写过这条分支）恰好永远不会
+		// 产生带 Rebase 的批次，于是永远记不上，永远发全量。
+		if batch.ContentTree != "" && s.workSync != nil {
+			s.workSync.noteBase(project, branch, peerKey, batch.ContentTree)
+			s.workSync.notePeerTree(project, branch, peerKey, batch.ContentTree)
+		}
 		s.recordSync(syncRecord{
 			Dir: "pull", Peer: peerName, Node: batch.Node,
 			Project: project, Branch: branch,

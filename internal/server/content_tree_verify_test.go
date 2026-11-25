@@ -47,7 +47,7 @@ func TestContentTreeDetectsDroppedCommand(t *testing.T) {
 	}
 
 	// 源端按「对端是空树」导出：得到带 Rebase + ContentTree 的整树快照。
-	batch, err := src.exportOpsFromPeer(project, branch, 0, gitstore.EmptyTreeSHA, "dst")
+	batch, err := src.exportOpsFromPeer(project, branch, 0, gitstore.EmptyTreeSHA, "", "dst")
 	if err != nil {
 		t.Fatalf("导出: %v", err)
 	}

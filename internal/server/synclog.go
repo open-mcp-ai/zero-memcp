@@ -517,11 +517,21 @@ func (s *Server) syncTopology(c Caller) (upstreams, peers, downstreams []syncPee
 func (s *Server) peerView(project, branch, peerName, role string, now time.Time) syncPeerView {
 	v := syncPeerView{Name: peerName, Role: role, Project: project, Branch: branch}
 
-	// 对端最新位点：从流水里找最近一条带 PeerHead 的记录。
+	// 对端最新位点：按方向找记录，不能「最近一条不分方向」。
+	//
+	// pull 记录的 To 是「我拉到哪」，push 记录的 To 是「我推到哪」——
+	// 两个方向的同名字段含义不同。不分方向地取最近一条，可能拿到反方向
+	// 的那条：实测 hub-3060 配置里只推不拉，最近的却是一条旧 pull 记录
+	// （To=0），于是下游视图报 `never synced (peer is at seq 0)`，
+	// 而同一时刻 sync <project> <remote> 报 `pushed out (out seq 1)`。
+	wantDir := "pull"
+	if role == "downstream" {
+		wantDir = "push"
+	}
 	var lastRec *syncRecord
 	for i := len(s.syncLog.All()) - 1; i >= 0; i-- {
 		r := s.syncLog.All()[i]
-		if r.Project != project || r.Branch != branch || r.Peer != peerName {
+		if r.Dir != wantDir || r.Project != project || r.Branch != branch || r.Peer != peerName {
 			continue
 		}
 		rr := r
@@ -593,17 +603,31 @@ func (s *Server) peerView(project, branch, peerName, role string, now time.Time)
 		return v
 	}
 
-	// 我推它 / 它拉我：比的是「我的日志头」与「它追到哪」。
+	// 我推它 / 它拉我：比的是「我推到哪」与「它追到哪」。
 	//
 	// 不能拿它自己的位点跟自己比——那永远显示 caught up，
 	// 而真正要回答的是「它离我还有多远」。
-	v.LocalSeq = s.localOpHead(project, branch)
+	//
+	// 这里**不能**用 localOpHead 当「我有多少」：commit 会把命令流折叠进
+	// 新的 commit 并清空 oplog，Last() 随即归零——而内容明明还在。
+	// 实测 zero@main 就是这样：视图一报 `pushed out (out seq 1)`，
+	// 无参视图却因为 localOpHead==0 报 `never synced (peer is at seq 1)`。
+	//
+	// 用持久化的 out 水位：它就是上一次推送成功时对端确认的位点，
+	// 与 push 记录里的 To 是同一个数，两边天生一致。
+	//
+	// 局限要写清楚：commit 之后「本端是否有新命令还没推」在位点上已经
+	// 看不出来（oplog 空了），那个由内容树比对负责，不是这个视图的职责。
+	v.LocalSeq = s.lastPushedPosition(project, branch, peerName)
 	if lastRec != nil {
 		v.PeerSeq = lastRec.To
 		v.LastSeen = lastRec.TS
 	}
 	switch {
-	case v.LocalSeq == 0:
+	case v.LocalSeq == 0 && v.PeerSeq == 0:
+		// 两边都空才算「从未同步」。只看 LocalSeq 会把「推过、水位没读到、
+		// 但对端确认过位点」的分支报成从未同步——实测 zero@main 恰好卡在
+		// 这里：流水里有 To=1 的推送记录，而 out 水位读出来是 0。
 		v.State = "never"
 	case v.PeerSeq >= v.LocalSeq:
 		v.State = "caught up"
@@ -612,6 +636,15 @@ func (s *Server) peerView(project, branch, peerName, role string, now time.Time)
 		v.Behind = v.LocalSeq - v.PeerSeq
 	}
 	return v
+}
+
+// lastPushedPosition 返回上一次向该对端推送成功时的位点（持久化水位）。
+func (s *Server) lastPushedPosition(project, branch, peerName string) int64 {
+	if s.workSync == nil {
+		return 0
+	}
+	out, _ := s.workSync.cursors(project, branch, s.resolvePeer(peerName))
+	return out
 }
 
 // lastPulledPeerHead 返回最近一次从该对端**拉取**时它自报的位点。

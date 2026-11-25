@@ -518,26 +518,44 @@ func (s *Server) peerView(project, branch, peerName, role string, now time.Time)
 	}
 
 	if role == "upstream" || role == "peer" {
-		// 双向对端：判据必须与 `sync <project> <remote>` 一致。
+		// 双向对端：两个方向都要看，取落后的那一个。
 		//
 		// 只看 in（我拉它到哪）是不够的：对端从不主动推送时 in 恒为 0，
-		// 于是一条已经对齐的分支会被报成 `never synced (peer is at seq 0)`，
-		// 而 `sync BlackEggAI/zero hub-3060` 对同一条分支报 `in sync (0 op)`
-		// ——同一个事实，两个视图两种说法。实测就是这么被绕进去的。
+		// 于是一条已经对齐的分支被报成 `never synced (peer is at seq 0)`，
+		// 而 `sync BlackEggAI/zero hub-3060` 报的是 `pushed out (out seq 1)`。
 		//
-		// 最近一轮同步实际传了几条（lastOutOps）才是两个视图共用的判据：
-		// 有记录就说明那一轮跑完且成功，对齐与否已经由内容树比对决定了。
+		// 判据必须落在**持久化水位**上，不能用 lastOutOps：那个是内存态，
+		// 进程重启就空了，而无参视图恰恰是用来看「现在什么情况」的——
+		// 三个节点刚重启完，它会一律回落到水位比较，修复等于没做。
+		//
+		//   推方向落后 = localOpHead - out   （它确认到的位点 vs 我的全部）
+		//   拉方向落后 = 对端位点 - in        （它有而我还没拉的）
 		if role == "peer" && s.workSync != nil {
 			peerKey := s.resolvePeer(peerName)
-			if _, ran := s.workSync.lastOutOps(project, branch, peerKey); ran {
-				out, _ := s.workSync.cursors(project, branch, peerKey)
-				v.LocalSeq, v.PeerSeq = out, out
+			out, in := s.workSync.cursors(project, branch, peerKey)
+			v.LocalSeq, v.PeerSeq = out, in
+			if lastRec != nil {
+				v.LastSeen = lastRec.TS
+			}
+			var lagOut int64
+			if head := s.localOpHead(project, branch); head > out {
+				lagOut = head - out
+			}
+			var lagIn int64
+			if peerAt := s.lastPulledPeerHead(project, branch, peerName); peerAt > in {
+				lagIn = peerAt - in
+			}
+			if lagOut == 0 && lagIn == 0 {
 				v.State = "caught up"
-				if lastRec != nil {
-					v.LastSeen = lastRec.TS
-				}
 				return v
 			}
+			v.State = "behind"
+			if lagOut >= lagIn {
+				v.Behind = lagOut
+			} else {
+				v.Behind = lagIn
+			}
+			return v
 		}
 		// 我拉它：本地水位是 in，对端位点来自流水。
 		if s.workSync != nil {
@@ -582,6 +600,23 @@ func (s *Server) peerView(project, branch, peerName, role string, now time.Time)
 		v.Behind = v.LocalSeq - v.PeerSeq
 	}
 	return v
+}
+
+// lastPulledPeerHead 返回最近一次从该对端**拉取**时它自报的位点。
+//
+// 只看 pull 记录：push 记录的 PeerHead 是「对端拥有到哪一位」（我自己推的
+// 结果），不是对端有什么新东西，拿它算「我落后多少」会得出零。
+
+func (s *Server) lastPulledPeerHead(project, branch, peerName string) int64 {
+	all := s.syncLog.All()
+	for i := len(all) - 1; i >= 0; i-- {
+		r := all[i]
+		if r.Dir != "pull" || r.Project != project || r.Branch != branch || r.Peer != peerName {
+			continue
+		}
+		return int64(r.PeerHead)
+	}
+	return 0
 }
 
 // localOpHead 返回某分支本地命令流的最新位点。

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -227,6 +228,13 @@ func TestPeerViewPeerRoleReportsCaughtUp(t *testing.T) {
 	if err := src.syncOpsWithRemote(client, rm, "blackegg/me"); err != nil {
 		t.Fatalf("同步: %v", err)
 	}
+
+	// 模拟一次进程重启：内存态（lastOps）清空，只有持久化水位还在。
+	//
+	// 这一步不是多余的——第一版修复用 lastOutOps 当判据，同进程内测着
+	// 是绿的，可三个节点重启之后无参视图又一律回落到水位比较，修复在
+	// 真实环境里等于没做。判据必须落在持久化水位上。
+	src.workSync.lastOps = sync.Map{}
 
 	// 直接问 peer 角色那一条路径。
 	v := src.peerView("blackegg/me", "zero", "hub", "peer", time.Now())

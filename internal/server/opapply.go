@@ -45,6 +45,12 @@ type opApplyResult struct {
 	// changedPathsOf 只看 ops，看不到这些路径，于是它们的索引
 	// 永远不会被刷新——恢复出来的内容搜不到。
 	DeletedPaths []string `json:"deleted_paths,omitempty"`
+	// Touched 是**真正落地**的路径（含墓碑与 rename 的源）。
+	//
+	// 与 changedPathsOf(ops) 的区别：后者列的是「批次提到了哪些路径」，
+	// 整树快照会列出全部几万条；这里只有内容确实变了的那些。刷索引
+	// 该按这个来——按批次条目刷等于给每条路径都重建一次索引。
+	Touched []string `json:"touched,omitempty"`
 }
 
 // opContext 是一次应用所需要的本地上下文。
@@ -54,6 +60,13 @@ type opApplyResult struct {
 type opContext struct {
 	repo  *gitstore.Repo
 	local map[string]gitstore.DirtyChange
+	// touched 记录**真正落地**的路径。
+	//
+	// 为什么不能拿批次里的路径当变更表：整树快照会把几万条条目全列出来，
+	// 而其中绝大多数内容与本端完全一样、被跳过。按条目刷索引等于给每条
+	// 路径都重建一次，实测 26145 条推给开着索引的对端，每条抢一次分支写
+	// 令牌，同步直接超时——而真实变更只有几百条。
+	touched map[string]bool
 	// clean 是已提交树里的路径表：判断「本地已有同样内容」时要用，
 	// 否则一条远端命令只要本地脏层没记录就会被当成新改动重放。
 	clean map[string]gitstore.Entry
@@ -70,7 +83,12 @@ func (s *Server) newOpContext(project, branch string) (*opContext, error) {
 	if err != nil {
 		return nil, err
 	}
-	ctx := &opContext{repo: repo, local: map[string]gitstore.DirtyChange{}, clean: map[string]gitstore.Entry{}}
+	ctx := &opContext{
+		repo:    repo,
+		local:   map[string]gitstore.DirtyChange{},
+		clean:   map[string]gitstore.Entry{},
+		touched: map[string]bool{},
+	}
 
 	changes, err := repo.DirtyChanges(branch)
 	if err != nil {
@@ -214,6 +232,7 @@ func (s *Server) applyOp(project, branch, peerNode string, ctx *opContext, op tr
 		}
 		delete(ctx.local, op.Path)
 		delete(ctx.clean, op.Path)
+		ctx.touched[op.Path] = true
 		res.Deleted++
 		return "", nil
 
@@ -244,6 +263,7 @@ func (s *Server) applyOp(project, branch, peerNode string, ctx *opContext, op tr
 			return "", fmt.Errorf("apply set %s: %w", op.Path, err)
 		}
 		ctx.local[op.Path] = gitstore.DirtyChange{Path: op.Path, Mode: gitstore.Mode(op.Mode), SHA: op.SHA}
+		ctx.touched[op.Path] = true
 		s.clearWorkConflict(project, branch, peerNode, op.Path)
 		res.Applied++
 		return "", nil
@@ -274,6 +294,7 @@ func (s *Server) applyOp(project, branch, peerNode string, ctx *opContext, op tr
 			return "", fmt.Errorf("apply %s %s: %w", op.Kind, op.Path, err)
 		}
 		ctx.local[op.Path] = gitstore.DirtyChange{Path: op.Path, Mode: gitstore.Mode(mode), SHA: src}
+		ctx.touched[op.Path] = true
 		res.Applied++
 		if op.Kind == opRename {
 			// rename 的源删除与目标新增在同一条命令里，对端不会看到中间态。
@@ -282,6 +303,7 @@ func (s *Server) applyOp(project, branch, peerNode string, ctx *opContext, op tr
 			}
 			delete(ctx.local, op.From)
 			delete(ctx.clean, op.From)
+			ctx.touched[op.From] = true
 			res.Deleted++
 		}
 		return "", nil
@@ -317,6 +339,14 @@ func (s *Server) applyOps(project, branch, peerNode string, ops []treeOp) (opApp
 		}
 	}
 	sort.Strings(res.Missing)
+	if len(ctx.touched) > 0 {
+		paths := make([]string, 0, len(ctx.touched))
+		for p := range ctx.touched {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		res.Touched = paths
+	}
 	return res, nil
 }
 
@@ -355,6 +385,31 @@ func changedPathsOf(ops []treeOp) []string {
 // 这是**唯一**的落盘后置动作：push 接收端与 pull 落地端都走这里。
 // 早先两处各写了一遍「refreshPath + publishTreeChange」，那种重复
 // 会让「磁盘有数据但搜不到」这种故障在一侧复发而另一侧正常。
+// refreshPathsFor 决定这一批命令要刷新哪些路径的索引。
+//
+// 按**实际落地**的路径来，不按批次列出的条目。整树快照会把全部条目写进
+// ops（几万条），而其中绝大多数内容与本端相同、applyOp 直接跳过；按条目
+// 刷等于给每条路径都重建一次索引，每条还要抢一次分支写令牌——实测
+// 26145 条整树推给开着索引的对端，同步直接超时，而真实变更只有几百条。
+func (s *Server) refreshPathsFor(project, branch string, ops []treeOp, res opApplyResult) []string {
+	paths := res.Touched
+	if len(paths) == 0 && (res.Applied > 0 || res.Deleted > 0) {
+		// 没有落地路径却报了 applied/deleted 是不可能的；留个对照让
+		// 「结果与路径不一致」立刻可见，而不是悄悄少刷索引。
+		s.logf("op-sync: %s@%s: applied %d deleted %d but no touched path recorded; falling back to batch paths",
+			project, branch, res.Applied, res.Deleted)
+		paths = changedPathsOf(ops)
+	}
+	// Replace 整树算出来的墓碑不在 ops 里，但也必须刷新索引。
+	for _, p := range res.DeletedPaths {
+		if !containsStr(paths, p) {
+			paths = append(paths, p)
+		}
+	}
+	sort.Strings(paths)
+	return paths
+}
+
 func (s *Server) commitOpsLocal(project, branch, peerNode string, ops []treeOp, res opApplyResult) {
 	for _, cf := range res.Conflicted {
 		kind := cf.Kind
@@ -363,14 +418,7 @@ func (s *Server) commitOpsLocal(project, branch, peerNode string, ops []treeOp, 
 		}
 		s.recordWorkConflict(project, branch, cf.Path, cf.LocalSHA, cf.RemoteSHA, cf.Peer, kind)
 	}
-	paths := changedPathsOf(ops)
-	// Replace 整树算出来的墓碑不在 ops 里，但也必须刷新索引。
-	for _, p := range res.DeletedPaths {
-		if !containsStr(paths, p) {
-			paths = append(paths, p)
-		}
-	}
-	sort.Strings(paths)
+	paths := s.refreshPathsFor(project, branch, ops, res)
 	for _, p := range paths {
 		if err := s.refreshPath(project, branch, p, true); err != nil {
 			s.logf("op-sync: refresh %s@%s:%s failed: %v", project, branch, p, err)

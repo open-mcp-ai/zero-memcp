@@ -688,6 +688,28 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	// 推的水位：我作为日志属主，对端（peerName）确认到哪一位。
 	// 推方向由本端记，因为对端不会主动告诉我它收到哪了。
 	peerKey := s.resolvePeer(peerName)
+
+	// 「我记得发过什么」只要本轮没走到成功，就必须作废。
+	//
+	// 导出器在**发送之前**就记了 sentTree（它只负责算批，不知道成败），
+	// 而下一轮拿它当「对端手上是哪棵树」去算差分。失败却留着这条记忆，
+	// 下一轮就会得出「差 0 条」→ 报 in sync → 对端永远收不到那批内容，
+	// 而且两边都不报错。
+	//
+	// 实测（2026-11-25）：rock64 的 main.dev 少了 1107 条整（抽查路径
+	// 读不到，本机 read 正常），而本机一直报 in sync (0 op)。原因就是
+	// 补正文阶段某条出口 return 时没清 sentTree——那条出口是
+	// 「读本地 blob 失败 / 上传 blob 失败 / 补完仍报 missing」，
+	// 每一处都是早退，各自 return，漏一个就漏一片。
+	// 用 defer 兜住所有出口：只有走到末尾才算发成功。
+	sentOK := false
+	if s.workSync != nil {
+		defer func() {
+			if !sentOK {
+				s.workSync.forgetSentTree(project, branch, peerKey)
+			}
+		}()
+	}
 	curBase := l.BaseTree()
 	// 对端手上是哪棵树——用 peerTrees，不是 bases（见 syncwork.go 的说明）。
 	peerBase := ""
@@ -796,20 +818,13 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		res, err = postOpPush(client, baseURL, token, batch)
 	}
 	if err != nil {
-		// 推失败必须把「我记得发出过什么」作废。
-		//
-		// 导出器在**发送之前**就记了 sentTree（它只负责算批，不知道成败）。
-		// 失败却留着这条记忆，下一轮就会按「对端已经有了」算差分，
-		// 而对端其实没收到——被拒、回落、再发快照、再失败，死循环。
+		// sentTree 由上面的 defer 统一作废，这里不用重复。
 		//
 		// 但**不能**因此忘掉「对端手上是哪棵树」：那是对端的事实，
 		// 与本轮传输成没成无关。一并忘掉会造成更坏的循环——对端明明
 		// 有内容，本端却按「它是空的」每轮重发整树；整树推不动就一直
 		// 超时，超时又把记忆清掉。实测 18990 条推给开着索引的 3060，
 		// 每轮都重发全量、每轮都超时，而差分支路只用 102 条。
-		if s.workSync != nil {
-			s.workSync.forgetSentTree(project, branch, peerKey)
-		}
 		return res, err
 	}
 	if len(res.Missing) > 0 {
@@ -858,9 +873,8 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 			}())
 	}
 	// 只有对端确认之后才推进本地水位，并记下这个水位属于哪段流。
-	// 只有对端确认之后才推进本地水位，并记下这个水位属于哪段流。
+	sentOK = true
 	s.workSync.noteOut(project, branch, peerName, l.Last())
-	// 这一轮实际传了几条。水位说「推到哪了」，它说「这一轮做了多少」，
 	// 两者只在一直有东西传时才一起前进；内容一致时传 0 条，status
 	// 只看水位就会把「一致」和「刚推过」混起来。
 	s.workSync.noteOutOps(project, branch, peerName, len(batch.Ops))

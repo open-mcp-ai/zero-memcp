@@ -7,8 +7,8 @@ import (
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
-	"path/filepath"
 	"os"
+	"path/filepath"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/index"
 )
@@ -135,7 +135,7 @@ func TestIndexDisabledSkipsBranchRefresh(t *testing.T) {
 	dataDir := t.TempDir()
 	cfgWithIndex := `
 [server]
-data = "` + dataDir + `"
+data = ` + tomlPath(dataDir) + `
 
 [index]
 enabled = true
@@ -198,7 +198,7 @@ mode  = "rwxr-xr-x"
 	// 第二阶段：在同一个 dataDir 上启动【冷备份】实例（未配置 [index]）
 	cfgCold := `
 [server]
-data = "` + dataDir + `"
+data = ` + tomlPath(dataDir) + `
 
 [[user]]
 name = "zero"

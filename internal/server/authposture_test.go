@@ -102,7 +102,7 @@ func TestNewRefusesNetworkListenerWithoutEnforceAuth(t *testing.T) {
 	cfgPath := filepath.Join(dataDir, "zero-memcp.toml")
 	raw := `
 [server]
-data = "` + dataDir + `"
+data = ` + tomlPath(dataDir) + `
 
 enforce_auth = false
 

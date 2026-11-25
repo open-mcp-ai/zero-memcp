@@ -84,7 +84,7 @@ func newServerAt(t *testing.T, dataDir string) *Server {
 	t.Helper()
 	cfg := `
 [server]
-data = "` + dataDir + `"
+data = ` + tomlPath(dataDir) + `
 
 [[user]]
 name = "zero"

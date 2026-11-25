@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
@@ -109,8 +110,10 @@ auto_sync = true
 	if err != nil {
 		t.Fatalf("远端应包含未提交的那条记忆: %v", err)
 	}
-	if string(data) != "还没说出口\n" {
-		t.Fatalf("远端内容不符: %q", string(data))
+	// Windows 上 git 检出会把行尾写成 CRLF，内容本身是一样的；
+	// 比较的是「这条记忆有没有到」而不是行尾风格。
+	if got := strings.ReplaceAll(string(data), "\r\n", "\n"); got != "还没说出口\n" {
+		t.Fatalf("远端内容不符: %q", got)
 	}
 }
 

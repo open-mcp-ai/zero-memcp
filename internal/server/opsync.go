@@ -595,7 +595,23 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	}
 	// exportOpsFromPeer 自己判断「对齐还是发快照」：
 	// 认得出对端手上的树是本端流的某个前缀（含上次发的内容树）就发增量。
-	batch, err := s.exportOpsFromPeer(project, branch, after, effectivePeerBase, peerKey)
+	//
+	// 包成闭包是为了**重算一次**：被对端以基准不符拒绝之后，本端对
+	// 「对端手上是哪棵树」的记忆就已经被证伪，必须抹掉重导（见下）。
+	exportBatch := func() (opBatch, error) {
+		peerBase := ""
+		if s.workSync != nil {
+			peerBase = s.workSync.peerTreeOf(project, branch, peerKey)
+		}
+		if peerBase == "" && s.workSync != nil {
+			peerBase = s.workSync.sentTreeOf(project, branch, peerKey)
+		}
+		if peerBase == "" {
+			peerBase = gitstore.EmptyTreeSHA
+		}
+		return s.exportOpsFromPeer(project, branch, after, peerBase, peerKey)
+	}
+	batch, err := exportBatch()
 	if err != nil {
 		return zero, err
 	}
@@ -603,6 +619,28 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		return zero, nil
 	}
 	res, err := postOpPush(client, baseURL, token, batch)
+	if err != nil && isBaseTreeMismatch(err) {
+		// 对端说「我不认识你那个基准」。它对，本端那个记忆确实过期了——
+		// 对端离线期间本端折过 commit，内容树已经走到别处。
+		//
+		// 早先这里直接把错误抛出去，下一次、再下一次还是同一批、同一个
+		// 位置，而错误信息在叫人手工去要快照。没有人会去，备份就永久停住。
+		s.logf("op-sync: %s@%s: peer %s rejected our base (stale memory); re-sending as a full snapshot",
+			project, branch, peerKey)
+		if s.workSync != nil {
+			s.workSync.forgetPeerTree(project, branch, peerKey)
+			s.workSync.forgetSentTree(project, branch, peerKey)
+		}
+		var rerr error
+		batch, rerr = exportBatch()
+		if rerr != nil {
+			return zero, rerr
+		}
+		if len(batch.Ops) == 0 {
+			return zero, nil
+		}
+		res, err = postOpPush(client, baseURL, token, batch)
+	}
 	if err != nil {
 		return res, err
 	}
@@ -723,6 +761,16 @@ func pathOfSHA(ops []treeOp, sha string) string {
 		}
 	}
 	return ""
+}
+
+// isBaseTreeMismatch 判断一个推送失败是不是「对端不认识我们的基准」。
+//
+// 为什么靠文本（而不是类型化错误）：这句话是**对端**生成的，对端可能跑着
+// 旧版本，消息本身不在本端控制之内。跨机器传递的错误只能按对方实际发出的
+// 那句话识别；这个判据一旦失效，代价是回落到「人工去要快照」——所以它同时
+// 被测试按真实错误串钉住（见 TestPushFallsBackToSnapshotOnBaseMismatch）。
+func isBaseTreeMismatch(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "base tree mismatch")
 }
 
 // pullOpsFromPeer 从对端拉命令，落地并补齐对象。

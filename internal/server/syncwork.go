@@ -353,6 +353,24 @@ func (w *workSyncState) sentTreeOf(project, branch, peer string) string {
 	return ""
 }
 
+// forgetPeerTree 抹掉「该对端手上是哪棵树」的记忆。
+//
+// 什么时候必须抹（2026-11-25 实测，rock64 停机 19 小时后）：
+// 这个记忆是本端的推测，不是对端的事实。对端离线期间本端折了 commit、
+// 内容树前进了几代，记忆还停在旧树上。于是发送方按旧基准算差分，接收方
+// 拿自己的基准一比对就拒收，返回「base tree mismatch」，而错误信息叫**人**
+// 去要一份整树快照——没有人会去，这条备份就永久停在那里，每轮重试同一批。
+// 收到这个拒绝就等于对端在说「我不知道你那个基准」，此时唯一正确的动作是
+// 把它忘掉，按「对端手上什么都没有」重新导出，导出器自然会选整树快照。
+func (w *workSyncState) forgetPeerTree(project, branch, peer string) {
+	w.peerTrees.Delete(workKey(project, branch, peer))
+}
+
+// forgetSentTree 抹掉「上次发给该对端的快照树」的记忆（同上，一并作废）。
+func (w *workSyncState) forgetSentTree(project, branch, peer string) {
+	w.sentTrees.Delete(workKey(project, branch, peer))
+}
+
 // baseOf 返回该对端水位所属的基准树；从未同步过则为空。
 func (w *workSyncState) baseOf(project, branch, peer string) string {
 	if v, ok := w.bases.Load(workKey(project, branch, peer)); ok {

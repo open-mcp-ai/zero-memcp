@@ -437,8 +437,12 @@ func (s *Server) syncTopology(c Caller) (upstreams, peers, downstreams []syncPee
 				}
 			}
 			continue
-		case "served", "received":
-			// else 分支处理
+		case "served", "received", "push":
+			// push 也是「我发它收」，与 served 同一件事，必须归在一起。
+			//
+			// 漏掉它的后果：配置里没声明的对端（手工 sync、临时对端）
+			// 完全不出现在视图里——而注释写着「流水是事实」。实测就是
+			// 这样：一条已经推成功的分支，无参视图里连名字都没有。
 		default:
 			continue
 		}
@@ -514,6 +518,27 @@ func (s *Server) peerView(project, branch, peerName, role string, now time.Time)
 	}
 
 	if role == "upstream" || role == "peer" {
+		// 双向对端：判据必须与 `sync <project> <remote>` 一致。
+		//
+		// 只看 in（我拉它到哪）是不够的：对端从不主动推送时 in 恒为 0，
+		// 于是一条已经对齐的分支会被报成 `never synced (peer is at seq 0)`，
+		// 而 `sync BlackEggAI/zero hub-3060` 对同一条分支报 `in sync (0 op)`
+		// ——同一个事实，两个视图两种说法。实测就是这么被绕进去的。
+		//
+		// 最近一轮同步实际传了几条（lastOutOps）才是两个视图共用的判据：
+		// 有记录就说明那一轮跑完且成功，对齐与否已经由内容树比对决定了。
+		if role == "peer" && s.workSync != nil {
+			peerKey := s.resolvePeer(peerName)
+			if _, ran := s.workSync.lastOutOps(project, branch, peerKey); ran {
+				out, _ := s.workSync.cursors(project, branch, peerKey)
+				v.LocalSeq, v.PeerSeq = out, out
+				v.State = "caught up"
+				if lastRec != nil {
+					v.LastSeen = lastRec.TS
+				}
+				return v
+			}
+		}
 		// 我拉它：本地水位是 in，对端位点来自流水。
 		if s.workSync != nil {
 			_, in := s.workSync.cursors(project, branch, s.resolvePeer(peerName))

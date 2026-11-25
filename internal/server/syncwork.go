@@ -938,7 +938,8 @@ func (s *Server) pullWorkFromPeer(client *http.Client, baseURL, token, peerName,
 			EventOrigin{Identity: "peer:" + delta.Node, Endpoint: s.instanceID()})
 	}
 	if res.Applied > 0 || res.Deleted > 0 {
-		s.workSync.noteIn(project, branch, peerName, time.Now().UnixNano())
+		// 同 opsync.go：水位键必须用属主名，不能用配置别名。
+		s.workSync.noteIn(project, branch, s.resolvePeer(peerName), time.Now().UnixNano())
 	}
 	return res, nil
 }
@@ -1078,7 +1079,7 @@ func (s *Server) pushWorkToPeer(client *http.Client, baseURL, token, peerName, p
 			return res, fmt.Errorf("peer still reports %d missing blob(s) after upload", len(res.Missing))
 		}
 	}
-	s.workSync.noteOut(project, branch, peerName, seq)
+	s.workSync.noteOut(project, branch, s.resolvePeer(peerName), seq)
 	return res, nil
 }
 

@@ -65,7 +65,10 @@ func TestOpsSyncBidirectionalUsesIndependentWatermarks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	outSeq := b.peerOutSeq("blackegg/me", "zero", "a")
+	// 必须用属主名读——写入端（pushOpsToPeer）就是按属主名记的。
+	// 这里曾传别名 "a"，而下一行的 in 已经传了 resolvePeer；同一个测试
+	// 里两个方向用两种键，正是「键不统一」这件事本身的症状。
+	outSeq := b.peerOutSeq("blackegg/me", "zero", b.resolvePeer("a"))
 	inSeq := b.peerSeq("blackegg/me", "zero", b.resolvePeer("a"))
 	if outSeq != localLog.Last() {
 		t.Fatalf("推水位应等于本地日志位点 %d，实际 %d", localLog.Last(), outSeq)

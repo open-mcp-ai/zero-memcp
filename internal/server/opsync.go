@@ -785,10 +785,12 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		// 内容都一致时一个显示 pushed 一个显示 no change，看着像一条在传
 		// 一条没传——实测就是这么被误导的，白查了一轮。
 		if s.workSync != nil {
-			s.workSync.noteOutOps(project, branch, peerName, 0)
+			// 键必须是属主名（peerKey）而不是配置别名：见 resolvePeer 的说明，
+			// 同一台机器换别名之后别名键就废了，水位会从头重来。
+			s.workSync.noteOutOps(project, branch, peerKey, 0)
 			if s.opLogs != nil {
 				if l, lerr := s.opLogs.For(project, branch); lerr == nil {
-					s.workSync.noteOut(project, branch, peerName, l.Last())
+					s.workSync.noteOut(project, branch, peerKey, l.Last())
 				}
 			}
 		}
@@ -874,10 +876,10 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	}
 	// 只有对端确认之后才推进本地水位，并记下这个水位属于哪段流。
 	sentOK = true
-	s.workSync.noteOut(project, branch, peerName, l.Last())
+	s.workSync.noteOut(project, branch, peerKey, l.Last())
 	// 两者只在一直有东西传时才一起前进；内容一致时传 0 条，status
 	// 只看水位就会把「一致」和「刚推过」混起来。
-	s.workSync.noteOutOps(project, branch, peerName, len(batch.Ops))
+	s.workSync.noteOutOps(project, branch, peerKey, len(batch.Ops))
 	// 记给对端的基准：对端收下这批之后手上是哪棵树。
 	//
 	// 必须是**这批命令的终端内容树**（batch.ContentTree），不是
@@ -904,9 +906,19 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	}
 	s.workSync.noteBase(project, branch, peerKey, curBase)
 	s.recordSync(syncRecord{
+		// PeerHead 在所有记录里都必须是「对端拥有到哪一位」，不能是别的。
+		//
+		// 这里曾经写 len(batch.Ops)（这一轮推了几条命令）——那是完全不同
+		// 的量纲，而 syncPeerView 拿 PeerHead 当对端位点用。后果：`sync`
+		// 无参视图把「这一轮推了 124 条」当成「对端在 124」，再比本地 in
+		// 水位（0），报出 never synced，而 `sync <project> <remote>` 对
+		// 同一条分支报 in sync (0 op)。同一个事实，两个视图两种说法。
+		//
+		// 推送成功意味着对端拥有到 l.Last()，那才是这里的对端位点。
+		// 推了几条的信息在 Applied（对端实际应用数）里，不重复记。
 		Dir: "push", Peer: peerName, Node: s.resolvePeer(peerName),
 		Project: project, Branch: branch,
-		From: after, To: l.Last(), PeerHead: len(batch.Ops),
+		From: after, To: l.Last(), PeerHead: int(l.Last()),
 		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
 		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
 		Rejected: len(res.Rejected),

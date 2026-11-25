@@ -742,9 +742,15 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		if peerBase == "" {
 			peerBase = gitstore.EmptyTreeSHA
 		}
-		// 推方向不另报 have_tree：peerBase 本身就是「对端手上的内容」
-		// （peerTreeOf 记的是对端内容树），两个字段会是同一个值。
-		return s.exportOpsFromPeer(project, branch, after, peerBase, "", peerKey)
+		// 推方向：base_tree 留空、把「对端手上的内容」报在 have_tree 里。
+		//
+		// 不能报在 base_tree：那个字段的意思是「命令流原点」，导出器会
+		// 拿它和本端原点比，相等就发位点增量。可本端记的是**对端"内容**，
+		// 不是对端原点；两者碰巧相等时就会发位点增量过去，而对端按自己
+		// 的原点校验必被拒（实测 base tree mismatch (local 69030dda,
+		// peer 4b825dc6, rebase=false)）。内容相等只说明差多少是零，
+		// 不说明位点可比。
+		return s.exportOpsFromPeer(project, branch, after, "", peerBase, peerKey)
 	}
 	batch, err := exportBatch()
 	if err != nil {
@@ -777,14 +783,19 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		res, err = postOpPush(client, baseURL, token, batch)
 	}
 	if err != nil {
-		// 推失败必须把「我记得发出过什么」一起作废。
+		// 推失败必须把「我记得发出过什么」作废。
 		//
 		// 导出器在**发送之前**就记了 sentTree（它只负责算批，不知道成败）。
 		// 失败却留着这条记忆，下一轮就会按「对端已经有了」算差分，
 		// 而对端其实没收到——被拒、回落、再发快照、再失败，死循环。
+		//
+		// 但**不能**因此忘掉「对端手上是哪棵树」：那是对端的事实，
+		// 与本轮传输成没成无关。一并忘掉会造成更坏的循环——对端明明
+		// 有内容，本端却按「它是空的」每轮重发整树；整树推不动就一直
+		// 超时，超时又把记忆清掉。实测 18990 条推给开着索引的 3060，
+		// 每轮都重发全量、每轮都超时，而差分支路只用 102 条。
 		if s.workSync != nil {
 			s.workSync.forgetSentTree(project, branch, peerKey)
-			s.workSync.forgetPeerTree(project, branch, peerKey)
 		}
 		return res, err
 	}
@@ -835,21 +846,30 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	}
 	// 只有对端确认之后才推进本地水位，并记下这个水位属于哪段流。
 	s.workSync.noteOut(project, branch, peerName, l.Last())
-	// 记给对端的基准：快照落地后对端手上的树是内容树，不是本端原点。
-	// 记错了下一轮就会按原点声明增量，对端按内容树校验，永远对不上。
-	// 对端手上的内容推进到哪了：
-	//   整树快照 → 我们算出的那棵内容树
-	//   差分批次 → 也是那棵内容树（对端收下全部增量后内容就等于它）
-	//   普通增量 → 同上，内容跟着前进
-	// 三种情况其实一致：对端收下这批之后，内容就是本端当前的内容。
+	// 记给对端的基准：对端收下这批之后手上是哪棵树。
 	//
-	// 认错了的后果是每轮都判定「对端落后」→ 每轮重算并重发同一批差分，
-	// 备份永不收敛（这正是本轮要根治的形状）。
-	newPeerTree := batch.BaseTree
-	if st := s.workSync.sentTreeOf(project, branch, peerKey); st != "" {
-		newPeerTree = st
+	// 必须是**这批命令的终端内容树**（batch.ContentTree），不是
+	// batch.BaseTree——后者是这批命令的**起点**，也就是对端原来就有
+	// 的那棵树。记成起点等于说「对端没前进」，下一轮依旧判定它落后，
+	// 于是重算、重发同一批差分，备份永不收敛。
+	//
+	// 实测就是这个形状：差分成功发过 9 条，下一轮却仍报
+	// 「peer base 4b825dc6 != local base 08461f8a，sending full tree
+	// snapshot (19072 entries)」——记忆停在了空树上，而 3060 已经接过
+	// 好几次全量，逐条 refreshPath 抢分支写令牌，推送侧直接超时。
+	newPeerTree := batch.ContentTree
+	if newPeerTree == "" {
+		if st := s.workSync.sentTreeOf(project, branch, peerKey); st != "" {
+			newPeerTree = st
+		}
 	}
-	s.workSync.notePeerTree(project, branch, peerKey, newPeerTree)
+	if newPeerTree == "" {
+		newPeerTree = batch.BaseTree
+	}
+	// 有命令被拒或正文缺失时，对端手上就不是那棵树——不能记。
+	if len(res.Rejected) == 0 && len(res.Missing) == 0 {
+		s.workSync.notePeerTree(project, branch, peerKey, newPeerTree)
+	}
 	s.workSync.noteBase(project, branch, peerKey, curBase)
 	s.recordSync(syncRecord{
 		Dir: "push", Peer: peerName, Node: s.resolvePeer(peerName),

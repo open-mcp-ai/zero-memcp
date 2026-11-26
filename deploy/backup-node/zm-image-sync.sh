@@ -12,7 +12,7 @@
 # 就拒绝打标签。docker-compose.yml 里仍然只写 ghcr.io 的镜像名。
 set -eu
 
-TAG="${1:?用法: zm-image-sync.sh <tag>  例如 v0.2.7}"
+TAG="${1:?用法: zm-image-sync.sh <tag>  例如 v0.2.8}"
 REPO="open-mcp-ai/zero-memcp"
 SRC="ghcr.nju.edu.cn/${REPO}"
 DST="ghcr.io/${REPO}"

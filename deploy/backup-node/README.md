@@ -25,7 +25,7 @@ laptop (本机, 权威)          rock64 (10.192.168.164, 纯备份)
 #
 #    镜像源不是第二个来源：脚本会先向 ghcr.io 要官方的 index digest，
 #    再拿镜像源拉回来的 digest 去比，不相等就拒绝打标签。
-./zm-image-sync.sh v0.2.7
+./zm-image-sync.sh v0.2.8
 
 # 2. 建目录
 mkdir -p /mnt/private/deploy/zero-memcp/{data,conf}

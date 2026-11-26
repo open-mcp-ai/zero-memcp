@@ -37,7 +37,7 @@
 
 ```bash
 # 1. 取镜像并校验 digest
-../backup-node/zm-image-sync.sh v0.2.7
+../backup-node/zm-image-sync.sh v0.2.8
 
 # 2. 从宿主机配置派生容器配置
 python3 gen-container-config.py

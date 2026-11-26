@@ -22,7 +22,7 @@
 
 services:
   zero-memcp:
-    image: ghcr.io/open-mcp-ai/zero-memcp:v0.2.7
+    image: ghcr.io/open-mcp-ai/zero-memcp:v0.2.8
     container_name: zero-memcp
     restart: unless-stopped
     ports:

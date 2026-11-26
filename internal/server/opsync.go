@@ -340,12 +340,20 @@ func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult
 	s.learnPeerIdentity(batch.Node, batch.Node)
 	// 只有在命令真正被处理之后才推进对端水位：
 	// 「收到了」不等于「落地了」，先推进水位会让丢命令变成永久丢失。
-	if batch.To > 0 {
-		s.notePeerSeq(project, branch, batch.Node, batch.To)
+	//
+	// 同理，一批里若有命令被拒（res.Rejected 非空），水位绝不能跳过
+	// 最早那条被拒的位点——否则下一轮 pull 从 batch.To 之后开始要，
+	// 被拒那条和它之前没落地的内容就永远再也不被重拉。
+	// （实测旧逻辑直接把水位推到 batch.To，水位说「同步到了 seq N」
+	// 而内容压根没到。）
+	if safeTo := safePeerAdvanceSeq(batch.To, res.Rejected, res.RejectedSeq); safeTo > 0 {
+		s.notePeerSeq(project, branch, batch.Node, safeTo)
 	}
 	// 记下「这个水位属于哪段流」：对端流归零后位点会重来，
 	// 不绑基准就会出现「数字对得上、含义完全不同」的静默停摆。
-	if s.workSync != nil && s.opLogs != nil {
+	//
+	// 有被拒命令时也不能把本地基准说成已经对齐，免得下一轮按已对齐算。
+	if len(res.Rejected) == 0 && s.workSync != nil && s.opLogs != nil {
 		if l, lerr := s.opLogs.For(project, branch); lerr == nil {
 			s.workSync.noteBase(project, branch, batch.Node, l.BaseTree())
 		}
@@ -931,6 +939,50 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	return res, nil
 }
 
+// safePeerAdvanceSeq 算出一批命令应用之后，对端水位**安全能推进到哪**。
+//
+// 没有任何拒绝时就是 batch.To。一旦有命令被拒，只能推进到「最早那条
+// 被拒命令的前一位」（minSeq - 1）：
+//   - 它之前的命令确实全都落地了，可以推进；
+//   - 它自己与它之后的命令必须留在未确认区间里，等下一轮重拉或人工处理；
+//   - 若某条拒绝没有具体位点（seq <= 0，例如整树 replace 整体失败），整批
+//     都不可信，返回 0 表示不推进。
+func safePeerAdvanceSeq(batchTo int64, rejected []string, rejectedSeq []int64) int64 {
+	if batchTo <= 0 {
+		return 0
+	}
+	if len(rejected) == 0 {
+		return batchTo
+	}
+	minBad := firstRejectedSeq(opApplyResult{Rejected: rejected, RejectedSeq: rejectedSeq})
+	if minBad == 0 {
+		// 有拒绝却没带任何可用的位点（包含整树整体失败记的 0）：
+		// 宁可不推，绝不乱推。
+		return 0
+	}
+	if minBad-1 < batchTo {
+		return minBad - 1
+	}
+	return batchTo
+}
+
+// firstRejectedSeq 返回被拒命令里最小的那个位点；没有可用位点则为 0。
+//
+// 位点 0 在这里是「这条拒绝不属于任何具体命令」（整树整体失败），
+// 它使整批都不可信，所以直接归零而不参与取最小值。
+func firstRejectedSeq(res opApplyResult) int64 {
+	var first int64
+	for _, seq := range res.RejectedSeq {
+		if seq <= 0 {
+			return 0
+		}
+		if first == 0 || seq < first {
+			first = seq
+		}
+	}
+	return first
+}
+
 // firstBlockedSeq 返回「缺正文的命令」里最小的那个 seq。
 //
 // 水位要钉在它之前：水位是「到这儿为止都落地了」的声明，而这条没落地。
@@ -1080,6 +1132,19 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 		}
 		s.commitOpsLocal(project, branch, batch.Node, batch.Ops, res)
 
+		// 第二趟若冒出新的拒绝（第一趟只看到缺正文、正文补回来后才知道
+		// 被拒），之前第一趟按「无拒绝」推进过的水位必须退回它之前。
+		if len(res.Rejected) > 0 {
+			minBad := firstRejectedSeq(res)
+			pinTo := int64(0)
+			if minBad > 1 {
+				pinTo = minBad - 1
+			}
+			got := pinWatermark(&s.workSync.in, workKey(project, branch, batch.Node), pinTo)
+			s.logf("op-sync: %s@%s: 补正文重放后仍有 %d 条命令被拒，水位钉在 seq %d",
+				project, branch, len(res.Rejected), got)
+		}
+
 		// 仍然缺的那些命令：留证，并把水位钉在它之前。
 		//
 		// 为什么必须钉（而不是直接推进到 batch.To）：水位一过，下一轮
@@ -1099,9 +1164,16 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 				})
 			}
 			if pin > 0 {
-				forceWatermark(&s.workSync.in, workKey(project, branch, batch.Node), pin-1)
-				s.logf("op-sync: %s@%s: %d 条命令缺正文，已把水位钉在 seq %d（其余命令已落地）",
-					project, branch, len(res.Missing), pin-1)
+				// 只能降不能升：同一批里若还有命令被拒（位点更早），
+				// 无条件赋值会把水位重新抬过那条被拒的命令，
+				// 把「永久丢失」重新种回去。
+				if got := pinWatermark(&s.workSync.in, workKey(project, branch, batch.Node), pin-1); got != pin-1 {
+					s.logf("op-sync: %s@%s: %d 条命令缺正文，但水位已经更低（%d），不再回退",
+						project, branch, len(res.Missing), got)
+				} else {
+					s.logf("op-sync: %s@%s: %d 条命令缺正文，已把水位钉在 seq %d（其余命令已落地）",
+						project, branch, len(res.Missing), pin-1)
+				}
 			}
 		} else {
 			if n := s.workSync.clearBlockedPeer(project, branch, batch.Node); n > 0 {

@@ -299,6 +299,31 @@ func forceWatermark(m *sync.Map, key string, seq int64) {
 	actual.(*atomic.Int64).Store(seq)
 }
 
+// pinWatermark 把水位钉到 seq，且只降不升。
+//
+// 为什么必须单向：同一个批次里可能既有缺正文的命令、又有被拒的命令。
+// 两处都会各自把水位往回钉，而后一处算出的位点可能比前一处更靠后。
+// 无条件赋值的话，后一处就把水位重新抬过了前一处钉住的命令——
+// 「永久丢失」就这样被重新种回去，而两行日志都写着「已钉住」。
+//
+// 返回最终的水位，供调用方判断是「钉下去了」还是「本来就更低」。
+func pinWatermark(m *sync.Map, key string, seq int64) int64 {
+	if seq < 0 {
+		seq = 0
+	}
+	actual, _ := m.LoadOrStore(key, new(atomic.Int64))
+	cur := actual.(*atomic.Int64)
+	for {
+		old := cur.Load()
+		if old <= seq {
+			return old
+		}
+		if cur.CompareAndSwap(old, seq) {
+			return seq
+		}
+	}
+}
+
 func newWorkSyncState() *workSyncState {
 	return &workSyncState{}
 }

@@ -653,3 +653,119 @@ url     = "http://127.0.0.1:1/repos/p.git"
 		t.Fatal("拼错的字段必须被拒绝")
 	}
 }
+
+// subscribe 是三态：没写按默认判，写了就听写下的。
+//
+// 为什么必须能区分「没写」与「写了 false」：默认值要对工作层对端开着，
+// 但人得能显式关掉它。用 bool 而不是 *bool 的话，`subscribe = false`
+// 与缺省在解析后长得一模一样，「默认开、显式关」就没法表达。
+func TestRemoteSubscribeTriState(t *testing.T) {
+	base := func(extra string) string {
+		return `
+[server]
+data = "/tmp/x"
+
+[[user]]
+name = "zero"
+root = true
+
+[[remote]]
+project = "p"
+name    = "hub"
+url     = "http://127.0.0.1:1729"
+auto_sync = true
+push = ["main"]
+` + extra
+	}
+
+	f, err := ParseFile([]byte(base("")))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if f.Remotes[0].Subscribe != nil {
+		t.Fatal("没写 subscribe 时必须保持 nil（= 按默认判）")
+	}
+
+	f, err = ParseFile([]byte(base("subscribe = true\n")))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if f.Remotes[0].Subscribe == nil || !*f.Remotes[0].Subscribe {
+		t.Fatal("subscribe = true 应解析为 true")
+	}
+
+	f, err = ParseFile([]byte(base("subscribe = false\n")))
+	if err != nil {
+		t.Fatalf("解析失败: %v", err)
+	}
+	if f.Remotes[0].Subscribe == nil || *f.Remotes[0].Subscribe {
+		t.Fatal("subscribe = false 必须解析成显式的 false，且与 nil 可区分")
+	}
+
+	// 拼错必须被拒绝，不能静默当成没写
+	if _, err := ParseFile([]byte(base("subscibe = true\n"))); err == nil {
+		t.Fatal("拼错的字段必须被拒绝")
+	}
+}
+
+// 配了但永远不生效的组合必须当场报错，而不是安静地什么都没做。
+func TestRemoteSubscribeRejectsPointlessCombos(t *testing.T) {
+	base := func(extra string) string {
+		return `
+[server]
+data = "/tmp/x"
+
+[[user]]
+name = "zero"
+root = true
+
+[[remote]]
+project = "p"
+name    = "hub"
+url     = "http://127.0.0.1:1729"
+` + extra
+	}
+
+	cases := []struct {
+		name string
+		toml string
+	}{
+		{"没开 auto_sync", "subscribe = true\npush = [\"main\"]\n"},
+		{"push_only 从不拉", "subscribe = true\nauto_sync = true\npush_only = true\npush = [\"main\"]\n"},
+		{"fetch_only", "subscribe = true\nauto_sync = true\nfetch_only = true\npush = [\"main\"]\n"},
+		{"没有任何分支", "subscribe = true\nauto_sync = true\n"},
+	}
+	for _, c := range cases {
+		if _, err := ParseFile([]byte(base(c.toml))); err == nil {
+			t.Errorf("%s：应报错，实际通过了（配置看起来生效，实际不会有任何连接）", c.name)
+		}
+	}
+
+	// Git 远端没有 MCP 端点可订阅：单独构造，避免同块里出现第二个 url 键
+	// （那会先被「重复键」拦下，测到的是另一条规则——我第一版就写成了这样，
+	// 测试绿着却什么也没验证）。
+	gitRemote := `
+[server]
+data = "/tmp/x"
+
+[[user]]
+name = "zero"
+root = true
+
+[[remote]]
+project = "p"
+name    = "hub"
+url     = "https://github.com/x/y.git"
+subscribe = true
+auto_sync = true
+push = ["main"]
+`
+	if _, err := ParseFile([]byte(gitRemote)); err == nil {
+		t.Error("Git 远端 subscribe = true 应报错：它没有 MCP 端点可订阅")
+	}
+
+	// 正常组合必须通过。
+	if _, err := ParseFile([]byte(base("subscribe = true\nauto_sync = true\npush = [\"main\"]\n"))); err != nil {
+		t.Fatalf("合法组合不应报错: %v", err)
+	}
+}

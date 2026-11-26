@@ -35,6 +35,14 @@ type opApplyResult struct {
 	Conflicted []workConflict `json:"conflicted,omitempty"`
 	// Rejected 是因故没能落地的命令（缺对象之外的原因）。
 	Rejected []string `json:"rejected,omitempty"`
+	// RejectedSeq 是与 Rejected 一一对应的命令位点，0 表示这条拒绝
+	// 不属于任何具体位点（例如整树 replace 整体失败）。
+	//
+	// 为什么需要它：同步水位只能推进到「所有命令都落地了」的位置。
+	// 而从 Rejected 的文案里解析位点是错的——那是给人读的字符串，
+	// 措辞一改水位就悄悄错位，而水位错了表现为「内容永久缺失但不报错」。
+	// 所以位点必须由产生拒绝的那一处结构化地带出来。
+	RejectedSeq []int64 `json:"rejected_seq,omitempty"`
 	// Kept 是权威整树里本地有未提交改动、因而拒绝被覆盖的路径。
 	// 它们既不在 Applied 也不在 Deleted 里——必须能被看见。
 	Kept []string `json:"kept,omitempty"`
@@ -162,6 +170,7 @@ func (s *Server) applyTreeReplace(project, branch, peerNode string, ctx *opConte
 		missing, err := s.applyOp(project, branch, peerNode, ctx, one, res)
 		if err != nil {
 			res.Rejected = append(res.Rejected, fmt.Sprintf("tree set %s: %v", e.Path, err))
+			res.RejectedSeq = append(res.RejectedSeq, op.Seq)
 			continue
 		}
 		if missing != "" {
@@ -187,6 +196,7 @@ func (s *Server) applyTreeReplace(project, branch, peerNode string, ctx *opConte
 		tomb := treeOp{Seq: op.Seq, Node: op.Node, Ts: op.Ts, Kind: opDelete, Path: path}
 		if _, err := s.applyOp(project, branch, peerNode, ctx, tomb, res); err != nil {
 			res.Rejected = append(res.Rejected, fmt.Sprintf("tree delete %s: %v", path, err))
+			res.RejectedSeq = append(res.RejectedSeq, op.Seq)
 			continue
 		}
 		// 记录被墓碑的路径，供 commitOpsLocal 刷新索引。
@@ -323,6 +333,9 @@ func (s *Server) applyOps(project, branch, peerNode string, ops []treeOp) (opApp
 		if raw.Kind == opTree && raw.Replace {
 			if terr := s.applyTreeReplace(project, branch, peerNode, ctx, raw, &res); terr != nil {
 				res.Rejected = append(res.Rejected, fmt.Sprintf("tree replace: %v", terr))
+				// 整树整体失败时没有「具体哪一条」——记 0 表示
+				// 「这批不可信」，调用方据此不推进水位。
+				res.RejectedSeq = append(res.RejectedSeq, 0)
 			}
 			continue
 		}
@@ -330,6 +343,7 @@ func (s *Server) applyOps(project, branch, peerNode string, ops []treeOp) (opApp
 			missing, aerr := s.applyOp(project, branch, peerNode, ctx, op, &res)
 			if aerr != nil {
 				res.Rejected = append(res.Rejected, fmt.Sprintf("seq %d %s %s: %v", op.Seq, op.Kind, op.Path, aerr))
+				res.RejectedSeq = append(res.RejectedSeq, op.Seq)
 				continue
 			}
 			if missing != "" && !seenMissing[missing] {

@@ -255,6 +255,19 @@ type Remote struct {
 	// Pull 是允许拉取的分支白名单；空表示不主动拉任何分支。
 	// 下游节点把上游配成 remote 并声明 pull，就能实现「他多了你拉」。
 	Pull []string
+	// Subscribe 控制要不要向这个工作层对端订阅分支变更。
+	//
+	// nil 表示没写，按默认判：工作层对端、开了 auto_sync、不是 push_only
+	// 或 fetch_only、且分支列表非空，就订阅。
+	//
+	// 为什么需要它（2026-11-26）：kickSync 只在**本机写入**时触发，
+	// 反方向没有任何触发点——上游写了内容，下游要等 [[sync]].interval
+	// （默认 5m）的定时器才知道。备份没坏，只是慢了最多五分钟，
+	// 而这个「慢」在 status 上完全看不出来。
+	//
+	// 指针而不是 bool：`subscribe = false` 与「没写」必须能区分开，
+	// 否则没法「默认开、显式关」。
+	Subscribe *bool
 	// SSHKey 是服务端 system/sshkeys 下的私钥名；不包含私钥内容。
 	SSHKey string
 	// HostKey 是 SSH server 的 SHA256 host-key fingerprint，必须显式 pin。
@@ -343,7 +356,7 @@ var knownKeys = map[string]map[string]bool{
 	"access":   {"user": true, "project": true, "branch": true, "perm": true},
 	"auth.key": {"name": true, "public_key": true, "caps": true, "root": true},
 	"listen":   {"addr": true, "allow": true, "require": true, "mount": true, "webui": true, "tls_cert": true, "tls_key": true},
-	"remote":   {"project": true, "name": true, "url": true, "fetch_only": true, "push_only": true, "push": true, "pull": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
+	"remote":   {"project": true, "name": true, "url": true, "fetch_only": true, "push_only": true, "push": true, "pull": true, "subscribe": true, "ssh_key": true, "host_key": true, "http_user": true, "http_token": true, "auto_sync": true, "on_receive": true, "tls_ca": true, "tls_pin": true},
 }
 
 // checkKeys 拒绝未知分节与未知键。
@@ -560,6 +573,14 @@ func ParseFile(raw []byte) (*File, error) {
 		if rm.Pull, err = list(sec, "[[remote]]", "pull"); err != nil {
 			return nil, err
 		}
+		// subscribe 是三态：没写 = 按默认判，写了就听写下的。
+		if _, present := sec["subscribe"]; present {
+			v, berr := boolean(sec, "[[remote]]", "subscribe")
+			if berr != nil {
+				return nil, berr
+			}
+			rm.Subscribe = &v
+		}
 		if rm.SSHKey, err = str(sec, "[[remote]]", "ssh_key"); err != nil {
 			return nil, err
 		}
@@ -608,6 +629,26 @@ func ParseFile(raw []byte) (*File, error) {
 		// push_only 与 fetch_only 一起写等于两边都不做，这条远端没有任何作用。
 		if rm.PushOnly && rm.FetchOnly {
 			return nil, fmt.Errorf("[[remote]] %q push_only = true conflicts with fetch_only = true; the remote would neither push nor pull", rm.Name)
+		}
+		// 订阅的用途只有一个：知道对端有新内容，好去拉。
+		// 对「永不从它拉」或「不跑后台同步」的远端开订阅，只会多一条
+		// 永远建不起来的连接，而配置看起来是生效的。
+		if rm.Subscribe != nil && *rm.Subscribe {
+			if !rm.AutoSync {
+				return nil, fmt.Errorf("[[remote]] %q subscribe = true requires auto_sync = true (a subscription only exists to trigger the background sync pass)", rm.Name)
+			}
+			if rm.PushOnly {
+				return nil, fmt.Errorf("[[remote]] %q subscribe = true conflicts with push_only = true (we never pull from it, so its changes are none of our business)", rm.Name)
+			}
+			if rm.FetchOnly {
+				return nil, fmt.Errorf("[[remote]] %q subscribe = true conflicts with fetch_only = true", rm.Name)
+			}
+			if len(rm.Pull) == 0 && len(rm.Push) == 0 {
+				return nil, fmt.Errorf("[[remote]] %q subscribe = true needs a non-empty pull or push list to know what to watch", rm.Name)
+			}
+			if strings.HasSuffix(strings.ToLower(strings.TrimRight(rm.URL, "/")), ".git") {
+				return nil, fmt.Errorf("[[remote]] %q subscribe is only for work-layer peers (URL without .git suffix); a Git remote has no MCP endpoint to subscribe to", rm.Name)
+			}
 		}
 		if rm.HTTPToken != "" {
 			if err := ValidateSSHKeyName(rm.HTTPToken); err != nil {

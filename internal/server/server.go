@@ -199,6 +199,8 @@ type Server struct {
 
 	// syncState 是后台对等同步的进程内状态（冲突队列、上次同步时间）。
 	syncState syncState
+	// peerEventHook 仅用于测试观测「订阅确实收到了变更并准备 kickSync」。
+	peerEventHook atomic.Pointer[func()]
 	// workSync 是工作层同步的水位记录。
 	workSync *workSyncState
 	// opLogs 是本节点的命令流日志库（跨机器一致性的唯一内部抽象）。

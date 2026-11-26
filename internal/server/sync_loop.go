@@ -367,6 +367,12 @@ func (s *Server) startSyncLoop() {
 			}
 		}
 	}()
+
+	// 订阅对端变更：把「等下一次 ticker」换成「对端说它那边有新东西」。
+	//
+	// 放在这里而不是 Start() 里另起一段：订阅只负责把 kick 打得勤一点，
+	// 它没有自己的语义，与同步循环同生同死。
+	s.startPeerSubscriptions()
 }
 
 // kickSync 请求一次尽快同步（提交成功后调用）。非阻塞、去重。

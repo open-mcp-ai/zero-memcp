@@ -107,16 +107,9 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 	// 踩过的坑：只在 put 里登记，结果 write 走的另一条路径完全没进
 	// 命令流——同步时这些改动凭空消失，而本地一切正常。
 	if e, ok, serr := repo.ReadPathSHA(branch, path); serr == nil && ok {
-		s.noteWriteOp(proj, branch, path, string(e.Mode), e.SHA)
+		s.noteWriteOp(c, proj, branch, path, string(e.Mode), e.SHA)
 	} else if serr != nil {
 		s.logf("oplog: cannot resolve written blob for %s@%s:%s: %v", proj, branch, path, serr)
 	}
-	// 广播资源变更：同上，不能只让 put 广播而 write 静默——订阅这棵树
-	// 的对端或分身写完规则文件同样该立刻知道。
-	s.publishTreeChange(proj, branch, path, "", "", EventOrigin{
-		Identity: c.Identity,
-		Session:  c.Session,
-		Endpoint: s.cfg.Endpoint,
-	})
 	return fmt.Sprintf("written to %s@%s/%s (%d bytes); index refreshed", proj, branch, path, len(content)), nil
 }

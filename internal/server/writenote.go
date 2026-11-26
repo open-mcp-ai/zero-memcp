@@ -236,29 +236,29 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 		path = treePrefix + "/" + path
 	}
 
-	// 记下写入前的头，供事件携带——「写入发生在哪个版本之上」。
-	prevHead, _ := repo.Resolve(writeBranch)
-
 	if err := repo.Write(writeBranch, path, []byte(content), gitstore.ModeContent); err != nil {
 		return "", "", "", err
 	}
 
-	// 写入即通知：commit 是底层折叠动作，不是语义事件。
+	// 写入即通知 + 登记命令流：两件事必须在同一个地方做完。
 	//
-	// 早先广播只挂在 commit 上，于是「外部往 inbox 写一条，等它自己折叠」
-	// 这条最常见的用法根本不触发唤醒——数据进了脏层，索引也更新了，
-	// 但订阅者收不到任何东西。让调用方为了叫醒别人而多调一次 commit，
-	// 等于把内部机制泄漏成外部契约。
+	// 语义是「树被写了」而不是「树被折叠了」：commit 是底层动作，
+	// 不是语义事件。早先广播只挂在 commit 上，于是「写一条、等它自己
+	// 折叠」这条最常见的用法根本不触发唤醒——数据进了脏层，索引也更新了，
+	// 但订阅者收不到任何东西。
 	//
-	// 语义从「树被折叠了」改成「树被写了」。commit 留空：脏层没有新版本号，
-	// path 必须带上：客户端据此知道「这一次写的是哪个文件」。早先传空，
-	// 订阅方只能 ls 一遍猜最新一条，猜错就反复处理同一条旧输入。
-	// 取差量的正确方式是按路径读，而不是 since <commit>。
-	s.publishTreeChange(targetProject, writeBranch, path, prevHead, "", EventOrigin{
-		Identity: c.Identity,
-		Session:  c.Session,
-		Endpoint: s.cfg.Endpoint,
-	})
+	// 命令流也在这里记：早先只有 execPut 那一层调 noteWriteOp，而本函数
+	// 还有 putRef 与 writeNote 两个调用者——它们写进去的内容从来没有位点，
+	// 同步时凭空消失，而本地一切正常。放到这里，调用者就不可能漏。
+	if e, ok, serr := repo.ReadPathSHA(writeBranch, path); serr == nil && ok {
+		s.noteWriteOp(c, targetProject, writeBranch, path, string(e.Mode), e.SHA)
+	} else {
+		// 回读不到 SHA 时仍要广播：内容确实变了，只是这次没法进命令流。
+		// 静默不广播会让订阅者以为没发生任何事。
+		s.logf("oplog: cannot resolve written blob for %s@%s:%s: %v",
+			targetProject, writeBranch, path, serr)
+		s.publishLocalWrite(targetProject, writeBranch, path, c)
+	}
 
 	addr = targetProject + "/" + path
 	s.dedup.Store(dedupKey, path)

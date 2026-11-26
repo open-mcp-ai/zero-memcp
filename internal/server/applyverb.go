@@ -122,7 +122,7 @@ func (s *Server) execApply(rest string, c Caller, defaultBranch string) (string,
 			}
 			written++
 			if e, ok, serr := repo.ReadPathSHA(branch, pid); serr == nil && ok {
-				s.noteWriteOp(proj, branch, pid, string(e.Mode), e.SHA)
+				s.noteWriteOp(c, proj, branch, pid, string(e.Mode), e.SHA)
 			}
 		case "delete":
 			if err := repo.Delete(branch, pid); err != nil {
@@ -130,7 +130,7 @@ func (s *Server) execApply(rest string, c Caller, defaultBranch string) (string,
 					i+1, len(patches), pid, err)
 			}
 			deleted++
-			s.noteDeleteOp(proj, branch, pid)
+			s.noteDeleteOp(c, proj, branch, pid)
 		}
 	}
 

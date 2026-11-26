@@ -397,16 +397,16 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 		// 源分支（mv 时）记一条 delete——两边的位点各自单调。
 		if srcBranch == dstBranch {
 			if isMove {
-				s.noteMoveOp(dstProj, dstBranch, srcPath, target)
+				s.noteMoveOp(c, dstProj, dstBranch, srcPath, target)
 			} else if e, ok, serr := repo.ReadPathSHA(dstBranch, target); serr == nil && ok {
-				s.noteCopyOp(dstProj, dstBranch, srcPath, target, string(e.Mode), e.SHA)
+				s.noteCopyOp(c, dstProj, dstBranch, srcPath, target, string(e.Mode), e.SHA)
 			}
 		} else {
 			if e, ok, serr := repo.ReadPathSHA(dstBranch, target); serr == nil && ok {
-				s.noteWriteOp(dstProj, dstBranch, target, string(e.Mode), e.SHA)
+				s.noteWriteOp(c, dstProj, dstBranch, target, string(e.Mode), e.SHA)
 			}
 			if isMove {
-				s.noteDeleteOp(srcProj, srcBranch, srcPath)
+				s.noteDeleteOp(c, srcProj, srcBranch, srcPath)
 			}
 		}
 
@@ -831,7 +831,7 @@ func (s *Server) execDelete(rest string, c Caller, defaultBranch string) (string
 			return "", err
 		}
 		// 删除也是一条命令，与写入同一条流。不是特例分支。
-		s.noteDeleteOp(proj, branch, p)
+		s.noteDeleteOp(c, proj, branch, p)
 		removed = append(removed, p)
 	}
 

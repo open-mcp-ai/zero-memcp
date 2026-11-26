@@ -189,15 +189,7 @@ func (s *Server) putBody(target, body, session string, c Caller) (TermResult, er
 	commitSHA, _ := repo.Resolve(branch)
 	virtPath := s.virtualPath(c, proj, branch, rel)
 
-	// 登记进命令流：这次写入从此有一个位点，对端按位点增量取走。
-	//
-	// 放在回读校验之后：只有确认真的落进脏层的写入才配拥有位点，
-	// 否则日志里会出现一条指向不存在内容的命令。
-	if e, ok, serr := repo.ReadPathSHA(branch, rel); serr == nil && ok {
-		s.noteWriteOp(proj, branch, rel, string(e.Mode), e.SHA)
-	} else if serr != nil {
-		s.logf("oplog: cannot resolve written blob for %s@%s:%s: %v", proj, branch, rel, serr)
-	}
+	// 登记命令流与广播已经由 writeNoteGit 做完，这里不再重复。
 
 	text := "ok " + virtPath
 	if commitSHA != "" {

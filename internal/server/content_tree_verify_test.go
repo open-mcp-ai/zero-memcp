@@ -82,15 +82,34 @@ func TestContentTreeDetectsDroppedCommand(t *testing.T) {
 	if len(broken.Ops[0].Batch) < 2 {
 		t.Fatalf("快照至少需要两条才能做丢弃实验，实际 %d", len(broken.Ops[0].Batch))
 	}
-	dropped := broken.Ops[0].Batch[0].Path
-	broken.Ops[0].Batch = broken.Ops[0].Batch[1:]
+	// 必须抽走一条**接收端本来没有**的路径。
+	//
+	// 早先无条件抽 Batch[0]，而 Batch[0] 恰好是 setupMountServer 给两端
+	// 都种下的同一个文件（内容同 SHA）。那种「丢失」对接收端是零影响，
+	// 抽走它却仍然报错，靠的正是当时那条「快照里没有就删本地」的错误
+	// 规则（本地被删掉，树才对不上）。现在那条规则已移除，所以这里改成
+	// 抽走源端独有的一条，才是在测「丢命令会不会被发现」。
+	dropped := "a.md"
+	kept := make([]opEntry, 0, len(broken.Ops[0].Batch)-1)
+	found := false
+	for _, e := range broken.Ops[0].Batch {
+		if e.Path == dropped {
+			found = true
+			continue
+		}
+		kept = append(kept, e)
+	}
+	if !found {
+		t.Fatalf("快照里应当含 %s", dropped)
+	}
+	broken.Ops[0].Batch = kept
 
 	_, err = dst2.ingestOps(project, branch, broken)
 	if err == nil {
 		t.Fatalf("抽走 %s 之后内容已经与声明不符，却被当成同步成功——这正是静默丢内容", dropped)
 	}
-	if !strings.Contains(err.Error(), "content tree mismatch") {
-		t.Fatalf("报错应当点名内容树不一致，实际: %v", err)
+	if !strings.Contains(err.Error(), "did not land") && !strings.Contains(err.Error(), "content tree") {
+		t.Fatalf("报错应当点名内容不一致，实际: %v", err)
 	}
 	t.Logf("丢弃一条被检出：%v", err)
 

@@ -8,16 +8,22 @@ import (
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
 )
 
-// 权威整树必须能删，不只是能加。
+// 整树同步只加只改：缺一个路径不是删除的证据。
 //
-// 2026-11-22 部署前发现：opTree 原本只展开成 set。后果是「整树同步」
-// 只能加不能减——把一台落后八天的节点当成上游，会把八天里删掉的内容
-// 全部复活；反过来，上游的删除也永远传不下来。
+// 演进（2026-11-26）：早先这里钉的是「本地有、权威整树里没有 → 墓碑」，
+// 依据是「整树同步不能只加不减，否则删掉的东西会复活」。那条规则把
+// 「对端手上没有」当成了「对端删过」，而最常见的成因恰恰是「本地刚写完
+// 还没推出去」。生产环境因此累计丢了 347 个文件的内容：笔记本写完 41 个
+// 切片并折叠成 commit（推送前的正常动作），紧接着先拉一轮，3060 的树里
+// 还没有它们，于是回了一串删除命令把它们全删了。
 //
-// 这个测试钉住两条不变量：
-//  1. 本地有、权威整树里没有 → 墓碑（对端已删）
-//  2. 本地有未提交改动 → 保留，进 Kept，绝不静默覆盖
-func TestTreeReplaceDeletesPathsMissingFromAuthoritativeTree(t *testing.T) {
+// 现在的语义：
+//  1. 删除是**显式动作**——一条 opDelete 命令，沿命令流到达对端。
+//     整树快照只负责「把对端有的搬过来」，不负责推断谁该消失。
+//  2. 本地有、快照里没有 → 保留，并进 Kept 点名（既不是静默忽略，
+//     也不冒充「两端已经一致」）。
+//  3. 显式 delete 命令照旧生效（见 TestOpsSyncDeleteIsACommand）。
+func TestTreeReplaceKeepsPathsMissingFromAuthoritativeTree(t *testing.T) {
 	srv, dataDir := newWatchTestServer(t)
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "w", Cap: "rwx"})
 
@@ -72,15 +78,20 @@ func TestTreeReplaceDeletesPathsMissingFromAuthoritativeTree(t *testing.T) {
 		t.Fatalf("applyTreeReplace: %v", err)
 	}
 
-	// 1. 不在批次里的 stale.md 必须被墓碑。
-	if !hasConflictOrDeleted(res, "stale.md") && !deletedLocally(t, repo, "stale.md") {
-		t.Fatalf("权威整树里缺失的 stale.md 应被删除，实际 res=%+v", res)
+	// 1. 不在批次里的 stale.md 必须**保留**：缺一个路径不是删除的证据。
+	if hasConflictOrDeleted(res, "stale.md") || deletedLocally(t, repo, "stale.md") {
+		t.Fatalf("权威整树里缺失的路径不得被当成删除，实际 res=%+v", res)
 	}
-	if _, err := callMCP(t, srv, tok, "read daily@zero:stale.md"); err == nil {
-		t.Fatal("stale.md 应已读不到")
+	if _, err := callMCP(t, srv, tok, "read daily@zero:stale.md"); err != nil {
+		t.Fatalf("stale.md 应当保留（对端没有≠对端删过）: %v", err)
 	}
 
-	// 2. 批次里的路径仍在。
+	// 2. 保留必须点名，不能静默：否则调用方会把它当成「两端已一致」。
+	if !containsStr(res.Kept, "stale.md") {
+		t.Fatalf("保留的路径必须出现在 Kept 里，实际 res=%+v", res)
+	}
+
+	// 3. 批次里的路径仍在。
 	if _, err := callMCP(t, srv, tok, "read daily@zero:keep.md"); err != nil {
 		t.Fatalf("keep.md 应保留: %v", err)
 	}

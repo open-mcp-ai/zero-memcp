@@ -178,8 +178,21 @@ func (s *Server) applyTreeReplace(project, branch, peerNode string, ctx *opConte
 		}
 	}
 
-	// 本地有、批次里没有 → 对端已删除。
-	var gone []string
+	// 本地有、批次里没有 → **保留，不删**。
+	//
+	// 早先这里是「对端已删除」并打墓碑，依据只是「批次里没这个路径」。
+	// 而批次里没有只能说明对端手上没有——最常见的成因是本地刚写完、
+	// 还没推出去（先拉后推的必然窗口），以及对端从未收到过这条内容。
+	//
+	// 删除是显式动作：它是一条 opDelete 命令，沿命令流到达对端。
+	// 拿「对方没有」当删除证据，结果是替对方把它自己的新内容删掉——
+	// 2026-11-26 生产环境因此累计丢了 347 个文件的内容（全部可从 git
+	// 历史找回，但在 read/recall 里不可见）。
+	//
+	// 保留 ≠ 忽略：这些路径一律进 Kept，调用方因此不会把它当成
+	// 「两端已经一致」，日志里也会点名。多留一条旧文件是可恢复的，
+	// 删掉对方刚写的东西不是。
+	var retained []string
 	for path := range ctx.clean {
 		if inBatch[path] {
 			continue
@@ -189,23 +202,21 @@ func (s *Server) applyTreeReplace(project, branch, peerNode string, ctx *opConte
 			res.Kept = append(res.Kept, path)
 			continue
 		}
-		gone = append(gone, path)
+		retained = append(retained, path)
 	}
-	sort.Strings(gone)
-	for _, path := range gone {
-		tomb := treeOp{Seq: op.Seq, Node: op.Node, Ts: op.Ts, Kind: opDelete, Path: path}
-		if _, err := s.applyOp(project, branch, peerNode, ctx, tomb, res); err != nil {
-			res.Rejected = append(res.Rejected, fmt.Sprintf("tree delete %s: %v", path, err))
-			res.RejectedSeq = append(res.RejectedSeq, op.Seq)
-			continue
+	sort.Strings(retained)
+	if len(retained) > 0 {
+		res.Kept = append(res.Kept, retained...)
+		sample := retained
+		if len(sample) > 5 {
+			sample = sample[:5]
 		}
-		// 记录被墓碑的路径，供 commitOpsLocal 刷新索引。
-		// 没有它，Replace 删除的路径在索引里永远是旧的。
-		res.DeletedPaths = append(res.DeletedPaths, path)
+		s.logf("op-sync: TREE REPLACE %s@%s from %s: 保留 %d 个对端快照里没有的本地路径（不当作删除；例如 %s）",
+			project, branch, peerNode, len(retained), strings.Join(sample, ", "))
 	}
 	if len(res.Kept) > 0 {
-		s.logf("op-sync: TREE REPLACE %s@%s kept %d locally-modified path(s): %s",
-			project, branch, len(res.Kept), strings.Join(res.Kept, ", "))
+		s.logf("op-sync: TREE REPLACE %s@%s kept %d locally-present path(s) (dirty or peer-lacks-them)",
+			project, branch, len(res.Kept))
 	}
 
 	// 整树快照落地后，把「这批内容对应的树」记成该对端的基准。

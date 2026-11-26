@@ -68,13 +68,22 @@ func (s *Server) diffTreesToOps(project, branch, fromTree, toTree string) ([]tre
 				SHA:  c.Hash,
 			})
 		case "deleted":
-			ops = append(ops, treeOp{
-				Seq:  seq,
-				Node: node,
-				Ts:   now,
-				Kind: opDelete,
-				Path: c.Path,
-			})
+			// 不发删除。
+			//
+			// 这里的 "deleted" 是 Diff(fromTree, toTree) 算出来的：它只说明
+			// 「起点树里有、目标树里没有」，而起点树是**拉取方自己报上来的
+			// 内容树**——里面含着它刚写完、还没推给我们的内容。把它当删除
+			// 发回去，等于「你没推给我的东西我替你删掉」。
+			//
+			// 实测事故（2026-11-26，三节点生产）：笔记本写入 41 个切片并折叠
+			// 成 commit（推送前的正常动作），紧接着按「先拉后推」拉了一轮；
+			// 3060 的树里没有那 41 个路径，于是回了一串 delete 命令，把它们
+			// 全删了。同类累计 347 个文件，全部来自同一个对端。
+			//
+			// 删除是**显式动作**：它是一条 opDelete 命令（delete / erase
+			// 动词产生），沿命令流到达对端。缺一个路径不是删除的证据——
+			// 最常见的成因恰恰是「还没同步过去」。
+			continue
 		}
 	}
 	return ops, nil
@@ -208,6 +217,10 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 			batch.BaseCommit = s.commitForTree(project, branch, diffFrom)
 			batch.Rebase = true
 			batch.ContentTree = curContentTree
+			// 不在这里带 ContentPaths：差分批次的意义就是「只发变化的路径」，
+			// 塞一份全量清单等于每轮多传整棵树（weft@main.record 实测
+			// 19,468 条 ≈ 1.2MB）。差分的完整性由「基准树 + 这批命令」
+			// 自算期望树来校验，见 verifyBatchContent。
 			batch.Ops = diffOps
 			batch.To = l.Last()
 			if s.workSync != nil && peerNode != "" {
@@ -224,6 +237,7 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	batch.BaseCommit = s.commitForTree(project, branch, cur)
 	batch.Rebase = true
 	batch.ContentTree = curContentTree
+	batch.ContentPaths = pathsOfEntries(entries)
 	if s.workSync != nil && peerNode != "" && curContentTree != "" {
 		s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
 	}
@@ -238,6 +252,18 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	s.logf("op-sync: %s@%s: peer base %s != local base %s; sending full tree snapshot (%d entries)",
 		project, branch, shortSHA(baseTree), shortSHA(cur), len(entries))
 	return batch, nil
+}
+
+// pathsOfEntries 抽出路径清单，供接收端校验「声明树里的每一条都在」。
+func pathsOfEntries(entries []opEntry) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Path)
+	}
+	return out
 }
 
 // exportOpsTail 收尾两条「对端就在本端原点上」的路径：按位点发增量。
@@ -366,38 +392,164 @@ func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult
 	return res, nil
 }
 
-// verifyBatchContent 校验「应用完这批命令，本端内容是否等于发送端声明的树」。
+// treeAfterOps 把「一棵树 + 一批命令」算成一棵新树，只读本地对象。
+//
+// 用途：差分批次的接收端自证完整性。丢一条 op 时算出来的树与对方声明的
+// 内容树不同——而那条 op 根本没被声明，逐条校验是看不见它的。
+func (s *Server) treeAfterOps(repo *gitstore.Repo, base string, ops []treeOp) (string, bool) {
+	if base == "" {
+		return "", false
+	}
+	baseEntries, derr := repo.Diff("", base)
+	if derr != nil {
+		return "", false
+	}
+	pathMap := make(map[string]gitstore.Entry, len(baseEntries))
+	for _, e := range baseEntries {
+		pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: e.Mode, Hash: e.Hash}
+	}
+	for _, op := range ops {
+		switch op.Kind {
+		case opSet:
+			if op.SHA == "" {
+				continue
+			}
+			pathMap[op.Path] = gitstore.Entry{Path: op.Path, Mode: gitstore.Mode(op.Mode), Hash: op.SHA}
+		case opDelete:
+			delete(pathMap, op.Path)
+		case opRename:
+			if e, ok := pathMap[op.From]; ok {
+				delete(pathMap, op.From)
+				e.Path = op.Path
+				pathMap[op.Path] = e
+			}
+		case opCopy:
+			if e, ok := pathMap[op.From]; ok {
+				e.Path = op.Path
+				pathMap[op.Path] = e
+			}
+		}
+	}
+	tree, werr := repo.WriteTreeFromPaths(pathMap)
+	if werr != nil {
+		return "", false
+	}
+	return tree, true
+}
+
+// verifyBatchContent 校验「发送端声明的每条命令是否真的落地了」。
 //
 // 这是整个同步的正确性底线。水位、基准、位点都只是**效率**机制：它们
 // 决定发什么，不决定对不对。对不对由这一比决定——任何一条命令丢失、
 // 被拒、或正文没补齐，都会在这里现形，而不是变成两边的静默分歧。
 //
-// 三种情况跳过，因为它们都是「内容本就不该相等」的合法状态：
-//   - 批次没声明 ContentTree（位点增量批次不带它）；
-//   - 还有正文没到（Missing 非空）：缺正文的路径不存在，树必然不完整，
-//     等补完 blob 重放之后再校；
-//   - 保留了本地改动（Kept / Conflicted 非空）：整树 Replace 会保留本地
-//     未提交内容，此刻两端内容**本就应该不同**。
+// # 为什么不是「两端内容树全等」（2026-11-26 改）
 //
-// Rejected 不在跳过之列：有命令被拒正是最需要比对的时候。若拒绝没有
-// 造成内容差异（例如幂等的重复投递），比对自然通过，不会误报。
+// 早先这里比的是 currentContentTree == batch.ContentTree，前提是「同步后
+// 两端内容必然一样」。那个前提在单向镜像里成立，在多写节点上不成立：
+// 本端可以有对端没有的内容（刚写完还没推出去），而那是合法的并集状态，
+// 不是丢内容。用全等去比，就逼着代码把「对端没有」当成「该删」。
+//
+// 改成逐条校验声明之后，两种错都还抓得住，且不误伤并集：
+//   - 命令丢了 → 声明的那条没有落地 → 点名路径报错；
+//   - 正文没补齐 → Missing 非空（调用方已知，此处跳过，等补完再校）。
+//
+// 三种情况跳过，因为它们都是「此刻不该判」的合法状态：
+//   - 批次没声明 ContentTree（位点增量批次不带它）；
+//   - 还有正文没到（Missing 非空）；
+//   - 有路径冲突（Conflicted 非空）：冲突路径的内容本就不确定。
 func (s *Server) verifyBatchContent(project, branch string, batch opBatch, res opApplyResult) error {
 	if batch.ContentTree == "" || !batch.Rebase {
 		return nil
 	}
-	if len(res.Missing) > 0 || len(res.Kept) > 0 || len(res.Conflicted) > 0 {
+	if len(res.Missing) > 0 || len(res.Conflicted) > 0 {
 		return nil
 	}
-	got := s.currentContentTree(project, branch)
-	if got == batch.ContentTree {
+	repo, rerr := s.projects.Get(project)
+	if rerr != nil {
+		return nil
+	}
+
+	var problems []string
+	checkSet := func(path, sha string) {
+		if len(problems) >= 8 {
+			return
+		}
+		e, ok, serr := repo.ReadPathSHA(branch, path)
+		if serr != nil || !ok {
+			problems = append(problems, path+" (declared, missing locally)")
+			return
+		}
+		if sha != "" && e.SHA != sha {
+			problems = append(problems, path+" (content mismatch)")
+		}
+	}
+	checkDelete := func(path string) {
+		if len(problems) >= 8 {
+			return
+		}
+		if _, ok, _ := repo.ReadPathSHA(branch, path); ok {
+			problems = append(problems, path+" (declared deleted, still present)")
+		}
+	}
+	// ① 声明树里的每一条都必须在（且内容一致）。
+	//
+	// 这一条抓「命令在传输中整条丢失」：那种命令根本没进 Ops，
+	// 逐条校验 Ops 是看不见的。清单来自发送端的完整内容树，不依赖 Ops。
+	//
+	// 反过来不查：本端多出来的路径不算失败——那是并集，不是丢内容。
+	if len(batch.ContentPaths) > 0 {
+		for _, path := range batch.ContentPaths {
+			checkSet(path, "")
+		}
+	}
+	// ② 树差分批次：丢一条 op 是「没被声明的丢失」，逐条校验看不见它。
+	//
+	// 自己算：本端报给对端的那棵树（BaseTree，它在本地对象库里）叠上
+	// 这批命令，应当得到对方声明的 ContentTree。丢一条 op，算出来就不同。
+	// 只读本地对象，不额外传输。
+	if len(batch.ContentPaths) == 0 && batch.BaseTree != "" {
+		if exp, ok := s.treeAfterOps(repo, batch.BaseTree, batch.Ops); ok && exp != batch.ContentTree {
+			problems = append(problems, fmt.Sprintf(
+				"base tree %s + %d op(s) computes %s, peer declared %s",
+				shortSHA(batch.BaseTree), len(batch.Ops), shortSHA(exp), shortSHA(batch.ContentTree)))
+		}
+	}
+	// ③ 声明过的每条命令都必须真的落地（含内容哈希比对与删除确认）。
+	for _, op := range batch.Ops {
+		switch op.Kind {
+		case opSet:
+			checkSet(op.Path, op.SHA)
+		case opDelete:
+			checkDelete(op.Path)
+		case opTree:
+			for _, e := range op.Batch {
+				checkSet(e.Path, e.SHA)
+			}
+		}
+	}
+	// ④ 被拒的命令本身就是「声明了却没落地」，不必再看内容。
+	//
+	// Rejected 从不属于可跳过之列：有命令被拒正是最需要出声的时候。
+	// 跳过它会让调用方误以为这批已经完整落地，进而记下「对端已有这棵树」，
+	// 分歧就此被封存——实测旧逻辑把水位直接推到 batch.To，水位说「同步到
+	// 了 seq N」而内容压根没到。
+	if len(res.Rejected) > 0 {
+		sample := res.Rejected
+		if len(sample) > 3 {
+			sample = sample[:3]
+		}
+		problems = append(problems, fmt.Sprintf("%d command(s) rejected: %s",
+			len(res.Rejected), strings.Join(sample, "; ")))
+	}
+	if len(problems) == 0 {
 		return nil
 	}
 	return fmt.Errorf(
-		"op-sync %s@%s: content tree mismatch after applying batch from %s: "+
-			"peer declared %s, local is %s (applied %d, deleted %d, rejected %d); "+
-			"will re-sync by tree diff",
-		project, branch, batch.Node,
-		shortSHA(batch.ContentTree), shortSHA(got),
+		"op-sync %s@%s: batch from %s declared %s but %d command(s) did not land: %s "+
+			"(applied %d, deleted %d, rejected %d); will re-sync by tree diff",
+		project, branch, batch.Node, shortSHA(batch.ContentTree), len(problems),
+		strings.Join(problems, "; "),
 		res.Applied, res.Deleted, len(res.Rejected))
 }
 
@@ -1187,21 +1339,29 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	// Missing 必然非空，此刻判「完整落地」一定为假。
 	// 为什么只在无保留时判：整树 Replace 会保留本地未提交改动，只要留了
 	// 一条，本端内容就不再等于对端内容，记错基准比不记更糟。
-	if batch.Rebase && len(res.Missing) == 0 && len(res.Kept) == 0 && len(res.Conflicted) == 0 {
+	// 注意条件里没有 Kept：并集语义下「保留了本地多出来的路径」是常态，
+	// 不是「这批没完整落地」。用它当阻断条件会让对端树永远记不上，于是
+	// 推送侧每轮按「对端是空的」发全量快照。
+	if batch.Rebase && len(res.Missing) == 0 && len(res.Conflicted) == 0 {
 		// 补齐正文之后再比一次：ingestOps 那一刻 Missing 非空，校验被
 		// 合法跳过，真正的完整性只有现在才能判定。比对不过就不记对端
 		// 水位——记了等于告诉发送端「对端已经有这棵树」，分歧就被封存。
 		if verr := s.verifyBatchContent(project, branch, batch, res); verr != nil {
 			s.logf("op-sync: %v", verr)
-		} else if tree := s.currentContentTree(project, branch); tree != "" && s.workSync != nil {
-			// 必须重算：ingestOps 里那次 rebase 发生在补正文之前，
-			// 那时缺正文的路径还不存在，算出来的树是不完整的。
-			s.workSync.noteBase(project, branch, batch.Node, tree)
+		} else if s.workSync != nil {
+			// 本端基准 = 本端自己的内容树，必须重算：ingestOps 里那次
+			// rebase 发生在补正文之前，那时缺正文的路径还不存在。
+			if mine := s.currentContentTree(project, branch); mine != "" {
+				s.workSync.noteBase(project, branch, batch.Node, mine)
+			}
+			// 对端手上是哪棵树，由它自己声明（batch.ContentTree）——
+			// 并集语义下它与本端内容树可以合法地不同，拿本端树去记
+			// 等于把「对端也有我刚写的东西」这条假信息记进账。
+			//
 			// 不记的后果：推送侧只能按「对端是空的」发全量快照。
 			// 实测把 18872 条路径推给开着索引的 3060，逐条 refreshPath
 			// 抢分支写令牌，满屏「写令牌等待超时（1m0s）」，推送侧超时。
-			// 而那一刻两边内容其实完全一样，本该一条命令都不发。
-			s.workSync.notePeerTree(project, branch, batch.Node, tree)
+			s.workSync.notePeerTree(project, branch, batch.Node, batch.ContentTree)
 		}
 	}
 	s.recordSync(syncRecord{

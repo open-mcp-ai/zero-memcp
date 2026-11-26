@@ -82,10 +82,17 @@ func TestPullRecordsPeerTreeAfterRebase(t *testing.T) {
 			"不记的话推送侧下一轮会按「对端是空的」发全量快照")
 	}
 
-	// 而且这棵树必须等于本端现在的内容树（Rebase 的语义就是两边内容相同）。
+	// 记下的必须是**对端声明的**那棵树，不是本端内容树。
+	//
+	// 早先断言两者相等，前提是「同步后两端内容必然一样」。并集语义下这个
+	// 前提不成立：本端可以有对端没有的内容（mine.md 就是），拿本端树去记
+	// 等于告诉推送侧「对端也有我刚写的东西」，下一轮就会漏推。
 	mine := dst.currentContentTree(project, branch)
-	if tree != mine {
-		t.Fatalf("记下的对端树应当等于本端内容树\n  对端=%s\n  本端=%s", tree, mine)
+	if tree == mine {
+		t.Fatalf("并集语义下本端与对端内容本就不同，记成本端树说明记错了来源\n  记下=%s", tree)
+	}
+	if tree == bogus {
+		t.Fatalf("记下的仍然是最初那个伪造的基准，说明拉取后没有更新对端树: %s", tree)
 	}
 	_ = dstToken
 }

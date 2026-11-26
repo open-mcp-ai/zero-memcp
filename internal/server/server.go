@@ -1336,10 +1336,27 @@ func (s *Server) handleMCP(w http.ResponseWriter, r *http.Request) {
 	result, err := s.dispatchMCP(r.Context(), req.Method, req.Params, caller)
 	w.Header().Set("Content-Type", "application/json")
 	if err != nil {
+		// 失败的**种类**必须进协议，不能只进文案（issue #12）。
+		//
+		// 早先这里一律 -32603，于是「地址不存在」「这张凭证看不到这个分支」
+		// 「参数写错了」「对端连不上」在协议层是同一种东西，调用方只能去
+		// 解析 message。带种类的拒绝给出 -3200x 与 data.reason，措辞怎么改
+		// 都不影响判断。
+		code := -32603
+		payload := map[string]any{"message": err.Error()}
+		if ref := asRefusal(err); ref != nil {
+			code = mcpCodeOf(ref.Kind)
+			payload["message"] = ref.Detail
+			data := map[string]any{"reason": string(ref.Kind)}
+			for k, v := range ref.Data {
+				data[k] = v
+			}
+			payload["data"] = data
+		}
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"jsonrpc": "2.0",
 			"id":      req.ID,
-			"error":   map[string]any{"code": -32603, "message": err.Error()},
+			"error":   payloadWithCode(code, payload),
 		})
 		return
 	}
@@ -1576,12 +1593,31 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	return buildToolResult(out, wantText, a.StructuredContent), nil
 }
 
+// payloadWithCode 把数值码并进 error 对象。
+//
+// 单独一个函数是为了让「错误信封长什么样」只有一处定义：早先手写
+// map[string]any{"code": ..., "message": ...} 散在两处，加一个字段
+// 就得记得改两遍。
+func payloadWithCode(code int, payload map[string]any) map[string]any {
+	out := map[string]any{"code": code}
+	for k, v := range payload {
+		out[k] = v
+	}
+	return out
+}
+
 // buildToolResult 按调用方要的投影组装工具结果。
 //
 // MCP 规范允许 content 为空数组，所以「只要 JSON」是一个合法的结果，
 // 而不是缺字段。
 func buildToolResult(r TermResult, wantText, wantStructured bool) map[string]any {
 	res := map[string]any{}
+
+	// _meta 回答「这次查到了没有、没查到是因为什么」，与要不要第二投影无关。
+	//
+	// 它是机器可判的那一份：调用方（程序或模型）据此分支，不必去比对
+	// "no matches" 这类排版文本——而排版是会变的，比对它的代码不会被告知。
+	res["_meta"] = metaFor(r)
 
 	if wantText {
 		res["content"] = []map[string]any{
@@ -1632,6 +1668,13 @@ type TermResult struct {
 	// from the text either - "no matches" is a rendering, and rewording it would
 	// silently invert every "fall back to the next layer" rule built on it.
 	Empty bool
+	// EmptyReason 说清「为什么没查到」，取值是 RefusalKind 的词面
+	// （not_found 等）。它进 MCP 的 _meta，让调用方不必从正文里猜。
+	//
+	// 与 Empty 分开的理由：Empty 回答“有没有”，EmptyReason 回答“为什么没有”。
+	// 「这个地址不存在」与「这张凭证看不见它」都可能是 Empty，而调用方
+	// 对它们该做的事完全不同。
+	EmptyReason string
 }
 
 // execTerm runs a DSL line, which may hold several statements.
@@ -1720,7 +1763,7 @@ func (s *Server) execTermVars(line string, vars map[string]string, args []string
 	// 同时把 vars/args 装配成 Subst。参见 term_compat.go。
 	normalized, sub, err := normalizeTermInput(line, vars, args)
 	if err != nil {
-		return TermResult{}, err
+		return TermResult{}, invalidf(nil, "%s", err.Error())
 	}
 
 	// 语法错误必须在任何动词执行之前返回。
@@ -1729,7 +1772,9 @@ func (s *Server) execTermVars(line string, vars map[string]string, args []string
 	// 副作用之前；这是协议的分层，不是这里的顺序约定。
 	file, err := t.Parse(normalized, sub)
 	if err != nil {
-		return TermResult{}, err
+		// 语法错是**调用方的错**，不是服务端内部错误。
+		// -32602 是 JSON-RPC 给 invalid params 的标准码（issue #12）。
+		return TermResult{}, invalidf(map[string]any{"line": line}, "%s", err.Error())
 	}
 
 	reply := t.Run(context.Background(), file)
@@ -1746,6 +1791,12 @@ func (s *Server) execTermVars(line string, vars map[string]string, args []string
 	// TermResult.Empty 里给调用方分支。
 	for _, sl := range reply.Slots {
 		if sl.Code >= 400 && sl.Code != 404 {
+			// 类型优先于正文：信封只剩 Code+Body，种类由 handler 记着。
+			// 正文比对是兜底，只在类型缺失时用（多语句链里失败的可能是
+			// 别的语句）。
+			if ref := h.lastRefusal; ref != nil && strings.TrimSpace(sl.Body) == ref.Detail {
+				return TermResult{}, ref
+			}
 			return TermResult{}, errors.New(strings.TrimSpace(sl.Body))
 		}
 	}
@@ -1790,7 +1841,8 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		if detail, ok := helpVerb(strings.Fields(arg)[0]); ok {
 			return TermResult{Text: detail}, nil
 		}
-		return TermResult{}, fmt.Errorf("unknown verb %q\n\n%s", strings.Fields(arg)[0], helpOverview())
+		return TermResult{}, invalidf(map[string]any{"verb": strings.Fields(arg)[0]},
+			"unknown verb %q\n\n%s", strings.Fields(arg)[0], helpOverview())
 
 	case "recall":
 		if !s.indexEnabled {
@@ -1906,9 +1958,9 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			if wantJSON {
 				// --json 时空结果也是合法 JSON，不是 "no matches" 这句人话。
 				// 程序消费者据此判空，不需要认识我们的排版。
-				return TermResult{Text: jsonText(empty), Structured: empty, Empty: true}, nil
+				return TermResult{Text: jsonText(empty), Structured: empty, Empty: true, EmptyReason: string(RefusalNotFound)}, nil
 			}
-			return TermResult{Text: text, Structured: empty, Empty: true}, nil
+			return TermResult{Text: text, Structured: empty, Empty: true, EmptyReason: string(RefusalNotFound)}, nil
 		}
 		var sb strings.Builder
 		structHits := make([]any, 0, len(hits))
@@ -1978,7 +2030,7 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			fields[i] = restorePayload(fields[i])
 		}
 		if len(fields) == 0 {
-			return TermResult{}, errors.New("read syntax: read <addr> [<addr> ...]")
+			return TermResult{}, invalidf(nil, "read syntax: read <addr> [<addr> ...]")
 		}
 
 		var out strings.Builder
@@ -1986,10 +2038,22 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		for _, addr := range fields {
 			proj, br, path, err := s.resolveAddr(addr, c)
 			if err == nil && !s.allowed(c, proj, br, configBitRead) {
-				out.WriteString("read: " + addr + " -> " + s.denyReason(c, proj, br, configBitRead) + "\n\n")
-				continue
+				// 「看不见」不是「没有」：把它写进正文继续跑，调用方会以为
+				// 这条记忆不存在，而真相是这张凭证不该看它。
+				//
+				// issue #12 把它归为 forbidden：协议层必须能分开这两种情况，
+				// 否则一次越权读取的表现与「读到空」完全一致。
+				return TermResult{}, forbiddenf(
+					map[string]any{"addr": addr, "project": proj, "branch": br},
+					"read %s: %s", addr, s.denyReason(c, proj, br, configBitRead))
 			}
 			if err != nil {
+				// 带种类的拒绝（越界 / 无权 / 地址形态错）是**结论**，
+				// 不是「这次没取到」：并进 missing 会让一次越权读取看起来
+				// 像一次普通的空结果（issue #12）。
+				if ref := asRefusal(err); ref != nil {
+					return TermResult{}, ref
+				}
 				missing = append(missing, addr+"("+err.Error()+")")
 				continue
 			}
@@ -2048,12 +2112,19 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			out.WriteString("\n")
 		}
 		if out.Len() == 0 {
-			// 路径越界不叫 not found。
+			// 全部没取到 = **未命中**，不是失败。
 			//
-			// 「不可见」与「不存在」必须说清楚：前者是凭证边界，
-			// 后者是记忆库真的没有。混在一起会让人以为记忆丢了，
-			// 于是去翻仓库——而事实是这张凭证压根不该看见它。
-			return TermResult{}, fmt.Errorf("%s", strings.Join(missing, ", "))
+			// issue #12：这里早先返回 error，于是 `read A || read B` 的分层
+			// 回落对 read 不成立——而 read 恰恰最需要它（先读 fact，没有就
+			// 读 record）。未命中走 404，与 grep / recall / ls 同一口径。
+			//
+			// 「不可见」不在此列：它是凭证边界，已在上面按 forbidden 拒绝，
+			// 不会被降级成「没有」。
+			return TermResult{
+				Text:        strings.Join(missing, ", "),
+				Empty:       true,
+				EmptyReason: string(RefusalNotFound),
+			}, nil
 		}
 		if len(missing) > 0 {
 			out.WriteString("\n[not retrieved] " + strings.Join(missing, ", ") + "\n")
@@ -2086,13 +2157,15 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 
 	case "merge":
 		if !c.canWrite() {
-			return TermResult{}, fmt.Errorf("merge requires w capability")
+			return TermResult{}, forbiddenf(map[string]any{"verb": "merge", "missing": "w"},
+				"merge requires w capability")
 		}
 		return s.execMerge(rest, c)
 
 	case "push":
 		if !c.canWrite() {
-			return TermResult{}, fmt.Errorf("push requires w capability")
+			return TermResult{}, forbiddenf(map[string]any{"verb": "push", "missing": "w"},
+				"push requires w capability")
 		}
 		// push 的地址不是 <project>@<branch>，而是 <project> [<remote>] <branch>。
 		// 直接把 rest 交给 requireBranchWide 会把 "<project>" 当地址解析，
@@ -2389,17 +2462,20 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			rest = stripFlags(rest, "-c", "--count")
 		}
 		if bad, ok := unknownFlag(rest); ok {
-			return TermResult{}, fmt.Errorf("grep: unknown flag %q (supported: --scope, -i, -c)", bad)
+			return TermResult{}, invalidf(nil, "grep: unknown flag %q (supported: --scope, -i, -c)", bad)
 		}
 		pattern, scopes := splitScopes(rest)
 		if pattern == "" {
-			return TermResult{}, errors.New("grep syntax: grep [-i] [-c] <pattern> [--scope <tree>]")
+			return TermResult{}, invalidf(nil, "grep syntax: grep [-i] [-c] <pattern> [--scope <tree>]")
 		}
 		grepText, grepFound, grepErr := s.execGrep(pattern, scopes, c, ignoreCase, countOnly)
 		if grepErr != nil {
 			return TermResult{}, grepErr
 		}
-		return TermResult{Text: grepText, Empty: !grepFound}, nil
+		if !grepFound {
+			return TermResult{Text: grepText, Empty: true, EmptyReason: string(RefusalNotFound)}, nil
+		}
+		return TermResult{Text: grepText}, nil
 
 	case "log":
 		// log [<project>[@<branch>][:<path>]] [N]
@@ -2426,17 +2502,27 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// ls [date]
 		//
 		// 列出某天（缺省今天/最新一天）的全部切片。
-		lsText, lsErr := s.execLs(rest, c)
+		lsText, lsFound, lsErr := s.execLs(rest, c)
 		if lsErr != nil {
 			return TermResult{}, lsErr
+		}
+		if !lsFound {
+			// 「没有」在四个动词上必须是同一种形状。
+			//
+			// 实测（issue #12）：同样的空结果，grep 走 404、ls 走 200，
+			// 于是 `ls <空日期> || ...` 从不回落，而调用方也无从判断
+			// 「没有这一天」与「这一天真的是空的」。
+			return TermResult{Text: lsText, Empty: true, EmptyReason: string(RefusalNotFound)}, nil
 		}
 		return TermResult{Text: lsText}, nil
 
 	default:
 		if suggestion := suggestVerb(verb); suggestion != "" {
-			return TermResult{}, fmt.Errorf("unknown verb %q; did you mean %q?", verb, suggestion)
+			return TermResult{}, invalidf(map[string]any{"verb": verb, "suggestion": suggestion},
+				"unknown verb %q; did you mean %q?", verb, suggestion)
 		}
-		return TermResult{}, fmt.Errorf("unknown verb %q (if connected to a downstream MCP, this should be passed through)\n\n%s", verb, helpOverview())
+		return TermResult{}, invalidf(map[string]any{"verb": verb},
+			"unknown verb %q (if connected to a downstream MCP, this should be passed through)\n\n%s", verb, helpOverview())
 	}
 }
 
@@ -2810,7 +2896,9 @@ func (s *Server) execLog(n int, scope string, c Caller) (string, error) {
 }
 
 // execLs 列出某天的切片。
-func (s *Server) execLs(rest string, c Caller) (string, error) {
+// execLs 列出某天的切片。第二个返回值是「有没有匹配」——未命中要让
+// 调用方在协议层看见（issue #12：四个动词同一口径）。
+func (s *Server) execLs(rest string, c Caller) (string, bool, error) {
 
 	// ls [date] [--scope <tree>]
 	//
@@ -2820,12 +2908,12 @@ func (s *Server) execLs(rest string, c Caller) (string, error) {
 	// "no matching entries"——而文件明明在那里。这与 grep/recall
 	// 的 --scope 处理对齐：先拆 scope，剩下的是日期。
 	if bad, ok := unknownFlag(rest); ok {
-		return "", fmt.Errorf("ls: unknown flag %q (supported: --scope)", bad)
+		return "", false, invalidf(nil, "ls: unknown flag %q (supported: --scope)", bad)
 	}
 	day, scopes := splitScopes(rest)
 	if i := strings.Index(day, " "); i >= 0 {
 		// 剩余参数多于一个（如两个日期）——不猜，直接报。
-		return "", fmt.Errorf("ls: expected one date, got %q", day)
+		return "", false, invalidf(nil, "ls: expected one date, got %q", day)
 	}
 	scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
 
@@ -2851,7 +2939,7 @@ func (s *Server) execLs(rest string, c Caller) (string, error) {
 		}
 	}
 	if len(matches) == 0 {
-		return "no matching entries", nil
+		return "no matching entries", false, nil
 	}
 	sort.Slice(matches, func(i, j int) bool {
 		return s.virtualPath(c, matches[i].Project, matches[i].Branch, matches[i].Path) <
@@ -2880,7 +2968,7 @@ func (s *Server) execLs(rest string, c Caller) (string, error) {
 	if total > lsMaxEntries {
 		fmt.Fprintf(&sb, "... and %d more entries (total %d). Narrow the query.", total-lsMaxEntries, total)
 	}
-	return strings.TrimRight(sb.String(), "\n"), nil
+	return strings.TrimRight(sb.String(), "\n"), true, nil
 }
 
 // ── 逻辑时钟（进程内 atomic）──────────────────────────────────
@@ -2975,7 +3063,8 @@ func (s *Server) requireBranchWideForPush(rest string, c Caller) error {
 		return nil
 	}
 	if !c.Mount.BranchWide(project, branch) {
-		return fmt.Errorf("%s@%s is mounted with a path subtree (%q); this operation acts on the whole branch and is not available to this credential",
+		return forbiddenf(map[string]any{"project": project, "branch": branch},
+			"%s@%s is mounted with a path subtree (%q); this operation acts on the whole branch and is not available to this credential",
 			project, branch, c.Mount.rootOf(project, branch))
 	}
 	return nil
@@ -3002,7 +3091,8 @@ func (s *Server) requireBranchWide(rest string, c Caller) error {
 		return nil
 	}
 	if !c.Mount.BranchWide(proj, br) {
-		return fmt.Errorf("%s@%s is mounted with a path subtree (%q); this operation acts on the whole branch and is not available to this credential",
+		return forbiddenf(map[string]any{"project": proj, "branch": br},
+			"%s@%s is mounted with a path subtree (%q); this operation acts on the whole branch and is not available to this credential",
 			proj, br, c.Mount.rootOf(proj, br))
 	}
 	return nil

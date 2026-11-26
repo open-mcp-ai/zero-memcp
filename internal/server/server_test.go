@@ -135,6 +135,57 @@ func callMCP(t *testing.T, srv *Server, token, cmd string) (string, error) {
 	return mcpText(t, rec.Body.Bytes())
 }
 
+// callMCPMeta 与 callMCP 同源，但把 result._meta 一并交出来。
+//
+// 为什么测试需要它：issue #12 之后，「查不到」不再是错误，而是一个
+// 机器可判的字段。断言「err != nil」等于在断言旧契约；断言
+// _meta["memcp/found"] == false 才是在测现在真正承诺的东西。
+func callMCPMeta(t *testing.T, srv *Server, token, cmd string) (text string, meta map[string]any, err error) {
+	t.Helper()
+	cmd, _, args := legacyToNative(cmd)
+	argJSON, _ := json.Marshal(args)
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":` +
+		strconv.Quote(cmd) + `,"args":` + string(argJSON) + `}}}`
+	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	srv.handleMCP(rec, req)
+	if rec.Code == http.StatusUnauthorized {
+		return "", nil, errors.New(strings.TrimSpace(rec.Body.String()))
+	}
+	text, err = mcpText(t, rec.Body.Bytes())
+	var resp struct {
+		Result struct {
+			Meta map[string]any `json:"_meta"`
+		} `json:"result"`
+	}
+	if jerr := json.Unmarshal(rec.Body.Bytes(), &resp); jerr == nil {
+		meta = resp.Result.Meta
+	}
+	return text, meta, err
+}
+
+// mustMiss 断言一条命令「跑成功了，但什么都没查到」。
+//
+// 这是 issue #12 要的那条不变式：查不到既不是错误，也不是一句
+// "no matches" 的字符串约定，而是 _meta 里一个可判的字段。
+func mustMiss(t *testing.T, srv *Server, token, cmd string) {
+	t.Helper()
+	text, meta, err := callMCPMeta(t, srv, token, cmd)
+	if err != nil {
+		t.Fatalf("%s 应报「未命中」而不是错误: %v", cmd, err)
+	}
+	found, ok := meta["memcp/found"]
+	if !ok {
+		t.Fatalf("%s 的结果缺少 _meta.memcp/found，调用方无从判断查没查到", cmd)
+	}
+	if found != false {
+		t.Fatalf("%s 应报未命中，实际 memcp/found=%v（text=%q）", cmd, found, text)
+	}
+}
+
 // mcpText 从 JSON-RPC 响应里取出文本投影。
 func mcpText(t *testing.T, body []byte) (string, error) {
 	t.Helper()
@@ -240,12 +291,17 @@ mode  = "rwxr-xr-x"
 	}
 
 	// bob 读机密被拒
-	out, _ := callMCP(t, srv, bobTok, "read private/sec.md")
+	out, rerr := callMCP(t, srv, bobTok, "read private/sec.md")
 	if strings.Contains(out, "机密") {
 		t.Fatalf("bob 不该能读到机密: %s", out)
 	}
-	if !strings.Contains(out, "lacks r permission") {
-		t.Fatalf("应给出权限不足的理由，实际: %s", out)
+	// 「看不见」必须是错误，不是「没查到」（issue #12）：
+	// 后者会让一次越权读取与一次空结果长得一模一样。
+	if rerr == nil {
+		t.Fatal("bob 读机密应被拒绝，而不是得到空结果")
+	}
+	if !strings.Contains(rerr.Error(), "lacks r permission") {
+		t.Fatalf("应给出权限不足的理由，实际: %v", rerr)
 	}
 
 	// bob 读公开内容应放行

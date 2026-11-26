@@ -68,9 +68,7 @@ func TestPushOnlyRemoteNeverPulls(t *testing.T) {
 	}
 
 	// ② 拉没发生：主机不该拿到只属于备份的那条。
-	if out, err := callMCP(t, laptop, tokLaptop, "read blackegg/me@zero:backup-only.md"); err == nil {
-		t.Fatalf("push_only 远端不该把内容写回主机，却读到了: %q", out)
-	}
+	mustMiss(t, laptop, tokLaptop, "read blackegg/me@zero:backup-only.md")
 
 	// ③ 水位证明「没拉过」：拉水位必须还停在 0。
 	if got := laptop.peerSeq("blackegg/me", "zero", laptop.resolvePeer("backup-164")); got != 0 {

@@ -90,9 +90,7 @@ func TestBlockedBlobDoesNotStallBranch(t *testing.T) {
 	if out, rerr := callMCP(t, dst, dstToken, "read blackegg/me@zero:good2.md"); rerr != nil || !strings.Contains(out, "第三条好记忆") {
 		t.Fatalf("good2 应该已落地: err=%v out=%s", rerr, out)
 	}
-	if _, rerr := callMCP(t, dst, dstToken, "read blackegg/me@zero:broken.md"); rerr == nil {
-		t.Fatal("broken.md 缺对象，绝不能落成空气引用")
-	}
+	mustMiss(t, dst, dstToken, "read blackegg/me@zero:broken.md")
 
 	// ② status 必须在最显眼处点名（失败必须看得见）
 	stOut, err := callMCP(t, dst, dstToken, "status")

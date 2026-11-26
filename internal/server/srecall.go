@@ -200,9 +200,9 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 			"semantic_route": s.semanticRouteLabel(),
 		}
 		if wantJSON {
-			return TermResult{Text: jsonText(empty), Structured: empty, Empty: true}, nil
+			return TermResult{Text: jsonText(empty), Structured: empty, Empty: true, EmptyReason: string(RefusalNotFound)}, nil
 		}
-		return TermResult{Text: "no matches", Structured: empty, Empty: true}, nil
+		return TermResult{Text: "no matches", Structured: empty, Empty: true, EmptyReason: string(RefusalNotFound)}, nil
 	}
 
 	var sb strings.Builder

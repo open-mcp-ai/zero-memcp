@@ -130,12 +130,19 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 			// 后者是「加一条共享分支不用重签凭证」的落点——凭证里没有
 			// 这条分支，但服务端表给了它，它就该能被寻址。
 			if !s.branchVisible(c, proj, br) {
-				return "", "", "", fmt.Errorf("project %s@%s is outside this credential's visible scope", proj, br)
+				// 「看不见」与「不存在」必须在协议层分开（issue #12）：
+				// 前者是凭证边界，降级成 not_found 会让人以为记忆丢了，
+				// 于是去翻仓库——而事实是这张凭证压根不该看见它。
+				return "", "", "", forbiddenf(
+					map[string]any{"project": proj, "branch": br},
+					"project %s@%s is outside this credential's visible scope", proj, br)
 			}
 			// ACL 授予的分支不在挂载表里，没有 root 子树可校验，
 			// 整条分支可见。
 			if c.Mount.Visible(proj, br) && !c.Mount.PathVisible(proj, br, p) {
-				return "", "", "", fmt.Errorf("path %q is outside this mount's subtree (%s@%s:%s)", p, proj, br, c.Mount.rootOf(proj, br))
+				return "", "", "", forbiddenf(
+					map[string]any{"project": proj, "branch": br, "path": p},
+					"path %q is outside this mount's subtree (%s@%s:%s)", p, proj, br, c.Mount.rootOf(proj, br))
 			}
 			return proj, br, p, nil
 		}
@@ -150,7 +157,9 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 		// ToReal 按「最长虚拟前缀」选挂载项，如果同分支挂了多个
 		// 子树挂载，选中的那条的 root 一定覆盖这个路径。
 		if !c.Mount.PathVisible(proj, br, p) {
-			return "", "", "", fmt.Errorf("path %q is outside this mount's subtree", addr)
+			return "", "", "", forbiddenf(
+				map[string]any{"addr": addr, "project": proj, "branch": br, "path": p},
+				"path %q is outside this mount's subtree", addr)
 		}
 		return proj, br, p, nil
 	}

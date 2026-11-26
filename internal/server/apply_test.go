@@ -61,9 +61,7 @@ func TestApplyWritesAndDeletesInOneCall(t *testing.T) {
 	if !strings.Contains(got, "新主题") {
 		t.Fatalf("新文件没写进去: %s", got)
 	}
-	if _, rerr := callMCP(t, srv, tok, "read blackegg/me@zero:08-old.md"); rerr == nil {
-		t.Fatal("08-old.md 应该已被删除")
-	}
+	mustMiss(t, srv, tok, "read blackegg/me@zero:08-old.md")
 }
 
 // 校验必须发生在写第一个字节之前：一批里有一条非法，整批都不落盘。
@@ -97,9 +95,7 @@ func TestApplyRejectsWholeBatchOnBadPatch(t *testing.T) {
 	}
 
 	// good.md 不该存在：整批被拒
-	if _, rerr := callMCP(t, srv, tok, "read blackegg/me@zero:good.md"); rerr == nil {
-		t.Fatal("整批被拒时 good.md 不该落盘")
-	}
+	mustMiss(t, srv, tok, "read blackegg/me@zero:good.md")
 }
 
 // 同一路径在一次 apply 里出现两次必须被拒——后者会静默覆盖前者。

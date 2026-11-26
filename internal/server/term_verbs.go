@@ -388,6 +388,15 @@ type termHandler struct {
 	server *Server
 	viewer Viewer
 	caller Caller
+	// lastRefusal / lastEmptyReason 让「拒绝的种类」与「未命中的原因」
+	// 穿过 termcp 的信封层。
+	//
+	// 信封只有 Code + Body，类型在这里会丢：不记的话，MCP 层拿到的
+	// 永远是 errors.New(body)，于是 issue #12 抱怨的「所有失败一个码」
+	// 又回来了——只是这次是被协议层抹平的。
+	lastRefusal     *Refusal
+	lastEmptyReason string
+
 	// lastStructured 记下最后一个动词自己的业务结构化投影
 	// （status 的 terms、ls 的列表等）。
 	//
@@ -405,10 +414,21 @@ func (h *termHandler) Handle(ctx context.Context, st directive.Statement) []enve
 
 	res, err := h.server.execStatement(cmdLine, h.viewer, h.caller)
 	h.lastStructured = res.Structured
+	h.lastEmptyReason = res.EmptyReason
+	h.lastRefusal = asRefusal(err)
 	if err != nil {
+		// 状态行必须与协议标志一致（issue #12 第 3 点）。
+		//
+		// 早先所有失败都是 400，于是「无权」「不存在」「参数错」在语句链里
+		// 长得一模一样，而单语句又把状态行剥掉——调用方看到的只剩正文。
+		// 现在按拒绝种类给码：403 无权、404 不存在、400 参数错、503 不可达。
+		code := 400
+		if ref := asRefusal(err); ref != nil {
+			code = slotCodeOf(ref.Kind)
+		}
 		return []envelope.Slot{
 			{
-				Code:    400,
+				Code:    code,
 				Headers: map[string]string{"Verb": st.Op},
 				Body:    err.Error(),
 			},
@@ -442,6 +462,32 @@ func (h *termHandler) Handle(ctx context.Context, st directive.Statement) []enve
 			Headers: headers,
 			Body:    res.Text,
 		},
+	}
+}
+
+// emptyReason 给出「这次为什么没查到」，缺省按 not_found。
+func (h *termHandler) emptyReason() string {
+	if h != nil && h.lastEmptyReason != "" {
+		return h.lastEmptyReason
+	}
+	return string(RefusalNotFound)
+}
+
+// slotCodeOf 把拒绝种类映射成 TERM/1 的状态码。
+//
+// 只用四个码，与 HTTP 的既有含义对齐：
+//
+//	403 forbidden / 404 not_found / 400 invalid_argument / 503 unavailable
+func slotCodeOf(kind RefusalKind) int {
+	switch kind {
+	case RefusalForbidden:
+		return 403
+	case RefusalNotFound:
+		return 404
+	case RefusalUnavailable:
+		return 503
+	default:
+		return 400
 	}
 }
 
@@ -576,18 +622,26 @@ func renderReply(reply envelope.Reply, h *termHandler) TermResult {
 		if h != nil && h.lastStructured != nil {
 			st = h.lastStructured
 		}
-		return TermResult{
+		out := TermResult{
 			Text:       sl.Body,
 			Structured: st,
 			Empty:      sl.Code >= 300 || sl.Code == 204,
 		}
+		if out.Empty {
+			out.EmptyReason = h.emptyReason()
+		}
+		return out
 	}
 
-	return TermResult{
+	out := TermResult{
 		Text:       reply.Text(),
 		Structured: reply.Structured(),
 		Empty:      allEmpty,
 	}
+	if out.Empty {
+		out.EmptyReason = h.emptyReason()
+	}
+	return out
 }
 
 const detail_apply = `apply —— 批量写（一次工具往返改写/删除多个文件）。

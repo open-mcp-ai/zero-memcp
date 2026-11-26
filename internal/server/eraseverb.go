@@ -150,6 +150,14 @@ func (s *Server) execErase(rest string, c Caller, defaultBranch string, withRepl
 	// 内存索引必须立刻跟上：被抹除的内容不能还留在可搜索的卡片柜里。
 	_ = s.refreshPath(project, branch, path, false)
 
+	// 抹除也是内容变更：不广播的话，订阅这棵树的分身会继续拿着已经被
+	// 改写过的内容，而它没有任何办法知道内容不再可信。
+	//
+	// 这里不记命令流：抹除改的是历史而不是前进（EraseBlob 重写 blob），
+	// 按位点同步的头绪在 auditErase 与 erase 自己的路径上，不在这条
+	// set 命令里。广播与同步是两件事，不该为了对称硬凑。
+	s.publishLocalWrite(project, branch, path, c)
+
 	// 审计：留一条不可回读的标记。
 	//
 	// 历史可以改写，但「曾经改写过」这件事本身不能消失。

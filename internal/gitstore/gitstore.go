@@ -2097,7 +2097,80 @@ func (r *Repo) ArchiveRef(branch string) error {
 	if err := r.FS().WriteFile(filepath.Join(dstDir, name), []byte(sha+"\n"), 0o644); err != nil {
 		return err
 	}
-	return r.FS().Remove(filepath.Join(r.Path, "refs", "heads", name))
+	return r.deleteRef("refs/heads/" + name)
+}
+
+// deleteRef 彻底移除一个 ref，两种存放方式都要处理。
+//
+// 为什么不能只 os.Remove：ref 有两种落盘方式——松散文件（refs/ 下的
+// 一个小文件）和打包（packed-refs 里的一行）。git pack-refs、git gc、
+// 以及 clone 出来的裸仓库都会把分支放进 packed-refs，此时 refs/heads/
+// 目录是空的。早先这里只删松散文件，于是对打包过的仓库必然失败：
+//
+//	remove .../refs/heads/zero: no such file or directory
+//
+// 而 archive 的调用顺序是「先 Fork 出 -archived 分支，再移走源分支」，
+// 失败发生在第二步，于是留下一条 <branch>-archived 残枝，源分支却还
+// 在——实测 archive BlackEggAI/zero@zero 就是这个结果。
+//
+// 顺序：先写 packed-refs（去掉那一行），再删松散文件。反过来的话，
+// 中间态是两个位置都指向不同 sha，读到谁全看运气。
+func (r *Repo) deleteRef(ref string) error {
+	ref = strings.TrimPrefix(strings.TrimSpace(ref), "/")
+	if ref == "" || strings.Contains(ref, "..") {
+		return fmt.Errorf("invalid ref: %q", ref)
+	}
+	if err := r.deletePackedRef(ref); err != nil {
+		return err
+	}
+	if err := r.FS().Remove(r.refPath(ref)); err != nil && !isNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// deletePackedRef 从 packed-refs 里抹掉一个 ref（连同它的 peeled 行）。
+//
+// peeled 行（以 ^ 开头）属于**上一行那个 tag**，删掉 tag 时必须一起删，
+// 否则留下的 ^sha 会挂到别的 ref 上——下次读 packed-refs 的人会把它
+// 当成那一条的解析结果。
+func (r *Repo) deletePackedRef(ref string) error {
+	path := filepath.Join(r.Path, "packed-refs")
+	b, err := r.FS().ReadFile(path)
+	if err != nil {
+		if isNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	lines := strings.Split(string(b), "\n")
+	out := make([]string, 0, len(lines))
+	changed := false
+	skipPeeled := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "^") {
+			if skipPeeled {
+				changed = true
+				continue
+			}
+			out = append(out, line)
+			continue
+		}
+		skipPeeled = false
+		if trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			if _, name, ok := strings.Cut(trimmed, " "); ok && name == ref {
+				changed = true
+				skipPeeled = true
+				continue
+			}
+		}
+		out = append(out, line)
+	}
+	if !changed {
+		return nil
+	}
+	return r.FS().WriteAtomicSync(path, []byte(strings.Join(out, "\n")), 0o644)
 }
 
 // Branches 列出该仓库所有的分支名（refs/heads/ 下的短名）。

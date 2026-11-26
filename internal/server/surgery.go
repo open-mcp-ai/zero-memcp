@@ -919,12 +919,17 @@ func (s *Server) execArchive(rest string, c Caller) (string, error) {
 		return "", fmt.Errorf("branch %s@%s does not exist or has no commits", proj, branch)
 	}
 
-	// 归档 = 把 ref 复制成新分支（零字节，只是写一个 sha）
-	if err := repo.Fork(branch, dstBranch); err != nil {
+	// 先把源 ref 移到不可见命名空间，再写归档分支。
+	//
+	// 颠倒的后果：ArchiveRef 失败时（例如 packed-refs 里的引用在老版本里
+	// 删不动）已经在 refs/heads/ 写出了 <branch>-archived，源分支却还
+	// 留在原地——白多一条副本分支。先移后写，移失败了什么也不留。
+	if err := repo.ArchiveRef(branch); err != nil {
 		return "", err
 	}
-	// 源分支移到不可见命名空间：不删除，只是不再出现在 branch 列表里
-	if err := repo.ArchiveRef(branch); err != nil {
+	if err := repo.SetRef("refs/heads/"+dstBranch, sha); err != nil {
+		// 目标写失败就把源还原回去（best-effort），别把分支留在黑盒里。
+		_ = repo.SetRef("refs/heads/"+branch, sha)
 		return "", err
 	}
 	// 归档改变了「哪些分支存在」，索引里要把源分支摘掉、把归档分支加上。

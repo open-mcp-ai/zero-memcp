@@ -77,11 +77,9 @@ func (r *Repo) DeleteRemoteRef(remote, branch string) error {
 	if err := ValidateBranch(branch); err != nil {
 		return err
 	}
-	err := r.FS().Remove(r.refPath("refs/remotes/" + remote + "/" + branch))
-	if err != nil && !isNotExist(err) {
-		return err
-	}
-	return nil
+	// 同一个坑：远端跟踪引用也会被 pack-refs 打包（fetch 之后很常见），
+	// 只删松散文件就删不掉。走统一的 deleteRef。
+	return r.deleteRef("refs/remotes/" + remote + "/" + branch)
 }
 
 // SetRef 写入任意 ref（本仓库自己的分支）。

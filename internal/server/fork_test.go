@@ -1,6 +1,8 @@
 package server
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -276,5 +278,71 @@ func TestForkDoesNotCopyObjects(t *testing.T) {
 	after := countObjects()
 	if after != before {
 		t.Fatalf("fork 不该复制对象：%d → %d", before, after)
+	}
+}
+
+// 归档一条**打包过**的分支。
+//
+// 为什么这条独立成测：ref 有两种落盘方式——松散文件与 packed-refs。
+// git pack-refs / git gc / clone 出来的裸仓库都会把分支放进 packed-refs，
+// 此时 refs/heads/ 目录是空的。早先 ArchiveRef 只删松散文件，于是
+// 对打包过的仓库必然失败：
+//
+//	remove .../refs/heads/zero: no such file or directory
+//
+// 而 archive 当时是「先 Fork 再移源」，失败发生在第二步，于是留下一条
+// <branch>-archived 残枝、源分支却还在。实测 archive BlackEggAI/zero@zero
+// 就是这个结果。修法：deleteRef 同时处理 packed-refs，且 archive 先移后写。
+func TestArchiveWorksOnPackedRefs(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "boss", Cap: "rwx"})
+	repo, err := srv.projects.Ensure("blackegg/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callMCP(t, srv, tok, "write blackegg/me@zero/keep.md -- 打包过的分支也要能归档"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m keep"); err != nil {
+		t.Fatal(err)
+	}
+	head, _ := repo.Resolve("zero")
+	if head == "" {
+		t.Fatal("zero 没有提交")
+	}
+
+	// 把分支打进 packed-refs，并删掉松散文件——这正是 git pack-refs 干的事。
+	packed := filepath.Join(dataDir, "repos", "blackegg", "me.git", "packed-refs")
+	if err := os.WriteFile(packed, []byte("# pack-refs with: peeled fully-peeled sorted\n"+head+" refs/heads/zero\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(dataDir, "repos", "blackegg", "me.git", "refs", "heads", "zero")); err != nil {
+		t.Fatalf("删松散 ref 失败（前置条件没建立）: %v", err)
+	}
+
+	if _, err := callMCP(t, srv, tok, "archive blackegg/me@zero"); err != nil {
+		t.Fatalf("打包过的分支归档失败: %v", err)
+	}
+
+	// 归档分支在，内容完整
+	if got, _ := repo.Resolve("zero-archived"); got != head {
+		t.Fatalf("归档分支应指向原提交: %s vs %s", got, head)
+	}
+	body, err := repo.Read("zero-archived", "keep.md")
+	if err != nil || !strings.Contains(string(body), "打包过的分支也要能归档") {
+		t.Fatalf("归档分支内容丢失: %v %q", err, string(body))
+	}
+
+	// 源分支既不在列表里，也不在 packed-refs 里
+	list, err := callMCP(t, srv, tok, "branch blackegg/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(list, "  zero ") || strings.Contains(list, "* zero ") {
+		t.Fatalf("归档后源分支不该再出现在列表: %s", list)
+	}
+	raw, _ := os.ReadFile(packed)
+	if strings.Contains(string(raw), "refs/heads/zero\n") {
+		t.Fatalf("源分支应已从 packed-refs 移除: %s", string(raw))
 	}
 }

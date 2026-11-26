@@ -16,8 +16,16 @@ laptop (本机, 权威)          rock64 (10.192.168.164, 纯备份)
 ## 一键部署（rock64）
 
 ```bash
-# 1. 拉镜像（CI 已构建多架构）
-docker pull ghcr.io/open-mcp-ai/zero-memcp:v0.1.1-backup
+# 1. 取镜像。
+#
+#    不要直接 docker pull ghcr.io/...：rock64 到 ghcr 的 blob CDN
+#    （pkg-containers.githubusercontent.com）实测只有约 20KB/s，4.4MB 的
+#    二进制层要三分多钟，dockerd 表现为「Download complete 之后再也不动」。
+#    而经国内镜像源是 5~10 秒。
+#
+#    镜像源不是第二个来源：脚本会先向 ghcr.io 要官方的 index digest，
+#    再拿镜像源拉回来的 digest 去比，不相等就拒绝打标签。
+./zm-image-sync.sh v0.2.7
 
 # 2. 建目录
 mkdir -p /mnt/private/deploy/zero-memcp/{data,conf}

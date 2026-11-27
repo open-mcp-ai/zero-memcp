@@ -202,9 +202,15 @@ Example: read 2026-10-28/023000-laptop-a1b2c3d4.md
 `
 
 const detail_grep = `
-grep <pattern> [--scope <tree>]
+grep [-i] [-c | -l] <pattern> [--scope <tree>]
 
 Search full text with a regular expression and surrounding lines.
+
+Flags:
+  -i, --ignore-case   case-insensitive match (default is case-sensitive, like shell grep)
+  -c, --count         count matching lines and blocks only
+  -l, --files-only    list matching entry addresses only (one per line, ready for read)
+  --scope <tree>      narrow to project, project@branch, or project@branch/subtree
 
 BM25 is not good at pure symbols or proper nouns (QQ numbers, IPs, function names, variable names),
 where grep is much more accurate than recall. This is the main reason models switch to bash and rg:

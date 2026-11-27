@@ -14,7 +14,7 @@ put [<tree>] $TEXT           write content to a memory tree (content comes throu
 ref <tree> <addr>            add a reference to existing memory in a tree without copying its content
 recall <text> [--scope tree] semantic search; searches long-term memory by default, with an optional scope
 read <addr> [<addr>...]     read full text; accepts multiple addresses
-grep <pattern> [--scope T]  search full text with a regular expression (exact symbols, names, numbers)
+grep [-i|-c|-l] <re> [--scope T] search full text (-i ignore case, -c count, -l files only)
 log [N]                     timeline of recent memories
 ls [date]                   list memory entries for a date
 trees <project>[@<branch>]  view the tree directory

@@ -2530,14 +2530,28 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			countOnly = true
 			rest = stripFlags(rest, "-c", "--count")
 		}
+		// -l / --files-only：只列命中的条目地址（issue #9 的第二件事）。
+		//
+		// 为什么必须有：语义召回（recall）对纯符号/数字/端口不灵，grep 是
+		// 唯一替代路径；而「哪些条目提到过 X」这种巡检既不需要上下文行，
+		// 也不该被行级截断砍掉后半截清单。
+		filesOnly := false
+		if hasFlag(rest, "-l", "--files-only") {
+			filesOnly = true
+			rest = stripFlags(rest, "-l", "--files-only")
+		}
+		if countOnly && filesOnly {
+			return TermResult{}, invalidf(nil, "grep: -c and -l cannot be combined (choose count or filenames)")
+		}
 		if bad, ok := unknownFlag(rest); ok {
-			return TermResult{}, invalidf(nil, "grep: unknown flag %q (supported: --scope, -i, -c)", bad)
+			return TermResult{}, invalidf(nil, "grep: unknown flag %q (supported: --scope, -i, -c, -l, --files-only)", bad)
 		}
 		pattern, scopes := splitScopes(rest)
 		if pattern == "" {
-			return TermResult{}, invalidf(nil, "grep syntax: grep [-i] [-c] <pattern> [--scope <tree>]")
+			return TermResult{}, invalidf(nil, "grep syntax: grep [-i] [-c | -l] <pattern> [--scope <tree>]")
 		}
-		grepText, grepFound, grepErr := s.execGrep(pattern, scopes, c, ignoreCase, countOnly)
+		grepText, grepFound, grepErr := s.execGrepWith(pattern, scopes, c,
+			grepOpts{ignoreCase: ignoreCase, countOnly: countOnly, filesOnly: filesOnly})
 		if grepErr != nil {
 			return TermResult{}, grepErr
 		}
@@ -2720,7 +2734,21 @@ func (s *Server) weightCount(addr string) int {
 // 为什么要先剥参数再编译正则：早先整个 rest 直接当正则用，
 // 于是 `grep 1729 --scope daily` 会把 "--scope daily" 也编进模式里，
 // 结果是必然零命中——而报错文本是「无命中」，看上去像内容不存在。
+// grepOpts 是 grep 的三个开关。用一个结构体而不是三个 bool 参数：
+// 调用点已经长到「false, false」看不出哪一个是哪一个。
+type grepOpts struct {
+	ignoreCase bool
+	countOnly  bool
+	filesOnly  bool
+}
+
+// execGrep 保留原签名（既有调用点与测试不受影响）。
 func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase, countOnly bool) (string, bool, error) {
+	return s.execGrepWith(pattern, scopes, c, grepOpts{ignoreCase: ignoreCase, countOnly: countOnly})
+}
+
+func (s *Server) execGrepWith(pattern string, scopes []string, c Caller, opts grepOpts) (string, bool, error) {
+	ignoreCase, countOnly, filesOnly := opts.ignoreCase, opts.countOnly, opts.filesOnly
 	// 默认大小写敏感（与 shell grep 一致）；-i 时加 (?i)。
 	//
 	// 为什么不再无条件 (?i)：那等于所有检索都不区分大小写，
@@ -2777,7 +2805,24 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 			if !matchAnyScope(b.ID(), scopes) {
 				continue
 			}
-			cands = append(cands, cand{block: b, virt: c.Mount.ToVirtual(b.Project, b.Branch, b.Path)})
+			// 地址必须走 virtualPath，不能只查挂载表。
+			//
+			// issue #9：`@ops` / `@main.shared` 这类分支是**服务端 ACL 表**
+			// 开出来的，不在凭证的挂载表里。只查挂载表会得到空串，而空串
+			// 一路拼进输出就成了 `--  --`：命中的行、行号、上下文都对，
+			// 唯独没有文件名，于是无法把命中落到具体条目上。
+			//
+			// virtualPath 对挂载表命中的分支照旧返回虚拟路径，对只被 ACL
+			// 授权的分支返回可直接喂给 read 的 project@branch:path，而在
+			// 子树 chroot 之外仍然返回空串。
+			//
+			// 空串一律跳过：那是「这条路径在这张凭证眼里不可见」的标志，
+			// 放进结果就是一次隔离泄漏（同分支兄弟子树的内容会被列出来）。
+			virt := s.virtualPath(c, b.Project, b.Branch, b.Path)
+			if virt == "" {
+				continue
+			}
+			cands = append(cands, cand{block: b, virt: virt})
 		}
 	}
 
@@ -2841,6 +2886,10 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 	totalHits := 0
 	// 计数模式的统计口径：一行算一处，一块算一处（与 grep -c 的“行数”对齐）。
 	matchedLines, matchedBlocks := 0, 0
+	// -l 的清单：上限比行级截断（30）宽得多——「哪些条目提到过 X」
+	// 这个问题要的就是完整清单，截到 30 条反而要人反复换 scope 去凑。
+	const filesOnlyLimit = 200
+	var listed []string
 	for i, cd := range cands {
 		h := hits[i]
 		if len(h.lines) == 0 {
@@ -2849,6 +2898,14 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 		matchedLines += len(h.lines)
 		matchedBlocks++
 		if countOnly {
+			continue
+		}
+		if filesOnly {
+			// 只列文件名（-l / --files-only）：配合 -c 就能做
+			// 「哪些条目提到过 X」的巡检。
+			if len(listed) < filesOnlyLimit {
+				listed = append(listed, cd.virt)
+			}
 			continue
 		}
 		lines := h.kept
@@ -2882,6 +2939,16 @@ func (s *Server) execGrep(pattern string, scopes []string, c Caller, ignoreCase,
 			return "no matches", false, nil
 		}
 		return fmt.Sprintf("%d matching line(s) in %d block(s)", matchedLines, matchedBlocks), true, nil
+	}
+	if filesOnly {
+		if len(listed) == 0 {
+			return "no matches", false, nil
+		}
+		out := strings.Join(listed, "\n")
+		if matchedBlocks > len(listed) {
+			out += fmt.Sprintf("\n[truncated: showing first %d of %d matching entries]", len(listed), matchedBlocks)
+		}
+		return out, true, nil
 	}
 	if totalHits == 0 {
 		// The bool is what a conditional branches on; the text is only a

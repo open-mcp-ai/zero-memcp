@@ -69,8 +69,8 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:   "grep",
 		Detail: detail_grep,
 		Kind:   term.KindFlags,
-		Flags:  []string{"scope", "all", "bare"},
-		Usage:  "grep <pattern> [--scope <tree>]",
+		Flags:  []string{"scope", "all", "bare", "i", "ignore-case", "c", "count", "l", "files-only"},
+		Usage:  "grep [-i] [-c | -l] <pattern> [--scope <tree>]",
 	},
 	{
 		Name:   "log",

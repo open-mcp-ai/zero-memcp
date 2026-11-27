@@ -3,7 +3,7 @@ package server
 // 动词帮助页：每条动词的 Detail 常量。
 // 共用页面的动词（remote/fetch/push/sync/merge 等）共用一个常量。
 
-const detail_put = `put [<tree>] [--session <id>] $TEXT
+const detail_put = `put [<tree>] [--session <id>] [--where] $TEXT
 
 Store content in a memory tree. If no target is given, the service chooses a default destination based on the stream declaration in SKILL.md;
 when a tree path is specified, content is written as a new entry in that subtree.
@@ -16,7 +16,12 @@ Reference mode does not copy content:
   cmd: ref notes/todo $1
   args: ["memories/2026-08-03/123456-local.md"]
 
-The address returned by put is a stable file reference. Writes enter the single-writer dirty layer and are immediately searchable; policy or commit folds them into history.`
+Probe destination without writing:
+  cmd:  put --where [<tree>]
+
+A successful write returns: ok <address> (<project>@<branch>:<path>; base <sha>)
+The FIRST token after "ok " is the address to read back; the parenthetical is context,
+and it says "default tree" when the service chose the destination because none was named. The address returned by put is a stable file reference. Writes enter the single-writer dirty layer and are immediately searchable; policy or commit folds them into history.`
 
 const detail_ref = `
 ref <tree> <addr>

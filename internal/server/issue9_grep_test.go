@@ -100,9 +100,9 @@ mode  = "rwxr-xr-x"
 
 	// weft 的挂载表只收窄到 main 的 allowed 子树；ops 不在挂载表里。
 	weftTok := mintRestricted(t, dataDir, auth.Claims{
-		Sub: "weft",
+		Sub:  "weft",
 		Name: "weft",
-		Cap: "rw",
+		Cap:  "rw",
 		Mount: []auth.MountPoint{
 			{Project: "BlackEggAI/weft", Branch: "zero", Path: "allowed", At: "/"},
 		},

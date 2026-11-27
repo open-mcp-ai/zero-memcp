@@ -31,8 +31,8 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Target:         true,
 		TargetOptional: true,
 		PayloadType:    term.PayloadVar,
-		Flags:          []string{"session"},
-		Usage:          "put [<tree>] [--session <id>] $TEXT",
+		Flags:          []string{"session", "where", "dry-run"},
+		Usage:          "put [<tree>] [--session <id>] [--where] $TEXT",
 		// Detail 是 help put 的正文。它住在动词声明里而不是 help.go：
 		// 一个动词的用法和它的解释分开写，改一处忘一处是迟早的事。
 	},

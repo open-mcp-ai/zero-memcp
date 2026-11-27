@@ -34,6 +34,13 @@ func (s *Server) execPut(rest string, c Caller) (TermResult, error) {
 	head = strings.TrimSpace(head)
 	body = restorePayload(strings.TrimSpace(body))
 
+	// --where / --dry-run：写前先问「我会落到哪」，不碰脏层与索引（issue #10）。
+	isWhere := false
+	if hasFlag(head, "--where", "--dry-run") {
+		isWhere = true
+		head = stripFlags(head, "--where", "--dry-run")
+	}
+
 	// --ref <addr> 可以出现在头部（put tree --ref addr 会被 Cut 成 head="tree "）。
 	isRef := false
 	refAddr := ""
@@ -49,6 +56,17 @@ func (s *Server) execPut(rest string, c Caller) (TermResult, error) {
 		body = ""
 	}
 
+	if isWhere {
+		// 保留头部的目标路径（剥掉 @session 与 flag 后剩下的部分）。
+		var tgt []string
+		for _, tok := range strings.Fields(head) {
+			if strings.HasPrefix(tok, "@") && !strings.Contains(tok, "/") {
+				continue
+			}
+			tgt = append(tgt, tok)
+		}
+		return s.execPutWhere(strings.Join(tgt, " "), c)
+	}
 	if isRef {
 		if refAddr == "" {
 			return TermResult{}, errors.New("put --ref requires an address")
@@ -78,6 +96,53 @@ func (s *Server) execPut(rest string, c Caller) (TermResult, error) {
 		return s.putRef(target, refAddr, session, c)
 	}
 	return s.putBody(target, body, session, c)
+}
+
+// execPutWhere 回答「一次无前缀 put 会落到哪里」，不写任何东西。
+//
+// issue #10 的第二个诉求：想先知道落点再决定写不写，没有任何出口。
+// 这个动词就是那个出口——它走与真实写入完全相同的解析路径
+// （planWrite），所以探测结果与实际落点不会漂移。
+//
+//	put --where [<tree>]
+func (s *Server) execPutWhere(target string, c Caller) (TermResult, error) {
+	if !c.canWrite() {
+		return TermResult{}, fmt.Errorf("credential lacks w capability")
+	}
+	spec := s.parsePutSpec(target, c)
+	plan, err := s.planWrite(c, spec.Explicit, spec.TreePath)
+	if err != nil {
+		return TermResult{}, err
+	}
+	// 文件名在写入那一刻才产生（时间戳 + 单调序列号），所以这里只能给出
+	// 布局与目录。说清这一点，比编一个假文件名强。
+	layout := "<YYYY-MM-DD>/<HHMMSS.uuuuuu>-<seq>-<endpoint>.md"
+	if plan.Policy.Layout != "date" {
+		layout = "<HHMMSS.uuuuuu>-<seq>-<endpoint>.md"
+	}
+	dir := plan.Project + "@" + plan.Branch
+	if plan.TreePrefix != "" {
+		dir += "/" + plan.TreePrefix
+	}
+	src := "explicit target"
+	if plan.Defaulted {
+		src = "default for this credential (no tree was named; the service chose it)"
+	}
+	text := fmt.Sprintf("put would write to %s\n  chosen by: %s\n  layout:    %s\n  filename is assigned at write time (timestamp + sequence)",
+		dir, src, layout)
+	return TermResult{
+		Text: text,
+		Structured: map[string]any{
+			"ok":        true,
+			"dry_run":   true,
+			"project":   plan.Project,
+			"branch":    plan.Branch,
+			"tree":      plan.TreePrefix,
+			"defaulted": plan.Defaulted,
+			"layout":    layout,
+			"addr":      dir,
+		},
+	}, nil
 }
 
 // putSpec 是把 put 的目标解析成写入位置的结果。
@@ -191,10 +256,26 @@ func (s *Server) putBody(target, body, session string, c Caller) (TermResult, er
 
 	// 登记命令流与广播已经由 writeNoteGit 做完，这里不再重复。
 
-	text := "ok " + virtPath
-	if commitSHA != "" {
-		text += " (base " + shortSHA(commitSHA) + ")"
+	// 落点必须看得见（issue #10）。
+	//
+	// 早先只回 "ok <虚拟路径>"：挂载在根的凭证看到的是 2026-11-27/x.md，
+	// 项目与分支都不在返回值里，于是「我到底写到哪儿了」只能靠 help 里
+	// 一句「服务端按 SKILL.md 的声明挑默认落点」去推——而那份声明
+	// 调用方在自己的上下文里根本看不见。
+	//
+	// 真实事故：一份规范地址在 @ops 的活表被无前缀 put 写进了 @main，
+	// 多出一份重复副本，而那次返回的 ok 看不出任何异常。
+	fullAddr := proj + "@" + branch + ":" + rel
+	loc := fullAddr
+	if spec.Explicit == "" && spec.TreePath == "" {
+		loc = "default tree " + fullAddr
 	}
+	text := "ok " + virtPath + " (" + loc
+	if commitSHA != "" {
+		text += "; base " + shortSHA(commitSHA)
+	}
+	text += ")"
+
 	return TermResult{
 		Text: text,
 		Structured: map[string]any{
@@ -202,11 +283,15 @@ func (s *Server) putBody(target, body, session string, c Caller) (TermResult, er
 			"queued":  true,
 			"pending": repo.Pending(branch),
 			"path":    virtPath,
-			"tree":    spec.TreePath,
-			"project": proj,
-			"branch":  branch,
-			"base":    commitSHA,
-			"clock":   s.Clock(),
+			"addr":    fullAddr,
+			// defaulted 让程序也能判断「这次落点是服务端替我选的」，
+			// 而不是只靠解析人读的文本。
+			"defaulted": spec.Explicit == "" && spec.TreePath == "",
+			"tree":      spec.TreePath,
+			"project":   proj,
+			"branch":    branch,
+			"base":      commitSHA,
+			"clock":     s.Clock(),
 		},
 	}, nil
 }
@@ -248,10 +333,12 @@ func (s *Server) putRef(target, refAddr, session string, c Caller) (TermResult, 
 	commitSHA, _ := dstRepo.Resolve(branch)
 	virtPath := c.Mount.ToVirtual(proj, branch, rel)
 
-	text := "ok " + virtPath
+	fullAddr := proj + "@" + branch + ":" + rel
+	text := "ok " + virtPath + " (" + fullAddr
 	if commitSHA != "" {
-		text += " (base " + shortSHA(commitSHA) + ")"
+		text += "; base " + shortSHA(commitSHA)
 	}
+	text += ")"
 	return TermResult{
 		Text: text,
 		Structured: map[string]any{
@@ -259,6 +346,7 @@ func (s *Server) putRef(target, refAddr, session string, c Caller) (TermResult, 
 			"queued":  true,
 			"pending": dstRepo.Pending(branch),
 			"path":    virtPath,
+			"addr":    fullAddr,
 			"ref":     refAddr,
 			"project": proj,
 			"branch":  branch,

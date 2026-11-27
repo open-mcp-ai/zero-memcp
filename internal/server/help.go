@@ -10,7 +10,7 @@ func helpOverview() string {
 	return strings.TrimSpace(`
 zero-memcp: persistent memory. Writes are stored locally and remain available after restart.
 
-put [<tree>] $TEXT           write content to a memory tree (content comes through vars/args, never inline)
+put [<tree>] $TEXT           write to a tree (put --where [<tree>] probes destination without writing)
 ref <tree> <addr>            add a reference to existing memory in a tree without copying its content
 recall <text> [--scope tree] semantic search; searches long-term memory by default, with an optional scope
 read <addr> [<addr>...]     read full text; accepts multiple addresses

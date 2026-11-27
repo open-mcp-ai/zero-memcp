@@ -46,7 +46,7 @@ mode  = "rwx------"
 	if !strings.Contains(out, "ok daily/team/chat/") {
 		t.Fatalf("切片应落在 daily/team/chat/ 下，实际: %s", out)
 	}
-	slicePath := strings.TrimPrefix(strings.SplitN(out, " @ ", 2)[0], "ok ")
+	slicePath := firstToken(strings.TrimPrefix(out, "ok "))
 
 	// 2. trees 命令应列出该目录
 	treeOut, err := callMCP(t, srv, tok, "trees daily@zero")
@@ -67,7 +67,7 @@ mode  = "rwx------"
 	}
 
 	// 读出引用切片，内容必须指向原文，而不是把原文全拷一遍
-	refSlice := strings.TrimPrefix(strings.SplitN(refOut, " @ ", 2)[0], "ok ")
+	refSlice := firstToken(strings.TrimPrefix(refOut, "ok "))
 	readOut, err := callMCP(t, srv, tok, "read "+refSlice)
 	if err != nil {
 		t.Fatalf("read 引用失败: %v", err)

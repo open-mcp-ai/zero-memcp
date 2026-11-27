@@ -224,7 +224,8 @@ func TestWriteReadEndToEnd(t *testing.T) {
 	if !strings.HasPrefix(res, "ok daily/") {
 		t.Fatalf("put 返回异常: %s", res)
 	}
-	addr := strings.TrimPrefix(res, "ok ")
+	// 契约：`ok ` 之后的第一个词就是地址，括号里是上下文（落点提示 / base）。
+	addr := firstToken(strings.TrimPrefix(res, "ok "))
 
 	readRes, err := callMCP(t, srv, tok, "read "+addr)
 	if err != nil {
@@ -551,4 +552,16 @@ mode  = "rwxrwxrwx"
 	if out, err := callMCP(t, srv, bobTok, "read shared/seed.md"); err != nil || !strings.Contains(out, "种子") {
 		t.Fatalf("子用户应能读 shared: %v, out=%s", err, out)
 	}
+}
+
+// firstToken 取响应里的地址：`ok ` 之后的第一个词。
+//
+// 契约是「第一个词是地址，其余是上下文（落点提示、base）」。早先有些
+// 用例把整行都当地址用，只是因为新建仓库没有 base 而侥幸成立——
+// 一旦返回体带上说明就会炸。
+func firstToken(s string) string {
+	if f := strings.Fields(s); len(f) > 0 {
+		return f[0]
+	}
+	return ""
 }

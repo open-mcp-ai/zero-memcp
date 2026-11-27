@@ -42,77 +42,13 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 		return "", "", "", errors.New("text cannot be empty")
 	}
 
-	defaultBranch := s.defaultBranch
-	// 写入分支：显式挂载点优先，否则用默认分支。
-	//
-	// "*" 是「这个项目的所有分支」的通配声明，不是一个真实分支名。
-	// 把它直接当落点会写出名为 "*" 的分支（已实测），或者在
-	// 底层 ref 校验开启后直接被拒——两种都是错的：隐式写入应落到
-	// 挂载点所代表的具体分支，通配时落到默认分支。
-	writeBranch := defaultBranch
-	if !c.Mount.Empty() {
-		if b := c.Mount.DefaultBranch(); b != "" && b != "*" {
-			writeBranch = b
-		}
-	}
-
-	// 显式目标里写了 @<branch> 时，分支也跟着它走。
-	//
-	// 这是跨分支搬运的关键路径：调用方要把内容写进另一条版本线，
-	// 而它的默认分支跟那条不是一回事。没有 @branch，它只能往自己
-	// 分支上写，再多一步 mv——两跳之间被杀就留下半吊子状态。
-	// explicitBranch 记住调用方在目标里写明的分支。
-	// 它必须单独拿出来：否则后面 resolveWriteTarget 按挂载表默认分支
-	// 解析时会把「写到哪条分支」这个明确意图覆盖掉（实测：
-	// put proj@chat 写进了挂载表的分支，chat 根本没建）。
-	explicitBranch := ""
-	if explicit != "" {
-		if at := strings.Index(explicit, "@"); at >= 0 {
-			proj := explicit[:at]
-			rest := explicit[at+1:]
-			br, _, _ := strings.Cut(rest, "/")
-			if br != "" {
-				explicitBranch = br
-				if !s.branchVisible(c, proj, br) {
-					return "", "", "", fmt.Errorf("project %s@%s is outside this credential's visible scope", proj, br)
-				}
-				if !s.allowed(c, proj, br, configBitWrite) {
-					return "", "", "", errors.New(s.denyReason(c, proj, br, configBitWrite))
-				}
-				writeBranch = br
-				explicit = proj
-			}
-		}
-	}
-
-	// 写入目标必须同时满足三件事：挂载表可见、有写权限、配置里声明过。
-	// 取「全局第一个项目」是错的——那张凭证可能根本看不见它。
-	//
-	// 入口已经解析出明确分支时必须把它一并交给 resolveWriteTarget：
-	// 那个函数会拿「默认分支」去做可写校验，而分身边界凭证的默认分支
-	// 恰好是只读的 main。早先这里只传了剥掉 @branch 的项目名，于是同一
-	// 次写入先在第 77 行用 chat 校验通过，紧接着在 resolveWriteTarget
-	// 里用 main 再校验一次而失败——报错是 missing w permission，看起来
-	// 像凭证配错，实际是分支信息在传递中丢了。
-	targetProject, resolvedBranch, pol, err := s.resolveWriteTarget(c, defaultBranch, explicit, explicitBranch)
+	plan, err := s.planWrite(c, explicit, treePrefix)
 	if err != nil {
 		return "", "", "", err
 	}
-	// 写入分支的优先级：显式 @branch > 挂载表解析出的分支 > 默认分支。
-	//
-	// 显式分支在入口就校验过可见性与可写性，它是最强的意图，
-	// 不能被挂载表默认分支覆盖——否则「跨分支搬运」写进了错误的版本线，
-	// 而返回的 ok 地址看起来还是成功的。
-	if explicitBranch != "" {
-		writeBranch = explicitBranch
-	} else if resolvedBranch != "" {
-		writeBranch = resolvedBranch
-	} else if b := c.Mount.WritableBranch(targetProject); b != "" {
-		// 凭证是「读主干 + 写隔离分支」（main:r + chat:rw）时，
-		// 配置默认分支 main 恰好只读：不补这一层，写入永远被拒，
-		// 而报错是 missing w permission，看起来像凭证配错。
-		writeBranch = b
-	}
+	targetProject, writeBranch, pol := plan.Project, plan.Branch, plan.Policy
+	treePrefix = plan.TreePrefix
+
 	if implicitKind {
 		// 落点决定类型：项目声明的第一个 kind 就是它的默认语义。
 		if len(pol.Kinds) > 0 {
@@ -284,6 +220,107 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	s.kickSemantic()
 
 	return addr, targetProject, writeBranch, nil
+}
+
+// writePlan 是一次写入的落点：谁、哪条分支、哪棵子树、用哪份策略。
+//
+// 抽出来是为了让「我会写到哪」成为**一个可回答的问题**（issue #10）：
+// put 的返回体要给完整落点，put --where 要在写之前给出同一个答案。
+// 两处各写一遍解析，迟早会给出两种答案——而这类偏差的表现是
+// 「探测说写这儿，实际写那儿」，比不提供探测更坏。
+type writePlan struct {
+	Project    string
+	Branch     string
+	Policy     manifest.Policy
+	TreePrefix string
+	// Defaulted 为真表示调用方没有指定落点，位置是服务端替它选的。
+	// 这个事实必须能被看见：issue #10 的真实事故就是一份规范地址在
+	// @ops 的活表被无前缀 put 写进了 @main，多出一份重复副本，
+	// 而返回的 ok 里看不出这件事。
+	Defaulted bool
+}
+
+// planWrite 解析落点：显式目标 > 挂载表默认分支 > 默认分支。
+func (s *Server) planWrite(c Caller, explicit, treePrefix string) (writePlan, error) {
+	defaultBranch := s.defaultBranch
+	// 写入分支：显式挂载点优先，否则用默认分支。
+	//
+	// "*" 是「这个项目的所有分支」的通配声明，不是一个真实分支名。
+	// 把它直接当落点会写出名为 "*" 的分支（已实测），或者在
+	// 底层 ref 校验开启后直接被拒——两种都是错的：隐式写入应落到
+	// 挂载点所代表的具体分支，通配时落到默认分支。
+	writeBranch := defaultBranch
+	if !c.Mount.Empty() {
+		if b := c.Mount.DefaultBranch(); b != "" && b != "*" {
+			writeBranch = b
+		}
+	}
+
+	// 显式目标里写了 @<branch> 时，分支也跟着它走。
+	//
+	// 这是跨分支搬运的关键路径：调用方要把内容写进另一条版本线，
+	// 而它的默认分支跟那条不是一回事。没有 @branch，它只能往自己
+	// 分支上写，再多一步 mv——两跳之间被杀就留下半吊子状态。
+	// explicitBranch 记住调用方在目标里写明的分支。
+	// 它必须单独拿出来：否则后面 resolveWriteTarget 按挂载表默认分支
+	// 解析时会把「写到哪条分支」这个明确意图覆盖掉（实测：
+	// put proj@chat 写进了挂载表的分支，chat 根本没建）。
+	explicitBranch := ""
+	if explicit != "" {
+		if at := strings.Index(explicit, "@"); at >= 0 {
+			proj := explicit[:at]
+			rest := explicit[at+1:]
+			br, _, _ := strings.Cut(rest, "/")
+			if br != "" {
+				explicitBranch = br
+				if !s.branchVisible(c, proj, br) {
+					return writePlan{}, fmt.Errorf("project %s@%s is outside this credential's visible scope", proj, br)
+				}
+				if !s.allowed(c, proj, br, configBitWrite) {
+					return writePlan{}, errors.New(s.denyReason(c, proj, br, configBitWrite))
+				}
+				writeBranch = br
+				explicit = proj
+			}
+		}
+	}
+
+	// 写入目标必须同时满足三件事：挂载表可见、有写权限、配置里声明过。
+	// 取「全局第一个项目」是错的——那张凭证可能根本看不见它。
+	//
+	// 入口已经解析出明确分支时必须把它一并交给 resolveWriteTarget：
+	// 那个函数会拿「默认分支」去做可写校验，而分身边界凭证的默认分支
+	// 恰好是只读的 main。早先这里只传了剥掉 @branch 的项目名，于是同一
+	// 次写入先在第 77 行用 chat 校验通过，紧接着在 resolveWriteTarget
+	// 里用 main 再校验一次而失败——报错是 missing w permission，看起来
+	// 像凭证配错，实际是分支信息在传递中丢了。
+	targetProject, resolvedBranch, pol, err := s.resolveWriteTarget(c, defaultBranch, explicit, explicitBranch)
+	if err != nil {
+		return writePlan{}, err
+	}
+	// 写入分支的优先级：显式 @branch > 挂载表解析出的分支 > 默认分支。
+	//
+	// 显式分支在入口就校验过可见性与可写性，它是最强的意图，
+	// 不能被挂载表默认分支覆盖——否则「跨分支搬运」写进了错误的版本线，
+	// 而返回的 ok 地址看起来还是成功的。
+	if explicitBranch != "" {
+		writeBranch = explicitBranch
+	} else if resolvedBranch != "" {
+		writeBranch = resolvedBranch
+	} else if b := c.Mount.WritableBranch(targetProject); b != "" {
+		// 凭证是「读主干 + 写隔离分支」（main:r + chat:rw）时，
+		// 配置默认分支 main 恰好只读：不补这一层，写入永远被拒，
+		// 而报错是 missing w permission，看起来像凭证配错。
+		writeBranch = b
+	}
+
+	return writePlan{
+		Project:    targetProject,
+		Branch:     writeBranch,
+		Policy:     pol,
+		TreePrefix: strings.Trim(treePrefix, "/"),
+		Defaulted:  strings.TrimSpace(explicit) == "",
+	}, nil
 }
 
 // writeTarget 选出这次写入该落到哪个项目，并返回该项目的策略。

@@ -1762,6 +1762,17 @@ func (s *Server) execTermVars(line string, vars map[string]string, args []string
 	// （PayloadVar 要求必须有 payload），list / delete 没有正文。一个 Op
 	// 声明不了两种形态，所以无正文的那两个绕开语法层。
 	// 它们不带正文、不含变量、不需要链式，直送是安全的。
+	// put 的探针形态（put --where [<tree>]）同样没有正文，走同一条通道。
+	//
+	// 它不写任何东西：只回答「无前缀 put 会落到哪」。落点解析与真实写入
+	// 共用 planWrite，所以探测结果与实际落点不会漂移。
+	if tgt, ok := putWhereTarget(trimmed); ok {
+		res, err := s.execPutWhere(tgt, c)
+		if err != nil {
+			return TermResult{}, err
+		}
+		return res, nil
+	}
 	for _, pfx := range []string{"remote-key list", "remote-key delete", "remote-secret list", "remote-secret delete"} {
 		if strings.HasPrefix(trimmed, pfx) {
 			res, err := s.execStatement(trimmed, v, c)
@@ -1870,6 +1881,43 @@ func (s *Server) execTermWithPipes(line string, vars map[string]string, args []s
 	}
 	last.Text = strings.Join(texts, "\n")
 	return &last, nil
+}
+
+// putWhereTarget 识别 `put [<tree>] --where` / `--dry-run` 的探针形态，
+// 并返回其中的目标树（可为空）。
+//
+// 为什么绕开语法层：put 声明了 PayloadType=PayloadVar（正文只能是一个
+// 变量引用），而探针形态没有正文——一个 Op 装不下两种形态，这与
+// remote-key 的 list/delete 是同一类问题，用同一条既有通道解决。
+func putWhereTarget(line string) (string, bool) {
+	fields := strings.Fields(line)
+	if len(fields) < 2 || fields[0] != "put" {
+		return "", false
+	}
+	// 只有单语句才直送：带 `;` / `&&` / `||` 的链要交给语法层处理链语义。
+	if strings.ContainsAny(line, ";\n") || strings.Contains(line, "&&") || strings.Contains(line, "||") {
+		return "", false
+	}
+	found := false
+	var tgt []string
+	for i := 1; i < len(fields); i++ {
+		f := fields[i]
+		switch {
+		case f == "--where" || f == "--dry-run":
+			found = true
+		case f == "--session":
+			// 后面那个词是 session 的**值**，不是目标树。
+			i++
+		case strings.HasPrefix(f, "-"), strings.HasPrefix(f, "@"):
+			// 其它 flag、@session 位置词都不影响落点。
+		default:
+			tgt = append(tgt, f)
+		}
+	}
+	if !found {
+		return "", false
+	}
+	return strings.Join(tgt, " "), true
 }
 
 // execStatement runs exactly one statement.

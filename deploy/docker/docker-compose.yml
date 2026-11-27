@@ -17,7 +17,10 @@
 services:
   zero-memcp:
     image: ghcr.io/open-mcp-ai/zero-memcp:${ZERO_MEMCP_VERSION:-latest}
-    container_name: zero-memcp
+    # 容器名可覆盖：硬编码 name 会让「同时跑两份」直接失败——
+    # 第二份报 "Conflict. The container name \"/zero-memcp\" is already in use"，
+    # 而这是「先起一个试用、再起一个正式的」这种正常用法。
+    container_name: ${ZERO_MEMCP_CONTAINER_NAME:-zero-memcp}
     restart: unless-stopped
     ports:
       - "${ZERO_MEMCP_BIND:-127.0.0.1:1729}:1729"

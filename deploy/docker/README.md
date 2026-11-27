@@ -54,6 +54,22 @@ ZERO_MEMCP_CONFIG=~/.zero-memcp/zero-memcp.container.toml docker compose up -d
 2. **必须携带 Bearer Token**：经端口映射进来的连接源地址是 Docker 网关 IP，原「本机回环免签降级成 root」失效。请在配置里开启 `enforce_auth = true` 与 `require = "bearer"`，客户端携带签发好的 token。
 3. **升级与回滚**：改 `ZERO_MEMCP_VERSION`（或 `docker-compose.yml` 里的镜像 tag）后执行 `docker compose up -d`；旧镜像留在本地，回滚只需改回旧 tag 再 `up -d`。
 
+## 同时跑多份
+
+默认容器名是 `zero-memcp`。要再起一份（试用新版、或多项目隔离）时给它另一个名字与端口，否则会报
+`Conflict. The container name "/zero-memcp" is already in use`：
+
+```bash
+ZERO_MEMCP_CONTAINER_NAME=zero-memcp-test \
+ZERO_MEMCP_BIND=127.0.0.1:1731 \
+ZERO_MEMCP_DATA=~/.zero-memcp/data-test \
+ZERO_MEMCP_CONFIG=~/.zero-memcp/zero-memcp.test.toml \
+docker compose up -d
+```
+
+四者必须一起换：只换端口不换数据目录，两份会抢同一个 `instance.lock`
+（第二份直接拒绝启动）。
+
 ## 迁移已有宿主机进程到容器
 
 若宿主机上正在跑原生 `zero-memcp serve`：两者共用同一份 `data/` 与 `instance.lock`，必须先停宿主机进程再起容器：

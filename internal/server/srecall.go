@@ -37,7 +37,38 @@ import (
 const (
 	rrfK        = 60.0
 	srecallTopN = 5
+
+	// srecallLayerN 是**每一层**各自的候选配额（Issue #13）。
+	//
+	// 早先只有一路 BM25 取 8 条：那次讨论的 thought 逐字复述查询词、
+	// 篇幅又长，一次就把 8 个名额铺满，跨日期的 record 连名单都进不了。
+	// 按层各留 N 条后，record 不需要越过 thought 堆才能露头。
+	srecallLayerN = 8
 )
+
+// layerOrder 是参与分层 RRF 的层名，同时也是路径前缀。
+//
+// 与 semantic.go 的 isSemanticContent 保持同一套词：层是写在路径上的
+// （`record/YYYY-MM-DD/…`），不是写在正文里的——thought 切片正文里有
+// 一层 `layer: thought`，record 没有，只看正文会把 record 全归成空层。
+var layerOrder = []string{"fact", "record", "review", "thought"}
+
+// layerOfAddr 从物理地址（project@branch/path）里判层。
+//
+// 判不出来返回 ""（根级切片、导入的旧数据）。它会被当成独立一层：
+// 无名层里也有自己的第 1 名，不会因为“不知道属于哪层”就被挤掉。
+func layerOfAddr(addr string) string {
+	_, _, path, ok := memory.SplitID(addr)
+	if !ok {
+		return ""
+	}
+	for _, l := range layerOrder {
+		if path == l || strings.HasPrefix(path, l+"/") {
+			return l
+		}
+	}
+	return ""
+}
 
 func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	// 计时起点：tookMs 要覆盖向量路 + 关键词路 + 融合去重全过程。
@@ -86,8 +117,21 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 		}
 		return addrUnderScope(addr, scope)
 	}
-	bmHits := s.idxNow().SearchCovered(query, 8, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
-		return allowedHit(addr) && scopeMatch(addr)
+	// 每层配额：配额用完就不再放行该层，让后面的层有自己的名额。
+	//
+	// 过滤器按**分数降序**走，所以每层被放行的前 N 条就是该层
+	// 自己的 top-N——一次扫描就能拿到分层榜单，不必扫三遍。
+	layerQuota := map[string]int{}
+	bmHits := s.idxNow().SearchCovered(query, srecallLayerN*8, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
+		if !allowedHit(addr) || !scopeMatch(addr) {
+			return false
+		}
+		l := layerOfAddr(addr)
+		if layerQuota[l] >= srecallLayerN {
+			return false
+		}
+		layerQuota[l]++
+		return true
 	})
 
 	// 3) RRF 融合：按排名计分，与两路的原始分数尺度无关。
@@ -96,6 +140,19 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	// 结果 1729 案的 L2 种子（BM25 第 1、9.31 分）被语义的压缩噪声
 	// （0.84~0.85）挤出局。排名融合让两路各按名次贡献，双路命中
 	// 自动叠加——这正是「L2 在 BM25 第 1 + 语义第 25」想要的形状。
+	//
+	// 分层再融一次（Issue #13）：光分两路不够，因为每一路里
+	// 层与层仍然**同台竞争名次**。thought 是推理过程，逐字复述
+	// 查询词的概率极高、篇幅又长，在 BM25 里天然吃掉靠前的名次；
+	// 一次讨论就能把 top-N 铺满，跨日期的 record 根本进不了名单。
+	//
+	// 改法不是给 thought 乘一个魔法系数，而是把「层」当第三个维度
+	// 拆成独立榜单：每层的第 1 名都拿 1/(k+1)，名次只在**同层内**
+	// 比较。这样一条 record 不再需要越过一堆 thought 才能露头——
+	// 它只需要是 record 里最相关的那个。
+	//
+	// 为什么不用加权：力度靠人拍，而 RRF 的力度由名次自己决定。
+	// 真要调，也只调路由权重，不是给某一层编一个数字。
 	type finalHit struct {
 		addr      string  // 实际物理地址
 		virt      string  // 虚拟地址
@@ -108,23 +165,39 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	rrf := map[string]float64{}
 	src := map[string]string{}
 
+	// addRoute 把一路候选按层拆开，层内重新从 1 开始给名次。
+	//
+	// 入参已按该路分数降序，所以同层内出现的顺序就是该层的名次。
+	addRoute := func(route string, addrs []string) {
+		perLayer := map[string]int{}
+		for _, a := range addrs {
+			l := layerOfAddr(a)
+			perLayer[l]++
+			rrf[a] += 1.0 / (rrfK + float64(perLayer[l]))
+			if prev, ok := src[a]; ok && prev != route {
+				src[a] = "both"
+			} else if !ok {
+				src[a] = route
+			}
+		}
+	}
+
 	// 向量路：vHits 已按分数降序
-	for i, vh := range vHits {
+	vAddrs := make([]string, 0, len(vHits))
+	for _, vh := range vHits {
 		if !allowedHit(vh.ID) || !scopeMatch(vh.ID) {
 			continue
 		}
-		rrf[vh.ID] += 1.0 / (rrfK + float64(i+1))
-		src[vh.ID] = "semantic"
+		vAddrs = append(vAddrs, vh.ID)
 	}
-	// BM25 路：多取几个（8），它的中段与语义命中叠加后可能反超
-	for i, bh := range bmHits {
-		rrf[bh.Addr] += 1.0 / (rrfK + float64(i+1))
-		if prev, ok := src[bh.Addr]; ok && prev == "semantic" {
-			src[bh.Addr] = "both"
-		} else if _, ok := src[bh.Addr]; !ok {
-			src[bh.Addr] = "lexical"
-		}
+	addRoute("semantic", vAddrs)
+
+	// BM25 路：已经是每层各自 top-N（配额在检索时就限住了）
+	bmAddrs := make([]string, 0, len(bmHits))
+	for _, bh := range bmHits {
+		bmAddrs = append(bmAddrs, bh.Addr)
 	}
+	addRoute("lexical", bmAddrs)
 
 	// 排序取 top-N，再补齐展示信息（snippet/companion 要读树，锁内做）。
 	type ranked struct {

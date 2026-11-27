@@ -36,7 +36,22 @@ commit 只是"此刻在此处拍了一张照"，给外部 Git 工具与人审计
 
 ## 快速上手
 
-### 编译
+### 容器（推荐）
+
+```bash
+mkdir -p ~/.zero-memcp/data
+cp zero-memcp.example.toml ~/.zero-memcp/zero-memcp.toml
+cd deploy/docker
+docker compose up -d
+curl -sS http://127.0.0.1:1729/health
+```
+
+镜像同时提供 `linux/amd64` 与 `linux/arm64`；升级就是换 `ZERO_MEMCP_VERSION`
+再 `docker compose up -d`，数据在宿主绑定目录里不动。细节与回滚见
+[`deploy/docker/README.md`](deploy/docker/README.md)、
+[`deploy/UPGRADING.md`](deploy/UPGRADING.md)。
+
+### 编译（原生二进制）
 
 ```bash
 go build -o zero-memcp ./cmd/zero-memcp            # 默认：http + static 嵌入
@@ -45,7 +60,7 @@ go build -tags onnx ./cmd/zero-memcp               # 追加 ONNX（需 CGO + lib
 
 `zero-memcp version` 会打印本二进制编译进了哪些嵌入能力。
 
-### 启动
+### 启动（原生）
 
 ```bash
 zero-memcp serve -data ~/.zero-memcp/data -config ~/.zero-memcp/zero-memcp.toml

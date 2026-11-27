@@ -25,7 +25,7 @@ laptop (本机, 权威)          rock64 (10.192.168.164, 纯备份)
 #
 #    镜像源不是第二个来源：脚本会先向 ghcr.io 要官方的 index digest，
 #    再拿镜像源拉回来的 digest 去比，不相等就拒绝打标签。
-./zm-image-sync.sh v0.2.8
+./zm-image-sync.sh v0.2.10
 
 # 2. 建目录
 mkdir -p /mnt/private/deploy/zero-memcp/{data,conf}
@@ -79,7 +79,7 @@ interval = "0s"   # 纯备份节点不主动拉谁
 ```yaml
 services:
   zero-memcp:
-    image: ghcr.io/open-mcp-ai/zero-memcp:v0.1.1-backup
+    image: ghcr.io/open-mcp-ai/zero-memcp:${ZERO_MEMCP_VERSION:-latest}
     container_name: zero-memcp-backup
     restart: unless-stopped
     ports:
@@ -88,8 +88,12 @@ services:
       - ./data:/data
       - ./conf/zero-memcp.toml:/etc/zero-memcp/zero-memcp.toml:ro
     environment:
-      - TZ=Asia/Shanghai
+      - TZ=${TZ:-UTC}
 ```
+
+冷备份节点与活节点跑**同一个镜像**，差异只在配置：这里 `[index] enabled` 缺省
+（= 关），`[sync] interval = "0s"`，只收不拉。不要为备份单独做一个镜像——
+两个镜像意味着两条升级路径，而备份节点最不该成为「升不上去的那一个」。
 
 ## 主机侧配置（laptop）
 

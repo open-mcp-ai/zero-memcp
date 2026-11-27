@@ -202,6 +202,41 @@ func (ps *postingSlot) remove(addr string) bool {
 	return len(next) == 0
 }
 
+// removeMany 一次撤掉该词的多个 addr，只做一次拷贝。
+//
+// 与 remove 的区别就是拷贝次数：remove 撤一个 addr 就整份复制一遍
+// entries，而「换掉一整条分支」要撤掉两万篇共同命中的常见词——
+// 实测 20,448 篇逐条 remove 要 4m33s，按词聚合后是同一个量级里的
+// 零头。语义与 remove 一致：撤掉的 addr 不存在时不算错。
+func (ps *postingSlot) removeMany(gone map[string]bool) bool {
+	if len(gone) == 0 {
+		return false
+	}
+	release := ps.acquire()
+	defer release()
+	cur := ps.load()
+	next := make([]postingEntry, 0, len(cur.entries))
+	for _, e := range cur.entries {
+		if gone[e.Addr] {
+			continue
+		}
+		next = append(next, e)
+	}
+	if len(next) == len(cur.entries) {
+		// 一个都没命中：不写回，也不复制。
+		return len(cur.entries) == 0
+	}
+	var byAddr map[string]int
+	if len(next) >= 8 {
+		byAddr = make(map[string]int, len(next))
+		for i, e := range next {
+			byAddr[e.Addr] = i
+		}
+	}
+	ps.list.Store(&postingList{entries: next, byAddr: byAddr})
+	return len(next) == 0
+}
+
 // Index 是倒排表。
 //
 // # 为什么没有锁
@@ -410,6 +445,75 @@ func (ix *Index) Remove(addr string) bool {
 	ix.docTime.Delete(addr)
 	ix.totalDocs.Add(-1)
 	return true
+}
+
+// RemoveBatch 批量撤销一批文档，语义与逐条 Remove 完全一致。
+//
+// # 为什么必须有它
+//
+// 逐条 Remove 是 O(N²)：entries 是不可变切片，每撇一个 (doc, token)
+// 对都要整份复制一遍。而「重建一条分支的索引」意味着先把整条分支的
+// 两万篇全撤掉——它们共同命中同一批常见词，于是每次复制都是一万
+// 多条记录。实测 20,448 篇逐条 Remove 要 4m33s，而分词只要 1~2 秒。
+//
+// 这里把「要撤的 addr」按词聚合，每个词只复制一次。
+func (ix *Index) RemoveBatch(addrs []string) {
+	if len(addrs) == 0 {
+		return
+	}
+
+	// ① 先把每个 addr 的 token 记下来，按词倒排：token -> 待撤的 addr 集。
+	byToken := make(map[Token]map[string]bool, 4096)
+	docs := 0
+	var sumLen int64
+	for _, addr := range addrs {
+		tokens := ix.docTokensOf(addr)
+		if tokens == nil {
+			// 没有 token 记录但可能有长度/时间记录（空正文的块）
+			ix.docTime.Delete(addr)
+			ix.docLen.Delete(addr)
+			ix.docSize.Delete(addr)
+			continue
+		}
+		// 同一个词在同一篇里出现多次，撤一次就够（posting 里带 tf）。
+		seen := make(map[Token]struct{}, len(tokens))
+		for _, tok := range tokens {
+			if _, dup := seen[tok]; dup {
+				continue
+			}
+			seen[tok] = struct{}{}
+			set := byToken[tok]
+			if set == nil {
+				set = make(map[string]bool, 1)
+				byToken[tok] = set
+			}
+			set[addr] = true
+		}
+		sumLen += int64(ix.docLenOf(addr))
+		ix.docTokens.Delete(addr)
+		ix.docLen.Delete(addr)
+		ix.docSize.Delete(addr)
+		ix.docTime.Delete(addr)
+		docs++
+	}
+	if docs > 0 {
+		ix.totalDocs.Add(-int64(docs))
+	}
+	if sumLen > 0 {
+		ix.sumDocLen.Add(-sumLen)
+	}
+
+	// ② 每个词只复制、只写回一次。
+	for tok, gone := range byToken {
+		if empty := ix.slot(tok).removeMany(gone); empty {
+			if v, ok := ix.postings.Load(tok); ok {
+				ps, _ := v.(*postingSlot)
+				if ps != nil && len(ps.load().entries) == 0 {
+					ix.postings.CompareAndDelete(tok, ps)
+				}
+			}
+		}
+	}
 }
 
 // Hit 是一条检索结果。
@@ -745,10 +849,16 @@ func (ix *Index) AddBatch(docs []BatchDoc, workers int) {
 	// 如果索引不是空的（增量更新），先撤旧条目，防止「内容改了但旧词仍能搜到」
 	// （见 TestAddBatchOverwriteSameAddr 钉住的行为）。
 	// 冷建时 totalDocs==0，这一步直接跳过，零开销。
+	//
+	// 走 RemoveBatch 而不是逐条 Remove：批量版按词聚合，每个词只复制
+	// 一次倒排表。逐条版在「整条分支重建」这个场景下是 O(N²)——
+	// 20,448 篇实测 4m33s。
 	if ix.Docs() > 0 {
+		addrs := make([]string, len(docs))
 		for i := range docs {
-			ix.Remove(docs[i].Addr)
+			addrs[i] = docs[i].Addr
 		}
+		ix.RemoveBatch(addrs)
 	}
 	for i := range out {
 		d := docs[i]

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -208,9 +209,11 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 			if t.Project != proj || t.Branch != br {
 				continue
 			}
+			var gone []string
 			for _, b := range t.Indexable() {
-				idx.Remove(b.ID())
+				gone = append(gone, b.ID())
 			}
+			idx.RemoveBatch(gone)
 		}
 	}
 
@@ -584,18 +587,22 @@ func (s *Server) healIndexAgainstTrees(idx *index.Index, trees []*memory.Tree) (
 	//   ② 异常消失（对象丢失、分支被重置、合并出岔子）——此时这张卡片
 	//      是全库唯一还记得「这里曾有过一篇」的物证。
 	// 所以清归清，地址要留下来给调用方打日志。
+	var gone []string
 	for addr := range idx.AllDocs() {
 		if _, ok := liveBlocks[addr]; !ok {
-			idx.Remove(addr)
-			removed++
+			gone = append(gone, addr)
 			if len(orphans) < orphanSampleLimit {
 				orphans = append(orphans, addr)
 			}
 		}
 	}
+	removed = len(gone)
+	// 批量撤：孤儿可能是整条分支（几千到几万篇），逐条 Remove 是 O(N²)。
+	idx.RemoveBatch(gone)
 
 	// 2. 补全索引缺失的 block
 	idxDocs := idx.AllDocs()
+	var docs []index.BatchDoc
 	for id, b := range liveBlocks {
 		if _, ok := idxDocs[id]; ok {
 			continue
@@ -608,8 +615,11 @@ func (s *Server) healIndexAgainstTrees(idx *index.Index, trees []*memory.Tree) (
 		if at := sliceAtTime(string(data), b.Path); at > 0 {
 			stamp = at
 		}
-		idx.AddWithTime(id, string(data), stamp)
-		added++
+		docs = append(docs, index.BatchDoc{Addr: id, Text: string(data), ModTime: stamp})
+	}
+	if len(docs) > 0 {
+		idx.AddBatch(docs, runtime.NumCPU())
+		added = len(docs)
 	}
 	return removed, added, orphans
 }

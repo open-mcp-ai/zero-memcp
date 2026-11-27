@@ -7,6 +7,7 @@ import (
 	"sync"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
+	"github.com/open-mcp-ai/zero-memcp/internal/index"
 	"github.com/open-mcp-ai/zero-memcp/internal/manifest"
 	"github.com/open-mcp-ai/zero-memcp/internal/memory"
 )
@@ -532,16 +533,27 @@ func (s *Server) refreshBranch(project, branch string) error {
 
 	idx := s.idxNow()
 	if idx != nil {
-		// 先撤销旧分支的全部 doc，再按新树加回去。
+		// 先把旧分支的全部 doc 撇掉，再按新树加回去。
+		//
+		// 先撇后加并不是为了「消息一致」这种抽象理由，而是旧树里被删掉的
+		// 路径必须从索引里消失——否则症状是「文件删了但还能 recall 到」。
+		var oldAddrs []string
 		for _, old := range s.treeList() {
 			if old.Project != project || old.Branch != branch {
 				continue
 			}
 			for _, blk := range old.Indexable() {
-				idx.Remove(blk.ID())
+				oldAddrs = append(oldAddrs, blk.ID())
 			}
 		}
+		// 批量版本：逐条 Remove 在 20k 块上测得 4m33s，按词聚合后 2.7s。
+		// 这个差别不是优化级别的，是「同步一次就卡十分钟」级别的——
+		// 实测 weft@main.record（20,432 路径）每来一批 341 条 delta 就重建一次，
+		// 日志上表现为单条分支刷 866 秒，而 op-sync 还在不停往里写。
+		idx.RemoveBatch(oldAddrs)
+
 		if s.branchIndexed(project, branch) {
+			docs := make([]index.BatchDoc, 0, len(tree.Blocks))
 			for _, blk := range tree.Indexable() {
 				data, rerr := s.readBlock(blk)
 				if rerr != nil {
@@ -551,7 +563,10 @@ func (s *Server) refreshBranch(project, branch string) error {
 				if at := sliceAtTime(string(data), blk.Path); at > 0 {
 					stamp = at
 				}
-				idx.AddWithTime(blk.ID(), string(data), stamp)
+				docs = append(docs, index.BatchDoc{Addr: blk.ID(), Text: string(data), ModTime: stamp})
+			}
+			if len(docs) > 0 {
+				idx.AddBatch(docs, runtime.NumCPU())
 			}
 		}
 	}
@@ -612,9 +627,12 @@ func (s *Server) dropBranch(project, branch string) {
 	}
 	idx := s.idxNow()
 	if idx != nil {
+		// 批量撤：整条分支可能是几万篇，逐条 Remove 是 O(N²)。
+		var gone []string
 		for _, b := range cur[ti].Indexable() {
-			idx.Remove(b.ID())
+			gone = append(gone, b.ID())
 		}
+		idx.RemoveBatch(gone)
 	}
 	next := make([]*memory.Tree, 0, len(cur)-1)
 	next = append(next, cur[:ti]...)

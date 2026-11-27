@@ -147,3 +147,73 @@ func TestAddBatchOverwriteSameAddr(t *testing.T) {
 		t.Fatalf("覆盖后应只有 1 篇，实际 %d", ix.Docs())
 	}
 }
+
+// RemoveBatch 与逐条 Remove 必须完全等价。
+//
+// 判据不能只看「文档数变成 0」——真正的风险是残留：
+// 某个词的倒排里还留着已撤 addr、或 totalDocs/sumDocLen 记错。
+// 所以这里用「撤一半」来对拍：剩下的那一半必须和从没加过被撤文档的
+// 索引查到一模一样的结果。
+func TestRemoveBatchEquivalence(t *testing.T) {
+	docs := []BatchDoc{
+		{Addr: "keep/1", Text: "要留下的第一篇，关于中文分词与倒排索引", ModTime: 100},
+		{Addr: "keep/2", Text: "要留下的第二篇，也提到 zero-memcp 与 1729", ModTime: 200},
+		{Addr: "gone/1", Text: "要撤掉的第一篇，独有词只有它才有 zzzunique", ModTime: 300},
+		{Addr: "gone/2", Text: "要撤掉的第二篇，共享词中文分词 1729 也在里面", ModTime: 400},
+		{Addr: "gone/3", Text: "", ModTime: 500}, // 空文档边界：只有时间记录
+	}
+	gone := []string{"gone/1", "gone/2", "gone/3"}
+
+	// 逐条撤
+	serial := New()
+	serial.AddBatch(docs, 2)
+	for _, a := range gone {
+		serial.Remove(a)
+	}
+
+	// 批量撤
+	batch := New()
+	batch.AddBatch(docs, 2)
+	batch.RemoveBatch(gone)
+
+	// 从没加过被撤文档的索引（真相）
+	truth := New()
+	truth.AddBatch(docs[:2], 2)
+
+	if serial.Docs() != batch.Docs() || batch.Docs() != truth.Docs() {
+		t.Fatalf("文档数不一致：逐条 %d vs 批量 %d vs 真相 %d", serial.Docs(), batch.Docs(), truth.Docs())
+	}
+	if serial.Terms() != batch.Terms() || batch.Terms() != truth.Terms() {
+		t.Fatalf("词数不一致：逐条 %d vs 批量 %d vs 真相 %d", serial.Terms(), batch.Terms(), truth.Terms())
+	}
+
+	queries := []string{"中文", "分词", "1729", "zzzunique", "zero-memcp", "要撤掉的"}
+	for _, q := range queries {
+		h1 := serial.SearchCovered(q, 10, 0.1, 0.0, nil, nil)
+		h2 := batch.SearchCovered(q, 10, 0.1, 0.0, nil, nil)
+		h3 := truth.SearchCovered(q, 10, 0.1, 0.0, nil, nil)
+		if len(h1) != len(h2) || len(h2) != len(h3) {
+			t.Fatalf("查询 %q 命中数不一致：逐条 %d vs 批量 %d vs 真相 %d", q, len(h1), len(h2), len(h3))
+		}
+		for i := range h1 {
+			if h1[i].Addr != h2[i].Addr || h2[i].Addr != h3[i].Addr {
+				t.Fatalf("查询 %q 第 %d 名不一致：%s / %s / %s", q, i, h1[i].Addr, h2[i].Addr, h3[i].Addr)
+			}
+			if d := h1[i].Score - h2[i].Score; d > 1e-6 || d < -1e-6 {
+				t.Fatalf("查询 %q 第 %d 名得分不一致：%f vs %f", q, i, h1[i].Score, h2[i].Score)
+			}
+		}
+	}
+
+	// 共享词必须还留着一半：撤过头的症状是「剩下的也搜不到了」。
+	if got := batch.SearchCovered("1729", 10, 0.1, 0.0, nil, nil); len(got) != 1 || got[0].Addr != "keep/2" {
+		t.Fatalf("共享词 1729 该只剩 keep/2，实际 %v", got)
+	}
+
+	// 幂等：再撤一次不该出错、不该把别人的记录也带走。
+	batch.RemoveBatch(gone)
+	if batch.Docs() != truth.Docs() || batch.Terms() != truth.Terms() {
+		t.Fatalf("重复撤改变了索引状态：docs %d vs %d, terms %d vs %d",
+			batch.Docs(), truth.Docs(), batch.Terms(), truth.Terms())
+	}
+}

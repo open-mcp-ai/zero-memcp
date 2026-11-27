@@ -48,9 +48,12 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:      "recall",
 		Detail:    detail_recall,
 		Kind:      term.KindFlags,
-		Flags:     []string{"scope", "bare", "all", "json"},
+		// before / after / older-than 带值，所以不进 Valueless。
+		// 不登记会被 term 层的「unknown flag」挡在动词之前，
+		// 而 parseTimeWindow 根本轮不到执行。
+		Flags:     []string{"scope", "bare", "all", "json", "before", "after", "older-than"},
 		Valueless: []string{"bare", "all", "json"},
-		Usage:     "recall <query> [--scope <tree>] [--bare] [--json]",
+		Usage:     "recall <query> [--scope <tree>] [--before <date>] [--older-than <2h|3d>] [--bare] [--json]",
 	},
 	{
 		Name:      "srecall",

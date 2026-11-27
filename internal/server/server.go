@@ -2206,6 +2206,14 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 文本投影里分数是排版的一部分（`addr (73.79)`），解析它要靠正则，
 		// 而正则对排版变化毫无抵抗力——改一下缩进或小数位就静默取不到分。
 		rest, wantJSON := stripJSONFlag(rest)
+		// 时间窗：`--before` / `--after` / `--older-than`。
+		//
+		// 先摘掉再 splitScopes：否则 `--older-than 2h` 的 `2h` 会被当成
+		// 搜索词进索引（和当年 --scope 的词被当搜索词是同一个坑）。
+		rest, window, werr := parseTimeWindow(rest, tRecall)
+		if werr != nil {
+			return TermResult{}, werr
+		}
 		query, scopes := splitScopes(rest)
 		// 显式点名一条未建索引的分支时，必须报错而不是回「没有命中」。
 		//
@@ -2218,8 +2226,19 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			}
 		}
 		scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
-		hits := s.idxNow().SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
-			return allowedHit(addr) && scopeMatch(addr)
+		// 时间窗与权限、scope 同在一条过滤链上，而且都在**排序之后**
+		// 按分数降序执行（见 index.SearchCovered 末尾的注释）：被时间
+		// 筛掉的条目不会占掉 limit 名额，所以「限定范围」不会变成
+		// 「结果变少」。
+		idxNow := s.idxNow()
+		windowMatch := func(addr string) bool {
+			if !window.set() {
+				return true
+			}
+			return window.keep(idxNow.DocTime(addr))
+		}
+		hits := idxNow.SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
+			return allowedHit(addr) && scopeMatch(addr) && windowMatch(addr)
 		})
 		permHits := make([]index.Hit, 0, len(hits))
 		for _, h := range hits {

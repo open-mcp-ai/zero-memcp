@@ -182,7 +182,7 @@ Example:
 `
 
 const detail_recall = `
-recall <text>
+recall <text> [--scope <tree>] [--before <date>] [--after <date>] [--older-than <2h|3d>]
 
 Semantic search. Returns addresses, scores, and excerpts of about 240 characters around matching lines.
 
@@ -190,7 +190,17 @@ Why return excerpts instead of bare addresses: "addr (score)" does not show what
 so each entry must be read individually; after reading three or four entries, users switch to grep.
 not because they do not want memory tools, but because each answer requires several extra round trips. Excerpts reduce N reads to zero.
 
+Where to search is a separate axis from what to search for. --scope narrows to a tree;
+--before / --after / --older-than narrow to a time window. They compose.
+
+--older-than 2h is the usual answer to "stop surfacing what we just talked about":
+that text is already in your context, so finding it again is pure noise.
+Entries with unknown timestamps are kept — hiding them would silently drop data
+the server merely cannot date.
+
 Example: recall why the port is 1729
+    recall 海马体 --older-than 3d
+    recall 索引 --before 2026-11-20 --scope BlackEggAI/weft@main.record:record
 `
 
 const detail_read = `

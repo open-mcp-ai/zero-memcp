@@ -48,7 +48,7 @@ var payloadVerbs = map[string]bool{
 	"remote-key": true, "remote-secret": true,
 }
 
-// normalizeTermInput 把一行的 vars/args 装配成 term.Subst，并做上面两件事。
+// normalizeTermInput 把一行的 vars/args 装配成 term.Subst，并做上面几件事。
 func normalizeTermInput(cmd string, vars map[string]string, args []string) (string, term.Subst, error) {
 	sub := term.Subst{
 		Named: make(map[string]string, len(vars)),
@@ -62,7 +62,105 @@ func normalizeTermInput(cmd string, vars map[string]string, args []string) (stri
 		return "", term.Subst{}, err
 	}
 
-	return injectMissingTarget(protectLayeredScope(cmd)), sub, nil
+	// 规整顺序有讲究：
+	//	1. scope 折叠：先把 `--scope a||b` 收掉，否则 `||` 会被当成语句分隔符；
+	//	2. 箭头归一：`mv a -> b` → `mv a --to b`；
+	//	3. 多余 `--` 剥离：`write p $X` 前的 `--` 不是 flag；
+	//	4. 哨兵补位：得在箭头归一之后，否则位置词的个数还没定。
+	cmd = protectLayeredScope(cmd)
+	cmd = normalizeArrowSeparator(cmd)
+	cmd = stripStrayDashBeforeRef(cmd)
+	return injectMissingTarget(cmd), sub, nil
+}
+
+// arrowVerbs 是以 `--to` 声明目标的动词。
+//
+// 它们的语法在三种地方出现过三种写法：
+//
+//	grammar 声明   --to     （能被解析的那一个）
+//	help 概览      --to
+//	help <verb>    ->       （教的是一个解析层根本不认的形式）
+//
+// issue #7：按 `help mv` 写命令的调用方 100% 失败，而报错还把 `>` 解释成
+// shell 重定向（一个与 mv 语义无关的概念），接着又在 usage 行里继续教 `->`。
+// 文档正在教一个会被自己拒掉的写法。
+//
+// 修法：把 `->` 也认下来（它是内部动词、历史文档、人的肌肉记忆共用的形状），
+// 归一成 `--to` 后再进解析器。两种写法从此都真能执行。
+var arrowVerbs = map[string]bool{"cp": true, "mv": true, "diff": true, "archive": true}
+
+// normalizeArrowSeparator 把目标动词里的独立词 `->` 换成 `--to`。
+//
+// 只在两种情况下动手，其余原样保留：
+//   - 该分句的动词在 arrowVerbs 里；
+//   - `->` 是一个**独立词**（两侧是空白或行首尾）。
+//
+// 内容里绝不会出现 `->`：正文只能走 vars/args，从不参与解析。
+func normalizeArrowSeparator(cmd string) string {
+	if !strings.Contains(cmd, "->") {
+		return cmd
+	}
+	var out []string
+	changed := false
+	for _, raw := range splitStatements(cmd) {
+		fields := strings.Fields(raw)
+		if len(fields) == 0 || !arrowVerbs[fields[0]] {
+			out = append(out, raw)
+			continue
+		}
+		for i, f := range fields {
+			if f == "->" {
+				fields[i] = "--to"
+				changed = true
+			}
+		}
+		out = append(out, strings.Join(fields, " "))
+	}
+	if !changed {
+		return cmd
+	}
+	return joinWithOperators(cmd, out)
+}
+
+// stripStrayDashBeforeRef 去掉 payload 动词里紧跟在引用前的那个 `--`。
+//
+// issue #8：`help write` 教的是 `write <path> -- $BODY`，而语法层把 `--`
+// 当未知 flag 拒掉，报 `unknown flag for write: --`——文档教了一个自己
+// 不认的写法（同一个页面的 Example 行却又是对的，一个页面两种答案）。
+//
+// 剥掉之后正文**依然只能是一个变量引用**：PayloadVar 这条铁律没有被
+// 放松，正文仍然走 vars/args、从不进语法行。变的只是「前面多写了一个
+// 分隔符」不再导致失败。
+//
+// 只剥紧贴在 `$REF` 前面的那一个：`write p@b/x.md -- hello`（内联正文）
+// 不在此列，它会被协议层照常拒绝——那是该拒的。
+func stripStrayDashBeforeRef(cmd string) string {
+	if !strings.Contains(cmd, " -- ") {
+		return cmd
+	}
+	var out []string
+	changed := false
+	for _, raw := range splitStatements(cmd) {
+		fields := strings.Fields(raw)
+		if len(fields) == 0 || !payloadVerbs[fields[0]] {
+			out = append(out, raw)
+			continue
+		}
+		var kept []string
+		for i, f := range fields {
+			// `--` 后面紧跟一个引用 → 这个 `--` 是文档遗留，剥掉。
+			if f == "--" && i+1 < len(fields) && strings.HasPrefix(fields[i+1], "$") {
+				changed = true
+				continue
+			}
+			kept = append(kept, f)
+		}
+		out = append(out, strings.Join(kept, " "))
+	}
+	if !changed {
+		return cmd
+	}
+	return joinWithOperators(cmd, out)
 }
 
 // protectLayeredScope 把 `--scope A||B||C` 折叠成 `--scope A,B,C`。

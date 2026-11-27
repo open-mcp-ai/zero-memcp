@@ -18,8 +18,8 @@ func termTool() mcp.Tool {
 			"  grep [-i] [-c] <regex>   search full text (case-sensitive like shell grep; -i ignores case, -c counts only)\n"+
 			"  log [N]                  show dates and summaries of the most recent N entries (default 5)\n"+
 			"  ls [date]                list entries for a date\n"+
-			"  put [<tree>] -- $TEXT    write content to a memory tree (pass content through vars/args, not in the DSL)\n"+
-			"  put <tree> --ref <addr>  append a reference to existing memory in a tree\n"+
+			"  put [<tree>] $TEXT       write content to a memory tree (pass content through vars/args, not in the DSL)\n"+
+			"  ref <tree> <addr>        append a reference to existing memory in a tree\n"+
 			"  trees <project>[@<branch>]  view the tree directory\n"+
 			"  remind [<tree>]          watch a tree and receive notifications when it changes\n"+
 			"  since <tree> <commit>    retrieve tree changes since a commit\n"+
@@ -30,7 +30,7 @@ func termTool() mcp.Tool {
 			"search for exact strings (IP, port, QQ number, function name) -> grep;\n"+
 			"ask \"what was I working on recently?\" -> log.\n"+
 			"If the first word is the name of a downstream MCP, pass the rest through unchanged."),
-		mcp.WithString("cmd", mcp.Description("DSL command line, e.g. 'recall napcat' or 'put -- $TEXT'. Pass content in vars/args and reference it with $NAME / $1; a reference must occupy a whole word.")),
+		mcp.WithString("cmd", mcp.Description("DSL command line, e.g. 'recall napcat' or 'put $TEXT'. Pass content in vars/args and reference it with $NAME / $1; a reference must occupy a whole word.")),
 		mcp.WithArray("args",
 			mcp.Description("Positional arguments referenced as $1, $2, etc. in cmd. A reference must occupy a whole word. Values are not escaped or concatenated; pass content here instead of embedding it in cmd."),
 			mcp.Items(map[string]any{"type": "string"})),

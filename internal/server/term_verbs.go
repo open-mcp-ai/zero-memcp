@@ -138,7 +138,7 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Detail: detail_diff,
 		Kind:   term.KindFlags,
 		Flags:  []string{"raw", "to"},
-		Usage:  "diff <p>@<br> [-> <p>@<br>]",
+		Usage:  "diff <p>@<br> [--to <p>@<br>]",
 	},
 	{
 		Name:   "branch",
@@ -159,14 +159,14 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Detail: detail_cp,
 		Kind:   term.KindFlags,
 		Flags:  []string{"to"},
-		Usage:  "cp <src> -> <dst>",
+		Usage:  "cp <src> --to <dst>",
 	},
 	{
 		Name:   "mv",
 		Detail: detail_cp,
 		Kind:   term.KindFlags,
 		Flags:  []string{"to"},
-		Usage:  "mv <src> -> <dst>",
+		Usage:  "mv <src> --to <dst>",
 	},
 	{
 		Name:   "delete",
@@ -200,7 +200,8 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:   "archive",
 		Detail: detail_archive,
 		Kind:   term.KindFlags,
-		Usage:  "archive <p>@<br>",
+		Flags:  []string{"to"},
+		Usage:  "archive <p>@<br> [--to <p>@<as>]",
 	},
 	{
 		Name:   "reset",
@@ -497,7 +498,9 @@ func slotCodeOf(kind RefusalKind) int {
 //
 //	put/ref     动词从 rest 头部读一个 `@<session>` 位置词（不是 --session）
 //	put/write   动词要求正文写在 `-- <body>` 之后（不是原生 payload 位置）
-//	diff/cp/mv  动词以 `->` 分隔源与目标（`->` 在 termcp 里是重定向符）
+//	diff/cp/mv/archive  动词以 `->` 分隔源与目标（`->` 在 termcp 里是重定向符，
+//	            所以对外统一写 `--to`；调用方写 `->` 也会在入口处归一，见
+//	            term_compat.go 的 normalizeArrowSeparator）
 //	remote-*    动词以 `put <name>` 位置形式调用
 //
 // 还原的正文走 encodePayload：它是 base64 原子，不含空白与分隔符，

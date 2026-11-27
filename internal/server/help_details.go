@@ -75,7 +75,7 @@ and persists across restarts. Locked branches are marked [locked] in the branch 
 Typical sequence for retiring a branch:
   lock   proj/notes@work             # the next non-root request gets 403
   ls     proj/notes@work             # triage: inspect its contents
-  cp     proj/notes@work/x.md -> proj/notes@main/lessons/
+  cp     proj/notes@work/x.md --to proj/notes@main/lessons/
   archive proj/notes@work            # finish: preserve content and move the ref to the archive namespace
   # or keep using it: unlock proj/notes@work
 `
@@ -279,14 +279,16 @@ const detail_diff = `
 diff <project>@<branch>
 diff <project>@<branch> --to <project>@<branch>
 
+(-> is accepted as a spelling of --to here too.)
+
 Branch comparison: list path differences between the two sides.
 
 The single-branch form lists changes relative to its parent commit; the arrow form compares two branches.
 
-Branch comparison entry point: use diff audited -> raw to extract unreviewed content.
+Branch comparison entry point: use diff audited --to raw to extract unreviewed content.
 
 Example: diff proj/memories@main
-    diff proj/memories@reviewed -> proj/memories@raw
+    diff proj/memories@reviewed --to proj/memories@raw
 `
 
 const detail_branch = `
@@ -320,8 +322,11 @@ Example: tag proj/memories
 `
 
 const detail_cp = `
-cp <src>@<br>/<path> ... -> <dst>@<br>/[<path>]
-mv <src>@<br>/<path> ... -> <dst>@<br>/[<path>]
+cp <src>@<br>/<path> ... --to <dst>@<br>/[<path>]
+mv <src>@<br>/<path> ... --to <dst>@<br>/[<path>]
+
+(-> is accepted as a spelling of --to. --to is the one to prefer: it also
+survives a shell, where > is a redirect.)
 
 Copy (cp) or move (mv) entries across branches.
 
@@ -330,8 +335,8 @@ without reading and rewriting it (which would lose the original file timestamp a
 
 mv = cp + delete; both steps complete within the same commit boundary.
 
-Example: cp proj/memories@work/x.md -> proj/memories@main/lessons/
-    mv proj/notes@work/x.md -> proj/notes@main/lessons/
+Example: cp proj/memories@work/x.md --to proj/memories@main/lessons/
+    mv proj/notes@work/x.md --to proj/notes@main/lessons/
 `
 
 const detail_delete = `
@@ -345,7 +350,7 @@ Example: delete proj/memories@main/2026-10-28/old.md
 `
 
 const detail_archive = `
-archive <project>@<branch> [-> <project>@<as>]
+archive <project>@<branch> [--to <project>@<as>]
 
 Archive a branch by moving its ref into refs/archived/; all content is preserved.
 
@@ -355,7 +360,7 @@ and it no longer appears in the default refs for clone/push.
 Typical use: when a task branch is complete, it should no longer be treated as an active line of development.
 
 Example: archive proj/notes@work
-    archive proj/notes@work -> proj/notes@work-2026-10
+    archive proj/notes@work --to proj/notes@work-2026-10
 `
 
 const detail_reset = `
@@ -370,7 +375,7 @@ Example: reset proj/memories@main from proj/memories@import
 `
 
 const detail_write = `
-write <project>[@<branch>]/<path> -- <content>
+write <project>[@<branch>]/<path> $TEXT
 
 Write content to a specified path; you choose the filename and location.
 
@@ -380,9 +385,14 @@ SKILL.md frontmatter controls injection and indexing, which cannot be expressed 
 
 Root only: anyone who can edit SKILL.md can change who sees what, which is more dangerous than changing content itself.
 
-Pass content through vars/args as well:
-  cmd:  write proj/notes@main/SKILL.md -- $BODY
+Content ALWAYS travels through vars/args as a variable reference - never inline
+(the protocol refuses an inline body outright, because a body must never be read
+back as syntax):
+  cmd:  write proj/notes@main/SKILL.md $BODY
   vars: {"BODY": "---\nname: me\n---\n"}
+
+A redundant '--' before the reference is tolerated: write p@b/x.md -- $BODY
+means the same thing. What is refused is an inline body.
 
 Example: write proj/notes@main/rules/01.md $TEXT
 `

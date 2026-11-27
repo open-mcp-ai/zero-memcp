@@ -45,6 +45,7 @@ reset <p>@<br> from <src>      reset a branch to another branch
 lock / unlock <p>@<br>         lock/unlock a branch (suspend non-root access)
 chmod <p>@<br>/<path> mode     change rule/content mode
 write <p>@<br>/<path> $TEXT   write an exact file (for rules only; root required)
+ledger check|put|list        provenance ledger for actions taken outside (dedupe by external_id)
 
 Several statements in one call:
   Separate verbs with ';' or a newline to run them in one round trip.
@@ -86,7 +87,7 @@ func helpAll() string {
 	var b strings.Builder
 	b.WriteString(helpOverview())
 	b.WriteString("\n\n")
-	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "ref", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "merge", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "erase", "replace", "archive", "reset", "acl", "config", "reload", "whoami", "users", "help"} {
+	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "ref", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "merge", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "erase", "replace", "archive", "reset", "acl", "ledger", "config", "reload", "whoami", "users", "help"} {
 		if d, ok := helpVerb(v); ok {
 			b.WriteString("\n-- " + v + " ")
 			b.WriteString(strings.Repeat("-", max(0, 60-len(v))))

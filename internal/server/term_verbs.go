@@ -169,6 +169,13 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Usage:  "mv <src> --to <dst>",
 	},
 	{
+		Name:   "ledger",
+		Detail: detail_ledger,
+		Kind:   term.KindFlags,
+		Flags:  []string{"result", "identity", "channel", "action", "hash", "tree", "since", "limit"},
+		Usage:  "ledger check <external_id> | ledger put <external_id> --result R | ledger list",
+	},
+	{
 		Name:   "delete",
 		Detail: detail_delete,
 		Kind:   term.KindFlags,

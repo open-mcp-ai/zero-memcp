@@ -19,7 +19,7 @@ func TestEveryDispatchedVerbHasHelp(t *testing.T) {
 		"remote-key", "remote-secret", "remote", "fetch", "push", "sync",
 		"branch", "tag", "cp", "mv", "chmod", "delete", "erase", "replace",
 		"lock", "unlock", "archive", "reset", "diff", "ref",
-		"commit", "write", "config", "reload", "whoami", "users", "status", "grep", "log", "ls",
+		"commit", "write", "config", "reload", "whoami", "users", "status", "grep", "log", "ls", "ledger",
 	}
 
 	for _, v := range dispatchVerbs {

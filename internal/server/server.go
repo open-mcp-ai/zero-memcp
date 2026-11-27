@@ -2336,6 +2336,14 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		out, err := s.execChmod(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
 
+	case "ledger":
+		// 对外写动作的 provenance 账本（issue #11）。
+		//
+		//	ledger check <external_id>   查重：做过没有（明确二元答案）
+		//	ledger put <external_id> ... 写回执（失败也要写）
+		//	ledger list [--identity I] [--since T]
+		return s.execLedger(rest, c)
+
 	case "delete":
 		if err := s.requireBranchWide(rest, c); err != nil {
 			return TermResult{}, err

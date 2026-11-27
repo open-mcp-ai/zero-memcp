@@ -350,6 +350,41 @@ Example: cp proj/memories@work/x.md --to proj/memories@main/lessons/
     mv proj/notes@work/x.md --to proj/notes@main/lessons/
 `
 
+const detail_ledger = `
+ledger check <external_id>
+ledger put <external_id> --result <ok|failed:...> [--identity I] [--channel C] [--action A] [--hash H] [--tree T]
+ledger list [--identity I] [--since T] [--limit N]
+
+Provenance ledger for write actions taken against outside systems (posting,
+replying, commenting, submitting). It answers two questions that memory alone
+could not: "which session did this, when, under which identity, on which
+channel, with what result" and "has this external action already been done".
+
+Entries are ordinary memory entries under a ledger/ subtree: same commit,
+same permissions, same sync, same grep. Nothing is stored twice.
+
+Order of use:
+  1. ledger check <external_id>   before acting; "no record" means go ahead
+  2. do the action
+  3. ledger put <external_id> --result ok|failed:...   write the receipt
+
+A failure must be recorded too (--result failed:<reason>): an unrecorded
+failure makes the next retry look like it never happened.
+
+Re-recording the same (external_id, result) is idempotent and returns the
+existing record. A different result (failed then ok) is appended, keeping
+history: the retry succeeding is itself an auditable fact.
+
+Fields: external_id, at (server time - never client-reported), actor,
+identity (a readable label; credentials are NEVER stored), channel, action,
+result, content_hash.
+
+Example:
+  ledger check forum-post-8842
+  ledger put forum-post-8842 --result ok --channel forum --action post --identity identity-a
+  ledger list --identity identity-a --limit 20
+`
+
 const detail_delete = `
 delete <project>@<branch>/<path> [<path> ...]
 

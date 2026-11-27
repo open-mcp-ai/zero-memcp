@@ -68,9 +68,14 @@ func TestDedupDifferentiatesDifferentText(t *testing.T) {
 	}
 }
 
-// TestStoredSliceHasNoSessionLine 钉住「落盘是纯对话」：
-// frontmatter 里不该再出现 session 行。
-func TestStoredSliceHasNoSessionLine(t *testing.T) {
+// TestStoredSliceCarriesSessionForProvenance 钉住新契约：
+// session 写进 frontmatter 当溯源，但**不参与判重**。
+//
+// 2026-11-23 为了压掉压缩分叉产生的 91.9% 重复，把 session 同时
+// 赶出了判重键和 frontmatter。前一半必须留（可重键只能看内容），
+// 后一半是附带损失：同一分支上再也没法回答「这几条来自哪个会话」。
+// 现在拆开：落盘带 session，判重仍只看内容。
+func TestStoredSliceCarriesSessionForProvenance(t *testing.T) {
 	srv, dataDir := setupMountServer(t)
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "boss", Cap: "rwx"})
 
@@ -88,8 +93,8 @@ func TestStoredSliceHasNoSessionLine(t *testing.T) {
 	if err != nil {
 		t.Fatalf("读取失败: %v", err)
 	}
-	if strings.Contains(body, "session:") {
-		t.Fatalf("落盘内容不该含 session 行，实际:\n%s", body)
+	if !strings.Contains(body, "session: sess-X") {
+		t.Fatalf("落盘内容应带 session 溯源行，实际:\n%s", body)
 	}
 	if !strings.Contains(body, "ZMFRONT") {
 		t.Fatalf("读取到的内容不含正文，说明地址解析或写入有问题:\n%s", body)

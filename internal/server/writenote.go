@@ -81,16 +81,22 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	if !implicitKind {
 		kindLine = fmt.Sprintf("kind: %s\n", kind)
 	}
-	// 落盘内容不带 session。
+	// 落盘内容带 session，但 session **不参与判重**。这两件事必须分开。
 	//
-	// 早先写 `session: <id>`，目的是「这条记忆从哪个会话来」的溯源。
-	// 但它把 Pi 的压缩分支机制变成了重复源：每次压缩产生新 sessionId，
-	// 而新会话文件里带着完整逐字历史（实测子文件首条消息与父文件
-	// 同时间戳、同内容），重放时同一段对话被算成 N 条不同记录。
+	// session 不参与判重是 2026-11-23 定下的，论据见 dedupKey：携带
+	// 完整逐字历史的压缩分叉会把同一段对话重写成 N 条，实测一条链
+	// 28 个会话 80,290 轮去重后只剩 6,498 轮，重复 91.9%。
 	//
-	// 落盘就是对话本身。要问「这条从哪来」时，created 加内容已经够定位。
-	content := fmt.Sprintf("---\n%ssource: %s\nendpoint: %s\ncreated: %s\n---\n\n%s\n",
-		kindLine, source, endpoint, now.Format(time.RFC3339), text)
+	// 但那次改动把「不参与判重」顺手做成了「不落盘」，于是同一条分支上
+	// 不同会话写的内容再也无法区分——只能靠 source/endpoint（机器）
+	// 和 created（时间）猜。溯源字段本身不制造重复，去掉它只失去了
+	// 「这条从哪来」。所以写回 frontmatter，判重键一个字不动。
+	sessionLine := ""
+	if session != "" {
+		sessionLine = fmt.Sprintf("session: %s\n", session)
+	}
+	content := fmt.Sprintf("---\n%ssource: %s\nendpoint: %s\ncreated: %s\n%s---\n\n%s\n",
+		kindLine, source, endpoint, now.Format(time.RFC3339), sessionLine, text)
 
 	// 幂等判重：按「语义内容」而不是整份文件。
 	//

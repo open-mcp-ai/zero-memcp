@@ -231,11 +231,22 @@ func (s *Server) shortestTick(defCommit time.Duration) time.Duration {
 	return t
 }
 
-// maybeWriteDailyCheckpoints 给「今天有写入但还没打锚点」的分支打一个 tag。
+// maybeWriteDailyCheckpoints 给「今天动过但还没打锚点」的分支打一个 tag。
 //
 // 时机选择：放在维护环里而不是写路径上。写路径是热路径（0.5ms），
 // 而算一次完整 fileTimes 可能要几百毫秒到几秒——不能挂在 put 上。
 // 维护环每秒跑一次，晚一秒打上完全够用。
+//
+// 判据是「分支头今天动过」，不是「本机有未提交写入」。
+//
+// 这里曾经用 PendingRefs()：只覆盖本机 put 过还没提交的分支。于是
+// 同步进来的分支永远拿不到锚点——本机没有 pending，条件不成立。
+// 实测代价（laptop，v0.2.11）：zero@inbox 有 2,074 个提交、0 个锚点，
+// List() 每次沿父链走完整个历史要 62.4 秒，写一次锚点后 812ms。
+// 它在启动路径上（Reload 扫描 + maintain 的 head 检测）被调两遍，
+// 于是每次重启白等两分钟，日志上表现为「listing 前有几百秒空档」。
+//
+// 现在的判据从已提交的 head 来，同步、push、本机提交都算「动过」。
 func (s *Server) maybeWriteDailyCheckpoints(projects []string) {
 	today := time.Now().Format("2006-01-02")
 	for _, proj := range projects {
@@ -243,17 +254,26 @@ func (s *Server) maybeWriteDailyCheckpoints(projects []string) {
 		if err != nil {
 			continue
 		}
-		for _, ref := range repo.PendingRefs() {
+		for _, ref := range repo.Branches() {
 			if repo.HasDailyCheckpoint(ref, today) {
 				continue
 			}
-			// 打锚点要算出「此刻每个路径的最后改动时间」。
-			// 已经有昨天的锚点时这一步是增量的（只走今天那一段），很便宜。
-			if _, err := repo.List(ref); err != nil {
+			// 头没动就别打：锚点的作用是把回溯截断在一个已知的 commit 上，
+			// 而旧锚点已经指在同一个 head 时，新的那份数据完全一样。
+			// 不判这一下，18 条分支每天各多一个 tag，而它们的数据一个字节没变。
+			head, herr := repo.Resolve(ref)
+			if herr != nil || head == "" {
 				continue
 			}
-			times, err := repo.FileTimes(ref)
-			if err != nil {
+			if cp, cerr := repo.LatestDailyCheckpoint(ref); cerr == nil && cp != nil && cp.Commit == head {
+				continue
+			}
+			// 打锚点要算出「此刻每个路径的最后改动时间」。
+			// 已有旧锚点时这一步是增量的（只走旧锚点之后那一段）；
+			// 从没锚点的分支则要第一次走完全史（inbox 实测 44 秒），
+			// 那一次之后它就永远便宜了。
+			times, ferr := repo.FileTimes(ref)
+			if ferr != nil || len(times) == 0 {
 				continue
 			}
 			if err := repo.WriteDailyCheckpoint(ref, today, "", times); err != nil {

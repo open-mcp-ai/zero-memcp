@@ -385,6 +385,42 @@ Example:
   ledger list --identity identity-a --limit 20
 `
 
+const detail_role = `
+role ls
+role put <name> <project>[@<branch>[:<subtree>]] <perm> [<spec> <perm> ...] [--note <text>]
+role bind <name> <identity> [<identity> ...]
+role unbind <name>
+role rm <name>
+
+A role is a named NARROWING profile: a set of boundaries a call may declare
+when it wants to see less than its credential allows.
+
+One invariant governs the whole mechanism: a role can only turn a permission
+from yes into no, never the other way. Every entry must lie inside the token's
+own ceiling (mount table + cap), so declaring a role - even one you were
+tricked into declaring - cannot grant anything the credential did not already
+have. That is what makes it safe to carry the role in the request (MCP "role"
+field or the X-Memcp-Role header) instead of baking it into the token.
+
+Why this exists: several sub-agents usually share one identity (one token),
+and each should see only its own slice - e.g. one only record/forum, another
+only record/chat. Mailing a token per sub-agent is a distribution problem;
+letting a request widen its own rights is a privilege-escalation hole. Roles
+are the third option: narrower per call, never wider.
+
+A role must be bound to an identity before that identity may use it. Binding
+is not a security boundary (narrowing cannot escalate) but a correctness one:
+an unbound or misspelled role is refused loudly instead of silently meaning
+"no extra restriction".
+
+Anything not written in the role is denied. An empty role denies everything.
+
+Example:
+  role put forum-reader "BlackEggAI/zero@main.record:record/forum" r
+  role bind forum-reader group-bot
+  # from then on, group-bot may add: cmd: "recall x" ... with role=forum-reader
+`
+
 const detail_delete = `
 delete <project>@<branch>/<path> [<path> ...]
 

@@ -16,14 +16,20 @@ func (s *Server) aclActive() bool { return s.acl != nil }
 // 反过来不成立：ACL 没写不等于拒绝。没有命中时退回挂载表，保持对
 // 老部署的兼容（它们的权限完全写在凭证里）。
 func (s *Server) branchVisible(c Caller, project, branch string) bool {
-	if c.Mount.Visible(project, branch) {
-		return true
+	// 与 allowed 同一条不变式：凭证天花板是最后一道闸，ACL 只能在里面挑。
+	//
+	// 曾经这里先看 ACL、再看挂载表，于是「ACL 开出来的分支」在列举里可见、
+	// 在 allowed 里也可写——两条路径各自成立，但都越过了 token。
+	// 现在统一：挂载表看不见的分支就是看不见，ACL 不会让它出现。
+	if !c.Mount.Visible(project, branch) {
+		return false
 	}
 	if s.aclActive() {
-		_, ok := s.acl.Lookup(c.Identity, project, branch)
-		return ok
+		if _, ok := s.acl.Lookup(c.Identity, project, branch); ok {
+			return true
+		}
 	}
-	return false
+	return true
 }
 
 // adminAllowed 报告这个身份能否做实例级管理动作。

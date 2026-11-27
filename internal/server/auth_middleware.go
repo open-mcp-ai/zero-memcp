@@ -26,6 +26,13 @@ type Caller struct {
 	// Cap 是能力上限（rwx 子集），空表示不额外限制。
 	Cap string
 
+	// Role 是本次调用声明的收窄档案名（MCP role 字段或 X-Memcp-Role 头）。
+	//
+	// 它**只收窄、绝不放宽**：role 的每一条都必须在 token 天花板之内
+	// （定义时就校验过），所以即使被提示词注入骗着自报一个 role，
+	// 也拿不到任何凭证本来没有的东西。
+	Role string
+
 	// JTI 是这张凭证的编号，写审计用。
 	JTI string
 
@@ -73,6 +80,18 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 	// 客户端就无法判断「这次变更是不是我自己造成的」——自激循环的
 	// 第一道防线直接失效。实测就是这么漏的。
 	sess := strings.TrimSpace(r.Header.Get("X-Memcp-Session"))
+
+	// X-Memcp-Role 是「本次调用声明一个收窄档案」。
+	//
+	// 与早先删掉的 X-Zero-Role **不是一回事**，两者必须分清：
+	//
+	//	X-Zero-Role（已删）  逐请求切换**身份**——等于把「我是谁」交给
+	//	                     传输层，任何能发 header 的东西都能提权。
+	//	X-Memcp-Role（这个） 在**已定身份**之上再收窄一次——它只能让
+	//	                     权限变小（见 roleAllows），因此自报无收益。
+	//
+	// 这正是它能安全地留在请求里的原因：一个只做减法的输入，不需要信任。
+	reqRole := strings.TrimSpace(r.Header.Get("X-Memcp-Role"))
 
 	token := ""
 	if authHdr := r.Header.Get("Authorization"); strings.HasPrefix(authHdr, "Bearer ") {
@@ -184,7 +203,10 @@ func (s *Server) authenticate(r *http.Request) (Caller, error) {
 			// 会话标识由客户端声明，只用于事件溯源，不参与鉴权。
 			// 它不在凭证里：会话是易变的，凭证是长期身份。
 			Session: sess,
-			Gated:   claims.Gated,
+			// Role 同样由客户端声明，但它只能收窄（见 role.go 的不变式），
+			// 所以自报不构成提权通道。
+			Role:  reqRole,
+			Gated: claims.Gated,
 		}, nil
 	}
 

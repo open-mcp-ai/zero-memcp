@@ -98,13 +98,18 @@ mode  = "rwxr-xr-x"
 		t.Fatalf("授予 ACL 失败: %s", e)
 	}
 
-	// weft 的挂载表只收窄到 main 的 allowed 子树；ops 不在挂载表里。
+	// weft 的挂载表：zero 分支收窄到 allowed 子树；ops 单独挂在自己的虚拟根。
+	//
+	// 注：早先这里的 ops 是「只由 ACL 授权、完全不在挂载表里」——那种形态在
+	// 「token 是选择范围」的不变式下已不存在（ACL 不能越过挂载表）。
+	// ACL 仍是一层有效判定，只是它只能在天花板之内收窄/放行。
 	weftTok := mintRestricted(t, dataDir, auth.Claims{
 		Sub:  "weft",
 		Name: "weft",
 		Cap:  "rw",
 		Mount: []auth.MountPoint{
 			{Project: "BlackEggAI/weft", Branch: "zero", Path: "allowed", At: "/"},
+			{Project: "BlackEggAI/weft", Branch: "ops", At: "/ops", Cap: "r"},
 		},
 	})
 
@@ -116,9 +121,9 @@ mode  = "rwxr-xr-x"
 	if strings.Contains(out, "--  --") {
 		t.Fatalf("ACL 分支命中头不能是空的 `--  --`:\n%s", out)
 	}
-	const expectedAddr = "BlackEggAI/weft@ops:ports/1729.md"
+	const expectedAddr = "ops/ports/1729.md"
 	if !strings.Contains(out, "-- "+expectedAddr+" --") {
-		t.Fatalf("应回显完整可定位地址 %q，实际:\n%q", expectedAddr, out)
+		t.Fatalf("应回显可定位路径 %q，实际:\n%q", expectedAddr, out)
 	}
 	// 回显的地址必须真的能直接喂给 read。
 	rd, e := rawTerm(t, srv, weftTok, "read "+expectedAddr, nil)
@@ -146,8 +151,8 @@ mode  = "rwxr-xr-x"
 	if strings.Contains(lOut, "port=") {
 		t.Fatalf("grep -l 不应带正文字面内容:\n%s", lOut)
 	}
-	if !strings.Contains(lOut, "BlackEggAI/weft@ops:ports/1729.md") ||
-		!strings.Contains(lOut, "BlackEggAI/weft@ops:ports/8080.md") {
+	if !strings.Contains(lOut, "ops/ports/1729.md") ||
+		!strings.Contains(lOut, "ops/ports/8080.md") {
 		t.Fatalf("grep -l 应列出两份命中文件:\n%s", lOut)
 	}
 	lLongOut, e := rawTerm(t, srv, weftTok, "grep --files-only 关键词-UNIQUE9 --scope BlackEggAI/weft@ops", nil)

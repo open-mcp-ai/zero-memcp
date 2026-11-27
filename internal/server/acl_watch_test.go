@@ -39,7 +39,16 @@ func TestACLRuleBeatsWildcard(t *testing.T) {
 
 // ACL 命中时，凭证挂载表里没有这条分支也必须放行——这是
 // 「不用重签凭证」的全部意义。
-func TestAllowedUsesACLBeyondMounts(t *testing.T) {
+// ACL 不能越过凭证天花板（挂载表）。
+//
+// 这条测试原先断言的是相反的行为（"ACL 授予的 main.shared 应当可写，
+// 即使凭证没挂这条分支"）。语义统一成「token 是选择范围，其它层只能在
+// 里面挑」之后，那个行为就是一条绕过通道：一张只挂了 branch-a 的 token
+// 被 acl put 开了 branch-b 之后就能读 branch-b。
+//
+// 想保留「随时给凭证开新分支」的便利，把分支（或 "*"）写进挂载表——
+// 那是这张凭证本来就该声明的意图，而不是事后由另一张表替它扩大。
+func TestACLCannotExceedCredentialMounts(t *testing.T) {
 	dir := t.TempDir()
 	store, err := acl.Open(filepath.Join(dir, "acl.json"))
 	if err != nil {
@@ -50,7 +59,7 @@ func TestAllowedUsesACLBeyondMounts(t *testing.T) {
 	}
 
 	s := &Server{acl: store, defaultBranch: "main", projects: NewProjectStore(t.TempDir())}
-	// 凭证只挂了 main.dev，没有 main.shared
+	// 凭证只挂了 main.dev
 	c := Caller{
 		User:     "zero", // 与主体同一用户：ACL 按身份区分，不按用户
 		Identity: "zero-dev",
@@ -58,15 +67,40 @@ func TestAllowedUsesACLBeyondMounts(t *testing.T) {
 		Mount:    NewMount([]auth.MountPoint{{Project: "BlackEggAI/zero", At: "/", Branch: "main.dev", Cap: "rwx"}}, "main"),
 	}
 
-	if !s.allowed(c, "BlackEggAI/zero", "main.shared", configBitWrite) {
-		t.Fatal("ACL 授予的 main.shared 应当可写，即使凭证没挂这条分支")
+	if s.allowed(c, "BlackEggAI/zero", "main.shared", configBitWrite) {
+		t.Fatal("ACL 授予的 main.shared 不得越过凭证挂载表（天花板在最底层拦）")
 	}
-	if !s.branchVisible(c, "BlackEggAI/zero", "main.shared") {
-		t.Fatal("branchVisible 应当把 ACL 授予的分支算作可见")
+	if s.branchVisible(c, "BlackEggAI/zero", "main.shared") {
+		t.Fatal("branchVisible 与 allowed 必须同一口径：看不见的分支不能靠 ACL 变可见")
 	}
 	// 没被 ACL 授予、也不在挂载表里的分支仍然不可见
 	if s.allowed(c, "BlackEggAI/zero", "main.chat", configBitRead) {
 		t.Fatal("main.chat 既没挂载也没授权，必须拒绝")
+	}
+
+	// 天花板之内，ACL 仍然是有效的一层：挂载表覆盖全部分支时，
+	// 由 ACL 决定「哪几条开、开多大」。
+	c2 := Caller{
+		User:     "zero",
+		Identity: "zero-dev",
+		Cap:      "rwx",
+		Mount:    NewMount([]auth.MountPoint{{Project: "BlackEggAI/zero", At: "/", Branch: "*"}}, "main"),
+	}
+	if !s.allowed(c2, "BlackEggAI/zero", "main.shared", configBitWrite) {
+		t.Fatal("天花板覆盖该分支时，ACL 的授权应当生效")
+	}
+	if !s.branchVisible(c2, "BlackEggAI/zero", "main.shared") {
+		t.Fatal("天花板覆盖该分支时，ACL 授予的分支应算可见")
+	}
+	// 天花板之内 ACL 依然能收窄：给它 r，它就写不进去（cap 明明有 w）。
+	if _, err := store.Put(acl.Rule{User: "zero-dev", Project: "BlackEggAI/zero", Branch: "main.chat", Perm: "r"}); err != nil {
+		t.Fatal(err)
+	}
+	if !s.allowed(c2, "BlackEggAI/zero", "main.chat", configBitRead) {
+		t.Fatal("ACL 给了 r，读应当放行")
+	}
+	if s.allowed(c2, "BlackEggAI/zero", "main.chat", configBitWrite) {
+		t.Fatal("ACL 只给了 r，即使 cap 有 w 也必须拒绝")
 	}
 }
 
@@ -168,11 +202,12 @@ func TestVirtualPathFallsBackForACLBranches(t *testing.T) {
 	if got := s.virtualPath(c, "p", "main.dev", "a/b.md"); got != "a/b.md" {
 		t.Fatalf("mounted branch virtual path = %q, want a/b.md", got)
 	}
-	// ACL 授予、未被挂载的分支：退回真实地址，而不是空串
-	if got := s.virtualPath(c, "p", "main.shared", "a/b.md"); got != "p@main.shared:a/b.md" {
-		t.Fatalf("acl branch virtual path = %q, want p@main.shared:a/b.md", got)
+	// 未被挂载表覆盖的分支：即使 ACL 写着允许，也必须返回空串（token 天花板）。
+	if got := s.virtualPath(c, "p", "main.shared", "a/b.md"); got != "" {
+		t.Fatalf("unmounted branch must stay invisible even with ACL, got %q", got)
 	}
-	// 既没挂载也没授权：空串（调用方据此跳过）
+	// 挂载表只写了项目或通配（Branch="*"）但没有显式虚拟路径映射时，
+	// 才由 branchVisible 放行并退回真实地址。
 	if got := s.virtualPath(c, "p", "main.chat", "a/b.md"); got != "" {
 		t.Fatalf("unrelated branch virtual path = %q, want empty", got)
 	}

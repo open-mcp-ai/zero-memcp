@@ -157,6 +157,10 @@ type Server struct {
 	// 造新快照再 Store。Index 自身也已无锁（见 internal/index）。
 	treesPtr atomic.Pointer[treeSet]
 
+	// roles 是收窄档案表（roles.json）。与 ACL 同包不同文件：
+	// ACL 回答「这格开没开」，role 回答「这一次只让它看多小」。
+	roles *acl.RoleStore
+
 	// indexProg 是索引构建进度。读者只看完整快照，不阻塞构建。
 	indexProg atomic.Pointer[indexProgress]
 	// indexBuildDone 在后台构建结束时关闭；Close 等它，避免关掉仓库后
@@ -568,6 +572,19 @@ func New(cfg Config) (*Server, error) {
 	} else {
 		s.acl = store
 		startupStage("acl: %d rule(s)", len(store.Rules()))
+	}
+	// 收窄档案表（<data>/system/roles.json）。
+	//
+	// 读不出来时不阻断启动，但必须出声：静默退回「没有 role」会让
+	// 一个本来受限的子 agent 拿到完整权限——而调用方以为它被收窄了。
+	if rs, rerr := acl.OpenRoles(filepath.Join(cfg.DataDir, "system", "roles.json")); rerr != nil {
+		startupStage("roles: %v (role narrowing disabled)", rerr)
+		s.logf("roles: %v — role narrowing disabled; callers declaring a role will be refused", rerr)
+	} else {
+		s.roles = rs
+		if n := len(rs.Roles()); n > 0 {
+			startupStage("roles: %d role(s)", n)
+		}
 	}
 	// 会话表：改口令时清空全部会话，所以它必须能看到口令状态。
 	s.indexEnabled = cfg.IndexEnabled
@@ -1652,6 +1669,14 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 		Args []string          `json:"args"`
 		Vars map[string]string `json:"vars"`
 
+		// Role 是本次调用声明的收窄档案（见 role.go）。
+		//
+		// 它与 HTTP 头 X-Memcp-Role 等价，两者取「显式参数优先」——
+		// 但都只能收窄，所以谁赢都不影响安全性，只影响可预期性。
+		// 提供两条入口是因为 vmcp 转发时加头最省事，而直连 MCP 的
+		// 客户端只能走参数。
+		Role string `json:"role"`
+
 		// For 是调用者的会话 UUID（分身身份）。
 		//
 		// 它刻意放在参数里而不是 cmd 里：身份是传输层的事实，
@@ -1722,6 +1747,7 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	// 会让下面的端口策略整个被跳过——于是一条写命令从只读端口的检查里漏过去，
 	// 而它随后真会被执行。先剥掉管道再预检，两处看法才一致。
 	plan, perr := probe.Parse(stripCommandPipes(cmd), term.Subst{})
+	_ = plan
 	if perr != nil {
 		// 语法错误交给 execTerm 去报（那里有完整的 usage 提示），
 		// 这里不重复判断——但语法不通的行不可能绕过策略。
@@ -1738,6 +1764,16 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 				}
 			}
 		}
+	}
+
+	// 本次调用的收窄档案：参数优先于头，但两者都只能减不能加。
+	if a.Role != "" {
+		c.Role = a.Role
+	}
+	// 声明了 role 就必须可用：不存在、未绑定给这张凭证、或 role 表
+	// 不可用时当场拒绝。静默忽略是最坏的选择——调用方以为自己收窄了。
+	if err := s.roleError(c); err != nil {
+		return nil, err
 	}
 
 	viewer := Viewer{Channel: "mcp"}
@@ -2136,12 +2172,19 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 「明明有 360 篇相关记录，recall 返回无命中」。
 		// 在这张凭证的可见范围内算出 top-N，才是它该看到的最佳答案。
 		allowedHit := func(addr string) bool {
-			proj, br, _, ok := memory.SplitID(addr)
+			proj, br, path, ok := memory.SplitID(addr)
 			if !ok {
 				proj = s.projectOfAddr(addr)
 				br = s.defaultBranch
+				path = ""
 			}
 			if !s.branchVisible(c, proj, br) {
+				return false
+			}
+			// 分支级之外还要过子树级：role 可能写着 `p@main.record:record/贴吧`，
+			// 而 recall 返回的是整条分支里的命中，不做这一层就等于把
+			// 兄弟子树的内容送出去了。
+			if !s.roleAllowsPath(c, proj, br, path, configBitRead) {
 				return false
 			}
 			return s.allowed(c, proj, br, configBitRead)
@@ -2512,6 +2555,14 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// chmod <project>[@<branch>]/<path> rule|content
 		out, err := s.execChmod(rest, c, defaultBranch)
 		return TermResult{Text: out}, err
+
+	case "role":
+		// 收窄档案：命名的一组「只能更窄」的权限边界。
+		//
+		//	role ls
+		//	role put <name> <spec> <perm> [...]
+		//	role bind <name> <identity>...
+		return s.execRole(rest, c)
 
 	case "ledger":
 		// 对外写动作的 provenance 账本（issue #11）。
@@ -3068,6 +3119,14 @@ func (s *Server) execGrepWith(pattern string, scopes []string, c Caller, opts gr
 			//
 			// 空串一律跳过：那是「这条路径在这张凭证眼里不可见」的标志，
 			// 放进结果就是一次隔离泄漏（同分支兄弟子树的内容会被列出来）。
+			// role 的子树边界也要在扫描型动词上生效。
+			//
+			// grep 不走 resolveAddr：它直接遍历 treeList 读盘。只在地址解析
+			// 处拦，等于「read 某个文件被拦、grep 整库把同一段内容打出来」——
+			// 收窄完全失效。所有列举/检索入口都必须过同一条判定。
+			if !s.roleAllowsPath(c, b.Project, b.Branch, b.Path, configBitRead) {
+				continue
+			}
 			virt := s.virtualPath(c, b.Project, b.Branch, b.Path)
 			if virt == "" {
 				continue
@@ -3227,6 +3286,9 @@ func (s *Server) execLog(n int, scope string, c Caller) (string, error) {
 			if scope != "" && !addrUnderScope(memory.MakeID(b.Project, b.Branch, b.Path), scope) {
 				continue
 			}
+			if !s.roleAllowsPath(c, b.Project, b.Branch, b.Path, configBitRead) {
+				continue
+			}
 			all = append(all, b)
 		}
 	}
@@ -3311,6 +3373,9 @@ func (s *Server) execLs(rest string, c Caller) (string, bool, error) {
 		for _, b := range tr.Blocks {
 			// 用虚拟地址匹配，不用 b.Path：后者是树内路径，
 			// 两个仓库里同名的日期目录会被混在一起。
+			if !s.roleAllowsPath(c, b.Project, b.Branch, b.Path, configBitRead) {
+				continue
+			}
 			virt := s.virtualPath(c, b.Project, b.Branch, b.Path)
 			if virt == "" {
 				continue

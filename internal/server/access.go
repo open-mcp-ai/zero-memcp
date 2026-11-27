@@ -38,6 +38,24 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 	if !s.rootUnrestricted(c) && s.branchLocked(project, branch) {
 		return false
 	}
+
+	// 最后一道闸：凭证天花板。**任何路径都必须过它**。
+	//
+	// 这条曾经只写在「挂载表」那条分支里，而 ACL 命中时会直接 return——
+	// 于是 ACL 成了绕过凭证的通道：一张只挂了 branch-a 的 token，被
+	// `acl put` 开了 branch-b 之后就能读 branch-b。
+	//
+	// 语义统一成「token 是选择范围，其它层只能在里面挑」之后：
+	//   - 想保留「随时给凭证开新分支」的便利，就把该分支（或 "*"）写进
+	//     挂载表——那本来就是这张凭证的意图声明；
+	//   - 想把子 agent 收窄，用 role（见 acl/role.go），role 只能减不能加。
+	//
+	// 放在最底层而不是最上层：ACL 与 config 的判定逻辑一个字都不用动，
+	// 它们继续各自回答「这一格开没开」，天花板只负责最后说「不行」。
+	if !s.tokenCeiling(c, project, branch, perm) {
+		return false
+	}
+
 	// 服务端授权表：命中即权威（含「凭证没挂这条分支」的情形）
 	if s.aclActive() {
 		// 主体是**凭证身份**（claims.name），不是用户。
@@ -46,42 +64,10 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 		// 但它们的权限必须不同——按 user 记规则，等于把两个分身的权限
 		// 搅成同一份，「dev 只读、主体可写」这类要求无从表达。
 		if granted, ok := s.acl.Lookup(c.Identity, project, branch); ok {
-			bit := capBit(perm)
-			if !hasCap(c.Cap, bit) {
-				return false
-			}
-			return permLetterHas(granted, string(bit))
+			return permLetterHas(granted, string(capBit(perm)))
 		}
 	}
-	// 凭证层：项目必须在这张凭证的挂载表里
-	if !c.Mount.Visible(project, branch) {
-		return false
-	}
 
-	// 凭证层：能力上限。
-	//
-	// 两处来源取交集：凭证级 cap（整张凭证的天花板）与
-	// 该挂载点的 cap（这一个仓库的天花板）。这样一张凭证就能表达
-	// 「写自己的仓库、别处只读」，不必为此发两张。
-	effective := c.Cap
-	if pc := c.Mount.CapOf(project, branch); pc != "" {
-		effective = intersectCap(c.Cap, pc)
-	}
-
-	// cap 里被按住的那几位，要靠临时授权打开。
-	//
-	// 判定顺序是「先问这个位在不在上限里，再问它此刻有没有被放行」，
-	// 而不是「有授权就给这个位」——后者会让授权变成绕开 cap 的通道。
-	// 所以 Gated 必须同时是 cap 的子集（签发时已校验），
-	// 而授权又必须是 Gated 的子集（管理台已校验）：
-	// 三层各自收窄，谁也不能往上顶。
-	bit := capBit(perm)
-	if !hasCap(effective, bit) {
-		return false
-	}
-	if gatedHas(c.Gated, bit) && !s.grantAllows(c, project, branch, bit) {
-		return false
-	}
 	// 配置层
 	if s.cfgIndex() == nil {
 		return true
@@ -95,6 +81,43 @@ func (s *Server) allowed(c Caller, project, branch string, perm uint8) bool {
 		return c.Root
 	}
 	if !config.Check(s.cfgIndex(), c.User, project, branch, perm) {
+		return false
+	}
+	return true
+}
+
+// tokenCeiling 是凭证本身允许的上限：挂载表可见 + cap（含挂载点 cap）
+// + Gated 二次授权。
+//
+// 它是权限判定的**最后一道闸**，不是「其中一层」：任何别的层（ACL、
+// TOML、将来的 role）都只能在它之内挑，谁也不能把它顶宽。
+// 三条各自收窄，且都不接受「调用方自报」的输入——cap 与 mount 都在
+// 签发的 token 里（有签名），Gated 的放行来自管理台。
+func (s *Server) tokenCeiling(c Caller, project, branch string, perm uint8) bool {
+	// ① 挂载表：这张凭证能看哪些项目/分支。
+	if !c.Mount.Visible(project, branch) {
+		return false
+	}
+	// ② 能力上限：凭证级 cap 与挂载点 cap 取交集，于是「写自己的仓库、
+	//    别处只读」用一张凭证就能表达。
+	effective := c.Cap
+	if pc := c.Mount.CapOf(project, branch); pc != "" {
+		effective = intersectCap(c.Cap, pc)
+	}
+	bit := capBit(perm)
+	if !hasCap(effective, bit) {
+		return false
+	}
+	// ③ 被按住的位要靠临时授权打开。
+	//
+	// 判定顺序是「先问这个位在不在上限里，再问它此刻有没有被放行」，
+	// 而不是「有授权就给这个位」——后者会让授权变成绕开 cap 的通道。
+	if gatedHas(c.Gated, bit) && !s.grantAllows(c, project, branch, bit) {
+		return false
+	}
+	// ④ role 收窄（调用方通过 MCP role 字段 / X-Memcp-Role 头声明）。
+	//    纯减法：role 只可能让结果从 true 变 false。
+	if !s.roleAllows(c, project, branch, perm) {
 		return false
 	}
 	return true
@@ -208,6 +231,33 @@ func (s *Server) denyReason(c Caller, project, branch string, perm uint8) string
 	}
 	if gatedHas(c.Gated, bit) && !s.grantAllows(c, project, branch, bit) {
 		return fmt.Sprintf("%s access to %s@%s is not active (this credential holds that bit until the admin panel grants it)", string(bit), project, branch)
+	}
+	// role 收窄必须出现在理由里。
+	//
+	// 不写的后果：一次被 role 拒绝的调用会落到下面的 config.Explain，
+	// 输出「root」之类的解释——调用方于是去查配置、去换凭证，
+	// 而真相只是它声明了一个更窄的档案。理由指错地方比不说更费时间。
+	if !s.roleAllows(c, project, branch, perm) {
+		allowed := "(denies everything on this branch)"
+		if role, ok := s.activeRole(c); ok {
+			var parts []string
+			for _, e := range role.Entries {
+				b := e.Branch
+				if b == "" {
+					b = "*"
+				}
+				p := ""
+				if e.Path != "" {
+					p = ":" + e.Path
+				}
+				parts = append(parts, e.Project+"@"+b+p+" "+e.Perm)
+			}
+			if len(parts) > 0 {
+				allowed = strings.Join(parts, ", ")
+			}
+		}
+		return fmt.Sprintf("%s@%s: role %q allows %s (a role can only narrow, never widen)",
+			project, branch, c.Role, allowed)
 	}
 	if s.cfgIndex() == nil {
 		return "access denied"

@@ -73,6 +73,11 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 	if path == "" {
 		return "", fmt.Errorf("%q specifies a project but no file path", addr)
 	}
+	// resolveAddr 判的是**读**位（它服务于所有读动词）；写动词必须自己
+	// 再判一次写位，否则一条 `p@br:sub/x` 的写会通过 role 的只读边界。
+	if !s.roleAllowsPath(c, proj, branch, path, configBitWrite) {
+		return "", s.roleDenyError(c, proj, branch, path)
+	}
 	if !s.allowed(c, proj, branch, configBitWrite) {
 		return "", fmt.Errorf("not authorized to write to %s@%s", proj, branch)
 	}

@@ -47,6 +47,7 @@ chmod <p>@<br>/<path> mode     change rule/content mode
 write <p>@<br>/<path> $TEXT   write an exact file (for rules only; root required)
 config index [--include A,B]  scope which branches get indexed (applies immediately)
 ledger check|put|list        provenance ledger for actions taken outside (dedupe by external_id)
+role ls|put|bind             named narrowing profiles for sub-agents (can only restrict, never widen)
 
 Several statements in one call:
   Separate verbs with ';' or a newline to run them in one round trip.
@@ -88,7 +89,7 @@ func helpAll() string {
 	var b strings.Builder
 	b.WriteString(helpOverview())
 	b.WriteString("\n\n")
-	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "ref", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "merge", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "erase", "replace", "archive", "reset", "acl", "ledger", "config", "reload", "whoami", "users", "help"} {
+	for _, v := range []string{"recall", "read", "grep", "log", "ls", "put", "ref", "write", "remind", "trees", "since", "status", "chmod", "lock", "unlock", "remote-key", "remote-secret", "remote", "fetch", "push", "sync", "merge", "commit", "diff", "branch", "tag", "cp", "mv", "delete", "erase", "replace", "archive", "reset", "acl", "role", "ledger", "config", "reload", "whoami", "users", "help"} {
 		if d, ok := helpVerb(v); ok {
 			b.WriteString("\n-- " + v + " ")
 			b.WriteString(strings.Repeat("-", max(0, 60-len(v))))

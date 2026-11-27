@@ -144,6 +144,13 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 					map[string]any{"project": proj, "branch": br, "path": p},
 					"path %q is outside this mount's subtree (%s@%s:%s)", p, proj, br, c.Mount.rootOf(proj, br))
 			}
+			// 收窄档案的子树边界：与挂载表 chroot 同一处判，语义一致。
+			//
+			// 放在这里而不是各个动词里：read / write / grep / delete / cp…
+			// 全都经过 resolveAddr，一处收口就不可能漏掉某个动词。
+			if !s.roleAllowsPath(c, proj, br, p, configBitRead) {
+				return "", "", "", s.roleDenyError(c, proj, br, p)
+			}
 			return proj, br, p, nil
 		}
 	}
@@ -161,6 +168,9 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 				map[string]any{"addr": addr, "project": proj, "branch": br, "path": p},
 				"path %q is outside this mount's subtree", addr)
 		}
+		if !s.roleAllowsPath(c, proj, br, p, configBitRead) {
+			return "", "", "", s.roleDenyError(c, proj, br, p)
+		}
 		return proj, br, p, nil
 	}
 	proj, p, derr := s.splitAddrPwd(addr, "")
@@ -168,6 +178,12 @@ func (s *Server) resolveAddr(addr string, c Caller) (project, branch, path strin
 		return "", "", "", derr
 	}
 	br := s.defaultBranch
+	// 全命名空间凭证（无挂载表）也照样受 role 约束：
+	// 这一条尤其重要——没有它，一张全量凭证声明 role 之后，
+	// 子树收窄只对「有挂载表」的凭证生效，等于默认放行。
+	if !s.roleAllowsPath(c, proj, br, p, configBitRead) {
+		return "", "", "", s.roleDenyError(c, proj, br, p)
+	}
 	return proj, br, p, nil
 }
 

@@ -68,6 +68,35 @@ enabled = true
 # 缓存键是 blob SHA，无失效逻辑，内容变哈希必变。
 body_cache_mb = 512
 
+# ── 多级权限收紧 ──────────────────────────────────────────────
+#
+# 三层各自收窄，谁也不能往上顶：
+#
+#   1. 凭证（token）：挂载表 + cap 是**天花板**，签发了就改不了；
+#   2. ACL（acl.json）：在凭证之内授权，MCP 里随时改，不重签凭证；
+#   3. role（roles.json）：命名收窄档案，调用时声明，**只能减不能加**。
+#
+# 天花板是权限判定的**最后一道闸**：ACL 与 role 都只能在凭证的挂载表
+# 与 cap 之内挑。所以「给凭证新开一条共享分支」要么把它写进挂载表
+# （或写 "*"），要么重新签发——事后用另一张表替它扩大是不允许的。
+#
+# 子 agent 的常见形态：几个子 agent 共用一张 token，各自绑一个 role，
+# 于是各自只看到自己那一小块：
+#
+#   role put  forum-only "BlackEggAI/zero@main.record:record/forum" r
+#   role bind forum-only group-bot
+#
+#   role put  chat-only  "BlackEggAI/zero@main.record:record/chat"  r
+#   role bind chat-only  tieba-bot
+#
+# 调用时声明（vmcp 转发时加头最省事；直连 MCP 用 role 字段）：
+#
+#   X-Memcp-Role: forum-only          或   arguments.role = "forum-only"
+#
+# 注意与「逐请求切换身份」的区别：role 不改变你是谁，只缩小你这次能看
+# 到多少。因此自报一个 role 不构成提权——最坏也只是把自己关得更窄。
+# 未绑定、拼错、或不存在的 role 会被明确拒绝，不会静默等于「不限制」。
+
 # ── 端口策略 ──────────────────────────────────────────────────
 #
 # [[listen]] 块声明监听端口与能力白名单。

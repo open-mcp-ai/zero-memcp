@@ -156,6 +156,12 @@ type Server struct {
 	// 现在：读路径一次 Load 拿到底，写路径取 treeTok 令牌后
 	// 造新快照再 Store。Index 自身也已无锁（见 internal/index）。
 	treesPtr atomic.Pointer[treeSet]
+
+	// indexProg 是索引构建进度。读者只看完整快照，不阻塞构建。
+	indexProg atomic.Pointer[indexProgress]
+	// indexBuildDone 在后台构建结束时关闭；Close 等它，避免关掉仓库后
+	// 还有协程在读。
+	indexBuildDone chan struct{}
 	// indexEnabled 控制本实例是否构建倒排索引、正文缓存和向量索引。
 	//
 	// 由配置文件的 [index] enabled 控制；默认 false（冷备份节点安全默认）。
@@ -573,11 +579,44 @@ func New(cfg Config) (*Server, error) {
 		s.indexEnabled = s.indexEnabled || cfgFile.Index.Enabled
 	}
 	if s.indexEnabled {
-		startupStage("building initial index (reading every branch of every project)")
-		if err := s.Reload(); err != nil {
-			return nil, fmt.Errorf("build initial index: %w", err)
+		// 后台构建：[index] async（默认开启，配置驱动的实例）。
+		//
+		// 动机是实测的冷启动：扫描 23s + 分词 9s，这段时间里服务不可用。
+		// 但其中只有「分词」真正需要等——ls / log / read / grep / put /
+		// sync 都不依赖倒排表。于是先发布树、立刻返回，索引在后台一段一段
+		// 建起来，status 报进度，recall 明说「只覆盖已建好的部分」。
+		//
+		// 直接构造 server.Config 且没有配置文件的调用方（库用户、测试）
+		// 保持同步：它们期待 New() 返回后立刻能查到东西。
+		async := false
+		if f := s.cfgFilePtr.Load(); f != nil {
+			async = f.Index.AsyncBuild()
 		}
-		startupStage("initial index ready")
+		if async {
+			startupStage("building initial index in background ([index] async)")
+			s.treesPtr.Store(&treeSet{trees: nil, idx: index.New()})
+			s.setIndexProgress(indexProgress{Phase: "scanning", StartedAt: time.Now()})
+			s.indexBuildDone = make(chan struct{})
+			go func() {
+				defer close(s.indexBuildDone)
+				if err := s.Reload(); err != nil {
+					p := s.indexProgressNow()
+					p.Phase = "failed"
+					p.Err = err.Error()
+					p.FinishedAt = time.Now()
+					s.setIndexProgress(p)
+					s.logf("background index build failed: %v", err)
+					return
+				}
+				s.reconcileAfterAsyncScan()
+			}()
+		} else {
+			startupStage("building initial index (reading every branch of every project)")
+			if err := s.Reload(); err != nil {
+				return nil, fmt.Errorf("build initial index: %w", err)
+			}
+			startupStage("initial index ready")
+		}
 	} else {
 		startupStage("index: disabled by configuration (cold backup mode; configure [index] enabled = true to enable)")
 		// 挂载一个空的不可变快照，保证并发读不会 panic
@@ -648,6 +687,14 @@ func (s *Server) Reload() error {
 
 	defaultBranch := s.defaultBranch
 
+	// 进度状态：索引是动态过程，调用方要能看见它走到哪一步。
+	//
+	// 为什么必须可见：半份索引的危险不在结果少，而在结果少得**没有区别**。
+	// 用户问「有没有提过 X」拿到空结果，于是得出「没有」这个错误结论——
+	// 这类静默失效污染的是结论本身。
+	buildStart := time.Now()
+	s.setIndexProgress(indexProgress{Phase: "scanning", StartedAt: buildStart})
+
 	startupStage("reload: scanning repositories")
 
 	// 快速路径：先试索引快照。
@@ -663,6 +710,11 @@ func (s *Server) Reload() error {
 	// 快照是优化，全量重建仍是正确性保底。
 	if s.tryLoadIndexSnapshot(defaultBranch) {
 		startupStage("reload: loaded index from snapshot")
+		docs := int64(s.idxNow().Docs())
+		s.setIndexProgress(indexProgress{
+			Phase: "ready", Done: docs, Total: docs,
+			StartedAt: buildStart, FinishedAt: time.Now(),
+		})
 		s.rememberTreeHeads()
 		return nil
 	}
@@ -682,18 +734,84 @@ func (s *Server) Reload() error {
 	startupStage("reload: dedup table seeded")
 
 	idx := index.New()
+	// 树先发布，索引随后填：两者分开，服务才能「立刻可用」。
+	//
+	// 建索引（分词）是唯一必须等待的部分；ls / log / read / grep / put /
+	// sync 全都不依赖倒排表。先发布树意味着进程起来的第一秒这些动词就是
+	// 正确的，只有 recall 处于「部分覆盖」状态（而它会明说这一点）。
+	s.publishTrees(trees, idx)
+
+	// 待索引的块数：只数参与索引的分支（[index] include/exclude）。
+	// 这个数是进度的分母，也是「有多少内容没进检索」的唯一依据。
+	var totalBlocks int64
+	for _, t := range trees {
+		if !s.branchIndexed(t.Project, t.Branch) {
+			continue
+		}
+		totalBlocks += int64(len(t.Indexable()))
+	}
+	s.setIndexProgress(indexProgress{
+		Phase: "building", Total: totalBlocks, StartedAt: buildStart,
+	})
+
 	// 分段计时：readBlock（读盘/缓存）与 AddWithTime（分词）是两件
 	// 完全不同的事，混在一起看就只知道「慢」而不知道慢在哪。
 	var readNS, tokenizeNS time.Duration
 	var batchDocs []index.BatchDoc
+	var indexed int64
+
+	workers := runtime.NumCPU() * 2
+	if workers > 32 {
+		workers = 32
+	}
+	// 边读边建：每攒够一批就当场分词入库并推进进度。
+	//
+	// index.Index 是「每 key 独立原子容器」的无锁结构，所以边建边搜是
+	// 安全的：读侧永远看到「已经加进去的那部分」，看不到半篇文档，
+	// 也不会被写侧阻塞。这同时把内存峰值从「全库正文」压到「一批正文」。
+	const buildChunk = 1024
+	flush := func(force bool) {
+		for len(batchDocs) >= buildChunk || (force && len(batchDocs) > 0) {
+			n := buildChunk
+			if n > len(batchDocs) {
+				n = len(batchDocs)
+			}
+			tk0 := time.Now()
+			idx.AddBatch(batchDocs[:n], workers)
+			tokenizeNS += time.Since(tk0)
+			batchDocs = batchDocs[n:]
+			indexed += int64(n)
+			s.setIndexProgress(indexProgress{
+				Phase: "building", Done: indexed, Total: totalBlocks,
+				StartedAt: buildStart,
+			})
+		}
+	}
+
 	for _, t := range trees {
+		indexThisBranch := s.branchIndexed(t.Project, t.Branch)
+		if !indexThisBranch {
+			startupStage("reload: %s@%s NOT indexed ([index] include/exclude)", t.Project, t.Branch)
+		}
 		startupStage("reload: indexing %s@%s (%d blocks)", t.Project, t.Branch, len(t.Blocks))
 		for _, b := range t.Indexable() {
+			isSkill := b.Path == "SKILL.md" || strings.HasSuffix(b.Path, "/SKILL.md")
+			// 被排除的分支只看 SKILL.md（策略需要），绝不解压它的几万篇正文——
+			// 否则一次 Reload 还是把整棵大分支的 Git 对象解压一遍并塞进缓存。
+			if !indexThisBranch && !isSkill {
+				continue
+			}
 			tr0 := time.Now()
 			data, err := s.readBlock(b)
 			readNS += time.Since(tr0)
 			if err != nil {
 				return fmt.Errorf("read %s: %w", b.Addr(), err)
+			}
+			if isSkill {
+				s.policies.Store(t.Project, manifest.Parse(t.Project, data))
+			}
+			if !indexThisBranch {
+				continue
 			}
 			stamp := b.Time
 			if at := sliceAtTime(string(data), b.Path); at > 0 {
@@ -704,19 +822,15 @@ func (s *Server) Reload() error {
 				Text:    string(data),
 				ModTime: stamp,
 			})
-
-			if b.Path == "SKILL.md" || strings.HasSuffix(b.Path, "/SKILL.md") {
-				s.policies.Store(t.Project, manifest.Parse(t.Project, data))
-			}
+			// 满一批就当场建：这样「索引到一半也能用」是真的——
+			// 前 1024 块建完就已经能被 recall 搜到，而不是等全库
+			// 扫完再一口气分词。顺带把内存峰值从「全库正文」压到
+			// 「最多一批正文」。
+			flush(false)
 		}
 	}
-	tt0 := time.Now()
-	workers := runtime.NumCPU() * 2
-	if workers > 32 {
-		workers = 32
-	}
-	idx.AddBatch(batchDocs, workers)
-	tokenizeNS = time.Since(tt0)
+	// 收尾：把最后不满一批的余量也建进去。
+	flush(true)
 
 	// 索引建完，Block.Body 这个「扫描期缓存」就该扔掉。
 	//
@@ -733,12 +847,41 @@ func (s *Server) Reload() error {
 	}
 
 	s.publishTrees(trees, idx)
-	startupStage("reload: index built (read %.1fs, tokenize %.1fs)",
-		readNS.Seconds(), tokenizeNS.Seconds())
+	s.setIndexProgress(indexProgress{
+		Phase: "ready", Done: indexed, Total: totalBlocks,
+		StartedAt: buildStart, FinishedAt: time.Now(),
+	})
+	startupStage("reload: index built (read %.1fs, tokenize %.1fs, %d blocks indexed)",
+		readNS.Seconds(), tokenizeNS.Seconds(), indexed)
 
 	// 更新观察水位：让下一次 checkExternalUpdates 有比对基准。
 	s.rememberTreeHeads()
 	return nil
+}
+
+// reconcileAfterAsyncScan 补偿「扫描期间发生的写入」。
+//
+// 后台构建有个新窗口：扫描从 t0 开始，而服务从 t0 就在接请求。若这期间
+// 有 put / sync 落到某条分支，发布出去的树是 t0 之前的快照——新内容会
+// 出现在索引里（写路径自己 AddWithTime）但不在树里，ls / log 就看不到它。
+//
+// 判据用脏层：有未折叠改动的分支才可能有这个偏差，重扫它一次即可。
+// 已折叠的写入必然已经进了 git 头，而扫描读的就是 git 头——
+// 那种情况最多差一个 commit 的时间窗，且下一次 checkExternalUpdates
+// 会按 head movement 自动追平。
+func (s *Server) reconcileAfterAsyncScan() {
+	for _, tr := range s.treeList() {
+		repo, err := s.projects.Get(tr.Project)
+		if err != nil {
+			continue
+		}
+		if repo.Pending(tr.Branch) == 0 {
+			continue
+		}
+		if err := s.refreshBranch(tr.Project, tr.Branch); err != nil {
+			s.logf("post-scan reconcile %s@%s: %v", tr.Project, tr.Branch, err)
+		}
+	}
 }
 
 // DescribeProjects 返回一句话的项目概览，供启动日志用。
@@ -928,6 +1071,13 @@ func (s *Server) Close() error {
 	// 已经在拆，来不及做完一次 40MB 的写。
 	if err := s.saveIndexSnapshot(); err != nil {
 		s.logf("index snapshot save on shutdown failed: %v", err)
+	}
+	// 停后台索引构建：它正在读仓库，必须在关仓库之前等它退出。
+	//
+	// 不等的话，Close 关掉仓库后它还会去 repo.Read，轻则报错重则 panic，
+	// 而测试里表现为 TempDir 清理失败（"directory not empty"）。
+	if s.indexBuildDone != nil {
+		<-s.indexBuildDone
 	}
 	// 停语义索引的后台追平：它会读仓库，必须在关仓库之前停。
 	s.stopSemanticMaintainer()
@@ -2008,6 +2158,16 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		// 而正则对排版变化毫无抵抗力——改一下缩进或小数位就静默取不到分。
 		rest, wantJSON := stripJSONFlag(rest)
 		query, scopes := splitScopes(rest)
+		// 显式点名一条未建索引的分支时，必须报错而不是回「没有命中」。
+		//
+		// 这是本功能最重要的一条护栏：`recall X --scope p@main.chat` 回空，
+		// 调用方会得出「聊天记录里没提过 X」——而真相是这条分支没进索引。
+		// 错误结论会一路被引用下去，比慢和报错都贵。
+		for _, sc := range scopes {
+			if err := s.excludedScopeError(sc, c); err != nil {
+				return TermResult{}, err
+			}
+		}
 		scopeMatch := func(addr string) bool { return matchAnyScope(addr, scopes) }
 		hits := s.idxNow().SearchCovered(query, 3, 0, recallMinCoverage, s.weightCount, func(addr string) bool {
 			return allowedHit(addr) && scopeMatch(addr)
@@ -2061,6 +2221,11 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		}
 		if len(hits) == 0 {
 			text := "no matches"
+			// 索引还在建的时候，「没有命中」只意味着**已建好的那部分**里没有。
+			// 这两句话的差别决定了调用方是「去写一份新的」还是「等一会儿再查」。
+			if prog := s.indexProgressNow(); prog.Building() {
+				text = fmt.Sprintf("no matches in the indexed portion yet - %s", prog.Line())
+			}
 			// 带 scope 却没命中时，多跑一次不带 scope 的判定：
 			// 「这个范围外有」比「记忆里没有」有用得多——前者说明
 			// 换个范围就找得到，后者会让人以为要重新写一遍。
@@ -2117,6 +2282,18 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			// 分不清是「这条消息没查」还是「查了但改写了查询词」。
 			"query":  query,
 			"tookMs": time.Since(tRecall).Milliseconds(),
+		}
+		// 构建中必须标注：这次命中的是「已建好的那部分索引」。
+		// 不标的话，调用方无法判断「只有这几条」还是「还有更多没索引到」。
+		if prog := s.indexProgressNow(); prog.Building() {
+			structured["index_building"] = true
+			structured["index_progress"] = map[string]any{
+				"phase": prog.Phase, "done": prog.Done, "total": prog.Total, "percent": prog.Percent(),
+			}
+			if wantJSON {
+				return TermResult{Text: jsonText(structured), Structured: structured}, nil
+			}
+			sb.WriteString("[note: " + prog.Line() + "]\n")
 		}
 		if wantJSON {
 			return TermResult{Text: jsonText(structured), Structured: structured}, nil
@@ -2483,10 +2660,18 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		var text string
 		if !s.indexEnabled {
 			text = "index: disabled (cold backup node; configure [index] enabled = true to enable)"
-		} else if c.Mount.Empty() {
-			text = fmt.Sprintf("docs: %d, terms: %d", docs, terms)
 		} else {
-			text = fmt.Sprintf("docs: %d", docs)
+			// 进度必须第一眼可见：索引是动态过程，而半份索引的表现是
+			// 「搜不到」——不写清楚，读的人会把「还没索引到」当成「没有」。
+			text = s.indexProgressNow().Line()
+			if c.Mount.Empty() {
+				text += fmt.Sprintf("\ndocs: %d, terms: %d", docs, terms)
+			} else {
+				text += fmt.Sprintf("\ndocs: %d", docs)
+			}
+			if note := s.indexScopeNote(); note != "" {
+				text += "\n" + note
+			}
 		}
 		text += "\nsemantic: " + sem
 		if c.Mount.Empty() {
@@ -2534,6 +2719,7 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			}
 		}
 
+		prog := s.indexProgressNow()
 		return TermResult{
 			Text: text,
 			Structured: map[string]any{
@@ -2542,6 +2728,14 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 				"clock":    s.Clock(),
 				"semantic": sem,
 				"sync":     syncLines,
+				"index_progress": map[string]any{
+					"phase":    prog.Phase,
+					"done":     prog.Done,
+					"total":    prog.Total,
+					"percent":  prog.Percent(),
+					"building": prog.Building(),
+					"err":      prog.Err,
+				},
 			},
 		}, nil
 

@@ -211,13 +211,17 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// 这些词在重启前搜不到、重启后才出现——同一份记忆的可检索性
 	// 随进程生命周期变化，docLen 也跟着变，BM25 分数跟着漂。
 	blockID := memory.MakeID(targetProject, writeBranch, path)
-	s.idxNow().AddWithTime(blockID, content, now.Unix())
+	indexed := s.branchIndexed(targetProject, writeBranch)
+	if indexed {
+		s.idxNow().AddWithTime(blockID, content, now.Unix())
+	}
 	s.addBlockLocked(targetProject, repo, writeBranch, path, int64(len(content)), now.Unix())
 
 	s.bumpClock()
-	// 写入改变了树状态：请求一次语义索引追平。
-	// 非阻塞、去重（3 秒窗口攒批），失败由后台周期兜底重试。
-	s.kickSemantic()
+	// 写入改变了树状态：只有参与索引的分支才请求语义追平。
+	if indexed {
+		s.kickSemantic()
+	}
 
 	return addr, targetProject, writeBranch, nil
 }

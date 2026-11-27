@@ -45,6 +45,7 @@ reset <p>@<br> from <src>      reset a branch to another branch
 lock / unlock <p>@<br>         lock/unlock a branch (suspend non-root access)
 chmod <p>@<br>/<path> mode     change rule/content mode
 write <p>@<br>/<path> $TEXT   write an exact file (for rules only; root required)
+config index [--include A,B]  scope which branches get indexed (applies immediately)
 ledger check|put|list        provenance ledger for actions taken outside (dedupe by external_id)
 
 Several statements in one call:

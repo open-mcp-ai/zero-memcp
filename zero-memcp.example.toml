@@ -46,6 +46,22 @@ interval = "2h"
 [index]
 enabled = true
 
+# 后台建索引：进程立即开始服务，索引在后台一段一段建起来。
+# status 报进度（done/total），recall 会明说「只覆盖已建好的部分」。
+# 默认 true。设 false 则启动时同步建完才对外服务。
+# async = true
+
+# 按分支控制「建不建索引」。两支互斥（同一个问题不能既有白名单又有黑名单）。
+# 不建索引的分支照样能 read / ls / log / grep（它们读仓库，不读索引），
+# 但 recall 看不到它；显式 --scope 指名这种分支会报错，而不是回「没有命中」。
+#
+# 实测动机：本机 ~60,800 块里 main.chat + main.record + inbox 三条占 89%，
+# 而索引体积、常驻内存、启动时间基本由它们决定。
+#
+# 改这两项不必重启：`config index --exclude "..."` 走 MCP，立即生效。
+# exclude = ["BlackEggAI/zero@main.chat", "BlackEggAI/zero@inbox"]
+# include = ["BlackEggAI/zero@ops", "*@main.fact"]
+
 # 检索性能调优
 [search]
 # 正文缓存预算（MB）。默认 512。设为 0 表示禁用（省内存，但大库 grep 变慢）。

@@ -52,6 +52,11 @@ func (s *Server) execSRecall(rest string, c Caller) (TermResult, error) {
 	if query == "" {
 		return TermResult{}, fmt.Errorf("srecall syntax: srecall <text> [--scope <tree>]")
 	}
+	if scope != "" {
+		if err := s.excludedScopeError(scope, c); err != nil {
+			return TermResult{}, err
+		}
+	}
 
 	// 0) 语言判定：决定先查哪个索引，并作为审计字段回显。
 	//

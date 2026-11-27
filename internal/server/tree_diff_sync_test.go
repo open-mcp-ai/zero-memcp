@@ -14,7 +14,9 @@ import (
 //
 // 踩过的坑（2026-11-24，rock64 实测抓到）：
 // 18,446 篇里改了 1 篇，日志打出：
-//   sending full tree snapshot (18446 entries)
+//
+//	sending full tree snapshot (18446 entries)
+//
 // 虽然对端只 applied 1，但整整 18,446 条被完整序列化、网络传输、
 // 对端逐个路径比对，每轮耗时数分钟，在慢速板子上浪费 CPU 和带宽。
 func TestTreeDiffSendsOnlyChangedPaths(t *testing.T) {

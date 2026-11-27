@@ -377,7 +377,8 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:   "config",
 		Detail: detail_config,
 		Kind:   term.KindFlags,
-		Usage:  "config",
+		Flags:  []string{"include", "exclude", "reset"},
+		Usage:  "config show | path | put <TOML> | index [--include A,B | --exclude A,B | --reset]",
 	},
 	{
 		Name:  "content",

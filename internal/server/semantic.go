@@ -378,6 +378,9 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 	// 收集待索引的块。只取 thought 分支，只取可读的普通内容块。
 	var jobs []job
 	for _, t := range s.snapshotTrees() {
+		if !s.branchIndexed(t.Project, t.Branch) {
+			continue
+		}
 		for _, b := range t.Indexable() {
 			// 按**路径**决定是否进语义索引（isSemanticContent），
 			// 不再看分支名。分支可以是任何名字（main、main/record、

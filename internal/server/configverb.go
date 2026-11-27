@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/config"
@@ -35,6 +36,36 @@ func (s *Server) execConfig(rest string, c Caller) (string, error) {
 	sub, body, _ := strings.Cut(rest, " ")
 	sub = strings.TrimSpace(sub)
 	body = strings.TrimSpace(body)
+
+	// termcp 重建命令行时会把 --include / --exclude / --reset 挪到位置参数
+	// 前面（`config index --exclude x` 会变成 `config --exclude x index`），
+	// 所以不能只看第一个词判子命令——看到 index 的 flag 也算 index。
+	{
+		isIndex := sub == "index"
+		if !isIndex {
+			for _, f := range []string{"--include", "--exclude", "--reset"} {
+				if strings.Contains(" "+rest+" ", " "+f+" ") {
+					isIndex = true
+					break
+				}
+			}
+		}
+		if isIndex {
+			if err := s.requireRootGlobal(c, 'w'); err != nil {
+				return "", err
+			}
+			// 去掉字面的 "index" 词（它可能出现在 flag 前面也可能在后面），
+			// 剩下的全部交给 setIndexScope 解析。
+			var keep []string
+			for _, f := range strings.Fields(rest) {
+				if f == "index" {
+					continue
+				}
+				keep = append(keep, f)
+			}
+			return s.setIndexScope(strings.Join(keep, " "))
+		}
+	}
 
 	switch sub {
 	case "path":
@@ -122,4 +153,218 @@ func (s *Server) putConfig(body string) (string, error) {
 		return "", fmt.Errorf("config was written, but reload failed: %w", err)
 	}
 	return fmt.Sprintf("config written to %s and applied", s.cfg.ConfigFile), nil
+}
+
+// setIndexScope 通过 MCP 改 [index] include/exclude，改完立即生效。
+//
+//	config index --exclude "BlackEggAI/zero@main.chat,BlackEggAI/zero@inbox"
+//	config index --include "BlackEggAI/zero@ops"
+//	config index --reset
+//
+// 纪律：绝不用正则改配置；按行替换、写后回读校验、失败不落盘。
+func (s *Server) setIndexScope(rest string) (string, error) {
+	if s.cfg.ConfigFile == "" {
+		return "", errors.New("this instance has no config file path to write to (start -config)")
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		f := s.cfgFilePtr.Load()
+		if f == nil {
+			return "index scope: (no config file)", nil
+		}
+		return fmt.Sprintf("include: %v\nexclude: %v\nasync: %v",
+			f.Index.Include, f.Index.Exclude, f.Index.AsyncBuild()), nil
+	}
+
+	// 解析参数：--include / --exclude 取逗号分隔列表，--reset 清空两者。
+	inc, exc, reset := []string(nil), []string(nil), false
+	incSet, excSet := false, false
+	fields := strings.Fields(rest)
+	for i := 0; i < len(fields); i++ {
+		switch fields[i] {
+		case "--reset":
+			reset = true
+		case "--include", "--exclude":
+			key := fields[i]
+			var val string
+			if i+1 >= len(fields) {
+				return "", fmt.Errorf("%s needs a value (comma-separated project@branch patterns)", key)
+			}
+			val = fields[i+1]
+			i++
+			var list []string
+			for _, part := range strings.Split(val, ",") {
+				if p := strings.TrimSpace(part); p != "" {
+					list = append(list, p)
+				}
+			}
+			if key == "--include" {
+				inc, incSet = list, true
+			} else {
+				exc, excSet = list, true
+			}
+		default:
+			return "", fmt.Errorf("config index: unknown argument %q (supported: --include A,B | --exclude A,B | --reset)", fields[i])
+		}
+	}
+	if incSet && excSet {
+		return "", fmt.Errorf("config index: --include and --exclude cannot both be set " +
+			"(a whitelist and a blacklist at once has no single answer; pick one)")
+	}
+
+	raw, err := os.ReadFile(s.cfg.ConfigFile)
+	if err != nil {
+		return "", err
+	}
+	updated, err := rewriteIndexSection(string(raw), inc, exc, incSet, excSet, reset)
+	if err != nil {
+		return "", err
+	}
+	// 先校验：坏配置绝不落盘（与 config put 同一条纪律）。
+	if _, err := config.ParseFile([]byte(updated)); err != nil {
+		return "", fmt.Errorf("resulting config is invalid; not written (existing config unchanged): %w", err)
+	}
+	if err := writeFileAtomic(s.cfg.ConfigFile, updated); err != nil {
+		return "", err
+	}
+	if err := s.Reload(); err != nil {
+		return "", fmt.Errorf("index scope written, but reload failed: %w", err)
+	}
+	f := s.cfgFilePtr.Load()
+	return fmt.Sprintf("index scope applied (no restart): include=%v exclude=%v\n%s",
+		f.Index.Include, f.Index.Exclude, s.indexProgressNow().Line()), nil
+}
+
+// rewriteIndexSection 按行重写 [index] 里的 include / exclude。
+//
+// 按行而不是正则：这份文件里还有权限、端口、密钥路径，一个贪婪匹配
+// 改错一行的代价是服务起不来或权限放开。规矩与手工编辑一致：
+// 只碰目标键所在的那一行，其余逐字保留。
+func rewriteIndexSection(src string, inc, exc []string, incSet, excSet, reset bool) (string, error) {
+	lines := strings.Split(src, "\n")
+	section := ""
+	seenIndex := false
+	// indexEnd 是「[index] 节的末尾」在 out 里的下标（插入新键的位置）。
+	// -1 表示还没确定（还在这一节里）。
+	indexEnd := -1
+	var out []string
+
+	formatList := func(name string, list []string) string {
+		quoted := make([]string, len(list))
+		for i, v := range list {
+			quoted[i] = strconv.Quote(v)
+		}
+		return name + " = [" + strings.Join(quoted, ", ") + "]"
+	}
+	dropOld := reset || incSet || excSet
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(stripInlineComment(line))
+		// 分节头（含 [[数组表]]）：它标志上一节到此结束。
+		//
+		// `[[user]]` 这种双括号头同样是边界——漏判的后果是把新键插到
+		// 文件末尾、落在别的节里，那份配置直接失效（写之前会校验，
+		// 所以不会落盘，但功能也就没生效）。
+		if strings.HasPrefix(trimmed, "[") {
+			if section == "index" && indexEnd < 0 {
+				indexEnd = len(out)
+			}
+			section = ""
+			if !strings.HasPrefix(trimmed, "[[") {
+				section = strings.Trim(trimmed, "[] ")
+			}
+			if section == "index" {
+				seenIndex = true
+				indexEnd = -1
+			}
+			out = append(out, line)
+			continue
+		}
+		if section == "index" && dropOld {
+			if k, _, ok := strings.Cut(trimmed, "="); ok {
+				key := strings.TrimSpace(k)
+				if key == "include" || key == "exclude" {
+					// 丢掉旧行：稍后统一写入新值。
+					continue
+				}
+			}
+		}
+		out = append(out, line)
+	}
+	if section == "index" && indexEnd < 0 {
+		indexEnd = len(out)
+	}
+	if !seenIndex {
+		// 没有 [index] 节就补一个。enabled 是它的必填语义（不写等于关闭），
+		// 所以必须显式打开——否则写了 exclude 却整体没启用。
+		out = append(out, "", "[index]", "enabled = true")
+		indexEnd = len(out)
+	}
+
+	var add []string
+	if !reset {
+		if incSet && len(inc) > 0 {
+			add = append(add, formatList("include", inc))
+		}
+		if excSet && len(exc) > 0 {
+			add = append(add, formatList("exclude", exc))
+		}
+	}
+	if len(add) > 0 {
+		if indexEnd < 0 || indexEnd > len(out) {
+			indexEnd = len(out)
+		}
+		merged := make([]string, 0, len(out)+len(add))
+		merged = append(merged, out[:indexEnd]...)
+		merged = append(merged, add...)
+		merged = append(merged, out[indexEnd:]...)
+		out = merged
+	}
+	return strings.Join(out, "\n"), nil
+}
+
+// stripInlineComment 去掉行尾注释，但不碰引号里的 #。
+func stripInlineComment(line string) string {
+	inStr := false
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '\\':
+			if inStr && i+1 < len(line) {
+				i++
+			}
+		case '"':
+			inStr = !inStr
+		case '#':
+			if !inStr {
+				return line[:i]
+			}
+		}
+	}
+	return line
+}
+
+// writeFileAtomic 临时文件 + fsync + rename，与 config put 同一套写法。
+func writeFileAtomic(path, content string) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".zero-memcp-*.tmp")
+	if err != nil {
+		return err
+	}
+	name := tmp.Name()
+	defer func() { _ = os.Remove(name) }()
+	if _, err := tmp.WriteString(content); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(name, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(name, path)
 }

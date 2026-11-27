@@ -428,10 +428,11 @@ func (s *Server) refreshPath(project, branch, path string, exists bool) error {
 	defer release()
 
 	idx := s.idxNow()
-	// ① 索引：内部无锁，直接增删。
+	// ① 索引：内部无锁，直接增删。被排除分支同样先 Remove（以防刚改完规则），
+	// 但绝不 Add：不能「启动排除、同步推来又悄悄索引进去」。
 	if idx != nil {
 		idx.Remove(id)
-		if exists && !block.Hidden && text != "" {
+		if exists && !block.Hidden && text != "" && s.branchIndexed(project, branch) {
 			idx.AddWithTime(id, text, stamp)
 		}
 	}
@@ -540,16 +541,18 @@ func (s *Server) refreshBranch(project, branch string) error {
 				idx.Remove(blk.ID())
 			}
 		}
-		for _, blk := range tree.Indexable() {
-			data, rerr := s.readBlock(blk)
-			if rerr != nil {
-				continue
+		if s.branchIndexed(project, branch) {
+			for _, blk := range tree.Indexable() {
+				data, rerr := s.readBlock(blk)
+				if rerr != nil {
+					continue
+				}
+				stamp := blk.Time
+				if at := sliceAtTime(string(data), blk.Path); at > 0 {
+					stamp = at
+				}
+				idx.AddWithTime(blk.ID(), string(data), stamp)
 			}
-			stamp := blk.Time
-			if at := sliceAtTime(string(data), blk.Path); at > 0 {
-				stamp = at
-			}
-			idx.AddWithTime(blk.ID(), string(data), stamp)
 		}
 	}
 	// 索引建完就扔掉扫描期缓存：留着等于整分支正文常驻内存。

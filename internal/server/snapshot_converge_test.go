@@ -84,7 +84,8 @@ func TestSnapshotSentOnceThenConverges(t *testing.T) {
 // 这一条覆盖的是「记账」那一环：快照落地后对端手上的树是内容树，
 // 如果发送端还是按自己的 oplog 原点声明增量，接收端按内容树校验，
 // 两边永远对不上——实测症状是每轮 500:
-//   op-sync: base tree mismatch (local <内容树>, peer <原点>)
+//
+//	op-sync: base tree mismatch (local <内容树>, peer <原点>)
 func TestSnapshotThenDeltaKeepsAligning(t *testing.T) {
 	up, upData := newWatchTestServer(t)
 	upTok := mintRestricted(t, upData, auth.Claims{Sub: "zero", Name: "up", Cap: "rwx"})

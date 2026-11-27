@@ -231,7 +231,7 @@ func TestSemanticStartsDownThenRecovers(t *testing.T) {
 			},
 			MaintainInterval: 150 * time.Millisecond,
 		},
-		IndexEnabled:  true,
+		IndexEnabled: true,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

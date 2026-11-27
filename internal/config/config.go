@@ -59,6 +59,115 @@ type IndexConfig struct {
 	// enabledSet 记录 [index] 节里是否显式写了 enabled。
 	// 未写时按关闭处理——「不配置不会生效」是这条设定的全部意义。
 	enabledSet bool
+
+	// Include / Exclude 按分支控制「建不建索引」。
+	//
+	// 动机是实测出来的：本机 ~60,800 个块里，zero@main.chat（29,182）
+	// + weft@main.record（20,121）+ zero@inbox（4,578）三条就占了 89%，
+	// 而它们几乎不需要 BM25 / 向量检索——索引体积、常驻内存、启动时间
+	// 基本都由这几条原始归档流决定。
+	//
+	// 注意「不建索引」不等于「看不见」：被排除的分支照样能 read / ls /
+	// log / grep（它们读的是仓库本身）。但它**不能**被 recall 的倒排/向量
+	// 命中，所以显式 --scope 指名它时必须报错，绝不能回「没有命中」——
+	// 那会让调用方以为「聊天记录里没提过这件事」。
+	//
+	// 两者互斥：同时配 include 与 exclude 时「哪些算在内」没有唯一答案，
+	// 而不猜是这个项目的规矩。要么白名单，要么黑名单。
+	Include []string
+	Exclude []string
+
+	// Async 让索引在后台构建：进程立即开始服务，status 报告进度。
+	//
+	// 默认**开启**（配置驱动的实例）；直接构造 server.Config 的测试保留
+	// 同步语义，否则「New() 返回后立刻查询」会随机拿到半份索引。
+	Async    bool
+	asyncSet bool
+}
+
+// AsyncBuild 报告是否后台建索引。未显式配置时为 true。
+func (c IndexConfig) AsyncBuild() bool {
+	if c.asyncSet {
+		return c.Async
+	}
+	return true
+}
+
+// Validate 检查分支过滤配置。
+func (c IndexConfig) Validate() error {
+	if len(c.Include) > 0 && len(c.Exclude) > 0 {
+		return fmt.Errorf("[index]: include and exclude cannot both be set " +
+			"(a whitelist and a blacklist at once has no single answer; pick one)")
+	}
+	for _, pat := range append(append([]string{}, c.Include...), c.Exclude...) {
+		if strings.TrimSpace(pat) == "" {
+			return fmt.Errorf("[index]: empty branch pattern")
+		}
+	}
+	return nil
+}
+
+// MatchBranch 报告某条分支是否**参与索引**。
+//
+// 模式支持 * 通配（匹配任意字符，含 /）：
+//
+//	"BlackEggAI/zero@main.chat"   精确一条
+//	"BlackEggAI/zero"              该项目所有分支
+//	"*@main.chat"                  所有项目的 main.chat
+//	"*"                            全部（含 include 全开 / exclude 全关）
+func (c IndexConfig) MatchBranch(project, branch string) bool {
+	target := project + "@" + branch
+	if !c.Enabled {
+		return false
+	}
+	if len(c.Include) > 0 {
+		return matchAnyPattern(c.Include, target, project)
+	}
+	if len(c.Exclude) > 0 {
+		return !matchAnyPattern(c.Exclude, target, project)
+	}
+	return true
+}
+
+func matchAnyPattern(patterns []string, target, project string) bool {
+	for _, p := range patterns {
+		if globMatch(p, target) || (!strings.Contains(p, "@") && globMatch(p, project)) {
+			return true
+		}
+	}
+	return false
+}
+
+// globMatch 是只认 * 的极简通配匹配。
+//
+// 为什么不用 path.Match：`*` 在那里不跨 `/`，而项目名本身带斜杠
+// （BlackEggAI/zero），`*@main.chat` 会匹配不到任何东西——一个「看起来
+// 能用、实际永远不命中」的配置项比没有这个配置项更坏。
+func globMatch(pattern, s string) bool {
+	if pattern == "*" {
+		return true
+	}
+	parts := strings.Split(pattern, "*")
+	if len(parts) == 1 {
+		return pattern == s
+	}
+	// 首段必须对齐，末段必须对齐，中间按序出现。
+	if !strings.HasPrefix(s, parts[0]) {
+		return false
+	}
+	s = s[len(parts[0]):]
+	for i := 1; i < len(parts)-1; i++ {
+		if parts[i] == "" {
+			continue
+		}
+		idx := strings.Index(s, parts[i])
+		if idx < 0 {
+			return false
+		}
+		s = s[idx+len(parts[i]):]
+	}
+	last := parts[len(parts)-1]
+	return strings.HasSuffix(s, last)
 }
 
 // Semantic 是本地语义向量检索配置。
@@ -348,7 +457,7 @@ var knownKeys = map[string]map[string]bool{
 	"gc":       {"interval": true},
 	"sync":     {"interval": true, "disabled": true},
 	"search":   {"body_cache_mb": true},
-	"index":    {"enabled": true},
+	"index":    {"enabled": true, "include": true, "exclude": true, "async": true},
 	"erase":    {"public_key": true, "require_ticket": true},
 	"user":     {"name": true, "groups": true, "root": true, "pwd": true},
 	"group":    {"name": true, "members": true},
@@ -368,7 +477,7 @@ func checkKeys(doc *Document) error {
 		}
 		for k, v := range sec {
 			if !allowed[k] {
-				return fmt.Errorf("unknown key %q in [%s] (line %d)", name, k, v.Line)
+				return fmt.Errorf("unknown key %q in [%s] (line %d)", k, name, v.Line)
 			}
 		}
 	}
@@ -686,6 +795,21 @@ func ParseFile(raw []byte) (*File, error) {
 		} else {
 			f.Index.Enabled = v
 			f.Index.enabledSet = true
+		}
+		if f.Index.Include, err = list(sec, "[index]", "include"); err != nil {
+			return nil, err
+		}
+		if f.Index.Exclude, err = list(sec, "[index]", "exclude"); err != nil {
+			return nil, err
+		}
+		if v, err := boolean(sec, "[index]", "async"); err != nil {
+			return nil, err
+		} else {
+			f.Index.Async = v
+			f.Index.asyncSet = true
+		}
+		if err := f.Index.Validate(); err != nil {
+			return nil, err
 		}
 	}
 	if sec, ok := doc.Sections["erase"]; ok {

@@ -58,6 +58,16 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 		startupStage("reload: no usable index snapshot (%v); full rebuild", err)
 		return false
 	}
+	// 索引范围变了，快照就不能用：它记录的是旧范围的文档集合。
+	//
+	// 不检查的后果是「配置没生效但看起来生效了」——刚被 exclude 掉的
+	// 分支会从旧快照里原样回来，recall 照样命中它们，而 status 明明
+	// 写着已排除。这种自相矛盾比不生效难查一百倍。
+	if hdr.IndexScope != s.indexScopeFingerprint() {
+		startupStage("reload: index scope changed (%q -> %q); discarding snapshot",
+			hdr.IndexScope, s.indexScopeFingerprint())
+		return false
+	}
 
 	// 树从树快照恢复，跳过扫描。
 	//
@@ -338,7 +348,11 @@ func (s *Server) saveIndexSnapshot() error {
 	// 并发写入会让「账本」和「数据」差一两篇，下次启动就被判为损坏、
 	// 整份快照作废、全量冷建 40 分钟。同一份 snap 里的 Addrs/Terms
 	// 就是写进文件的那两样东西，用它们的长度记账，头部与数据永远同源。
-	hdr := &index.SnapshotHeader{Heads: heads, Docs: len(snap.Addrs), Terms: len(snap.Terms), TreeFile: "index-trees.gob"}
+	hdr := &index.SnapshotHeader{
+		Heads: heads, Docs: len(snap.Addrs), Terms: len(snap.Terms),
+		TreeFile:   "index-trees.gob",
+		IndexScope: s.indexScopeFingerprint(),
+	}
 	// 先写倒排表（紧凑格式），再写头部——头部的存在等于「这份快照可用」。
 	// 顺序反了的话，进程在两步之间被杀会留下「头部说有、数据却没有」。
 	// 锁外写盘：用的是刚才复制出来的 snap，不碰 *Index。

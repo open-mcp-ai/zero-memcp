@@ -476,11 +476,26 @@ const detail_config = `
 config show
 config path
 config put <TOML>
+config index [--include A,B | --exclude A,B | --reset]
 
 View or update the service config file (root only).
 
 config show displays the currently loaded effective config.
 config put atomically overwrites the config file and triggers a reload (large TOML values can be passed through vars).
+
+config index changes ONLY [index] include/exclude, line by line, and applies
+immediately - no file editing, no restart. It is the safe way to scope what
+gets indexed (whitelist OR blacklist, never both):
+
+  config index                                  show the current scope
+  config index --exclude "p@main.chat,p@inbox"  stop indexing those branches
+  config index --include "p@ops"                index only those branches
+  config index --reset                          go back to indexing everything
+
+Branches excluded from indexing are still readable (read / ls / log / grep all
+work - they read the repository, not the index). What changes is that recall
+cannot see them; scoping recall explicitly to such a branch returns an error
+instead of "no matches", because "no matches" would be read as "not in memory".
 
 Example: config show
 `
@@ -489,6 +504,8 @@ const detail_reload = `
 reload
 
 Rescan all projects and rebuild the inverted index (root only).
+With [index] async, the rebuild runs in the background and status reports
+progress (done/total); the service keeps serving while it runs.
 
 After directly modifying a bare repository (for example, running git commit manually or pushing with an external tool),
 use this verb to force a refresh of in-memory state without restarting the process.

@@ -57,6 +57,12 @@ type SnapshotHeader struct {
 	Terms int
 	// TreeFile 是树快照的文件名（与倒排表分开存，因为它可以独立失效）。
 	TreeFile string
+	// IndexScope 是生成快照时 [index] include/exclude 的指纹。
+	//
+	// 为什么要它：改了索引范围却加载旧快照，等于把刚排除掉的那几万块
+	// 原样载回来——配置写了、status 也这么说，而 recall 照样能命中它们。
+	// 那种「配置没生效但看起来生效了」比不生效难查得多。
+	IndexScope string
 }
 
 // SnapshotData 是倒排表的可序列化形态。

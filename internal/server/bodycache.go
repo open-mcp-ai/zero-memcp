@@ -192,6 +192,9 @@ func (s *Server) warmBodyCache() {
 func (s *Server) warmBodyCacheNow() {
 	var cands []memory.Block
 	for _, tr := range s.treeList() {
+		if !s.branchIndexed(tr.Project, tr.Branch) {
+			continue
+		}
 		for _, b := range tr.Blocks {
 			if b.Hidden || b.Hash == "" {
 				continue

@@ -659,6 +659,25 @@ func (ix *Index) SearchCovered(query string, limit int, idfFloor, minCoverage fl
 	hits := make([]Hit, 0, len(scores))
 	totalQueryTerms := float64(len(uniq))
 	for addr, s := range scores {
+		// 覆盖率不达标**不丢**，只降权。
+		//
+		// 早先这里是 continue：覆盖率低于门槛的候选直接不进结果。
+		// 但覆盖率的分母是查询切出的全部唯一词，而中文二元切分会
+		// 在词边界上产生碎片——查询「海马体 和我的记忆体比咋样」
+		// 得到 10 个词，其中 和我 / 我的 / 的记 / 体比 是碎片，
+		// 几乎没有任何文档能匹配。于是分母虚高，真正的答案（含
+		// 海马 / 马体 / 记忆）覆盖率只有 0.40，被 0.5 的门槛当场杀掉。
+		//
+		// 实测（2026-11-27，3060，Issue #13）：
+		//   11-15 那条正确记录 coverage 0.40 → 被丢
+		//   当天回声 thought   coverage 0.40 → 也被丢
+		// 两边一起被丢，而结果是「只剩几条刚好达标的回声」——
+		// 门槛没有挡住噪声，它挡住了不如它幸运的那一条。
+		//
+		// 改成线性折减：恰好达标 1.0，覆盖率降到 0 时 0.5。
+		// 为什么不能完全不抑：多词查询里“只命中一个超高频词”的
+		// 长文仍会靠 tf 冲上来；保留一个下限折减就是那道护栏。
+		covPenalty := 1.0
 		if minCoverage > 0 && totalQueryTerms > 0 {
 			mTokens := matched[addr]
 			seenM := make(map[Token]bool, len(mTokens))
@@ -667,7 +686,7 @@ func (ix *Index) SearchCovered(query string, limit int, idfFloor, minCoverage fl
 			}
 			coverage := float64(len(seenM)) / totalQueryTerms
 			if coverage < minCoverage {
-				continue
+				covPenalty = 0.5 + 0.5*(coverage/minCoverage)
 			}
 		}
 
@@ -692,7 +711,7 @@ func (ix *Index) SearchCovered(query string, limit int, idfFloor, minCoverage fl
 				}
 			}
 		}
-		hits = append(hits, Hit{Addr: addr, Score: s * boost * freqBoost, Matched: matched[addr]})
+		hits = append(hits, Hit{Addr: addr, Score: s * boost * freqBoost * covPenalty, Matched: matched[addr]})
 	}
 	sort.Slice(hits, func(i, j int) bool {
 		if hits[i].Score != hits[j].Score {

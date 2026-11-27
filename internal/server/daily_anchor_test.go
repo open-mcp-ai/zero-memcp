@@ -145,3 +145,41 @@ func TestDailyAnchorSkippedWhenHeadUnmoved(t *testing.T) {
 		t.Fatal("头没动，不该再打一个新锚点")
 	}
 }
+
+// 补锚点不能占维护环。
+//
+// 给从没打过锚点的分支补第一个锚点要沿父链走完全史算 FileTimes
+// （inbox 实测 44.3 秒）。挂在维护环上会把同一圈的 fsync、
+// 折叠提交、索引快照一起停住。
+func TestAnchorWriterDoesNotBlockMaintainLoop(t *testing.T) {
+	srv, _ := setupMountServer(t)
+
+	// 用一条真实的分支，让 FileTimes 有活干。
+	// 这里只验证「调用立即返回」，不验证产出的锚点内容——
+	// 内容由前面两条测试覆盖。
+	start := time.Now()
+	for i := 0; i < 20; i++ {
+		srv.startAnchorWriter([]string{"blackegg/me"})
+	}
+	elapsed := time.Since(start)
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("startAnchorWriter 应当是立即返回的（实际 %s）——它占的是维护环", elapsed)
+	}
+
+	// 协程结束后所有权必须被释放，否则「补锚点」这辈子只会跑一次。
+	//
+	// 等而不是立刻断言：startAnchorWriter 是异步的，最后那一次
+	// 可能还在跑。这里等的是「它自己会结束并交还所有权」这件事。
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		run, ok := srv.anchorWriter.start()
+		if ok {
+			srv.anchorWriter.finish(run)
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("补锚点协程跑完后没有释放所有权，后续的锚点将永远不会再补")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}

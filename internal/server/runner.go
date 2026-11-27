@@ -58,3 +58,15 @@ func (r *backgroundRunner) kick() {
 		// 已有一笔待执行，全量追平一次就够，丢掉这笔请求。
 	}
 }
+
+// finish 在「一次性任务」跑完之后释放所有权（不关 stop）。
+//
+// 与 stopNow 的区别：stopNow 是外部叫停，会关掉 stop 让人退出；
+// finish 是任务自己干完了，只需要把占位清掉，让下一次 start 能成功。
+//
+// 用 CompareAndSwap 而不是 Store(nil)：如果期间有人 stopNow 之后又起了
+// 新的一轮，cur 已经指向新的 run，直接 Store(nil) 会把新的那份所有权
+// 抹掉——症状是「两个实例同时跑」，而它不会报任何错。
+func (r *backgroundRunner) finish(run *backgroundRun) {
+	r.cur.CompareAndSwap(run, nil)
+}

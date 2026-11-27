@@ -168,8 +168,15 @@ func (s *Server) maintain(done chan struct{}) {
 			// 走到锚点就停，不必重走整个历史（实测 main.chat 8.29s → 0.24s）。
 			// tag 会随 push 到远端，所以换机器、从备份恢复同样受益。
 			//
-			// 只在**有写入**的日子打：闲着的日子打一串空锚点没有意义。
-			s.maybeWriteDailyCheckpoints(projects)
+			// 放到独立协程里，不占维护环。
+			//
+			// 为什么：给一条从没打过锚点的分支补第一个锚点，要沿父链
+			// 走完全史算 FileTimes——实测 zero@inbox（2,074 个提交）
+			// 44.3 秒。而维护环每秒跑一次，同一圈里还要刷脏层 fsync、
+			// 折叠提交、存索引快照。卡在这里等于把那些一起停 44 秒，
+			// 症状是「某次重启后写入延迟突然变成几十秒」。
+			// 锚点晚几十秒打上没有任何影响——它只是让下次启动便宜。
+			s.startAnchorWriter(projects)
 
 			s.checkExternalUpdates()
 
@@ -410,4 +417,28 @@ func (s *Server) checkExternalUpdates() {
 // logf 是带前缀的日志输出。
 func (s *Server) logf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "zero-memcp: "+format+"\n", args...)
+}
+
+// startAnchorWriter 在后台补锚点，不阻塞调用方（维护环）。
+//
+// 同时在跑的只允许一个：这条路径都是「把某条分支的历史走一遍」的重活，
+// 并发跑多份只会互相抢磁盘，而锚点晚几十秒打上没有任何影响。
+//
+// 为什么不做成「每个分支一个协程」：那会在启动后瞬间扇出 18 个
+// FileTimes 遍历，每一个都在读同一批 pack 文件——磁盘队列排满，
+// 结果比串行还慢，而且内存里同时压 18 份 path→time 映射。
+func (s *Server) startAnchorWriter(projects []string) {
+	if len(projects) == 0 {
+		return
+	}
+	run, ok := s.anchorWriter.start()
+	if !ok {
+		return // 已经有一个在跑，下一圈再补
+	}
+	// 调用方传进来的切片可能被复用，拷一份再带进协程。
+	list := append([]string(nil), projects...)
+	go func() {
+		defer s.anchorWriter.finish(run)
+		s.maybeWriteDailyCheckpoints(list)
+	}()
 }

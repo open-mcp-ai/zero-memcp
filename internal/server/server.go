@@ -202,6 +202,12 @@ type Server struct {
 	semantic semanticState
 	// semanticMaint 管理语义索引的后台追平协程。
 	semanticMaint semanticMaintainer
+	// anchorWriter 保证同时只有一次「补锚点」在跑。
+	//
+	// 它做的事不占维护环：给从没打过锚点的分支补第一个锚点时
+	// 要沿父链走完全史算 FileTimes（inbox 实测 44.3 秒），
+	// 挂在维护环上会把同一圈的 fsync 与折叠提交一起停住。
+	anchorWriter backgroundRunner
 	// liveIdx 持有多套同时加载的向量索引（中文模型 + 英文模型并存时各占一套）。
 	liveIdx *liveIndexes
 	// masterKeys 是主人密钥环：多公钥 + 权限位 + 根钥派生。

@@ -56,6 +56,10 @@ exclude = ["a/b@other"]
 }
 
 // 默认异步：配置驱动的实例启动即可服务。
+//
+// 必须测到 ParseFile 这一层：如果只测 IndexConfig 零值，ParseFile 里
+// 「无条件置 asyncSet = true」的 bug 就不会被抓到——[index] 段里只写
+// enabled = true 的真实配置，全都会退回同步建索引、启动卡死数分钟。
 func TestIndexAsyncDefaultsOn(t *testing.T) {
 	var c IndexConfig
 	if !c.AsyncBuild() {
@@ -64,5 +68,40 @@ func TestIndexAsyncDefaultsOn(t *testing.T) {
 	c.Async, c.asyncSet = false, true
 	if c.AsyncBuild() {
 		t.Fatal("显式 async = false 时必须尊重")
+	}
+
+	const base = "[[user]]\nname = \"zero\"\nroot = true\n[server]\ndata = \"/tmp/x\"\n"
+	omitted, err := ParseFile([]byte(base + "[index]\nenabled = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !omitted.Index.AsyncBuild() {
+		t.Fatal("ParseFile: [index] 只写 enabled = true（未写 async）时，AsyncBuild() 必须仍为 true")
+	}
+
+	explicitFalse, err := ParseFile([]byte(base + "[index]\nenabled = true\nasync = false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if explicitFalse.Index.AsyncBuild() {
+		t.Fatal("ParseFile: 显式写了 async = false 时必须尊重")
+	}
+
+	explicitTrue, err := ParseFile([]byte(base + "[index]\nenabled = true\nasync = true\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !explicitTrue.Index.AsyncBuild() {
+		t.Fatal("ParseFile: 显式写了 async = true 时必须为 true")
+	}
+
+	// 同理：光写 [index]（未写 enabled）不得把 enabledSet 置真。
+	emptySection, err := ParseFile([]byte(base + "[index]\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if emptySection.Index.enabledSet || emptySection.Index.Enabled {
+		t.Fatalf("ParseFile: 空 [index] 段不应把 enabled 标为已设置，实际 set=%v enabled=%v",
+			emptySection.Index.enabledSet, emptySection.Index.Enabled)
 	}
 }

@@ -104,6 +104,7 @@ mode  = "rwx------"
 
 	srv2 := open()
 	defer srv2.Close()
+	waitIndexReady(t, srv2)
 	second, err := srv2.ExecLineVars(context.Background(), "put $1", nil, []string{"重启也要记得这条"})
 	if err != nil {
 		t.Fatalf("重启后写入失败: %v", err)

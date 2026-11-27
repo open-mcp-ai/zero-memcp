@@ -70,6 +70,18 @@ func TestBodyCacheMBDistinguishesUnsetFromZero(t *testing.T) {
 	if unset.Search.bodyCacheSet {
 		t.Error("没写 [search] 时不该标记为已设置")
 	}
+	// 光有 [search] 段、里面没写 body_cache_mb——这是最容易漏的一种：
+	// 段存在但旋钮缺失，早先会把「已设置」置真，预算读成 0（=禁用）。
+	sectionOnly, err := ParseFile([]byte(base + "[search]\n"))
+	if err != nil {
+		t.Fatalf("空 [search] 段应当被接受，实际: %v", err)
+	}
+	if sectionOnly.Search.bodyCacheSet {
+		t.Error("空 [search] 段不该标记为已设置")
+	}
+	if sectionOnly.Search.BodyCacheBudget() <= 0 {
+		t.Error("空 [search] 段应当走默认预算，而不是被读成 0（禁用）")
+	}
 	if !zero.Search.bodyCacheSet || zero.Search.BodyCacheMB != 0 {
 		t.Errorf("写了 0 应当记为「已设置且为 0」，实际 set=%v mb=%d",
 			zero.Search.bodyCacheSet, zero.Search.BodyCacheMB)

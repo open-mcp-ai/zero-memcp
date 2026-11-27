@@ -92,6 +92,24 @@ func withIndex(cfg string) string {
 	return cfg + "\n[index]\nenabled = true\n"
 }
 
+// waitIndexReady 等后台索引构建结束。
+//
+// [index] async 的默认值是 true（配置驱动的实例），所以 New() 返回时
+// 树可能还没加载完——「先监听端口，再建索引」正是这个默认的全部意义。
+// 测试若要断言「一启动就能查到」，就必须显式等；不等就断言，测到的是
+// 竞态而不是功能。
+func waitIndexReady(t *testing.T, s *Server) {
+	t.Helper()
+	if s == nil || s.indexBuildDone == nil {
+		return
+	}
+	select {
+	case <-s.indexBuildDone:
+	case <-time.After(120 * time.Second):
+		t.Fatal("后台索引构建 120s 未完成")
+	}
+}
+
 func mintToken(t *testing.T, dataDir, sub string) string {
 	t.Helper()
 	secret, err := auth.LoadOrCreateSecret(filepath.Join(dataDir, "system", "jwt.key"))

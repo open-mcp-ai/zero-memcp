@@ -782,17 +782,21 @@ func ParseFile(raw []byte) (*File, error) {
 	}
 
 	if sec, ok := doc.Sections["search"]; ok {
-		if v, err := integer(sec, "[search]", "body_cache_mb"); err != nil {
+		// 只在这一项真的写了时才置「已设置」：光有 [search] 段不算数。
+		// 早先无条件置真，于是 [search] 里没写 body_cache_mb 时预算被读成
+		// 0（=禁用），正文缓存静默关掉，每次 grep 重新解压全库。
+		if v, set, err := integerIfSet(sec, "[search]", "body_cache_mb"); err != nil {
 			return nil, err
-		} else {
+		} else if set {
 			f.Search.BodyCacheMB = int(v)
 			f.Search.bodyCacheSet = true
 		}
 	}
 	if sec, ok := doc.Sections["index"]; ok {
-		if v, err := boolean(sec, "[index]", "enabled"); err != nil {
+		// 同样只在真写了这一项时置「已设置」：光有 [index] 段不算数。
+		if v, set, err := booleanIfSet(sec, "[index]", "enabled"); err != nil {
 			return nil, err
-		} else {
+		} else if set {
 			f.Index.Enabled = v
 			f.Index.enabledSet = true
 		}
@@ -802,9 +806,12 @@ func ParseFile(raw []byte) (*File, error) {
 		if f.Index.Exclude, err = list(sec, "[index]", "exclude"); err != nil {
 			return nil, err
 		}
-		if v, err := boolean(sec, "[index]", "async"); err != nil {
+		// async 的默认是「开」，所以这里必须区分「没写」与「写了 false」：
+		// 无条件置 asyncSet = true 会让默认值永远不生效，[index] 段里
+		// 只写 enabled = true 的实例都会退回同步建索引。
+		if v, set, err := booleanIfSet(sec, "[index]", "async"); err != nil {
 			return nil, err
-		} else {
+		} else if set {
 			f.Index.Async = v
 			f.Index.asyncSet = true
 		}
@@ -1269,6 +1276,36 @@ func integer(sec map[string]Value, section, key string) (int64, error) {
 		return 0, fmt.Errorf("%s in %s must be an integer (line %d)", section, key, v.Line)
 	}
 	return v.Int, nil
+}
+
+// booleanIfSet 与 boolean 的唯一差别：多报一个「配置里到底写没写这一项」。
+//
+// 为什么必须有它：凡是「未配置时用默认值」的字段，都得先分清「没写」与
+// 「写了 false」。boolean 把两者都返回 false，调用方若据此置「已设置」
+// 标记，默认值就永远不生效——[index] 段里没写 async 时，后台建索引的
+// 默认被读成 false，启动时同步重建全量索引，端口几分钟不监听（实测
+// >120s 拿不到 /health）。
+func booleanIfSet(sec map[string]Value, section, key string) (val, set bool, err error) {
+	if _, ok := sec[key]; !ok {
+		return false, false, nil
+	}
+	v, err := boolean(sec, section, key)
+	if err != nil {
+		return false, false, err
+	}
+	return v, true, nil
+}
+
+// integerIfSet 是 integer 的「带是否设置」版本，理由同 booleanIfSet。
+func integerIfSet(sec map[string]Value, section, key string) (val int64, set bool, err error) {
+	if _, ok := sec[key]; !ok {
+		return 0, false, nil
+	}
+	v, err := integer(sec, section, key)
+	if err != nil {
+		return 0, false, err
+	}
+	return v, true, nil
 }
 
 // number 读一个数值，整数与小数都收。

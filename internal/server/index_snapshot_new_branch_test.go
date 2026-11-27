@@ -56,6 +56,7 @@ func TestSnapshotRestoreIncludesBranchesCreatedAfterSnapshot(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = restarted.Close() })
+	waitIndexReady(t, restarted)
 
 	out, err := callMCP(t, restarted, tok, "recall "+marker+" --scope blackegg/me@after-snapshot")
 	if err != nil {

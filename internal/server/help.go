@@ -54,6 +54,7 @@ Several statements in one call:
       recall q --scope p@fact || recall q --scope p@record || recall q --scope p@thought
   "Found something" means hits, not exit status: a search that legitimately
   matches nothing is not an error. A real error stops the chain either way.
+  Output pipes: '| head [N]', '| tail [N]', and '| less' slice or inspect output.
   Content ALWAYS travels through vars/args as a variable reference ($TEXT or $1):
   the protocol refuses an inline body outright. A ';' inside a value stays in
   that value, because values are spliced in and never re-read as syntax.

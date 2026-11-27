@@ -1566,7 +1566,12 @@ func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage
 	// 与真正执行的语句可能不是同一组——这类不一致只在被利用时才显形。
 	// 现在检查与执行都走 termcp 的 Parse。
 	probe, _ := s.newTerm(Viewer{Channel: "mcp"}, c)
-	plan, perr := probe.Parse(cmd, term.Subst{})
+	// 预检必须看到「真正会执行的那条语句」。
+	//
+	// 带轻量管道（`put x $T | head`）时 termcp.Parse 不认识 `|`，perr 非空
+	// 会让下面的端口策略整个被跳过——于是一条写命令从只读端口的检查里漏过去，
+	// 而它随后真会被执行。先剥掉管道再预检，两处看法才一致。
+	plan, perr := probe.Parse(stripCommandPipes(cmd), term.Subst{})
 	if perr != nil {
 		// 语法错误交给 execTerm 去报（那里有完整的 usage 提示），
 		// 这里不重复判断——但语法不通的行不可能绕过策略。
@@ -1732,6 +1737,16 @@ func (s *Server) execTerm(line string, v Viewer, c Caller) (TermResult, error) {
 
 // execTermVars 是带 vars/args 注入的执行入口。
 func (s *Server) execTermVars(line string, vars map[string]string, args []string, v Viewer, c Caller) (TermResult, error) {
+	// 轻量输出管道（issue #6）：`grep x | head -40`、`recall q | tail 5`、`ls | less`。
+	//
+	// 没有管道时一个字节都不改地走原来的路径（原封不动交给 termcp），
+	// 所以这条兼容层对绝大多数调用是零影响。
+	if piped, err := s.execTermWithPipes(line, vars, args, v, c); piped != nil || err != nil {
+		if err != nil {
+			return TermResult{}, err
+		}
+		return *piped, nil
+	}
 	// 变量注入：vars/args 的值进 Subst，DSL 里只留引用。
 	//
 	// 注入发生在解析之前，所以值里有什么字符都不会变成语法——
@@ -1801,6 +1816,60 @@ func (s *Server) execTermVars(line string, vars map[string]string, args []string
 		}
 	}
 	return renderReply(reply, h), nil
+}
+
+// execTermWithPipes 处理带轻量输出管道的命令行。
+//
+// 返回 nil, nil 表示「这一行没有管道」，调用方继续走原来的 termcp 路径。
+//
+// 为什么要在这里接管而不是改 termcp：`|` 在 termcp 里是 `read <h> | write <h>`
+// 专用（跨设备搬字节），zero-memcp 根本没有那个构造。让调用方按 shell 习惯
+// 写 `grep x | head -40` 是合理的期待，而它现在的报错把使用者引向一个
+// 不存在的语法糖（issue #6）。
+//
+// 安全边界不变：每条语句剥掉管道之后仍然完整交给 termcp 解析与执行，
+// 变量引用校验、PayloadVar 隔离、端口白名单一个不少。
+func (s *Server) execTermWithPipes(line string, vars map[string]string, args []string, v Viewer, c Caller) (*TermResult, error) {
+	stmts, ops, hasPipe, err := parseCommandPipes(line)
+	if err != nil {
+		return nil, err
+	}
+	if !hasPipe {
+		return nil, nil
+	}
+
+	// 逐句执行，并按 `&&` / `||` 短路——语义与 termcp 的单语句链一致：
+	// 「找到了」才算成功（Empty 为假），未命中触发 `||` 的下一层。
+	var texts []string
+	last := TermResult{Empty: true}
+	for i, st := range stmts {
+		if i > 0 {
+			op := ";"
+			if i-1 < len(ops) {
+				op = ops[i-1]
+			}
+			switch op {
+			case "&&":
+				if last.Empty {
+					continue
+				}
+			case "||":
+				if !last.Empty {
+					continue
+				}
+			}
+		}
+		res, rerr := s.execTermVars(st.left, vars, args, v, c)
+		if rerr != nil {
+			return nil, rerr
+		}
+		text := applyPipeStages(res.Text, res.Empty, st.stages)
+		last = res
+		last.Text = text
+		texts = append(texts, text)
+	}
+	last.Text = strings.Join(texts, "\n")
+	return &last, nil
 }
 
 // execStatement runs exactly one statement.

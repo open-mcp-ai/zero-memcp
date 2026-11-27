@@ -632,9 +632,7 @@ func (ix *Index) SearchCovered(query string, limit int, idfFloor, minCoverage fl
 		}
 
 		for _, e := range entries {
-			if filter != nil && !filter(e.Addr) {
-				continue
-			}
+			// 这里**不**调 filter。原因见函数末尾的"权限过滤放在最后"。
 			dl := float64(ix.docLenOf(e.Addr))
 			if dl == 0 {
 				dl = 1
@@ -702,6 +700,42 @@ func (ix *Index) SearchCovered(query string, limit int, idfFloor, minCoverage fl
 		}
 		return hits[i].Addr < hits[j].Addr // 稳定排序，结果可复现
 	})
+
+	// 权限过滤放在**排序之后**，按分数从高到低走，凑够 limit 就停。
+	//
+	// 这里曾经把 filter 放在最内层的 posting 循环里，代价是：查询的每个词
+	// 在索引里出现的**每一条 posting** 都要跑一次完整的权限链
+	// （SplitID → branchVisible → roleAllowsPath → allowed → 挂载表 → ACL）。
+	// 常见词在 6.4 万块的库里有几万条 posting，于是实测：
+	//
+	//	recall 的        → 9.5~11.2s   （root 凭证同一句 31ms）
+	//	recall 记忆      → 2.2~9.2s
+	//	recall <生僻词>  → 2.5~3.4s   （只命中 1 篇，仍要 3 秒）
+	//
+	// 最后一条是决定性证据：命中数只有 1，耗时却和热门词同量级——说明
+	// 成本在"扫了多少 posting"，不在"返回多少结果"。
+	//
+	// 为什么可以移到后面：BM25 对每篇文档的打分只依赖它自己的 tf 和
+	// 全局 avgLen，与别的文档是否被过滤无关；覆盖率、时间增益、频次增益
+	// 同样是逐文档可算的。所以"先全量算分再按序过滤"与"边算边过滤"
+	// 得到的是同一个集合、同一个顺序。
+	//
+	// 为什么不会让别人的内容占名额：过滤仍然是**按分数顺序**做的，
+	// 遇到无权访问的就跳过继续往下取，直到凑够 limit。被跳过的那些
+	// 不会挤掉任何有权的文档——这正是原来那条注释担心的情形。
+	if filter != nil {
+		kept := hits[:0]
+		for _, h := range hits {
+			if !filter(h.Addr) {
+				continue
+			}
+			kept = append(kept, h)
+			if limit > 0 && len(kept) >= limit {
+				break
+			}
+		}
+		hits = kept
+	}
 	if limit > 0 && len(hits) > limit {
 		hits = hits[:limit]
 	}

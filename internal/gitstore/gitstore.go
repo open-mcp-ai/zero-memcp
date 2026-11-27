@@ -98,6 +98,22 @@ type Repo struct {
 	fsBox     atomic.Pointer[fsHolder]
 	lockerBox atomic.Pointer[lockerHolder]
 
+	// lockCache 缓存「被锁的分支 → 加锁时的提交」。
+	//
+	// 为什么需要：BranchLocked 每次都要读一次锁文件，而它就在 allowed()
+	// 的第一行——也就是**每一次权限判定都要付一次真实磁盘 syscall**。
+	// Windows bind mount 上实测约 1.25ms/次。recall 曾经把权限过滤放在
+	// 倒排扫描的内层，于是一次查询要跑几千上万次，11 秒全耗在这个读文件上。
+	//
+	// 为什么可以缓存：锁只有本进程会改（LockBranch / UnlockBranch），
+	// 而数据目录由 instance.lock 保证单实例独占。两个失效点都在这两个
+	// 函数里，改完置 nil 即可。
+	//
+	// 存的是「整份锁表」而不是单个分支：首次访问走一次目录，之后全部
+	// 命中内存；只缓存单个分支的话，没被锁的分支（绝大多数）每查一次
+	// 仍要回一次盘——而那恰好是最常见的情形。
+	lockCache atomic.Pointer[map[string]string]
+
 	// writer 是单线程脏层写者。Write/Delete 只把任务投递进队列就返回；
 	// Read/List/Commit 会排一个 barrier，保证此前已接受的任务先处理完。
 	writerOnce sync.Once

@@ -172,13 +172,18 @@ type indexCounters struct {
 // indexScopeFingerprint 是当前 [index] 范围的稳定指纹。
 //
 // 进快照头，用来判断「这份快照还是不是当前范围建的」。
+//
+// 没有配置文件（库调用方、测试）时也必须走同一套拼法：
+// 早先这里单独返回 "all"，而配置文件存在但没写 include/exclude 时
+// 返回 "inc=;exc="。两者语义完全相同（都是全量索引），却是两个
+// 不同的字符串——于是一个用 "all" 写的快照被一个用 "inc=;exc=" 的
+// 实例读到就会判「范围变了」，白白全量重建一次。
 func (s *Server) indexScopeFingerprint() string {
-	f := s.cfgFilePtr.Load()
-	if f == nil {
-		return "all"
+	var inc, exc []string
+	if f := s.cfgFilePtr.Load(); f != nil {
+		inc = append(inc, f.Index.Include...)
+		exc = append(exc, f.Index.Exclude...)
 	}
-	inc := append([]string(nil), f.Index.Include...)
-	exc := append([]string(nil), f.Index.Exclude...)
 	sort.Strings(inc)
 	sort.Strings(exc)
 	return "inc=" + strings.Join(inc, ",") + ";exc=" + strings.Join(exc, ",")

@@ -79,6 +79,24 @@ func (s *Server) kickSemantic() {
 	s.semanticMaint.runner.kick()
 }
 
+// indexBuildRunning 报告初始索引是否仍在后台构建。
+//
+// indexBuildDone 只在 [index] async 路径上创建；同步构建（库调用方、测试）
+// 与索引关闭的情况下它是 nil，而那时 New() 返回时树已经完整，
+// 所以 nil 必须解释为「不在构建」，否则语义永远不启动。
+func (s *Server) indexBuildRunning() bool {
+	done := s.indexBuildDone
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
+}
+
 // catchUpSemantic 把语义索引追平到当前树状态。
 //
 // 这是「嵌入失败后自动补」的落点。它不假设嵌入服务可用，
@@ -86,6 +104,27 @@ func (s *Server) kickSemantic() {
 // 之前没算成的那批会因为「指纹在 prints 里查不到」被认成新增，
 // 走同一条增量路径补上。
 func (s *Server) catchUpSemantic(reason string) {
+	// 初始索引还在后台构建时，一律不追平。
+	//
+	// 这条是拿真实损失换来的。树是**逐分支发布**的：扫到第三条分支时，
+	// 前两条已经在快照里了，而 semanticDelta / buildSemanticIndex 看到的
+	// 是「当前树的全集」——它无从分辨「索引真的只有这几篇」和「扫描还没扫完」。
+	// 于是它按一个很小的 jobs 集合算完，把它当成完整结果 SaveRev 写盘。
+	//
+	// 实测（3060, v0.2.12）：快照因版本升级被丢弃→后台重建索引，
+	// 容器启动 4 秒时语义追平只看到 6 片，把原本 **54,630 条**的向量
+	// 缓存覆盖成 **6 条**（vectors.bin 从 218MB 变成 24KB）。之后要重跑
+	// 五万多次嵌入才补回来，而重建又占满嵌入服务，把正常查询拖到超时。
+	//
+	// 为什么 Mac 上没触发：那边快照 5.7 秒就加载完，语义启动时树已完整。
+	// 触发条件是「快照不可用 + 索引在后台建」这个组合，不是某个平台。
+	//
+	// 为什么不等它、而是跳过本轮：构建可能要几分钟，等就是占着维护协程；
+	// 而维护协程每周期都会再来一次，跳过不丢任何东西。
+	if s.indexBuildRunning() {
+		return
+	}
+
 	// 后端为 nil（启动时全链不可用）→ 每个周期尝试重建链。
 	emb := s.semantic.getEmb()
 	if emb == nil {

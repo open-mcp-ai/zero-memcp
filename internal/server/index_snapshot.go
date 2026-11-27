@@ -64,10 +64,31 @@ func (s *Server) tryLoadIndexSnapshot(defaultBranch string) bool {
 	// 不检查的后果是「配置没生效但看起来生效了」——刚被 exclude 掉的
 	// 分支会从旧快照里原样回来，recall 照样命中它们，而 status 明明
 	// 写着已排除。这种自相矛盾比不生效难查一百倍。
-	if hdr.IndexScope != s.indexScopeFingerprint() {
+	//
+	// 但空值要单独放行：IndexScope 是 v0.2.10 才加进头部的字段，
+	// 更早版本写的快照里它根本不存在，gob 解出来是 ""。而 "" 与
+	// 当前配置算出的 "inc=;exc=" 在语义上是同一件事——两者都表示
+	// 「没限定范围」。
+	//
+	// 不放过这一条的后果是实测到的：3060 从 v0.2.7 升到 v0.2.12，
+	// 第一次启动就判「范围变了」，丢掉快照、全量重建 42 分钟，
+	// 而配置一个字都没改。任何 ≤v0.2.9 升到 ≥v0.2.10 的部署都会踩。
+	//
+	// 为什么「空值等于不限定」而不是「空值一律拒绝」：快照里没有这个
+	// 字段，意味着写它的时候代码还没有范围这个概念，那时必然是全量索引。
+	// 除非当前配置真的加了范围（此时指纹非 "inc=;exc="），否则两者等价。
+	if hdr.IndexScope != "" && hdr.IndexScope != s.indexScopeFingerprint() {
 		startupStage("reload: index scope changed (%q -> %q); discarding snapshot",
 			hdr.IndexScope, s.indexScopeFingerprint())
 		return false
+	}
+	if hdr.IndexScope == "" {
+		// 老快照：范围信息缺失。只在当前也无限定范围时沿用。
+		if fp := s.indexScopeFingerprint(); fp != "inc=;exc=" && fp != "all" {
+			startupStage("reload: legacy snapshot has no index scope, but this instance is limited to %q; discarding snapshot", fp)
+			return false
+		}
+		startupStage("reload: adopting legacy snapshot (no index scope recorded; assuming unrestricted)")
 	}
 
 	// 树从树快照恢复，跳过扫描。

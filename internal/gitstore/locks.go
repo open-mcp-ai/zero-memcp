@@ -42,6 +42,7 @@ func (r *Repo) LockBranch(branch string) (string, error) {
 	if err := r.FS().WriteAtomic(path, []byte(sha+"\n"), 0o600); err != nil {
 		return "", err
 	}
+	r.lockCache.Store(nil) // 锁表变了：下次访问重新读一遍
 	return sha, nil
 }
 
@@ -58,20 +59,59 @@ func (r *Repo) UnlockBranch(branch string) (bool, error) {
 	if err := r.FS().Remove(path); err != nil && !isNotExist(err) {
 		return false, err
 	}
+	r.lockCache.Store(nil) // 锁表变了：下次访问重新读一遍
 	return true, nil
 }
 
 // BranchLocked 报告分支是否被锁，以及加锁时它指向的提交。
+//
+// 这是热路径：allowed() 第一行就调它，而 allowed() 在一次请求里会被
+// 调用很多次（每个候选文档一次、每个权限位一次）。所以这里走进程内
+// 锁表缓存，只在首次访问时扫一次目录。
+//
+// 实测：修正前的 recall 在一次查询里跑几千次 BranchLocked，在 Windows
+// bind mount 上每次约 1.25ms（ReadFile 命中 ENOENT 也要过一层 host
+// syscall），单次查询因此慢到 9.5~11.2 秒。
 func (r *Repo) BranchLocked(branch string) (bool, string) {
-	b, err := r.FS().ReadFile(r.lockPath(normalizeRef(branch)))
-	if err != nil {
-		return false, ""
+	name := normalizeRef(branch)
+	if m := r.lockCache.Load(); m != nil {
+		sha, ok := (*m)[name]
+		return ok, sha
 	}
-	sha := strings.TrimSpace(string(b))
-	if validSHA(sha) != nil {
-		return false, ""
-	}
-	return true, sha
+
+	table := r.loadLockTable()
+	r.lockCache.Store(&table)
+	sha, ok := table[name]
+	return ok, sha
+}
+
+// loadLockTable 读出当前全部锁（分支 → 提交）。
+//
+// 锁文件损坏（非 SHA）一律当作未锁，与旧的逐分支路径保持一致：
+// 锁是「额外的拒绝理由」，不能因为一个写坏的文件把整条分支永久封死。
+func (r *Repo) loadLockTable() map[string]string {
+	out := make(map[string]string)
+	root := filepath.Join(r.Path, lockDirName)
+	_ = r.FS().WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name, decErr := base64.RawURLEncoding.DecodeString(d.Name())
+		if decErr != nil {
+			return nil
+		}
+		b, readErr := r.FS().ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+		sha := strings.TrimSpace(string(b))
+		if validSHA(sha) != nil {
+			return nil
+		}
+		out[string(name)] = sha
+		return nil
+	})
+	return out
 }
 
 // LockedBranches 列出被锁的分支名。

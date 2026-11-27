@@ -8,19 +8,31 @@
 ## 快速开始
 
 ```bash
-# 1. 准备数据目录与配置
+# 1. 准备数据目录与配置（字面照抄；这份示例已经按容器改好了三处）
 mkdir -p ~/.zero-memcp/data
-cp ../../zero-memcp.example.toml ~/.zero-memcp/zero-memcp.toml
-# 或从宿主机现有配置派生（只替换 data/listen/vectors/ollama 四处挂载差异）：
+cp zero-memcp.container.example.toml ~/.zero-memcp/zero-memcp.toml
+
+# 2. 启动（compose 默认就以 ~/.zero-memcp/zero-memcp.toml 为配置）
+docker compose up -d
+
+# 3. 验证（应回 {"ok":true,"version":"..."}）
+curl -sS http://127.0.0.1:1729/health
+```
+
+首次启动会在日志里打印一次性管理口令，登录 WebUI 后必须修改：
+
+```bash
+docker compose logs | grep -i password
+```
+
+**已经有了宿主机原生配置？** 用 `derive-container-config.py` 派生，
+不要手抄第二份——手抄的那份会漂，漂了的症状是「同步静默落后」：
+
+```bash
 python3 derive-container-config.py \
   --src ~/.zero-memcp/zero-memcp.toml \
   --dst ~/.zero-memcp/zero-memcp.container.toml
-
-# 2. 启动
 ZERO_MEMCP_CONFIG=~/.zero-memcp/zero-memcp.container.toml docker compose up -d
-
-# 3. 验证
-curl -sS http://127.0.0.1:1729/health
 ```
 
 > 中国大陆网络直连 `ghcr.io` 的 blob CDN 速度较慢时，可用 `../backup-node/zm-image-sync.sh <tag>` 从国内镜像源拉取并校验官方 index digest 后再打回 `ghcr.io` 标签。

@@ -1,0 +1,38 @@
+# 容器部署用的最小配置。
+#
+# 与仓库根的 zero-memcp.example.toml 的差别只有三处，都是**容器带来的**：
+#   1. data 必须是挂载点 /data（宿主机目录被绑到这里）
+#   2. addr 必须监听 0.0.0.0（Docker 的端口转发连的是容器 eth0，不是 lo）
+#   3. 非回环监听必须带凭证（enforce_auth + require="bearer"），否则服务拒绝启动
+#
+# 用法见同目录 README：把它放到宿主机的挂载点，改掉 project 名即可。
+
+[server]
+data         = "/data"
+endpoint     = "container"
+enforce_auth = true
+
+[[listen]]
+addr    = "0.0.0.0:1729"
+allow   = ["*"]
+require = "bearer"
+
+[[user]]
+name = "zero"
+root = true
+
+[[project]]
+name  = "my/memory"
+owner = "zero"
+mode  = "rwx------"
+
+# 要读要搜的节点必须显式开索引；纯备份节点删掉这一节即可（内存几十 MB）。
+[index]
+enabled = true
+
+[commit]
+interval = "30s"
+count    = 100
+
+[gc]
+interval = "24h"

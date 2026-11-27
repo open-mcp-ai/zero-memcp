@@ -16,11 +16,14 @@ import (
 
 // flakyEmbedServer 模拟 Embedding 服务：可以随时切成故障/恢复。
 type flakyEmbedServer struct {
-	srv   *httptest.Server
-	down  atomic.Bool
-	calls atomic.Int64
-	texts atomic.Pointer[[]string]
-	dim   int
+	srv  *httptest.Server
+	down atomic.Bool
+	// downAfter > 0 时，第 downAfter 次请求之后开始失败（0 = 关掉这个开关）。
+	downAfter atomic.Int64
+	reqs      atomic.Int64
+	calls     atomic.Int64
+	texts     atomic.Pointer[[]string]
+	dim       int
 }
 
 func newFlakyEmbedServer(t *testing.T, dim int) *flakyEmbedServer {
@@ -28,6 +31,13 @@ func newFlakyEmbedServer(t *testing.T, dim int) *flakyEmbedServer {
 	f := &flakyEmbedServer{dim: dim}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// 故障态：模拟 Ollama 没起来 / 3060 断网
+		//
+		// downAfter 是「跑到一半才挂」：先放行 n 次请求，之后一律 503。
+		// 这个形态和「一开始就挂」不同——它才检验得出中途落盘有没有生效。
+		if lim := f.downAfter.Load(); lim > 0 && f.reqs.Add(1) > lim {
+			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		if f.down.Load() {
 			http.Error(w, "service unavailable", http.StatusServiceUnavailable)
 			return
@@ -65,7 +75,25 @@ func newFlakyEmbedServer(t *testing.T, dim int) *flakyEmbedServer {
 	return f
 }
 
-func (f *flakyEmbedServer) SetDown(v bool) { f.down.Store(v) }
+func (f *flakyEmbedServer) SetDown(v bool) {
+	f.down.Store(v)
+	// 恢复时必须把「第 n 批之后挂」的开关一起复位，
+	// 否则它仍然闸在那个位置，恢复请求继续 503。
+	if !v {
+		f.downAfter.Store(0)
+	}
+}
+
+// SetDownAfterBatch 让服务在第 n 批请求之后开始返回 503。
+//
+// 用来复现「一轮构建跑到一半后端挂了」——这是线上最常见的故障形态
+// （Ollama 重启、3060 断网），也是「中途落盘」唯一有价值的场景。
+// 批次的粒度靠 downAfter 里的累计条数控制，而调用方按 batchSize 分批，
+// 所以这里按「请求数」计：第 n 次请求之后开始失败。
+func (f *flakyEmbedServer) SetDownAfterBatch(n int) {
+	f.downAfter.Store(int64(n))
+	f.down.Store(false)
+}
 
 // TestSemanticSelfHealsAfterOutage 锁定自愈闭环：
 //

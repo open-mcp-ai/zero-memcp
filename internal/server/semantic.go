@@ -368,6 +368,14 @@ func (s *Server) semanticHeads() map[string]string {
 //
 // 复用常驻 embedder，不自己 Open：模型 449MB，建完索引后它还要
 // 继续服务查询，不能在这里 Close 掉。
+// semanticSaveEvery 是构建中途中途落盘的间隔。
+//
+// 依据是实测的写盘成本：20,448 条 1024 维向量 204ms（83.8 MB）。
+// 5 分钟一次意味着一个多小时的构建里总共多花几秒，换来「重启不白费」。
+//
+// 是 var 而不是 const：测试要把它压到 0 才能确定地观察到这条路径。
+var semanticSaveEvery = 5 * time.Minute
+
 func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cached *vecindex.Index, cachedPrints map[string]string) error {
 	emb := s.semantic.getEmb()
 	if emb == nil {
@@ -513,6 +521,7 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 	// 并发起来——逐条调用会让 5,000+ 片的建索引慢一个量级。
 	// ONNX 后端的 EmbedBatch 是加锁循环，行为不变。
 	var failed int
+	lastSave := time.Now()
 	for i := 0; i < len(toEmbed); i += batchSize {
 		end := i + batchSize
 		if end > len(toEmbed) {
@@ -568,6 +577,23 @@ func (s *Server) buildSemanticIndex(vecDir string, heads map[string]string, cach
 		}
 		if end%200 < batchSize {
 			s.logf("semantic: %d/%d embedded (%.1fs)", end, len(toEmbed), time.Since(start).Seconds())
+		}
+		// 中途落盘：整轮可能要跑一个多小时（26,293 片 × 本地 ollama），
+		// 而写一次只需 204ms（20,448 × 1024 维实测）。
+		//
+		// 不这样做的话，「重启 = 从零重算」。而重启是常态：发版、OOM、
+		// 改配置。线上实测过两次：跑到 18,400/26,293 时重启，1.5 小时的
+		// 推理全丢，日志上只表现为新进程把整个增量重跑一遍。
+		//
+		// 落盘的内容本身就是「已算完的部分」——prints 里只包含成功的那几条，
+		// 所以下次启动的增量比对会自然把剩下的当成新增，不会把半成品当完整。
+		if saveDir := s.vectorDirFor(emb); saveDir != "" && time.Since(lastSave) >= semanticSaveEvery {
+			if serr := ix.SaveRev(saveDir, emb.Name(), embed.Revision(emb), heads, prints); serr != nil {
+				s.logf("semantic: interim cache save failed (will retry later): %v", serr)
+			} else {
+				lastSave = time.Now()
+				s.logf("semantic: interim cache saved with %d vector(s) after %d/%d", ix.Len(), end, len(toEmbed))
+			}
 		}
 	}
 	if ix.Len() == 0 {

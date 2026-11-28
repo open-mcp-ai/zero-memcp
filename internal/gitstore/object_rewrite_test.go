@@ -2,6 +2,7 @@ package gitstore
 
 import (
 	"os"
+	"sync"
 	"testing"
 )
 
@@ -60,5 +61,44 @@ func TestRepeatedBlobPutIsIdempotentUnderSampling(t *testing.T) {
 		if err := r.PutBlob(sha, body); err != nil {
 			t.Fatalf("第 %d 次落盘失败: %v", i+1, err)
 		}
+	}
+}
+
+// 两个写者同时写同一个对象：一个走异步脏层写者，一个走 PutBlob。
+//
+// 这是 CI（windows）红的真实成因，而不是「抽检发现坏对象」那条路：
+// repo.Write 只是把任务投进写者队列，落盘是异步的，所以
+// PutBlob 的 Stat 完全可能说「对象还不存在」，而它的 rename 撞上
+// 异步写者刚写好的那个 0444 文件。POSIX 的 rename 能盖过只读，
+// Windows 的 MoveFileEx 不能——于是只有 Windows 红。
+func TestConcurrentBlobWritersOnReadOnlyStore(t *testing.T) {
+	r := newTestRepo(t)
+	body := []byte("两个写者抢着写同一个对象")
+	sha, err := r.BlobHash(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 先写一次，确保对象存在且是 0444（模拟异步写者已经写好了）。
+	if err := r.PutBlob(sha, body); err != nil {
+		t.Fatal(err)
+	}
+	// 再并发写同一个对象若干次：每次都会走「目标已存在」的处理。
+	var wg sync.WaitGroup
+	errs := make([]error, 8)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			errs[i] = r.PutBlob(sha, body)
+		}(i)
+	}
+	wg.Wait()
+	for i, e := range errs {
+		if e != nil {
+			t.Fatalf("第 %d 个并发写者失败: %v", i, e)
+		}
+	}
+	if err := r.verifyObjectFile(r.objectPath(sha), sha); err != nil {
+		t.Fatalf("并发写完之后对象内容不对: %v", err)
 	}
 }

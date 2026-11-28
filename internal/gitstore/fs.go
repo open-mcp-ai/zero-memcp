@@ -164,12 +164,51 @@ func writeAtomicNative(path string, perm os.FileMode, syncFile, syncDirectory bo
 		return err
 	}
 	if err := os.Rename(tmpName, path); err != nil {
+		// 目标已存在且是只读时，Windows 的 MoveFileEx 直接报 Access is denied；
+		// POSIX 的 rename 只看目录权限，能盖过去——所以这条在 macOS/Linux 上
+		// 永远测不出来（本地全绿、CI windows 红）。
+		//
+		// 这不是理论情形：对象文件就是 0444，而**两个写者会同时写同一个对象**。
+		// repo.Write 只是把任务投进写者队列（异步落盘），所以
+		//   repo.Write(branch, p, body)   ← 异步写者稍后写 blob
+		//   repo.PutBlob(sha, body)       ← 同一个 blob，Stat 时还没出现
+		// 两者会撞在一起：Stat 说「没有」→ 我们写 → rename 时它已经在了。
+		// 实测 CI（windows）就是这么红的：
+		//   persist object: rename …\objects\f8\.tmp-… …\objects\f8\e0804eaa…: Access is denied.
+		//
+		// 处理：放开目标权限删掉再重试一次。替换掉只读目标本来就是这里的
+		// 意图（rename 的语义就是覆盖），所以这一步不改变语义，只是把
+		// Windows 上做不到的那一步补上。
+		if rmErr := removeReadOnly(path); rmErr == nil {
+			if retryErr := os.Rename(tmpName, path); retryErr == nil {
+				if syncDirectory {
+					return syncDir(dir)
+				}
+				return nil
+			} else {
+				return retryErr
+			}
+		}
 		return err
 	}
 	if syncDirectory {
 		return syncDir(dir)
 	}
 	return nil
+}
+
+// removeReadOnly 把目标文件放开权限后删掉。
+//
+// Windows 上删只读文件会失败（POSIX 上删除只看目录权限，所以这一步在
+// Unix 上通常多余但无害）。先 chmod 再删：chmod 失败不致命——可能文件
+// 本来就可写，继续尝试删除；确实删不掉就把错误交回调用方，让它如实报错。
+func removeReadOnly(path string) error {
+	_ = os.Chmod(path, 0o666)
+	err := os.Remove(path)
+	if err == nil || errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // isNotExist 判定错误是否表示文件/目录不存在。

@@ -350,6 +350,16 @@ func (s *Server) execCrossBranch(rest string, c Caller, isMove bool) (string, er
 	if !s.allowed(c, dstProj, dstBranch, configBitWrite) {
 		return "", fmt.Errorf("%s", s.denyReason(c, dstProj, dstBranch, configBitWrite))
 	}
+	// 拼错的目标分支同样要拦。cp/mv 直接拿 parseBranchAddr 的结果去写，
+	// 不经过 put 的 planWrite，所以那道门在它们身上不生效——
+	// 实测 `cp x -> blackegg/me@zeroo/y.md` 回了 "copy 1 files" 并建出
+	// 一条新分支。声明了的保护必须在每条写路径上都生效。
+	if newBranch, berr := s.checkWriteBranch(dstProj, dstBranch); berr != nil {
+		return "", berr
+	} else if newBranch {
+		s.logf("cp/mv: new branch %s@%s created by this operation (not in any sync list, not listed by trees)",
+			dstProj, dstBranch)
+	}
 
 	var moved []string
 	for _, raw := range srcs {

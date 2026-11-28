@@ -81,6 +81,19 @@ func (s *Server) execWrite(rest string, c Caller, defaultBranch string) (string,
 	if !s.allowed(c, proj, branch, configBitWrite) {
 		return "", fmt.Errorf("not authorized to write to %s@%s", proj, branch)
 	}
+	// 拼错的分支名在这里也要拦住。
+	//
+	// put 走 planWrite，那里有这道门；write 走 resolveAddr（服务于所有读
+	// 动词，不判「分支是否存在」），于是同一个手误在 put 上被拒绝、在 write
+	// 上却静默建出一条新分支——实测就是这样：`write blackegg/me@zeroo:x.md`
+	// 回了 "written to blackegg/me@zeroo/x.md; index refreshed"。
+	//
+	// 声明了的保护必须在每条写路径上都生效，否则它只是「put 的保护」。
+	if newBranch, berr := s.checkWriteBranch(proj, branch); berr != nil {
+		return "", berr
+	} else if newBranch {
+		s.logf("write: new branch %s@%s created by this write (not in any sync list, not listed by trees)", proj, branch)
+	}
 
 	// 写入路径必须和 put 一致：项目已声明且这次写入获准，就不该因为
 	// 「仓库目录还没建」而失败。早先用 Get（读语义，不建仓），于是

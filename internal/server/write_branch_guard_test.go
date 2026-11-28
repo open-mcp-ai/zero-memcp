@@ -116,3 +116,67 @@ func TestTypoCheckSeesUncommittedBranches(t *testing.T) {
 		t.Fatal("脏层里的分支也要参与拼错检测，实际放行了——内容会进一条没有 ref、不同步的分支")
 	}
 }
+
+// 拼错分支名的保护必须在**每一条写路径**上生效，不只是 put。
+//
+// 自狗粮第三轮抓到的覆盖缺口：put 走 planWrite（有门），而
+//
+//	write 走 resolveAddr（服务于所有读动词，不判分支存在）
+//	cp/mv 直接拿 parseBranchAddr 的结果去写
+//
+// 两条都绕过了那道门——实测 write 回 "written to blackegg/me@zeroo/x.md;
+// index refreshed"，cp 回 "copy 1 files"，各自静默建出一条新分支。
+//
+// 声明了的保护只在一条路上生效，它就不是保护，是「put 的保护」。
+func TestEveryWritePathRefusesMisspelledBranch(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Cap: "rwx"})
+	const project = "blackegg/me"
+
+	// 先让 zero 这条分支存在，并放一条内容供 cp/mv 用。
+	if _, err := callMCP(t, srv, tok, "put "+project+"@zero -- 基线内容"); err != nil {
+		t.Fatal(err)
+	}
+	out, err := callMCP(t, srv, tok, "ls")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repo, err := srv.projects.Get(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flat, ferr := repo.FlattenBranch("zero")
+	if ferr != nil || len(flat) == 0 {
+		t.Fatalf("基线内容没落地: %v", ferr)
+	}
+	src := project + "@zero/" + flat[0].Path
+
+	cases := []struct {
+		name string
+		cmd  string
+	}{
+		{"write", "write " + project + "@zeroo/x.md -- 打错"},
+		{"cp", "cp " + src + " -> " + project + "@zeroo/copy.md"},
+		{"mv", "mv " + src + " -> " + project + "@zeroo/move.md"},
+	}
+	for _, c := range cases {
+		if _, cerr := callMCP(t, srv, tok, c.cmd); cerr == nil {
+			t.Fatalf("%s 没拦住拼错的分支名——它会静默建出一条不同步、不可见的分支（实际命令：%s）", c.name, c.cmd)
+		} else if !strings.Contains(cerr.Error(), "did you mean") {
+			t.Fatalf("%s 拒绝了但没给出「你是指 X 吗」：%v", c.name, cerr)
+		}
+	}
+
+	// 拼错的分支一条都不许被建出来。
+	for _, b := range repo.Branches() {
+		if b == "zeroo" {
+			t.Fatal("拼错的分支被建出来了")
+		}
+	}
+	for _, b := range repo.PendingRefs() {
+		if b == "zeroo" {
+			t.Fatal("拼错的分支被建进脏层了")
+		}
+	}
+	_ = out
+}

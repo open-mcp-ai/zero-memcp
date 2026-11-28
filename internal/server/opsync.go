@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"sort"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -1470,27 +1471,117 @@ func (s *Server) syncOpsWithRemote(client *http.Client, rm configRemote, project
 	//
 	// 拉在前还有个好处：对端的新内容先落地，推送时能一并把双向差异
 	// 算干净，一轮就好。
+	// 逐分支「先拉后推」，而不是「先拉完所有分支、再推所有分支」。
+	//
+	// 为什么改（2026-11-28 实测，量化过）：早先是两段式——一个对端有 11 条
+	// 分支，其中 main.chat 一条就 3.9 万条。刚写下的那条轻分支要排队等
+	// chat 的拉取跑完才轮到推它。实测「写一条 → 对端能读到」是
+	// 5.5～14.2 秒，而流水里那次推送本身耗时 0 毫秒。延迟不在传输，
+	// **在排队**。
+	//
+	// 逐分支之后，「先拉后推」的理由依然成立：推送算差分要以「对端手上
+	// 是哪棵树」为起点，那个信息由**同一条分支**的拉取带来，不需要等
+	// 别的分支跑完。
+	pullSet := map[string]bool{}
 	if !rm.PushOnly {
 		for _, br := range fetchBranches(rm.Pull, rm.Push, rm.PushOnly) {
-			if br == "*" {
-				continue
-			}
+			pullSet[br] = true
+		}
+	}
+	pushSet := map[string]bool{}
+	if !rm.FetchOnly {
+		for _, br := range rm.Push {
+			pushSet[br] = true
+		}
+	}
+	branches := mergedBranchOrder(pullSet, pushSet)
+	// 有本地待推内容的分支排在前面：那才是「实时」要保护的对象。
+	// 没有它，一条刚写下的记忆可能排在十几条安静分支之后。
+	branches = pendingFirst(branches, func(br string) bool {
+		return s.branchHasPendingOps(project, br, s.resolvePeer(rm.Name))
+	})
+	for _, br := range branches {
+		if br == "*" {
+			continue
+		}
+		if pullSet[br] {
 			if _, err := s.pullOpsFromPeer(client, rm.URL, rm.Token, rm.Name, project, br); err != nil {
 				return fmt.Errorf("pull %s: %w", br, err)
 			}
 		}
-	}
-	if !rm.FetchOnly {
-		for _, br := range rm.Push {
-			if br == "*" {
-				continue
-			}
+		if pushSet[br] {
 			if _, err := s.pushOpsToPeer(client, rm.URL, rm.Token, rm.Name, project, br); err != nil {
 				return fmt.Errorf("push %s: %w", br, err)
 			}
 		}
 	}
 	return nil
+}
+
+// mergedBranchOrder 把拉取集合与推送集合并成一条有序分支表。
+//
+// 顺序：先拉取表里的（保持配置顺序），再补只在推送表里的。
+// 用切片而不是 map 遍历：分支的处理顺序会影响哪条先被同步，
+// map 的随机序会让同一个配置每轮表现不同。
+func mergedBranchOrder(pullSet, pushSet map[string]bool) []string {
+	seen := make(map[string]bool, len(pullSet)+len(pushSet))
+	out := make([]string, 0, len(pullSet)+len(pushSet))
+	add := func(br string) {
+		if br == "" || seen[br] {
+			return
+		}
+		seen[br] = true
+		out = append(out, br)
+	}
+	for _, br := range sortedKeys(pullSet) {
+		add(br)
+	}
+	for _, br := range sortedKeys(pushSet) {
+		add(br)
+	}
+	return out
+}
+
+// sortedKeys 给出稳定的键序（同一份配置每轮顺序一致）。
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// pendingFirst 把「有本地待推内容」的分支稳定地提到前面。
+//
+// 稳定性是刻意的：同为待推或同为安静的分支，保持传入顺序，
+// 否则一轮之内分支的相对次序会跳来跳去，出问题难以复现。
+func pendingFirst(branches []string, pending func(string) bool) []string {
+	head := make([]string, 0, len(branches))
+	tail := make([]string, 0, len(branches))
+	for _, br := range branches {
+		if pending(br) {
+			head = append(head, br)
+			continue
+		}
+		tail = append(tail, br)
+	}
+	return append(head, tail...)
+}
+
+// branchHasPendingOps 报告这条分支上是否有「产生过、对端还没确认」的命令。
+//
+// 判据只用位点，不碰内容：位点落后就是有东西要推，与内容是否相等无关
+// （内容可能恰好相同，推过去是零字节，代价可以忽略）。
+func (s *Server) branchHasPendingOps(project, branch, peerKey string) bool {
+	if s.opLogs == nil || s.workSync == nil {
+		return false
+	}
+	l, err := s.opLogs.For(project, branch)
+	if err != nil {
+		return false
+	}
+	return l.Last() > s.peerOutSeq(project, branch, peerKey)
 }
 
 // configRemote 是同步引擎需要的最小对端视图，避免与 config.Remote 耦合。

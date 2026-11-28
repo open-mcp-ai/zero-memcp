@@ -45,15 +45,20 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Usage:  "ref <tree> <addr>",
 	},
 	{
-		Name:      "recall",
-		Detail:    detail_recall,
-		Kind:      term.KindFlags,
+		Name:   "recall",
+		Detail: detail_recall,
+		Kind:   term.KindFlags,
 		// before / after / older-than 带值，所以不进 Valueless。
 		// 不登记会被 term 层的「unknown flag」挡在动词之前，
 		// 而 parseTimeWindow 根本轮不到执行。
-		Flags:     []string{"scope", "bare", "all", "json", "before", "after", "older-than"},
-		Valueless: []string{"bare", "all", "json"},
-		Usage:     "recall <query> [--scope <tree>] [--before <date>] [--older-than <2h|3d>] [--bare] [--json]",
+		//
+		// 这里原本登记着 bare，但从 970cf40 起一直没有任何实现：
+		// 带不带它输出一模一样。声明了却不生效比不声明更贵——
+		// 调用方以为自己要求了「只给内容」，拿到的却是原样。
+		// 2026-11-28 把它删掉：真的那个在 read 上（--bare 只给正文）。
+		Flags:     []string{"scope", "all", "json", "before", "after", "older-than"},
+		Valueless: []string{"all", "json"},
+		Usage:     "recall <query> [--scope <tree>] [--before <date>] [--older-than <2h|3d>] [--json]",
 	},
 	{
 		Name:      "srecall",
@@ -66,13 +71,18 @@ var zeroGrammar = term.NewGrammar([]term.Op{
 		Name:   "read",
 		Detail: detail_read,
 		Kind:   term.KindFlags,
-		Usage:  "read <addr> [<addr>...]",
+		// --raw：原样给整份文件（带 frontmatter）。--bare：只给正文，
+		// 连溯源那行也不给。缺省是「正文 + 溯源一行」——见 noterender.go
+		// 关于 120 字符摘要窗口的说明。
+		Flags:     []string{"raw", "bare"},
+		Valueless: []string{"raw", "bare"},
+		Usage:     "read <addr> [<addr>...] [--raw | --bare]",
 	},
 	{
 		Name:   "grep",
 		Detail: detail_grep,
 		Kind:   term.KindFlags,
-		Flags:  []string{"scope", "all", "bare", "i", "ignore-case", "c", "count", "l", "files-only"},
+		Flags:  []string{"scope", "all", "i", "ignore-case", "c", "count", "l", "files-only"},
 		Usage:  "grep [-i] [-c | -l] <pattern> [--scope <tree>]",
 	},
 	{

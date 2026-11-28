@@ -111,7 +111,7 @@ func TestTermcpPutWithTreeAndSession(t *testing.T) {
 	if slice == "" {
 		t.Fatalf("无法从回复提取切片地址: %s", res.Text)
 	}
-	read, err := srv.execTermVars("read "+slice, nil, nil, v, c)
+	read, err := srv.execTermVars("read "+slice+" --raw", nil, nil, v, c)
 	if err != nil {
 		t.Fatalf("read 回写切片失败: %v", err)
 	}

@@ -2410,6 +2410,18 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 		//
 		// 支持一次读多篇：模型经常需要同时看几篇才能回答一个问题，
 		// 一篇一次往返会让它转向 rg。
+		//
+		// 怎么吐出来：缺省是「正文 + 溯源一行」，--raw 原样整份文件，
+		// --bare 只给正文。见 noterender.go：frontmatter 实测 95 字符，
+		// 而 agent 侧取工具返回值的前 120 个字符做摘要——原样吐整份文件
+		// 时，摘要里一个字正文都没有。
+		wantRaw := hasFlag(rest, "--raw")
+		wantBare := hasFlag(rest, "--bare")
+		if wantRaw && wantBare {
+			// 两个都要：没说清想要什么。猜一个比报错贵。
+			return TermResult{}, forbiddenf(nil, "read: --raw and --bare contradict each other (--raw gives the whole file, --bare gives only the body)")
+		}
+		rest = stripFlags(rest, "--raw", "--bare")
 		fields := strings.Fields(rest)
 		for i := range fields {
 			fields[i] = restorePayload(fields[i])
@@ -2491,9 +2503,18 @@ func (s *Server) execStatement(line string, v Viewer, c Caller) (TermResult, err
 			nowUnix := time.Now().Unix()
 			s.weights.Bump(memory.MakeID(proj, br, path), nowUnix)
 			if len(fields) > 1 {
-				out.WriteString("==== " + addr + " ====\n")
+				// --bare 连这个分隔也不给：它要的就是「只有正文」。
+				if !wantBare {
+					out.WriteString("==== " + addr + " ====\n")
+				}
 			}
-			out.WriteString(string(d))
+			if wantBare {
+				// 只要正文：frontmatter 与溯源行都不给。
+				_, body, _ := splitFrontmatter(string(d))
+				out.WriteString(strings.TrimSpace(body))
+			} else {
+				out.WriteString(renderNote(string(d), wantRaw))
+			}
 			out.WriteString("\n")
 		}
 		if out.Len() == 0 {

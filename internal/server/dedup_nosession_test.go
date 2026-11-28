@@ -89,7 +89,8 @@ func TestStoredSliceCarriesSessionForProvenance(t *testing.T) {
 	if addr == "" {
 		t.Fatalf("没从 put 返回里解析出地址: %s", out)
 	}
-	body, err := callMCP(t, srv, tok, "read "+addr)
+	// --raw：这里断言的是**落盘**里的 session 行，不是呈现形态。
+	body, err := callMCP(t, srv, tok, "read "+addr+" --raw")
 	if err != nil {
 		t.Fatalf("读取失败: %v", err)
 	}

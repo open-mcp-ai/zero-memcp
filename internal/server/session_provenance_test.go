@@ -35,7 +35,8 @@ root = true
 	addr1 := strings.TrimPrefix(strings.TrimSpace(res1), "ok ")
 	addr1 = strings.Fields(addr1)[0]
 
-	raw, err := s.ExecLine(context.Background(), "read "+addr1)
+	// --raw：断言的是落盘内容（frontmatter 里的 session 行）。
+	raw, err := s.ExecLine(context.Background(), "read "+addr1+" --raw")
 	if err != nil {
 		t.Fatalf("读回切片失败: %v", err)
 	}
@@ -83,7 +84,7 @@ root = true
 	addr := strings.TrimPrefix(strings.TrimSpace(res), "ok ")
 	addr = strings.Fields(addr)[0]
 
-	raw, err := s.ExecLine(context.Background(), "read "+addr)
+	raw, err := s.ExecLine(context.Background(), "read "+addr+" --raw")
 	if err != nil {
 		t.Fatalf("读回切片失败: %v", err)
 	}

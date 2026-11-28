@@ -214,6 +214,15 @@ Directories with recall: off cannot be read; if the declaration says "do not sur
 or the declaration is meaningless.
 
 Example: read 2026-10-28/023000-laptop-a1b2c3d4.md
+
+Output shape:
+  default      body first, then one provenance line: -- source=weft · endpoint=laptop · created=...
+  --raw        the whole file byte-for-byte, frontmatter included (for round trips and diffing)
+  --bare       body only, no provenance line and no ==== addr ==== separators
+
+Why the body comes first: entries are stored with a YAML frontmatter block (source / endpoint / created)
+that measures ~95 characters, while tool-result summaries only show the first ~120 characters.
+Frontmatter first meant the summary window held nothing but metadata. Provenance is not dropped, only moved to the end.
 `
 
 const detail_grep = `

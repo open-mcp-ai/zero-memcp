@@ -174,6 +174,13 @@ type Server struct {
 	// 见 logf 的说明与 issue #14。
 	logOut atomic.Pointer[logSink]
 
+	// verifyCalls 统计整树校验（verifyBatchContent）跑了几遍。
+	//
+	// 用途同 flattenCalls：让「这件事做了几遍」是可断言的事实。
+	// 一次拉取里它跑两遍还是三遍，决定了要多花几个十几秒，
+	// 而这种重复在日志里看不出来（它自己不出声）。
+	verifyCalls atomic.Int64
+
 	// flattenCalls 统计「摊平整条分支」被调用的次数（O(条数) 的那件事）。
 	//
 	// 用途只有一个：让「这一轮没有做那件昂贵的事」可以被断言。

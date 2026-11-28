@@ -502,6 +502,9 @@ func (s *Server) treeAfterOps(repo *gitstore.Repo, base string, ops []treeOp) (s
 //   - 还有正文没到（Missing 非空）；
 //   - 有路径冲突（Conflicted 非空）：冲突路径的内容本就不确定。
 func (s *Server) verifyBatchContent(project, branch string, batch opBatch, res opApplyResult) error {
+	// 这条校验要整树遍历（Diff("", base) + 自算期望树）。它跑几遍是
+	// 可断言的事实，见 sync_export_test.go 与 sync_pull_once_test.go。
+	s.verifyCalls.Add(1)
 	if batch.ContentTree == "" || !batch.Rebase {
 		return nil
 	}
@@ -906,6 +909,13 @@ func (s *Server) recordSyncFailure(dir, peer, project, branch string, start time
 	s.logf("op-sync: %s %s@%s to/from %s FAILED after %s: %v",
 		dir, project, branch, peer, d.Round(time.Millisecond), err)
 }
+
+// slowPullThreshold 是「这次拉取慢到必须解释自己」的阈值。
+//
+// 为什么要有它：37 秒那次的事后追查，靠的是相邻两条日志的时间差，
+// 而中间 31 秒没有任何日志——我因此连着推错三轮原因。
+// 慢不可怕，慢得说不清才可怕。
+var slowPullThreshold = 5 * time.Second
 
 // batchLogThreshold 是「这批大到值得先说一声」的阈值（以路径数计）。
 //
@@ -1425,6 +1435,11 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	// 在忙，等于让人用相邻两条记录的时间差去猜。
 	applied0 := time.Now()
 	batchOps := countBatchOps(batch.Ops)
+	// 分段计时：一次拉取里真正贵的可能分布在完全不同的阶段
+	// （收包 / 落地 / 补正文 / 整树校验 / 记账），而它们都发生在
+	// 「一条日志都没有」的那段时间里。实测 37 秒的那次，事后只能靠
+	// 相邻两条日志的时间差去推，推错了三轮。慢就自己说清楚。
+	tAfterSend := time.Now()
 	if batchOps >= batchLogThreshold {
 		s.logf("op-sync: pull %s@%s from %s: applying %d op(s) (this can take a while)",
 			project, branch, peerName, batchOps)
@@ -1433,10 +1448,14 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 	if err != nil {
 		return res, err
 	}
+	// 这一趟有没有因为缺正文而重放。整树校验要不要再跑一遍，全看它：
+	// ingestOps 里已经校验过一次，只有「补完正文后又重放」才改变了状态。
+	fetchedBlobs := len(res.Missing) > 0
 	if batchOps >= batchLogThreshold {
 		s.logf("op-sync: pull %s@%s from %s: applied %d op(s) in %s",
 			project, branch, peerName, res.Applied, time.Since(applied0).Round(time.Millisecond))
 	}
+	tAfterApply := time.Now()
 	if len(res.Missing) > 0 {
 		seen := map[string]bool{}
 		failed := map[string]string{} // sha -> 错误
@@ -1513,6 +1532,7 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 			}
 		}
 	}
+	tAfterBlobs := time.Now()
 	// 这一批是权威整树（Rebase）且完整落地时，记下「对端手上是哪棵树」。
 	//
 	// 为什么必须等补完 blob 再判：ingestOps 那一刻缺正文的命令还没补，
@@ -1526,7 +1546,16 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 		// 补齐正文之后再比一次：ingestOps 那一刻 Missing 非空，校验被
 		// 合法跳过，真正的完整性只有现在才能判定。比对不过就不记对端
 		// 水位——记了等于告诉发送端「对端已经有这棵树」，分歧就被封存。
-		if verr := s.verifyBatchContent(project, branch, batch, res); verr != nil {
+		//
+		// 但只在**真的补过正文**时才比第二遍：这一遍要整树遍历整条分支
+		// （Diff("", base) 走完 2.1 万条，再自算一棵期望树）。没补过正文，
+		// ingestOps 里那次已经比对过并通过——重比是纯重复。
+		// 实测（2026-11-28）：整树快照落地后，这两遍校验各占十几秒。
+		verr := error(nil)
+		if fetchedBlobs {
+			verr = s.verifyBatchContent(project, branch, batch, res)
+		}
+		if verr != nil {
 			s.logf("op-sync: %v", verr)
 		} else if s.workSync != nil {
 			// 本端基准 = 本端自己的内容树，必须重算：ingestOps 里那次
@@ -1544,12 +1573,24 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 			s.workSync.notePeerTree(project, branch, batch.Node, batch.ContentTree)
 		}
 	}
+	total := time.Since(pullStart)
+	// 慢就出声，并且把时间分到阶段上。
+	// 阈值 5 秒：正常一轮是几十毫秒到一秒级，超过 5 秒一定有故事。
+	if total >= slowPullThreshold {
+		s.logf("op-sync: pull %s@%s from %s SLOW %s — receive %s, apply+commit %s, blobs+replay %s, verify+record %s (%d op(s), missing %d, kept %d)",
+			project, branch, peerName, total.Round(time.Millisecond),
+			tAfterSend.Sub(pullStart).Round(time.Millisecond),
+			tAfterApply.Sub(applied0).Round(time.Millisecond),
+			tAfterBlobs.Sub(tAfterApply).Round(time.Millisecond),
+			time.Since(tAfterBlobs).Round(time.Millisecond),
+			countBatchOps(batch.Ops), len(res.Missing), len(res.Kept))
+	}
 	s.recordSync(syncRecord{
 		Dir: "pull", Peer: peerName, Node: batch.Node,
 		Project: project, Branch: branch,
 		From: after, To: batch.To, PeerHead: int(batch.To),
 		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
-		DurationMs: time.Since(pullStart).Milliseconds(),
+		DurationMs: total.Milliseconds(),
 		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
 		Rejected: len(res.Rejected),
 	})

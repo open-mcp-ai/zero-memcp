@@ -5,8 +5,10 @@ import (
 	"compress/zlib"
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -43,15 +45,33 @@ func (r *Repo) writeObject(typ string, content []byte) (string, error) {
 	sum := sha1.Sum(full)
 	sha := hex.EncodeToString(sum[:])
 	dst := r.objectPath(sha)
+	overwriting := false
 	if _, err := r.FS().Stat(dst); err == nil {
 		if r.objectLooksTrustworthy(dst, sha) {
 			return sha, nil
 		}
-		// 抽检发现内容损坏：不信任旧文件，往下继续走压缩落盘覆盖它
+		// 抽检发现内容损坏：不信任旧文件，往下继续走压缩落盘覆盖它。
+		overwriting = true
 	}
 
 	if err := r.FS().MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return "", fmt.Errorf("create object directory: %w", err)
+	}
+
+	// 覆盖前必须先放开目标文件的权限。
+	//
+	// 对象落盘是 0444（只读）。POSIX 的 rename 只看目录权限，能直接盖过去；
+	// **Windows 不能**——MoveFileEx 遇到只读目标会报 Access is denied。
+	// 于是「抽检发现坏对象 → 重写修好」这条路在 Windows 上一直失败：
+	// 实测 CI（windows）报 `persist object: rename ... Access is denied`。
+	// 3060 就是 Windows，这条不是理论问题。
+	//
+	// 只删自己要覆盖的那个文件，删不掉就如实报错——静默跳过会留下一个
+	// 坏对象继续被信任。
+	if overwriting {
+		if rerr := r.FS().Remove(dst); rerr != nil && !errors.Is(rerr, fs.ErrNotExist) {
+			return "", fmt.Errorf("clear corrupt object %s before rewrite: %w", sha, rerr)
+		}
 	}
 
 	// 压缩到临时文件再 rename：通过 FS.WriteAtomicWithSync 原子同步

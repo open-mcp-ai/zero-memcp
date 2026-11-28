@@ -112,7 +112,7 @@ func mcpErrorOf(t *testing.T, srv *Server, token, cmd string) (int, string, stri
 	t.Helper()
 	cmd, _, args := legacyToNative(cmd)
 	argJSON, _ := json.Marshal(args)
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":` +
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mem","arguments":{"cmd":` +
 		strconv.Quote(cmd) + `,"args":` + string(argJSON) + `}}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 	if token != "" {

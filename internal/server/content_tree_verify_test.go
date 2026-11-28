@@ -33,7 +33,7 @@ func TestContentTreeDetectsDroppedCommand(t *testing.T) {
 	// 源端造两条记忆并封箱：这样导出的是一棵确定的内容树。
 	for _, p := range []string{"a.md", "b.md"} {
 		if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write " + project + "@" + branch + ":" + p + " $BODY",
 				"vars": map[string]string{"BODY": "内容 " + p},

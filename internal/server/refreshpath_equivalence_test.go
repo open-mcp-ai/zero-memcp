@@ -15,7 +15,7 @@ import (
 func callMCPVars(t *testing.T, srv *Server, tok, addr, body string) (string, error) {
 	t.Helper()
 	return callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write " + addr + " $BODY",
 			"vars": map[string]string{"BODY": body},

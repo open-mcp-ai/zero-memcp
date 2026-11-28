@@ -32,7 +32,7 @@ func TestPushOnlyRemoteNeverPulls(t *testing.T) {
 	write := func(s *Server, tok, path, body string) {
 		t.Helper()
 		if _, err := callMCPRaw(t, s, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 				"vars": map[string]string{"BODY": body},
@@ -89,7 +89,7 @@ func TestWorkPeerWithoutPushOnlyDoesPull(t *testing.T) {
 	write := func(s *Server, tok, path, body string) {
 		t.Helper()
 		if _, err := callMCPRaw(t, s, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 				"vars": map[string]string{"BODY": body},
@@ -213,7 +213,7 @@ func TestOpPushAutoInitsRepositoryOnEmptyPeer(t *testing.T) {
 	write := func(s *Server, tok, path, body string) {
 		t.Helper()
 		if _, err := callMCPRaw(t, s, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/brand-new@zero:" + path + " $BODY",
 				"vars": map[string]string{"BODY": body},

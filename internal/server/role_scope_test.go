@@ -236,7 +236,7 @@ func rawTermWithRole(t *testing.T, srv *Server, token, cmd, role string, vars ..
 	if len(vars) > 0 && vars[0] != nil {
 		args["vars"] = vars[0]
 	}
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":` +
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mem","arguments":` +
 		jsonMust(t, args) + `}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer "+token)
@@ -285,7 +285,7 @@ func TestRoleViaHTTPHeaderMatchesMCPField(t *testing.T) {
 	}
 
 	callHdr := func(cmd, hdrRole string) (int, string) {
-		body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":` +
+		body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mem","arguments":{"cmd":` +
 			jsonMust(t, cmd) + `}}}`
 		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 		req.Header.Set("Authorization", "Bearer "+tok)

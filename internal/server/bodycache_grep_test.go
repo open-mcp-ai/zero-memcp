@@ -24,7 +24,7 @@ func TestGrepUsesBodyCache(t *testing.T) {
 
 	for i := 0; i < 20; i++ {
 		if _, err := callMCPRaw(t, srv, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@fact:k" + itoa(i) + ".md $B",
 				"vars": map[string]string{"B": "缓存标记 " + itoa(i)},
@@ -78,7 +78,7 @@ func TestGrepResultIdenticalWithoutCache(t *testing.T) {
 
 	for i := 0; i < 10; i++ {
 		if _, err := callMCPRaw(t, srv, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@fact:m" + itoa(i) + ".md $B",
 				"vars": map[string]string{"B": "一致性子 " + itoa(i)},

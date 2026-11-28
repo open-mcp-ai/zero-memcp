@@ -30,7 +30,7 @@ func TestOpLogAssignsMonotonicSeqAndPersists(t *testing.T) {
 	write := func(path, body string) {
 		t.Helper()
 		if _, err := callMCPRaw(t, srv, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  fmt.Sprintf("write daily@zero:%s $BODY", path),
 				"vars": map[string]string{"BODY": body},
@@ -76,7 +76,7 @@ func TestOpLogIncrementalExport(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		if _, err := callMCPRaw(t, srv, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  fmt.Sprintf("write daily@zero:f%d.md $BODY", i),
 				"vars": map[string]string{"BODY": fmt.Sprintf("内容 %d", i)},
@@ -129,7 +129,7 @@ func TestOpsSyncUncommittedAcrossNodes(t *testing.T) {
 
 	// A 写入，不提交。
 	if _, err := callMCPRaw(t, a, tokA, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write daily@zero:note.md $BODY",
 			"vars": map[string]string{"BODY": "未提交也要同步"},
@@ -176,7 +176,7 @@ func TestOpsSyncDeleteIsACommand(t *testing.T) {
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "w", Cap: "rwx"})
 
 	if _, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write daily@zero:del.md $BODY",
 			"vars": map[string]string{"BODY": "待删"},
@@ -216,7 +216,7 @@ func TestTreeSyncAsBatchOp(t *testing.T) {
 
 	for _, n := range []string{"x.md", "y.md", "sub/z.md"} {
 		if _, err := callMCPRaw(t, a, tokA, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  fmt.Sprintf("write daily@zero:%s $BODY", n),
 				"vars": map[string]string{"BODY": "正文 " + n},

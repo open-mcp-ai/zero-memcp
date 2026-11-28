@@ -32,7 +32,7 @@ func TestRemindKeepsBaselineOnRepeat(t *testing.T) {
 
 	// 2. 分支往前跑（模拟 agent 停机期间对端写了东西）
 	if _, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write daily@zero:new.md $BODY",
 			"vars": map[string]string{"BODY": "停机期间的新内容"},
@@ -80,7 +80,7 @@ func TestRemindReanchorResetsBaseline(t *testing.T) {
 
 	// 真正推进分支：先写再提交（分支干净时 commit 什么也不做）。
 	if _, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write daily@zero:reanchor.md $BODY",
 			"vars": map[string]string{"BODY": "为了推进"},
@@ -123,7 +123,7 @@ func TestWatchesSurviveServerRestart(t *testing.T) {
 
 	// 停机期间分支推进
 	if _, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write daily@zero:while-down.md $BODY",
 			"vars": map[string]string{"BODY": "停机期间写入"},

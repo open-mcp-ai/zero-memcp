@@ -32,7 +32,7 @@ func TestDownstreamPullsUncommittedWriteFromUpstream(t *testing.T) {
 
 	// 上游写一条，**不 commit**。
 	if _, err := callMCPRaw(t, up, upToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 			"vars": map[string]string{"BODY": body},
@@ -94,7 +94,7 @@ func TestDownstreamPullAppliesUpstreamDelete(t *testing.T) {
 		tok string
 	}{{up, upToken}, {down, downToken}} {
 		if _, err := callMCPRaw(t, pair.s, pair.tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 				"vars": map[string]string{"BODY": "两端都有"},

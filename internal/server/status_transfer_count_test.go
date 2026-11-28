@@ -36,7 +36,7 @@ func TestStatusReportsActualTransferCount(t *testing.T) {
 
 	// 先推一轮把基础内容送过去，此时对端从空开始。
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write " + project + "@" + branch + ":base.md $BODY",
 			"vars": map[string]string{"BODY": "base"},
@@ -50,7 +50,7 @@ func TestStatusReportsActualTransferCount(t *testing.T) {
 
 	// 再写一条：这一轮必须有传输，报数不能是 0。
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write " + project + "@" + branch + ":second.md $BODY",
 			"vars": map[string]string{"BODY": "second"},

@@ -193,7 +193,7 @@ func TestPeerSubscriptionWakesOnPeerChangeAndSkipsSelf(t *testing.T) {
 
 	// ② 再在对端走真实 MCP 写入（put 与 write 两种路径）→ 都必须叫醒订阅方。
 	if _, err := callMCPRaw(t, peerSrv, peerTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "put blackegg/me@zero $BODY",
 			"vars": map[string]string{"BODY": "对端写的内容"},
@@ -217,7 +217,7 @@ func TestPeerSubscriptionWakesOnPeerChangeAndSkipsSelf(t *testing.T) {
 	// write 走的是另一条写路径（writeverb.go），同样必须广播，否则
 	// 规则库写入对订阅者与下游完全静默。
 	if _, err := callMCPRaw(t, peerSrv, peerTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:rule-from-peer.md $BODY",
 			"vars": map[string]string{"BODY": "对端写的规则"},

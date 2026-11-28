@@ -38,7 +38,7 @@ func TestPullRecordsPeerTreeAfterRebase(t *testing.T) {
 	// 对端先有内容（对拉取方来说，这批必然带 Rebase：
 	// 它没有任何基准，只能收到整树/差分快照）。
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write " + project + "@" + branch + ":a.md $BODY",
 			"vars": map[string]string{"BODY": "对端的内容"},
@@ -53,7 +53,7 @@ func TestPullRecordsPeerTreeAfterRebase(t *testing.T) {
 	// 那条路不重设基准，也就没有「对端内容树」可记。
 	// 必须在本地对象库里真实存在，否则导出器算不出差分只能整树。
 	if _, err := callMCPRaw(t, dst, dstToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write " + project + "@" + branch + ":mine.md $BODY",
 			"vars": map[string]string{"BODY": "本端自己的内容"},

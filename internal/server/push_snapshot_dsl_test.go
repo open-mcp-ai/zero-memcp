@@ -21,7 +21,7 @@ func TestPushSnapshotViaDSL(t *testing.T) {
 	write := func(path, body string) {
 		t.Helper()
 		if _, err := callMCPRaw(t, srv, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  fmt.Sprintf("write blackegg/me@zero:%s $BODY", path),
 				"vars": map[string]string{"BODY": body},
@@ -71,7 +71,7 @@ func TestPushSnapshotViaDSL(t *testing.T) {
 
 	// 调用 DSL: push blackegg/me dest zero --snapshot
 	out, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd": "push blackegg/me dest zero --snapshot",
 		},

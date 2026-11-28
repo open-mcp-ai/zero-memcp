@@ -27,7 +27,7 @@ func TestRemindSeesUncommittedWorkLayer(t *testing.T) {
 
 	// 2. 写一条工作层记忆（不 commit）
 	if _, err := callMCPRaw(t, srv, token, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@uncommitted:test.md $BODY",
 			"vars": map[string]string{"BODY": "未提交内容"},
@@ -58,7 +58,7 @@ func TestRemindSeesWorkLayerChangesOnCommittedBranch(t *testing.T) {
 
 	// 初始提交
 	if _, err := callMCPRaw(t, srv, token, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@main:init.md $BODY",
 			"vars": map[string]string{"BODY": "初始"},
@@ -83,7 +83,7 @@ func TestRemindSeesWorkLayerChangesOnCommittedBranch(t *testing.T) {
 
 	// 写入一条工作层新记忆（不 commit）
 	if _, err := callMCPRaw(t, srv, token, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@main:new.md $BODY",
 			"vars": map[string]string{"BODY": "新工作层条目"},

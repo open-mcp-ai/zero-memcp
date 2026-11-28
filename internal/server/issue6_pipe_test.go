@@ -20,7 +20,7 @@ func postTerm(t *testing.T, h http.Handler, token, cmd string, vars map[string]s
 	}
 	payload, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-		"params": map[string]any{"name": "term", "arguments": args},
+		"params": map[string]any{"name": "mem", "arguments": args},
 	})
 	if err != nil {
 		t.Fatal(err)

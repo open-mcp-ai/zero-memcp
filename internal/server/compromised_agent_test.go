@@ -30,7 +30,7 @@ func TestCompromisedAgentCannotErase(t *testing.T) {
 
 	const path = "2026-11-19/evidence.md"
 	if _, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 			"vars": map[string]string{"BODY": "对攻击者不利的记录"},
@@ -127,7 +127,7 @@ func TestEraseTicketBoundToBlob(t *testing.T) {
 
 	for _, p := range []string{"2026-11-19/harmless.md", "2026-11-19/target.md"} {
 		if _, err := callMCPRaw(t, srv, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + p + " $BODY",
 				"vars": map[string]string{"BODY": "内容 " + p},

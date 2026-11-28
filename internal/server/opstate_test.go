@@ -23,7 +23,7 @@ func TestOpSyncWatermarksSurviveRestart(t *testing.T) {
 	// 上游写三条。
 	for _, p := range []string{"w1.md", "w2.md", "w3.md"} {
 		if _, err := callMCPRaw(t, up, tokUp, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + p + " $BODY",
 				"vars": map[string]string{"BODY": "内容 " + p},

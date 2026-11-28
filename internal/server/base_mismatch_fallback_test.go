@@ -40,7 +40,7 @@ func TestPushFallsBackToSnapshotOnBaseMismatch(t *testing.T) {
 	write := func(path, body string) {
 		t.Helper()
 		if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write " + project + "@" + branch + ":" + path + " $BODY",
 				"vars": map[string]string{"BODY": body},

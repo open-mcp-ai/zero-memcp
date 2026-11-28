@@ -28,7 +28,7 @@ func TestWorkLayerSyncWithoutCommit(t *testing.T) {
 
 	// A 写一条记忆，**不 commit**。
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:2026-11-19/hello.md $BODY",
 			"vars": map[string]string{"BODY": "hello from A"},
@@ -109,7 +109,7 @@ func TestWorkLayerDeleteDoesNotResurrect(t *testing.T) {
 
 	// A 写一条（不 commit），推给 B。
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:2026-11-19/gone.md $BODY",
 			"vars": map[string]string{"BODY": "will be deleted"},

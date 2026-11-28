@@ -36,7 +36,7 @@ func TestWorkLayerDeleteOverLocalWriteIsReportedNotSilent(t *testing.T) {
 		tok string
 	}{{src, srcToken}, {dst, dstToken}} {
 		if _, err := callMCPRaw(t, pair.s, pair.tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + targetPath + " $BODY",
 				"vars": map[string]string{"BODY": "初始共识内容"},
@@ -54,7 +54,7 @@ func TestWorkLayerDeleteOverLocalWriteIsReportedNotSilent(t *testing.T) {
 		t.Fatalf("A 删: %v", err)
 	}
 	if _, err := callMCPRaw(t, dst, dstToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:" + targetPath + " $BODY",
 			"vars": map[string]string{"BODY": "B 本地的最新修改"},

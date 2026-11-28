@@ -22,7 +22,7 @@ commit 只是"此刻在此处拍了一张照"，给外部 Git 工具与人审计
    内联正文会被协议直接拒绝——正文里的 `;` 就是分号，不会被当成命令分隔符。
 
 4. **单工具，能力在命令空间**
-   MCP 只暴露一个 `term` 工具。能力增长发生在动词层，不在 `tools/list`，
+   MCP 只暴露一个 `mem` 工具。能力增长发生在动词层，不在 `tools/list`，
    所以上下文占用恒定。
 
 5. **权限落在端口、配置、凭证三层**
@@ -74,7 +74,7 @@ zero-memcp -data ~/.zero-memcp/data -listen 127.0.0.1:1729
 
 ```json
 {
-  "name": "term",
+  "name": "mem",
   "arguments": {
     "cmd": "put team/chat $TEXT",
     "vars": { "TEXT": "今天收敛了工作层同步：不再依赖 commit。" }
@@ -84,7 +84,7 @@ zero-memcp -data ~/.zero-memcp/data -listen 127.0.0.1:1729
 
 ```json
 {
-  "name": "term",
+  "name": "mem",
   "arguments": { "cmd": "recall $1", "args": ["工作层同步"] }
 }
 ```

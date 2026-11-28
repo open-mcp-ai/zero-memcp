@@ -182,7 +182,7 @@ func (s *Server) ledgerPut(externalID, rest string, c Caller) (TermResult, error
 	if tree != "" {
 		treePrefix = strings.Trim(tree, "/") + "/" + ledgerPrefix
 	}
-	addr, proj, branch, err := s.writeNoteGit("", body, "", c.Identity, c, tree, treePrefix)
+	addr, proj, branch, _, err := s.writeNoteGit("", body, "", c.Identity, c, tree, treePrefix)
 	if err != nil {
 		return TermResult{}, err
 	}

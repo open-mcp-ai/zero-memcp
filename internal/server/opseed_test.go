@@ -70,7 +70,7 @@ func TestOpLogSeedsExistingTreeOnInitialPull(t *testing.T) {
 
 	// 3. 上游随后有新写入时，位点必须连续推进（2, 3...），不重发整树。
 	if _, err := callMCPRaw(t, up, tokUp, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:after-seed.md $BODY",
 			"vars": map[string]string{"BODY": "播种之后的新写入"},

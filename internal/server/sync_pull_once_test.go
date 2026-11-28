@@ -35,7 +35,7 @@ func TestRebaseVerifyRunsOnceWhenNothingWasFetched(t *testing.T) {
 	write := func(path, body string) {
 		t.Helper()
 		if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 				"vars": map[string]string{"BODY": body},
@@ -88,7 +88,7 @@ func TestSlowPullExplainsItself(t *testing.T) {
 	defer srcSrv.Close()
 
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:a.md $BODY",
 			"vars": map[string]string{"BODY": "正文"},

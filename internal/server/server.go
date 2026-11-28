@@ -1666,16 +1666,20 @@ func (s *Server) dispatchMCP(ctx context.Context, method string, params json.Raw
 		}, nil
 
 	case "tools/list":
-		// 只暴露 term，声明来自 termTool()。
+		// 只暴露 mem，声明来自 memTool()。
 		//
-		// 本服务实现 termcp 协议：单工具 term({cmd})，动词在命令空间里分发。
+		// 工具名是 mem，不是 term：它是这个 agent 的持久记忆入口，
+		// 而 term 是底层协议（termcp）的名字。用人看到的名字命名工具，
+		// 模型读到的第一句才是「这是你的记忆」而不是「这是某协议入口」。
+		//
+		// 单工具 mem({cmd})，动词在命令空间里分发。
 		// 逐个暴露动词等于给每个动词开一个口子，工具表变长、每轮都进提示词，
 		// 而能力一点没多。
 		//
 		// schema 本身由 internal/server/mcp_tool.go 用 termcp 的 mcp.Tool 声明，
 		// 不再手写 map：协议层（字段名、required 的位置、default 的写法）
 		// 归 termcp，这里只回答"有哪些工具"。
-		return map[string]any{"tools": []any{termTool()}}, nil
+		return map[string]any{"tools": []any{memTool()}}, nil
 
 	case "tools/call":
 		var call struct {
@@ -1693,13 +1697,13 @@ func (s *Server) dispatchMCP(ctx context.Context, method string, params json.Raw
 }
 
 func (s *Server) callTool(ctx context.Context, name string, args json.RawMessage, c Caller) (any, error) {
-	// 只接受 term。
+	// 只接受 mem。
 	//
-	// tools/list 只声明了 term，这里也必须只接受 term——声明面和能力面
+	// tools/list 只声明了 mem，这里也必须只接受 mem——声明面和能力面
 	// 不一致是这类服务最容易出的事：清单上看不到的东西还能调用，
 	// 而调用方不会知道自己用了一个没被声明的接口。
-	if name != "term" {
-		return nil, fmt.Errorf("unknown tool: %s (this service exposes only term)", name)
+	if name != "mem" {
+		return nil, fmt.Errorf("unknown tool: %s (this service exposes only mem)", name)
 	}
 	var a struct {
 		Cmd string `json:"cmd"`
@@ -1875,7 +1879,8 @@ func buildToolResult(r TermResult, wantText, wantStructured bool) map[string]any
 }
 
 func (s *Server) writeNote(kind, text, session, source string, c Caller, explicit string) (addr, project, branch string, err error) {
-	return s.writeNoteGit(kind, text, session, source, c, explicit, "")
+	addr, proj, br, _, err := s.writeNoteGit(kind, text, session, source, c, explicit, "")
+	return addr, proj, br, err
 }
 
 // TermResult 是一条命令的两种投影。

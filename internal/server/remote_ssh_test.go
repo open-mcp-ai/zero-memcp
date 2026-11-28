@@ -190,7 +190,7 @@ func callMCPWithVars(t *testing.T, srv *Server, token, cmd string, vars map[stri
 	payload, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
 		"params": map[string]any{
-			"name":      "term",
+			"name":      "mem",
 			"arguments": map[string]any{"cmd": cmd, "vars": vars, "args": args},
 		},
 	})

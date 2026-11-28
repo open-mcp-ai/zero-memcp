@@ -39,7 +39,7 @@ func TestTermToolContract(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if len(parsed.Tools) != 1 || parsed.Tools[0].Name != "term" {
+	if len(parsed.Tools) != 1 || parsed.Tools[0].Name != "mem" {
 		t.Fatalf("只应暴露 term，实际: %s", raw)
 	}
 	tool := parsed.Tools[0]
@@ -59,7 +59,7 @@ func TestTermToolContract(t *testing.T) {
 	}
 
 	// 形状稳定：同样的声明序列化两次必须逐字节一致。
-	again, _ := json.Marshal(map[string]any{"tools": []any{termTool()}})
+	again, _ := json.Marshal(map[string]any{"tools": []any{memTool()}})
 	var a, b any
 	_ = json.Unmarshal(raw, &a)
 	_ = json.Unmarshal(again, &b)

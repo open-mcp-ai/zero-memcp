@@ -37,7 +37,7 @@ func TestSyncViewsAgreeOnPeerBranch(t *testing.T) {
 	defer dstSrv.Close()
 
 	if _, err := callMCPRaw(t, src, tokSrc, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:2026-11-19/agreement.md $BODY",
 			"vars": map[string]string{"BODY": "两个视图必须说同一句话"},
@@ -106,7 +106,7 @@ func TestPushRecordPeerHeadIsPosition(t *testing.T) {
 	// 写三条：让「位点」与「命令条数」明确可能是不同的数。
 	for _, name := range []string{"a", "b", "c"} {
 		if _, err := callMCPRaw(t, src, tokSrc, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:2026-11-19/" + name + ".md $BODY",
 				"vars": map[string]string{"BODY": "内容 " + name},
@@ -168,7 +168,7 @@ func TestPushWatermarkKeyedByOwnerName(t *testing.T) {
 	}
 
 	if _, err := callMCPRaw(t, src, tokSrc, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:k.md $BODY",
 			"vars": map[string]string{"BODY": "键必须用属主名"},
@@ -214,7 +214,7 @@ func TestPeerViewPeerRoleReportsCaughtUp(t *testing.T) {
 	defer dstSrv.Close()
 
 	if _, err := callMCPRaw(t, src, tokSrc, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:p.md $BODY",
 			"vars": map[string]string{"BODY": "对端角色也要说对齐"},

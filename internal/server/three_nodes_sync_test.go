@@ -38,7 +38,7 @@ func TestThreeInstancesWorkLayerConvergence(t *testing.T) {
 		path := fmt.Sprintf("fact/node-%d.md", i)
 		content := fmt.Sprintf("content from node %d", i)
 		if _, err := callMCPRaw(t, nodes[i], tokens[i], map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  fmt.Sprintf("write blackegg/me@zero:%s $BODY", path),
 				"vars": map[string]string{"BODY": content},

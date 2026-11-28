@@ -90,7 +90,7 @@ http_token = "tok-backup"
 
 	// 写一条记忆。
 	if _, err := callMCPRaw(t, host, tokHost, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:just-now.md $BODY",
 			"vars": map[string]string{"BODY": "刚写下的这条，必须立刻到备份"},
@@ -143,7 +143,7 @@ func TestBulkPushOutlivesShortClientTimeout(t *testing.T) {
 	write := func(path string) {
 		t.Helper()
 		if _, err := callMCPRaw(t, host, tokHost, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 				"vars": map[string]string{"BODY": "批量推送测试 " + path},

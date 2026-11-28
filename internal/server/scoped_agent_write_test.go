@@ -74,7 +74,7 @@ mode  = "rwx------"
 		t.Fatal(err)
 	}
 
-	addr, proj, br, err := srv.writeNoteGit("", "分身写的一条", "", "mcp", caller, "BlackEggAI/zero@chat", "")
+	addr, proj, br, _, err := srv.writeNoteGit("", "分身写的一条", "", "mcp", caller, "BlackEggAI/zero@chat", "")
 	if err != nil {
 		t.Fatalf("写 chat 被拒: %v", err)
 	}
@@ -84,7 +84,7 @@ mode  = "rwx------"
 	_ = addr
 
 	// 反例：写 main 必须被拒
-	_, _, _, err = srv.writeNoteGit("", "不该成功", "", "mcp", caller, "BlackEggAI/zero@main", "")
+	_, _, _, _, err = srv.writeNoteGit("", "不该成功", "", "mcp", caller, "BlackEggAI/zero@main", "")
 	if err == nil || !strings.Contains(err.Error(), "permission") {
 		t.Fatalf("写 main 应被拒且报权限，实际 err=%v", err)
 	}

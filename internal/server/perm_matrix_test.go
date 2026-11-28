@@ -495,7 +495,7 @@ func TestNarrowedRootIsNotUnrestricted(t *testing.T) {
 // roleReq 造一个带凭证（和可选角色 header）的请求。
 func roleReq(tok, role string) *http.Request {
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(
-		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":"ls"}}}`))
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mem","arguments":{"cmd":"ls"}}}`))
 	req.RemoteAddr = "127.0.0.1:12345"
 	req.Header.Set("Authorization", "Bearer "+tok)
 	if role != "" {

@@ -217,7 +217,7 @@ func (s *Server) putBody(target, body, session string, c Caller) (TermResult, er
 		source = "mcp"
 	}
 
-	path, proj, branch, err := s.writeNoteGit("", body, session, source, c, spec.Explicit, spec.TreePath)
+	path, proj, branch, newBranch, err := s.writeNoteGit("", body, session, source, c, spec.Explicit, spec.TreePath)
 	if err != nil {
 		return TermResult{}, err
 	}
@@ -274,6 +274,12 @@ func (s *Server) putBody(target, body, session string, c Caller) (TermResult, er
 	if commitSHA != "" {
 		text += "; base " + shortSHA(commitSHA)
 	}
+	// 新分支必须当场看见：它不在任何同步列表里，trees 也不列它。
+	// 打错字的那种已经在 checkWriteBranch 里拒掉了（「你是指 X 吗」），
+	// 走到这里的是真的新分支——但仍然得说明它还没被任何备份覆盖。
+	if newBranch {
+		text += "; NEW branch, not in any sync list"
+	}
 	text += ")"
 
 	return TermResult{
@@ -320,7 +326,7 @@ func (s *Server) putRef(target, refAddr, session string, c Caller) (TermResult, 
 
 	body := fmt.Sprintf("ref: %s@%s/%s\n", srcProj, srcBranch, srcPath)
 	spec := s.parsePutSpec(target, c)
-	path, proj, branch, err := s.writeNoteGit("", body, session, c.Identity, c, spec.Explicit, spec.TreePath)
+	path, proj, branch, newBranch, err := s.writeNoteGit("", body, session, c.Identity, c, spec.Explicit, spec.TreePath)
 	if err != nil {
 		return TermResult{}, err
 	}
@@ -337,6 +343,9 @@ func (s *Server) putRef(target, refAddr, session string, c Caller) (TermResult, 
 	text := "ok " + virtPath + " (" + fullAddr
 	if commitSHA != "" {
 		text += "; base " + shortSHA(commitSHA)
+	}
+	if newBranch {
+		text += "; NEW branch, not in any sync list"
 	}
 	text += ")"
 	return TermResult{

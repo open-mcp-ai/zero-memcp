@@ -28,7 +28,7 @@ func TestWorkLayerConcurrentRewriteReportsConflict(t *testing.T) {
 
 	// 1. A 写了自己的版本
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:" + targetPath + " $BODY",
 			"vars": map[string]string{"BODY": "版本 A：讨论了同步协议细节"},
@@ -39,7 +39,7 @@ func TestWorkLayerConcurrentRewriteReportsConflict(t *testing.T) {
 
 	// 2. B 在本地同时也写了自己的版本（未 commit）
 	if _, err := callMCPRaw(t, dst, dstToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:" + targetPath + " $BODY",
 			"vars": map[string]string{"BODY": "版本 B：讨论了多索引架构方案"},

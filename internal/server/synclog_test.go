@@ -21,7 +21,7 @@ func TestSyncJournalRecordsBothDirections(t *testing.T) {
 	// 上游写两条（不 commit）。
 	for _, p := range []string{"j1.md", "j2.md"} {
 		if _, err := callMCPRaw(t, up, tokUp, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + p + " $BODY",
 				"vars": map[string]string{"BODY": "内容 " + p},
@@ -83,7 +83,7 @@ func TestSyncJournalRecordsBothDirections(t *testing.T) {
 
 	// 三、反向：下游推一条，上游的流水里也要有 push 记录。
 	if _, err := callMCPRaw(t, down, tokDown, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:back.md $BODY",
 			"vars": map[string]string{"BODY": "下游写的"},
@@ -147,7 +147,7 @@ func TestSyncJournalUpstreamSeesDownstreamProgress(t *testing.T) {
 
 	for _, p := range []string{"u1.md", "u2.md", "u3.md"} {
 		if _, err := callMCPRaw(t, up, tokUp, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + p + " $BODY",
 				"vars": map[string]string{"BODY": "内容 " + p},

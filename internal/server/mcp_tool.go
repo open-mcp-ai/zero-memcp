@@ -2,7 +2,7 @@ package server
 
 import "github.com/open-mcp-ai/termcp/mcp"
 
-// termTool 是 term 工具在 MCP 层的声明。
+// memTool 是 mem 工具在 MCP 层的声明。
 //
 // 形状与 server.go 的 tools/list 分支一致，但用 termcp 的 mcp.Tool 表达：
 // 让协议层（tools/list 的字段名、required 的位置、annotations 的省略规则）
@@ -10,9 +10,9 @@ import "github.com/open-mcp-ai/termcp/mcp"
 //
 // 迁移顺序是先建声明、再比对，比对一致才切默认路径——schema 是客户端可见的
 // 表面，改形状等于改契约，不能靠"应该没问题"。
-func termTool() mcp.Tool {
-	return mcp.NewTool("term",
-		mcp.WithDescription("termcp protocol entry point (implemented by this service). Accepts one line of DSL:\n"+
+func memTool() mcp.Tool {
+	return mcp.NewTool("mem",
+		mcp.WithDescription("This agent's persistent memory. Accepts one line of DSL:\n"+
 			"  recall <text> [--scope T] semantic search (returns addresses and excerpts)\n"+
 			"  read <addr> [<addr>...]  read full text; accepts multiple addresses\n"+
 			"  grep [-i] [-c|-l] <regex> search full text (-i ignore case, -c count, -l files only)\n"+

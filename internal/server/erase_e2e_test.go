@@ -19,7 +19,7 @@ func TestEraseVerbE2E(t *testing.T) {
 
 	// 先写一条敏感记忆并 commit
 	if _, err := callMCPRaw(t, srv, rwxTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:2026-11-19/leak.md $BODY",
 			"vars": map[string]string{"BODY": "银行卡号 6222020200001234"},

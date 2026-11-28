@@ -24,7 +24,7 @@ func TestOpsSyncBidirectionalUsesIndependentWatermarks(t *testing.T) {
 	write := func(s *Server, tok, path, body string) {
 		t.Helper()
 		if _, err := callMCPRaw(t, s, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 				"vars": map[string]string{"BODY": body},

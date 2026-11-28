@@ -133,7 +133,7 @@ func TestMCPRejectsUISession(t *testing.T) {
 	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Cap: "rwx"})
 	_ = tok
 
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":"status"}}}`
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mem","arguments":{"cmd":"status"}}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 	req.AddCookie(cookie)
 	rec := httptest.NewRecorder()

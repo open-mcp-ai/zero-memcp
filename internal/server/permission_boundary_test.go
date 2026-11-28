@@ -30,7 +30,7 @@ func portCall(t *testing.T, srv *Server, blk ListenBlock, token, cmd string, var
 	}
 	payload, _ := json.Marshal(map[string]any{
 		"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-		"params": map[string]any{"name": "term", "arguments": args},
+		"params": map[string]any{"name": "mem", "arguments": args},
 	})
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(string(payload)))
 	req.Header.Set("Authorization", "Bearer "+token)

@@ -22,7 +22,7 @@ func TestBodyCacheWarmsInBackground(t *testing.T) {
 
 	for i := 0; i < 30; i++ {
 		if _, err := callMCPRaw(t, srv, tok, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@fact:warm" + itoa(i) + ".md $B",
 				"vars": map[string]string{"B": "预热内容 " + itoa(i)},

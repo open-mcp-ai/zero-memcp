@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -24,7 +25,7 @@ import (
 //   - 时间戳本身就是切片的自然时间坐标，人类与机器一眼可读。
 //
 // 序号不是装饰：它是唯一能在同一时刻把两次写入分开的东西。
-func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, explicit, treePrefix string) (addr, project, branch string, err error) {
+func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, explicit, treePrefix string) (addr, project, branch string, newBranch bool, err error) {
 	kind = strings.ToLower(strings.TrimSpace(kind))
 	// 空 kind 表示「由落点决定」：put 不再要求调用方先给自己分类。
 	implicitKind := kind == ""
@@ -35,16 +36,16 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// 而记忆库的写入方是模型自己。声明能改的东西里不能包含这条。
 	switch kind {
 	case "instruction", "rule":
-		return "", "", "", errors.New("refusing to write instruction or rule (inferred instructions must not enter the memory store)")
+		return "", "", "", false, errors.New("refusing to write instruction or rule (inferred instructions must not enter the memory store)")
 	}
 	text = strings.TrimSpace(text)
 	if text == "" {
-		return "", "", "", errors.New("text cannot be empty")
+		return "", "", "", false, errors.New("text cannot be empty")
 	}
 
 	plan, err := s.planWrite(c, explicit, treePrefix)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", false, err
 	}
 	targetProject, writeBranch, pol := plan.Project, plan.Branch, plan.Policy
 	treePrefix = plan.TreePrefix
@@ -57,13 +58,13 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 			kind = "fact"
 		}
 	} else if !pol.AllowsKind(kind) {
-		return "", "", "", fmt.Errorf("kind %q is not allowed by this project's write policy (allowed: %s)",
+		return "", "", "", false, fmt.Errorf("kind %q is not allowed by this project's write policy (allowed: %s)",
 			kind, strings.Join(pol.Kinds, " / "))
 	}
 
 	repo, err := s.projects.Ensure(targetProject)
 	if err != nil {
-		return "", "", "", fmt.Errorf("open write target %s: %w", targetProject, err)
+		return "", "", "", false, fmt.Errorf("open write target %s: %w", targetProject, err)
 	}
 
 	now := time.Now()
@@ -133,7 +134,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 			// 穿透去真正写一份新的。
 			rel := strings.TrimPrefix(p, targetProject+"/")
 			if _, rerr := repo.Read(writeBranch, rel); rerr == nil {
-				return targetProject + "/" + p, targetProject, writeBranch, nil
+				return targetProject + "/" + p, targetProject, writeBranch, false, nil
 			}
 			s.dedup.Delete(dedupKey)
 		}
@@ -179,7 +180,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	}
 
 	if err := repo.Write(writeBranch, path, []byte(content), gitstore.ModeContent); err != nil {
-		return "", "", "", err
+		return "", "", "", false, err
 	}
 
 	// 写入即通知 + 登记命令流：两件事必须在同一个地方做完。
@@ -221,7 +222,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 	// put 不经过 resolveAddr（它自己算落点名），所以只在地址解析处拦
 	// 就等于「读被拦住、写没拦住」——收窄最不能留的就是写口子。
 	if !s.roleAllowsPath(c, targetProject, writeBranch, path, configBitWrite) {
-		return "", "", "", s.roleDenyError(c, targetProject, writeBranch, path)
+		return "", "", "", false, s.roleDenyError(c, targetProject, writeBranch, path)
 	}
 
 	blockID := memory.MakeID(targetProject, writeBranch, path)
@@ -237,7 +238,7 @@ func (s *Server) writeNoteGit(kind, text, session, source string, c Caller, expl
 		s.kickSemantic()
 	}
 
-	return addr, targetProject, writeBranch, nil
+	return addr, targetProject, writeBranch, plan.NewBranch, nil
 }
 
 // writePlan 是一次写入的落点：谁、哪条分支、哪棵子树、用哪份策略。
@@ -256,6 +257,98 @@ type writePlan struct {
 	// @ops 的活表被无前缀 put 写进了 @main，多出一份重复副本，
 	// 而返回的 ok 里看不出这件事。
 	Defaulted bool
+	// NewBranch 为真表示这条分支是**这次写入才出现的**（不是打错字那种，
+	// 见 checkWriteBranch）。新分支不在任何同步列表里，也不会出现在
+	// trees 里——这两件事必须让调用方当场看到，而不是等发现没备份。
+	NewBranch bool
+}
+
+// checkWriteBranch 处理「往一条还不存在的分支上写」这件事。
+//
+// 既有契约是「显式 @branch 必须被尊重，不存在就建」——这是跨分支写入的
+// 关键路径（TestPutExplicitBranchIsHonored 钉着它），不能一刀切拒绝。
+//
+// 但自狗粮抓到过一个真 bug（2026-11-28）：`put blackegg/me@recrod $T`
+// 打错一个字母，返回 ok，内容落进一条新分支。而那条分支：
+// trees 看不见、同步配置里没有它所以永远推不出去、sync 视图不显示、
+// git 层面 branch -a 是空的（只活在 oplog 里）。用户以为写进去了，
+// 实际写进一个不备份、不可见、不同步的黑洞。
+//
+// 所以分三档：
+//
+//	分支已存在            → 什么都不做
+//	项目一条分支都没有     → 首次写入（bootstrap），放行
+//	与现有分支**太像**     → 拒绝并给出「你是指 X 吗」——这才是打错字的形状
+//	其余（真正的新分支）   → 放行，但把「这是新分支、它不在任何同步列表里」
+//	                       写进返回值和日志（见 noteNewBranch）
+func (s *Server) checkWriteBranch(project, branch string) (newBranch bool, err error) {
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		// 仓库还不存在：首次写入，写入路径自己会把仓库建出来。
+		return false, nil
+	}
+	// 分支要从两处合并：已提交的 refs，以及**只有脏层的分支**。
+	//
+	// 只用 Branches() 会漏掉刚写、还没提交过的分支（它们只活在脏层里，
+	// 没有 ref）——实测：先 put 到 zero，再 put 到 zeroo（多打一个 o），
+	// Branches() 还是空的，于是被当成 bootstrap 放行，拼错的分支就又
+	// 建出来了。typo 检测必须看得见「我刚写的那些分支」。
+	existing := repo.Branches()
+	seen := make(map[string]bool, len(existing))
+	for _, b := range existing {
+		seen[b] = true
+	}
+	for _, b := range repo.PendingRefs() {
+		if !seen[b] {
+			seen[b] = true
+			existing = append(existing, b)
+		}
+	}
+	for _, b := range existing {
+		if b == branch {
+			return false, nil
+		}
+	}
+	if len(existing) == 0 {
+		return false, nil
+	}
+	sort.Strings(existing)
+	// 只有一个候选像它时才算打错字；两个都像就说明这个新名字确实可能
+	// 是新的，不猜。
+	if near := nearBranches(branch, existing); len(near) == 1 {
+		return false, invalidf(map[string]any{
+			"project":    project,
+			"branch":     branch,
+			"didYouMean": near[0],
+			"existing":   existing,
+		}, "branch %q does not exist in %s — did you mean %q? "+
+			"(existing: %s; to really create a new branch use `branch %s %s`)",
+			branch, project, near[0], strings.Join(existing, ", "), project, branch)
+	}
+	return true, nil
+}
+
+// nearBranches 返回与 want 编辑距离足够近的分支名。
+//
+// 阈值随长度走：太短的词（main/chat）差一个字母就是完全另一个词，
+// 只按距离会把正常的新分支也拦掉；而 main.record 这种长名字差一两个
+// 字母一定是手滑。
+func nearBranches(want string, existing []string) []string {
+	limit := 1
+	if len(want) >= 6 {
+		limit = 2
+	}
+	var out []string
+	for _, e := range existing {
+		if e == want {
+			continue
+		}
+		d := editDistance(want, e)
+		if d > 0 && d <= limit {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // planWrite 解析落点：显式目标 > 挂载表默认分支 > 默认分支。
@@ -332,12 +425,36 @@ func (s *Server) planWrite(c Caller, explicit, treePrefix string) (writePlan, er
 		writeBranch = b
 	}
 
+	// 目标分支必须真的存在——除了「首次写入」这一种情况。
+	//
+	// 为什么必须拦（2026-11-28 自狗粮抓到的真 bug）：
+	// `put blackegg/me@recrod $T`（打错一个字母）返回 ok，内容落进了一条
+	// 新分支。而那条分支：`trees` 看不见、同步配置里没有它所以永远推不出去、
+	// `sync` 视图也不显示、git 层面 `branch -a` 是空的（只活在 oplog 里）。
+	// 用户以为写进去了，实际写进了一个不备份、不可见、不同步的黑洞。
+	//
+	// 分支创建是**显式动作**：`branch <project> <new> [from <src>]`。
+	// 和删除同一个道理——拿「你没写清楚」当「给你建一个」是最贵的那种错。
+	//
+	// 首次写入要放行：新项目、新实例第一次落盘时分支本来就不存在，
+	// 那是 bootstrap，不是打错字。判据是「这个项目一条分支都还没有」。
+	newBranch, berr := s.checkWriteBranch(targetProject, writeBranch)
+	if berr != nil {
+		return writePlan{}, berr
+	}
+	if newBranch {
+		// 出声：新分支不在任何同步列表里，也不会出现在 trees 里。
+		s.logf("write: new branch %s@%s created by this write (not in any sync list, not listed by trees)",
+			targetProject, writeBranch)
+	}
+
 	return writePlan{
 		Project:    targetProject,
 		Branch:     writeBranch,
 		Policy:     pol,
 		TreePrefix: strings.Trim(treePrefix, "/"),
 		Defaulted:  strings.TrimSpace(explicit) == "",
+		NewBranch:  newBranch,
 	}, nil
 }
 

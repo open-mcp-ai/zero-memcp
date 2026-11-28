@@ -136,7 +136,7 @@ func callMCP(t *testing.T, srv *Server, token, cmd string) (string, error) {
 	// 脚手架把旧写法翻成 termcp 原生语法（服务端只认原生）。
 	cmd, _, args := legacyToNative(cmd)
 	argJSON, _ := json.Marshal(args)
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":` +
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mem","arguments":{"cmd":` +
 		strconv.Quote(cmd) + `,"args":` + string(argJSON) + `}}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 	if token != "" {
@@ -162,7 +162,7 @@ func callMCPMeta(t *testing.T, srv *Server, token, cmd string) (text string, met
 	t.Helper()
 	cmd, _, args := legacyToNative(cmd)
 	argJSON, _ := json.Marshal(args)
-	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"term","arguments":{"cmd":` +
+	body := `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"mem","arguments":{"cmd":` +
 		strconv.Quote(cmd) + `,"args":` + string(argJSON) + `}}}`
 	req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(body))
 	if token != "" {

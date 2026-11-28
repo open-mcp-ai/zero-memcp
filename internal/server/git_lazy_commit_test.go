@@ -207,7 +207,7 @@ auto_sync = true
 		t.Fatal(err)
 	}
 	if _, werr := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write daily@main.record/later.md $TEXT",
 			"vars": map[string]string{"TEXT": "后来写的"},

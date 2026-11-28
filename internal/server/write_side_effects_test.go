@@ -72,7 +72,7 @@ func TestAllWriteVerbsRecordOpAndPublish(t *testing.T) {
 
 	// 1. put
 	putOut := run("put", map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "put blackegg/me@zero $BODY",
 			"vars": map[string]string{"BODY": "put 写的内容"},
@@ -83,7 +83,7 @@ func TestAllWriteVerbsRecordOpAndPublish(t *testing.T) {
 
 	// 2. ref（今天刚发现它之前从来不记命令流）
 	run("ref", map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd": "ref blackegg/me@zero blackegg/me@zero/" + putAddr,
 		},
@@ -91,7 +91,7 @@ func TestAllWriteVerbsRecordOpAndPublish(t *testing.T) {
 
 	// 3. write
 	run("write", map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero/direct.md $BODY",
 			"vars": map[string]string{"BODY": "write 写的内容"},
@@ -100,7 +100,7 @@ func TestAllWriteVerbsRecordOpAndPublish(t *testing.T) {
 
 	// 4. apply (write)
 	run("apply-write", map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "apply blackegg/me@zero -- $P",
 			"vars": map[string]string{"P": `[{"op":"write","path":"from-apply.md","content":"apply 写的"}]`},
@@ -109,7 +109,7 @@ func TestAllWriteVerbsRecordOpAndPublish(t *testing.T) {
 
 	// 5. cp
 	run("cp", map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd": "cp blackegg/me@zero/direct.md -> blackegg/me@zero/copied.md",
 		},
@@ -117,14 +117,14 @@ func TestAllWriteVerbsRecordOpAndPublish(t *testing.T) {
 
 	// 6. mv（要求源路径存在，先写一个专给它搬的）
 	run("write-for-mv", map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero/to-move.md $BODY",
 			"vars": map[string]string{"BODY": "待搬运"},
 		},
 	})
 	run("mv", map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd": "mv blackegg/me@zero/to-move.md -> blackegg/me@zero/moved.md",
 		},
@@ -132,7 +132,7 @@ func TestAllWriteVerbsRecordOpAndPublish(t *testing.T) {
 
 	// 7. apply (delete)
 	run("apply-delete", map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "apply blackegg/me@zero -- $P",
 			"vars": map[string]string{"P": `[{"op":"delete","path":"from-apply.md"}]`},
@@ -141,7 +141,7 @@ func TestAllWriteVerbsRecordOpAndPublish(t *testing.T) {
 
 	// 8. delete
 	run("delete", map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd": "delete blackegg/me@zero/copied.md",
 		},

@@ -36,7 +36,7 @@ func TestApplyWritesAndDeletesInOneCall(t *testing.T) {
 
 	cmd := "apply blackegg/me@zero $PATCHES"
 	out, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  cmd,
 			"vars": map[string]string{"PATCHES": string(raw)},
@@ -81,7 +81,7 @@ func TestApplyRejectsWholeBatchOnBadPatch(t *testing.T) {
 	// 第一条合法、第二条非法（路径逃出树）
 	bad := `[{"op":"write","path":"good.md","content":"应该不落盘"},{"op":"write","path":"../escape.md","content":"x"}]`
 	_, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "apply blackegg/me@zero $PATCHES",
 			"vars": map[string]string{"PATCHES": bad},
@@ -108,7 +108,7 @@ func TestApplyRejectsDuplicatePath(t *testing.T) {
 	}
 	dup := `[{"op":"write","path":"a.md","content":"1"},{"op":"write","path":"a.md","content":"2"}]`
 	_, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "apply blackegg/me@zero $PATCHES",
 			"vars": map[string]string{"PATCHES": dup},

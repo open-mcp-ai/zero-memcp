@@ -147,7 +147,7 @@ func TestRefusesToWipePeerWithEmptySnapshot(t *testing.T) {
 
 	// 对端先有内容（由它自己写，不经过同步）
 	if _, err := callMCPRaw(t, down, downTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write daily@zero:keep.md $BODY",
 			"vars": map[string]string{"BODY": "对端自己的内容"},

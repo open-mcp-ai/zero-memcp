@@ -36,7 +36,7 @@ func TestTreeReplaceRefreshesOnlyChangedPaths(t *testing.T) {
 	}
 	for p, body := range paths {
 		if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write " + project + "@" + branch + ":" + p + " $BODY",
 				"vars": map[string]string{"BODY": body},
@@ -45,7 +45,7 @@ func TestTreeReplaceRefreshesOnlyChangedPaths(t *testing.T) {
 			t.Fatalf("src 写 %s: %v", p, err)
 		}
 		if _, err := callMCPRaw(t, dst, dstToken, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write " + project + "@" + branch + ":" + p + " $BODY",
 				"vars": map[string]string{"BODY": body},
@@ -67,7 +67,7 @@ func TestTreeReplaceRefreshesOnlyChangedPaths(t *testing.T) {
 
 	// src 再加一条 dst 没有的：真实变更只有这 1 条。
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write " + project + "@" + branch + ":only-on-src.md $BODY",
 			"vars": map[string]string{"BODY": "only here"},

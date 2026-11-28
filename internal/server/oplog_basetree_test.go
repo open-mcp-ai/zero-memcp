@@ -29,7 +29,7 @@ import (
 func writeDaily(t *testing.T, srv *Server, tok, path, body string) {
 	t.Helper()
 	if _, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  fmt.Sprintf("write daily@zero:%s $BODY", path),
 			"vars": map[string]string{"BODY": body},

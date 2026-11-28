@@ -44,7 +44,7 @@ mode  = "rwx------"
 	// 1. vars 正文里包含换行和特殊字符：不应打乱 cmd
 	longBody := "第一行\n-- 第二行带横线\n第三行"
 	callJSON := map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "put -- $BODY",
 			"vars": map[string]string{"BODY": longBody},
@@ -60,7 +60,7 @@ mode  = "rwx------"
 
 	// 2. args 位置参数
 	callArgsJSON := map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "put -- $1",
 			"args": []string{"来自位置参数的正文"},
@@ -76,7 +76,7 @@ mode  = "rwx------"
 
 	// 3. 传了多余的 vars 必须报错（丢参数被严禁）
 	callUnusedJSON := map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "status",
 			"vars": map[string]string{"UNUSED": "val"},
@@ -88,7 +88,7 @@ mode  = "rwx------"
 
 	// 4. 写了 $ 却没在 vars/args 声明必须报错
 	callUndeclaredJSON := map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd": "put -- $MISSING",
 		},

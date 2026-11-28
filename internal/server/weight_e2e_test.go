@@ -65,7 +65,7 @@ func TestReadReinforcesRecall(t *testing.T) {
 
 	// 读 notes/b.md 三次
 	for i := 0; i < 3; i++ {
-		res, err := srv.callTool(context.Background(), "term",
+		res, err := srv.callTool(context.Background(), "mem",
 			[]byte(`{"cmd":"read notes/b.md"}`), rootCaller())
 		if err != nil {
 			t.Fatalf("read: %v", err)

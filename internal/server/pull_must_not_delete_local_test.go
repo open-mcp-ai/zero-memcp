@@ -31,7 +31,7 @@ func TestPullMustNotDeleteLocallyCommittedContent(t *testing.T) {
 
 	// A 写入并提交：这正是同步循环在推送前做的事。
 	if _, err := callMCPRaw(t, a, tokA, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write daily@zero:survive.md $BODY",
 			"vars": map[string]string{"BODY": "本地刚写完，还没推给对端"},

@@ -36,7 +36,7 @@ func TestDeleteWinsIsNotReportedAsLocalKept(t *testing.T) {
 
 	// A 写一条（不 commit），推给 B，B 拿到一条**未提交**的本地副本
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 			"vars": map[string]string{"BODY": "content"},

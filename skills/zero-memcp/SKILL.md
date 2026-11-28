@@ -29,7 +29,7 @@ daily/team/chat/2026-10-31/...           某棵子树下的内容
 
 ## 接口
 
-MCP 只有一个工具 `term`，参数是一行 DSL：
+MCP 只有一个工具 `mem`，参数是一行 DSL：
 
 ```
 term({cmd: "recall 端口为什么定1729"})

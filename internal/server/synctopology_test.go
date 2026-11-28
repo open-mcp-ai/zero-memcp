@@ -24,7 +24,7 @@ func TestNodeKnowsUpstreamStatus(t *testing.T) {
 	for i := 1; i <= 5; i++ {
 		p := fmt.Sprintf("u%d.md", i)
 		if _, err := callMCPRaw(t, up, tokUp, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + p + " $BODY",
 				"vars": map[string]string{"BODY": "up " + p},
@@ -89,7 +89,7 @@ func TestNodeKnowsDownstreamStatus(t *testing.T) {
 	for i := 1; i <= 10; i++ {
 		p := fmt.Sprintf("msg%d.md", i)
 		if _, err := callMCPRaw(t, up, tokUp, map[string]any{
-			"name": "term",
+			"name": "mem",
 			"arguments": map[string]any{
 				"cmd":  "write blackegg/me@zero:" + p + " $BODY",
 				"vars": map[string]string{"BODY": "msg"},

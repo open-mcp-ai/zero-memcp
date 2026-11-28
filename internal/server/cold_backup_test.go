@@ -91,7 +91,7 @@ func TestIndexDisabledSkipsRefreshPath(t *testing.T) {
 
 	// 写一篇记忆：Git 必须落盘，索引必须一动不动
 	if _, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:cold.md $BODY",
 			"vars": map[string]string{"BODY": "冷备份也要落盘"},
@@ -167,7 +167,7 @@ mode  = "rwxr-xr-x"
 	// 写一篇文档并存下快照（先走一次写入把仓库创建出来）
 	tok1 := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Cap: "rwx"})
 	if _, err := callMCPRaw(t, s1, tok1, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:doc.md $BODY",
 			"vars": map[string]string{"BODY": "真实文档"},
@@ -269,7 +269,7 @@ func TestColdBackupRefusesQueryVerbsLoudly(t *testing.T) {
 
 	// grep 必须报错
 	_, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd": "grep something",
 		},
@@ -283,7 +283,7 @@ func TestColdBackupRefusesQueryVerbsLoudly(t *testing.T) {
 
 	// recall 必须报错
 	_, err = callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd": "recall something",
 		},
@@ -297,7 +297,7 @@ func TestColdBackupRefusesQueryVerbsLoudly(t *testing.T) {
 
 	// status 必须明确打印 index: disabled
 	txt, err := callMCPRaw(t, srv, tok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd": "status",
 		},

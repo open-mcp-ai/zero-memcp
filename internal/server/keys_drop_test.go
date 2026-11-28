@@ -67,7 +67,7 @@ caps = ["erase"]
 	rwxTok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Cap: "rwx"})
 	const path = "2026-11-19/test-drop.md"
 	_, _ = callMCPRaw(t, srv, rwxTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:" + path + " $BODY",
 			"vars": map[string]string{"BODY": "待销毁数据"},
@@ -104,7 +104,7 @@ caps = ["erase"]
 	// 4. 再次写入一条，用 replace（需要 replace 权限位）测试越权拦截
 	const path2 = "2026-11-19/replace-test.md"
 	_, _ = callMCPRaw(t, srv, rwxTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:" + path2 + " $BODY",
 			"vars": map[string]string{"BODY": "待替换数据"},
@@ -113,7 +113,7 @@ caps = ["erase"]
 	_, _ = callMCP(t, srv, rwxTok, "commit blackegg/me@zero seed2")
 
 	res2, _ := callMCPRaw(t, srv, rwxTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "replace blackegg/me@zero:" + path2 + " $BODY",
 			"vars": map[string]string{"BODY": "[已抹除]"},
@@ -132,7 +132,7 @@ caps = ["erase"]
 	sigIllegal := base64.StdEncoding.EncodeToString(ed25519.Sign(eraserPriv, []byte(payload2)))
 	illegalCmd := "replace blackegg/me@zero:" + path2 + " --nonce " + nonce2 + " --sig " + sigIllegal + " $BODY"
 	_, err = callMCPRaw(t, srv, rwxTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  illegalCmd,
 			"vars": map[string]string{"BODY": "[已抹除]"},
@@ -150,7 +150,7 @@ caps = ["erase"]
 	sigRoot := base64.StdEncoding.EncodeToString(ed25519.Sign(phonePriv, []byte(payload2)))
 	legalCmd := "replace blackegg/me@zero:" + path2 + " --nonce " + nonce2 + " --sig " + sigRoot + " $BODY"
 	repOut, err := callMCPRaw(t, srv, rwxTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  legalCmd,
 			"vars": map[string]string{"BODY": "[已抹除]"},

@@ -31,7 +31,7 @@ func TestPushFailureForgetsSentTree(t *testing.T) {
 
 	// 先造出内容，让导出器有东西可发。
 	if _, err := callMCPRaw(t, src, srcToken, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write " + project + "@" + branch + ":a.md $BODY",
 			"vars": map[string]string{"BODY": "content"},

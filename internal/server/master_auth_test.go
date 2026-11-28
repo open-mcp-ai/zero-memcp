@@ -36,7 +36,7 @@ func TestMasterKeyEraseAuthorization(t *testing.T) {
 	// 先写一条敏感记忆
 	const targetPath = "2026-11-19/master-secret.md"
 	if _, err := callMCPRaw(t, srv, rwxTok, map[string]any{
-		"name": "term",
+		"name": "mem",
 		"arguments": map[string]any{
 			"cmd":  "write blackegg/me@zero:" + targetPath + " $BODY",
 			"vars": map[string]string{"BODY": "绝密资料，只有主人能决定销毁"},

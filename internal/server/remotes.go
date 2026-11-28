@@ -497,7 +497,7 @@ func (s *Server) execPush(rest string, c Caller) (TermResult, error) {
 // 与后台循环走的同步函数完全一致，不另开一条实现：
 // 两条路径一旦分叉，就一定会出现「手动能拉、后台不能」这种诡异现象。
 func (s *Server) execWorkPeerSync(project string, rm config.Remote, repo *gitstore.Repo, c Caller) (TermResult, error) {
-	if err := s.syncWorkWithRemote(project, rm, repo); err != nil {
+	if err := s.syncWorkWithRemote(project, rm, repo, false); err != nil {
 		return TermResult{}, fmt.Errorf("sync %s@%s failed: %w", project, rm.Name, err)
 	}
 

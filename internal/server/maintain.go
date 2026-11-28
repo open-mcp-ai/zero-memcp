@@ -149,7 +149,7 @@ func (s *Server) maintain(done chan struct{}) {
 							st.lastCommit = time.Now()
 							// 提交成功即踢一次同步：这是「数据量先到」那一半触发。
 							// 「2 小时先到」那一半由 startSyncLoop 的 ticker 兜底。
-							s.kickSync()
+							s.kickSync(kickPush)
 						}
 					}
 				}

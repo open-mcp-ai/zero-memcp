@@ -161,6 +161,13 @@ type Server struct {
 	// ACL 回答「这格开没开」，role 回答「这一次只让它看多小」。
 	roles *acl.RoleStore
 
+	// syncWant 是待办方向位（kickPush / kickPull 的位或）。
+	//
+	// kick 通道只能表达「有事」，表达不了「哪边有事」，而两者该跑的
+	// 工作量差一个量级：推有变化的分支是一两次往返，整轮 pass 是十几秒。
+	// 位或进这里，循环醒来时一并取走（Swap 保证不丢也不重复）。
+	syncWant atomic.Uint32
+
 	// logOut 是日志输出端（默认 os.Stderr）。
 	//
 	// 唯一用途是让「该出声的地方有没有出声」可被测试断言——

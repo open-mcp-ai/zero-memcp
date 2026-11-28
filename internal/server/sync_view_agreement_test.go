@@ -57,7 +57,7 @@ func TestSyncViewsAgreeOnPeerBranch(t *testing.T) {
 		Push:     []string{"zero"},
 		PushOnly: true,
 	}
-	if err := src.syncOpsWithRemote(client, rm, "blackegg/me"); err != nil {
+	if err := src.syncOpsWithRemote(client, rm, "blackegg/me", false); err != nil {
 		t.Fatalf("命令流同步: %v", err)
 	}
 
@@ -123,7 +123,7 @@ func TestPushRecordPeerHeadIsPosition(t *testing.T) {
 		Token: tokDst,
 		Push:  []string{"zero"},
 	}
-	if err := src.syncOpsWithRemote(client, rm, "blackegg/me"); err != nil {
+	if err := src.syncOpsWithRemote(client, rm, "blackegg/me", false); err != nil {
 		t.Fatalf("命令流同步: %v", err)
 	}
 
@@ -179,7 +179,7 @@ func TestPushWatermarkKeyedByOwnerName(t *testing.T) {
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	rm := configRemote{Name: "hub", URL: dstSrv.URL, Token: tokDst, Push: []string{"zero"}, PushOnly: true}
-	if err := src.syncOpsWithRemote(client, rm, "blackegg/me"); err != nil {
+	if err := src.syncOpsWithRemote(client, rm, "blackegg/me", false); err != nil {
 		t.Fatalf("同步: %v", err)
 	}
 
@@ -225,7 +225,7 @@ func TestPeerViewPeerRoleReportsCaughtUp(t *testing.T) {
 
 	client := &http.Client{Timeout: 15 * time.Second}
 	rm := configRemote{Name: "hub", URL: dstSrv.URL, Token: tokDst, Push: []string{"zero"}, PushOnly: true}
-	if err := src.syncOpsWithRemote(client, rm, "blackegg/me"); err != nil {
+	if err := src.syncOpsWithRemote(client, rm, "blackegg/me", false); err != nil {
 		t.Fatalf("同步: %v", err)
 	}
 

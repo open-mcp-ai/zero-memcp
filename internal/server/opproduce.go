@@ -68,7 +68,7 @@ func (s *Server) noteWriteOp(c Caller, project, branch, path, mode, sha string) 
 		s.publishLocalWrite(project, branch, path, c)
 		return
 	}
-	s.kickSync()
+	s.kickSync(kickPush)
 	s.publishLocalWrite(project, branch, path, c)
 }
 
@@ -78,7 +78,7 @@ func (s *Server) noteDeleteOp(c Caller, project, branch, path string) {
 		if _, err := s.recordTreeOp(project, branch, opDelete, path, "", "", ""); err != nil {
 			s.logf("oplog: record delete %s@%s:%s failed: %v", project, branch, path, err)
 		} else {
-			s.kickSync()
+			s.kickSync(kickPush)
 		}
 	}
 	s.publishLocalWrite(project, branch, path, c)
@@ -90,7 +90,7 @@ func (s *Server) noteMoveOp(c Caller, project, branch, from, to string) {
 		if _, err := s.recordTreeOp(project, branch, opRename, to, from, "", ""); err != nil {
 			s.logf("oplog: record rename %s@%s:%s -> %s failed: %v", project, branch, from, to, err)
 		} else {
-			s.kickSync()
+			s.kickSync(kickPush)
 		}
 	}
 	s.publishLocalWrite(project, branch, from, c)
@@ -103,7 +103,7 @@ func (s *Server) noteCopyOp(c Caller, project, branch, from, to, mode, sha strin
 		if _, err := s.recordTreeOp(project, branch, opCopy, to, from, mode, sha); err != nil {
 			s.logf("oplog: record copy %s@%s:%s -> %s failed: %v", project, branch, from, to, err)
 		} else {
-			s.kickSync()
+			s.kickSync(kickPush)
 		}
 	}
 	s.publishLocalWrite(project, branch, to, c)

@@ -96,7 +96,7 @@ auto_sync = true
 		t.Fatal("配置里应有一条 remote")
 	}
 	rm := cf.Remotes[0]
-	srv.syncOnce("daily", rm)
+	srv.syncOnce("daily", rm, false)
 
 	// ① 本地脏层被折成了 commit。
 	if got := repo.Pending(); got != 0 {
@@ -219,7 +219,7 @@ auto_sync = true
 	if cf == nil || len(cf.Remotes) == 0 {
 		t.Fatal("配置里应有一条 remote")
 	}
-	srv.syncOnce("daily", cf.Remotes[0])
+	srv.syncOnce("daily", cf.Remotes[0], false)
 
 	// 先证明折叠真的发生了：head 必须动过。
 	// 没有这一步，一个「根本没折叠」的实现也能让下面的断言平凡通过

@@ -78,7 +78,7 @@ type syncState struct {
 // 而是「对端不回了、连接半死」这种会把整条同步链永久堵住的形状。
 const workSyncBudget = 15 * time.Minute
 
-func (s *Server) syncOnce(project string, rm config.Remote) {
+func (s *Server) syncOnce(project string, rm config.Remote, onlyPending bool) {
 	key := project + "@" + rm.Name
 	root := s.rootCaller()
 
@@ -94,7 +94,7 @@ func (s *Server) syncOnce(project string, rm config.Remote) {
 	// 若对端是另一个 zero-memcp 实例（HTTP/HTTPS 且不以 .git 结尾），
 	// 先直接同步工作层改动——无需先 commit，两台机器立刻可见。
 	if isWorkPeerURL(rm.URL) {
-		if perr := s.syncWorkWithRemote(project, rm, repo); perr != nil {
+		if perr := s.syncWorkWithRemote(project, rm, repo, onlyPending); perr != nil {
 			s.recordSyncErr(key, "work-sync: "+perr.Error())
 		} else {
 			s.recordSyncOK(key)
@@ -352,18 +352,32 @@ func (s *Server) startSyncLoop() {
 			case <-s.done:
 				return
 			case <-first:
-				s.runSyncPass("startup")
+				s.runSyncPass("startup", false)
 			case <-ticker.C:
-				s.runSyncPass("periodic")
+				s.runSyncPass("periodic", false)
 			case <-kick:
 				// 提交触发：稍等合并连续提交，但别等太久——
 				// 用户刚写下的记忆应该几秒内就开始上传，而不是几十秒后。
 				select {
-				case <-time.After(2 * time.Second):
+				case <-time.After(500 * time.Millisecond):
 				case <-stop:
 					return
 				}
-				s.runSyncPass("commit")
+				kinds := syncKickKind(s.syncWant.Swap(0))
+				// 本地刚写过：只碰「对这条对端还有东西待推」的分支。
+				//
+				// 这一条是实时性的关键。整轮 pass 要对十几条分支各做
+				// pull + push 两次往返，实测 10 秒上下；而真正要传的只有
+				// 刚写那一条，传输 0.8 秒。窄化之后「写→对端可见」从
+				// 6.5～13.4 秒降到一两秒。
+				if kinds&kickPush != 0 {
+					s.runSyncPass("commit", true)
+				}
+				// 对端说有新东西：拉取必须看全部分支，无法窄化
+				// （不知道是哪条变了，订阅事件只给「有事」）。
+				if kinds&kickPull != 0 {
+					s.runSyncPass("commit-full", false)
+				}
 			}
 		}
 	}()
@@ -375,8 +389,32 @@ func (s *Server) startSyncLoop() {
 	s.startPeerSubscriptions()
 }
 
-// kickSync 请求一次尽快同步（提交成功后调用）。非阻塞、去重。
-func (s *Server) kickSync() {
+// syncKickKind 说明这次 kick 想干什么。
+//
+// 为什么 kick 要带方向（2026-11-28 实测）：早先所有 kick 都跑一整轮
+// runSyncPass——一个对端十几条分支，每条都要 pull + push 两次 HTTP 往返，
+// 即使没有任何变化。于是一轮 pass 要十几秒，而刚写下的那条记忆要等
+// 这一轮跑完才轮到它。实测流水：
+//
+//	push weft@main → hub   dur=852ms
+//	push weft@main → hub   dur=755ms   ← 相隔 14 秒
+//
+// 传输只要 0.8 秒，14 秒全花在「等这一轮空转结束」。分成方向之后，
+// 本地写入只推「确实有变化的分支」，一轮降到一两秒。
+type syncKickKind uint32
+
+const (
+	// kickPush：本地刚产生新命令，尽快推出去。
+	kickPush syncKickKind = 1 << iota
+	// kickPull：对端说有新东西，尽快拉回来。
+	kickPull
+)
+
+// kickSync 请求一次尽快同步。非阻塞、去重。
+//
+// 多个方向可以叠加：位或进 syncWant，循环醒来时一并取走。
+func (s *Server) kickSync(kind syncKickKind) {
+	s.syncWant.Or(uint32(kind))
 	s.syncState.runner.kick()
 }
 
@@ -391,7 +429,12 @@ func (s *Server) kickSync() {
 //
 // Git 远端是「快照给外部看」，晚几秒无影响；工作层对端是活链路，
 // 必须优先。
-func (s *Server) runSyncPass(reason string) {
+// runSyncPass 跑一轮同步。
+//
+// onlyPending 为真时，只处理「对本对端还有命令待推」的分支——写后即时
+// 推送走这条窄路；周期轮询与对端事件走完整一轮（onlyPending=false），
+// 那条路顺带把位点异常整回来。
+func (s *Server) runSyncPass(reason string, onlyPending bool) {
 	targets := s.syncTargets()
 	if len(targets) == 0 {
 		return
@@ -401,7 +444,7 @@ func (s *Server) runSyncPass(reason string) {
 			if isWorkPeerURL(t.Remote.URL) != pass {
 				continue
 			}
-			s.syncOnce(t.Project, t.Remote)
+			s.syncOnce(t.Project, t.Remote, onlyPending)
 		}
 	}
 	_ = reason
@@ -506,7 +549,7 @@ func isWorkPeerURL(rawURL string) bool {
 //	② 遍历 rm.Pull：主动向对端 pull 工作层改动落地。
 //	  若配置没写 Pull，但写了 Push，默认把同一批分支也纳入拉取——
 //	  因为通常对等节点的意图就是「这几条分支实时对齐」。
-func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gitstore.Repo) error {
+func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gitstore.Repo, onlyPending bool) error {
 	// 命令流同步用专用的客户端：批量推送要等对端应用完整批才回响应头，
 	// 20 秒的整请求预算是给 Git 传输定的，套在这里会让稍大的批次必败。
 	client, err := gittransport.NewSyncClient(gittransport.TLSConfig{
@@ -546,5 +589,5 @@ func (s *Server) syncWorkWithRemote(project string, rm config.Remote, repo *gits
 		Pull:      rm.Pull,
 		FetchOnly: rm.FetchOnly,
 		PushOnly:  rm.PushOnly,
-	}, project)
+	}, project, onlyPending)
 }

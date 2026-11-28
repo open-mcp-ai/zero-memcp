@@ -169,7 +169,7 @@ func TestBulkPushOutlivesShortClientTimeout(t *testing.T) {
 	}
 	// 旧实现用 20 秒整请求预算 + 3 秒响应延迟 × 多轮（push → 补 blob → 重放）
 	// 会踩线；新实现不设整请求上限，必须通过。
-	if err := host.syncOpsWithRemote(client, rm, "blackegg/me"); err != nil {
+	if err := host.syncOpsWithRemote(client, rm, "blackegg/me", false); err != nil {
 		t.Fatalf("批量推送给慢对端应成功，实际: %v", err)
 	}
 	for _, p := range []string{"b1.md", "b2.md", "b3.md"} {

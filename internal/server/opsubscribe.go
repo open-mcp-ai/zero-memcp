@@ -324,7 +324,7 @@ func (s *Server) streamPeerEvents(rm config.Remote, uris []string) error {
 		if fn := s.peerEventHook.Load(); fn != nil {
 			(*fn)()
 		}
-		s.kickSync()
+		s.kickSync(kickPull)
 	}
 	if err := sc.Err(); err != nil {
 		return err

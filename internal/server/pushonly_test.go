@@ -58,7 +58,7 @@ func TestPushOnlyRemoteNeverPulls(t *testing.T) {
 		Push:     []string{"zero"},
 		PushOnly: true,
 	}
-	if err := laptop.syncOpsWithRemote(client, rm, "blackegg/me"); err != nil {
+	if err := laptop.syncOpsWithRemote(client, rm, "blackegg/me", false); err != nil {
 		t.Fatalf("推给备份: %v", err)
 	}
 
@@ -110,7 +110,7 @@ func TestWorkPeerWithoutPushOnlyDoesPull(t *testing.T) {
 		Token: tokBackup,
 		Push:  []string{"zero"},
 	}
-	if err := laptop.syncOpsWithRemote(client, rm, "blackegg/me"); err != nil {
+	if err := laptop.syncOpsWithRemote(client, rm, "blackegg/me", false); err != nil {
 		t.Fatalf("同步: %v", err)
 	}
 	if out, err := callMCP(t, laptop, tokLaptop, "read blackegg/me@zero:backup-only.md"); err != nil || out == "" {
@@ -243,7 +243,7 @@ func TestOpPushAutoInitsRepositoryOnEmptyPeer(t *testing.T) {
 		Push:     []string{"zero"},
 		PushOnly: true,
 	}
-	if err := laptop.syncOpsWithRemote(client, rm, "blackegg/brand-new"); err != nil {
+	if err := laptop.syncOpsWithRemote(client, rm, "blackegg/brand-new", false); err != nil {
 		t.Fatalf("推给新节点应自动建库，实际失败: %v", err)
 	}
 

@@ -2,11 +2,11 @@ package server
 
 import (
 	"bytes"
-	"sort"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -1460,7 +1460,7 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 // 分支列表的缺省规则：pull 未显式配置时回落到 push 列表——
 // 大多数对等配置只写一次分支名单，意图就是这几条保持双向一致，
 // 不该逼人把同一组名字抄两遍。
-func (s *Server) syncOpsWithRemote(client *http.Client, rm configRemote, project string) error {
+func (s *Server) syncOpsWithRemote(client *http.Client, rm configRemote, project string, onlyPending bool) error {
 	// **先拉后推**，不能反过来。
 	//
 	// 推送要算差分，而差分的起点是「对端手上是哪棵树」——那个信息
@@ -1502,6 +1502,15 @@ func (s *Server) syncOpsWithRemote(client *http.Client, rm configRemote, project
 	})
 	for _, br := range branches {
 		if br == "*" {
+			continue
+		}
+		// 写后即时推送只碰「对这条对端还有东西待推」的分支。
+		//
+		// 判断必须在这里做，不能在上层过滤：判据要的是**这条对端的**
+		// 已确认位点，而上层只拿得到 project/branch，不知道对端是谁。
+		// 用空对端名去比会让「有没有待推」退化成「本地有没有命令」，
+		// 结果是对端早就收下了的分支每轮都被判成待推。
+		if onlyPending && !s.branchHasPendingOps(project, br, s.resolvePeer(rm.Name)) {
 			continue
 		}
 		if pullSet[br] {

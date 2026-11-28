@@ -125,7 +125,7 @@ func TestSyncOpsInterleavesPullAndPushPerBranch(t *testing.T) {
 	err = s.syncOpsWithRemote(&http.Client{Timeout: 10 * time.Second}, configRemote{
 		Name: "fake", URL: peer.URL, Token: "t",
 		Push: []string{"heavy", "light"}, Pull: []string{"heavy", "light"},
-	}, project)
+	}, project, false)
 	if err != nil {
 		t.Fatalf("syncOpsWithRemote: %v", err)
 	}
@@ -157,5 +157,85 @@ func TestSyncOpsInterleavesPullAndPushPerBranch(t *testing.T) {
 	}
 	if lightPull < 0 || lightPull > lightPush {
 		t.Fatalf("同一条分支必须先拉后推（推送算差分要以对端树为起点），顺序: %+v", order)
+	}
+}
+
+// onlyPending=true 时，只碰「对这条对端还有东西待推」的分支。
+//
+// 这是实时性的关键路径（2026-11-28）：写一条记忆后若跑完整一轮，
+// 要对十几条分支各做 pull + push 两次往返，实测 10 秒上下；
+// 而真正要传的只有那一条。窄化把「写→对端可见」从 6.5～13.4 秒
+// 降到一两秒。
+func TestOnlyPendingSkipsQuietBranches(t *testing.T) {
+	s, dataDir := setupMountServer(t)
+	_ = dataDir
+	const project = "blackegg/me"
+	if _, err := s.projects.Ensure(project); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, br := range []string{"quiet", "talky"} {
+		if err := repo.Write(br, "seed.md", []byte("x"), gitstore.ModeContent); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := repo.Commit(br, "seed"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 只有 talky 有命令要推。
+	if _, err := s.recordTreeOp(project, "talky", opSet, "new.md", "", "100644", "sha-new"); err != nil {
+		t.Fatal(err)
+	}
+
+	var contacted []string
+	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Project string `json:"project"`
+			Branch  string `json:"branch"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		contacted = append(contacted, req.Branch)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/push") {
+			_ = json.NewEncoder(w).Encode(opApplyResult{Applied: 1})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(opBatch{Project: req.Project, Branch: req.Branch, Node: "fake"})
+	}))
+	defer peer.Close()
+
+	rm := configRemote{
+		Name: "fake", URL: peer.URL, Token: "t",
+		Push: []string{"quiet", "talky"}, Pull: []string{"quiet", "talky"},
+	}
+	if err := s.syncOpsWithRemote(&http.Client{Timeout: 10 * time.Second}, rm, project, true); err != nil {
+		t.Fatalf("syncOpsWithRemote(onlyPending): %v", err)
+	}
+	for _, br := range contacted {
+		if br == "quiet" {
+			t.Fatalf("onlyPending 不该碰没有待推内容的分支，实际请求序列: %v", contacted)
+		}
+	}
+	if len(contacted) == 0 {
+		t.Fatal("有待推内容的分支必须被推到，实际一个请求都没有")
+	}
+
+	// 完整一轮（onlyPending=false）必须两条都碰到——它是兜底路径，
+	// 位点异常时靠它把状态整回来。
+	contacted = nil
+	if err := s.syncOpsWithRemote(&http.Client{Timeout: 10 * time.Second}, rm, project, false); err != nil {
+		t.Fatalf("syncOpsWithRemote(full): %v", err)
+	}
+	var sawQuiet bool
+	for _, br := range contacted {
+		if br == "quiet" {
+			sawQuiet = true
+		}
+	}
+	if !sawQuiet {
+		t.Fatalf("完整一轮必须覆盖安静分支，实际: %v", contacted)
 	}
 }

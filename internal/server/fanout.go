@@ -208,7 +208,7 @@ func (s *Server) triggerFanout(project, ref, newSHA, trigger string) {
 		for _, rm := range targets {
 			s.fanouts.updateTarget(batch.ID, rm.Name, "running", "")
 			// 复用已有的 syncOnce 逻辑
-			s.syncOnce(project, rm)
+			s.syncOnce(project, rm, false)
 			// 根据 lastErr 确认是否出现错误
 			key := project + "@" + rm.Name
 			errStr := ""

@@ -404,7 +404,14 @@ func (s *Server) ingestOps(project, branch string, batch opBatch) (opApplyResult
 	// 「整树命令」——它只是一串普通的 set/delete，只有批次本身知道
 	// 「这批合起来等于一棵新树」。
 	if batch.Rebase {
-		s.rebaseLocalToContent(project, branch, batch.Node)
+		// 基准用对端**声明过的**内容树：它一定在两边都存在，而 Rebase 的
+		// 语义就是「这批落地后本端内容等于它」。只有批次没完整落地
+		// （被拒 / 缺正文）时才不敢用——那时本端内容不等于它。
+		want := ""
+		if len(res.Rejected) == 0 && len(res.Missing) == 0 {
+			want = batch.ContentTree
+		}
+		s.rebaseLocalToContent(project, branch, batch.Node, want)
 	}
 	s.learnPeerIdentity(batch.Node, batch.Node)
 	// 只有在命令真正被处理之后才推进对端水位：
@@ -606,6 +613,91 @@ func (s *Server) verifyBatchContent(project, branch string, batch opBatch, res o
 // currentContentTree 把一条分支当前的工作层内容算成一棵内容树。
 //
 // 「当前」= 含未折叠的脏层。对端快照落地后，本端内容就是这棵树。
+// materializeDeclaredTree 把「对端声明的那棵内容树」在本端对象库里造出来。
+//
+// 为什么需要：整树快照落地时只写了 blob 与脏层条目，**没有任何人把
+// 「对端那一棵树」写成 tree 对象**（verifyBatchContent 走的是逐路径
+// ReadPathSHA，不建树）。于是 HasObject(batch.ContentTree) 为假，
+// 基准就设不上——而基准设不上，对端下一轮又认不出起点，又是整树快照。
+// 实测（2026-11-28）：这条因果链让 400 条的分支每轮发 401 条命令。
+//
+// 造法：声明清单 + 本端刚落地的 SHA 重建成树。内容一致，所以算出来的
+// SHA 正好等于对端声明的那棵（内容寻址）。清单为空或本端缺某条时不动手——
+// 造一棵猜出来的树比不造更糟。
+func (s *Server) materializeDeclaredTree(project, branch string, batch opBatch) {
+	if batch.ContentTree == "" || len(batch.ContentPaths) == 0 {
+		return
+	}
+	repo, err := s.projects.Get(project)
+	if err != nil || repo.HasObject(batch.ContentTree) {
+		return
+	}
+	// 用**声明里的原始条目**重建，不是用本端读回来的。
+	//
+	// 踩过的坑（2026-11-28 规模复现）：先用 ReadPathSHA 重建，得到的树
+	// 与声明的树内容完全一致（Diff 为空）而 SHA 不同——因为本端读回的
+	// mode 经过一次归一，而 mode 进树。整树快照这条路上，声明条目就在
+	// 手边（opTree 的 Batch），照抄它不可能错。
+	pathMap := make(map[string]gitstore.Entry, len(batch.ContentPaths))
+	for _, op := range batch.Ops {
+		if op.Kind != opTree {
+			continue
+		}
+		for _, e := range op.Batch {
+			if e.Path == "" || e.SHA == "" {
+				continue
+			}
+			pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: gitstore.Mode(e.Mode), Hash: e.SHA}
+		}
+	}
+	if len(pathMap) == 0 {
+		// 差分批次没有整树条目：那种批次不需要这一步（基准由 BaseTree 给出）。
+		return
+	}
+	built, werr := repo.WriteTreeFromPaths(pathMap)
+	if werr != nil {
+		s.logf("op-sync: materialize declared tree %s for %s@%s: %v",
+			shortSHA(batch.ContentTree), project, branch, werr)
+		return
+	}
+	if built != batch.ContentTree {
+		// 重建出来的树与对端声明的不一致，说明本端这 22 条里至少有一条
+		// 内容不同（或被保留的本地版本顶掉了）。这时不能把它当基准——
+		// 对端拿这棵树去算差分，算出来的差异是错的。
+		diff, _ := repo.Diff(built, batch.ContentTree)
+		if len(diff) > 4 {
+			diff = diff[:4]
+		}
+		s.logf("op-sync: materialized tree %s != declared %s for %s@%s (%d path(s)); diff=%v",
+			shortSHA(built), shortSHA(batch.ContentTree), project, branch, len(batch.ContentPaths), diff)
+	}
+}
+
+// resetOpLogBaseTo 把命令流的基准设到指定树。
+//
+// 只在它与当前基准不同时才写盘：Reset 会重写整份日志文件。
+// 树为空或本端对象库里没有它时不动手——那种基准是假的，
+// 设上去等于把「对端认得我」这条谎话写进账里。
+func (s *Server) resetOpLogBaseTo(project, branch, tree string) {
+	if s.opLogs == nil || tree == "" {
+		return
+	}
+	repo, err := s.projects.Get(project)
+	if err != nil || !repo.HasObject(tree) {
+		return
+	}
+	l, lerr := s.opLogs.For(project, branch)
+	if lerr != nil {
+		return
+	}
+	if l.BaseTree() == tree {
+		return
+	}
+	if rerr := l.Reset(tree); rerr != nil {
+		s.logf("op-sync: reset oplog base to %s for %s@%s: %v", shortSHA(tree), project, branch, rerr)
+	}
+}
+
 // currentContentTree 返回某条分支「当前内容」对应的树 SHA。
 //
 // 「当前」= 已提交树叠加脏层，与 FlattenBranch 同义。
@@ -653,22 +745,57 @@ func flattenBranchTree(repo *gitstore.Repo, branch string) string {
 	return tree
 }
 
-func (s *Server) rebaseLocalToContent(project, branch, peerNode string) {
+func (s *Server) rebaseLocalToContent(project, branch, peerNode, want string) {
 	repo, err := s.projects.Get(project)
 	if err != nil {
 		return
 	}
-	flat, ferr := repo.FlattenBranch(branch)
-	if ferr != nil || len(flat) == 0 {
-		return
+
+	// 基准取**已提交树**，不是脏层合并后的内容树。
+	//
+	// 这是 2026-11-28 规模复现出来的根因（400 条分支上复现：
+	// applied=401 而不是 1）：
+	//
+	// 命令流基准的意义是「我这串命令挂在哪棵树上」，它要跟对端对得上。
+	// 而脏层合并算出来的树里含本端独有、还没推出去的内容——那棵树
+	// 对端永远不会有。基准一设成它，之后每一轮对端都认不出起点，
+	// 只能发整树快照：21,332 条里只有 23 条是新的，落地端为此花 37 秒。
+	//
+	// 对端声明的 batch.ContentTree 则相反：它是对端刚算出来的那棵树，
+	// 对端必然在对象库里有它；而 Rebase 的语义正是「这批落地后本端
+	// 内容等于它」。所以它才是那个双方都能指的基准。
+	//
+	// 注意 commitOpsLocal **不提交**（只用刷新索引，提交由插件显式触发），
+	// 所以「已提交树」在这条路上根本推进不了——落地内容全在脏层里。
+	// 实测过：拿已提交树当基准，dst 侧报的是一棵只有 1 条路径的旧树，
+	// 对端照样算出 401 条差异、照样整树快照。
+	//
+	// 脏层不进基准不会被丢掉：它本来就以「未提交」的身份留着，对端推来的
+	// 命令不会删它（applyTreeReplace 的保留语义），下一轮推送再带上。
+	tree := want
+	if tree == "" {
+		if head, herr := repo.Resolve(branch); herr == nil && head != "" {
+			if t, terr := repo.TreeOfCommit(head); terr == nil {
+				tree = t
+			}
+		}
 	}
-	pathMap := make(map[string]gitstore.Entry, len(flat))
-	for _, e := range flat {
-		pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: e.Mode, Hash: e.SHA}
-	}
-	tree, werr := repo.WriteTreeFromPaths(pathMap)
-	if werr != nil || tree == "" {
-		return
+	if tree == "" {
+		// 还没有任何提交（整树快照刚落地、尚未折叠）：退回内容树。
+		// 这时基准确实只在本端存在，但下一轮提交后就会收敛到已提交树。
+		flat, ferr := repo.FlattenBranch(branch)
+		if ferr != nil || len(flat) == 0 {
+			return
+		}
+		pathMap := make(map[string]gitstore.Entry, len(flat))
+		for _, e := range flat {
+			pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: e.Mode, Hash: e.SHA}
+		}
+		t, werr := repo.WriteTreeFromPaths(pathMap)
+		if werr != nil || t == "" {
+			return
+		}
+		tree = t
 	}
 	if s.workSync != nil && peerNode != "" {
 		s.workSync.noteBase(project, branch, peerNode, tree)
@@ -1557,7 +1684,20 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 		}
 		if verr != nil {
 			s.logf("op-sync: %v", verr)
-		} else if s.workSync != nil {
+		} else {
+			// 补完正文、校验通过之后，才把命令流基准设到对端声明的树上。
+			//
+			// 为什么必须等到这里：整树快照落地时正文往往还没齐
+			// （实测 missing=400），那一刻 base 不敢用 batch.ContentTree，
+			// 只能退回一棵本端独有的树——而那正是「对端永远认不得起点、
+			// 每轮退整树快照」的根因。补完正文、校验通过，内容才真的等于
+			// 对端声明的那棵树，此时设基准既准确又对端可认。
+			//
+			// 这一步与 workSync 无关，不能挂在它的非空判断下面。
+			s.materializeDeclaredTree(project, branch, batch)
+			s.resetOpLogBaseTo(project, branch, batch.ContentTree)
+		}
+		if s.workSync != nil {
 			// 本端基准 = 本端自己的内容树，必须重算：ingestOps 里那次
 			// rebase 发生在补正文之前，那时缺正文的路径还不存在。
 			if mine := s.currentContentTree(project, branch); mine != "" {

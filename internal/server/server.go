@@ -174,6 +174,12 @@ type Server struct {
 	// 见 logf 的说明与 issue #14。
 	logOut atomic.Pointer[logSink]
 
+	// flattenCalls 统计「摊平整条分支」被调用的次数（O(条数) 的那件事）。
+	//
+	// 用途只有一个：让「这一轮没有做那件昂贵的事」可以被断言。
+	// 用时间断言会在慢机器上假红，而这个计数是事实。
+	flattenCalls atomic.Int64
+
 	// contentTrees 缓存「某条分支当前的内容树」。
 	//
 	// 内容树是「已提交树叠加脏层」的纯函数，而算一次要摊平整棵分支再

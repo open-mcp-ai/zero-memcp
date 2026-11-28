@@ -171,53 +171,49 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 		return s.exportOpsTail(batch, l, after, cur)
 	}
 
-	// 基准不同：把两边都算成内容树，用内容判断差多少。
-	entries, ferr := s.flattenTreeToOps(project, branch)
-	if ferr != nil {
-		return batch, ferr
-	}
-	// 本端一棵空树、对端却有内容：这是唯一会把对端清空的形状，必须拒绝。
-	if len(entries) == 0 && from != gitstore.EmptyTreeSHA {
-		return batch, fmt.Errorf(
-			"refusing to send an empty-tree snapshot for %s@%s: peer has %s which is not empty, "+
-				"this would erase everything on the peer", project, branch, shortSHA(from))
-	}
-	var curContentTree string
-	if repo, rerr := s.projects.Get(project); rerr == nil && len(entries) > 0 {
-		pathMap := make(map[string]gitstore.Entry, len(entries))
-		for _, e := range entries {
-			pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: gitstore.Mode(e.Mode), Hash: e.SHA}
-		}
-		if tree, werr := repo.WriteTreeFromPaths(pathMap); werr == nil {
-			curContentTree = tree
-		}
-	}
-	// 算差分用的起点：对端报的内容树。比 base_tree 更准，
-	// 因为它含对端未折叠的写入。
-	diffFrom := from
-
 	// 对端手上的内容已经和本端一模一样：一个字节都不发。
 	//
 	// 这是提交之后最常见的一轮——对端上次收到的就是本端当前的内容，
 	// 只是本端基准又前进了一次。认不出这种情况就会每轮重发整棵树。
-	if curContentTree != "" && curContentTree == diffFrom {
+	//
+	// 判等摆在**摊平之前**：内容树在上面已经算好（且带缓存），
+	// 而为了得出「没有差异」去摊平 2 万条、再把同一棵树写第二遍，
+	// 是纯浪费。实测这条浪费的形状：`applied=0` 的拉取耗时 37 秒。
+	if batch.ContentTree != "" && batch.ContentTree == from {
 		if s.workSync != nil && peerNode != "" {
-			s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
+			s.workSync.noteSentTree(project, branch, peerNode, batch.ContentTree)
 		}
 		batch.To = l.Last()
 		return batch, nil
 	}
 
+	// 本端一棵空树、对端却有内容：这是唯一会把对端清空的形状，必须拒绝。
+	//
+	// 用内容树判而不是摊平后的条数：两者等价（没有文件就没有内容树），
+	// 而内容树已经算好了。
+	if batch.ContentTree == "" && from != gitstore.EmptyTreeSHA {
+		return batch, fmt.Errorf(
+			"refusing to send an empty-tree snapshot for %s@%s: peer has %s which is not empty, "+
+				"this would erase everything on the peer", project, branch, shortSHA(from))
+	}
+
+	// 基准不同：算差多少。
+	//
+	// 算差分只需要「两棵树」，而两棵树都已经有了：对端报的 from，
+	// 与本端刚算出的 batch.ContentTree。不必先摊平成条目。
+	//
 	// 首选：树到树差分，只发变化的路径。
 	//
 	// 对端报的基准是一棵真实的树（不是空树），且本地对象库里存着它，
 	// 就能直接算出差异。18,446 篇里改 1 篇就只发 1 条命令。
-	if diffFrom != gitstore.EmptyTreeSHA && curContentTree != "" {
-		if diffOps, derr := s.diffTreesToOps(project, branch, diffFrom, curContentTree); derr == nil {
+	diffFrom := from
+	if diffFrom != gitstore.EmptyTreeSHA && batch.ContentTree != "" {
+		if diffOps, derr := s.diffTreesToOps(project, branch, diffFrom, batch.ContentTree); derr == nil {
 			batch.BaseTree = diffFrom
 			batch.BaseCommit = s.commitForTree(project, branch, diffFrom)
 			batch.Rebase = true
-			batch.ContentTree = curContentTree
+			// batch.ContentTree 已经是对端报的 from 差出来的目标树，不必再赋一次。
+			//
 			// 不在这里带 ContentPaths：差分批次的意义就是「只发变化的路径」，
 			// 塞一份全量清单等于每轮多传整棵树（weft@main.record 实测
 			// 19,468 条 ≈ 1.2MB）。差分的完整性由「基准树 + 这批命令」
@@ -225,22 +221,27 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 			batch.Ops = diffOps
 			batch.To = l.Last()
 			if s.workSync != nil && peerNode != "" {
-				s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
+				s.workSync.noteSentTree(project, branch, peerNode, batch.ContentTree)
 			}
 			s.logf("op-sync: %s@%s: peer base %s -> content %s: %d delta op(s) (tree diff, no full snapshot)",
-				project, branch, shortSHA(diffFrom), shortSHA(curContentTree), len(diffOps))
+				project, branch, shortSHA(diffFrom), shortSHA(batch.ContentTree), len(diffOps))
 			return batch, nil
 		}
 	}
 
 	// 回退：对端是空树，或本地没有对端那棵树（认不出差异只能整树给）。
+	// 只有这条分支需要逐条路径，所以摊平放这里。
+	entries, ferr := s.flattenTreeToOps(project, branch)
+	if ferr != nil {
+		return batch, ferr
+	}
 	batch.BaseTree = cur
 	batch.BaseCommit = s.commitForTree(project, branch, cur)
 	batch.Rebase = true
-	batch.ContentTree = curContentTree
+	// batch.ContentTree 在上面已经算好（缓存里那份），这里不再赋一次。
 	batch.ContentPaths = pathsOfEntries(entries)
-	if s.workSync != nil && peerNode != "" && curContentTree != "" {
-		s.workSync.noteSentTree(project, branch, peerNode, curContentTree)
+	if s.workSync != nil && peerNode != "" && batch.ContentTree != "" {
+		s.workSync.noteSentTree(project, branch, peerNode, batch.ContentTree)
 	}
 	batch.Ops = []treeOp{{
 		Kind:    opTree,

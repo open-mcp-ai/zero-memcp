@@ -583,6 +583,11 @@ func (s *Server) recordTreeBatch(project, branch string, entries []opEntry) (tre
 // 这是「历史 = 批量命令流」的桥：commit 指向的 tree 在这里变成
 // 一串节点添加，与 write 产生的单条命令进入同一个抽象。
 func (s *Server) flattenTreeToOps(project, branch string) ([]opEntry, error) {
+	// 摊平是 O(条数)：weft@main.record 实测 2.1 万条。
+	// 这个计数器让「这一轮没有摊平」成为**可断言的事实**，而不是
+	// 要看时间才知道的猜测——见 sync_export_test.go。
+	// 不测时间：计时断言在慢机器上会假红，而「有没有做这件事」是事实。
+	s.flattenCalls.Add(1)
 	repo, err := s.projects.Get(project)
 	if err != nil {
 		return nil, err

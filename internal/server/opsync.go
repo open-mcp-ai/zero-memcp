@@ -561,11 +561,38 @@ func (s *Server) verifyBatchContent(project, branch string, batch opBatch, res o
 // currentContentTree 把一条分支当前的工作层内容算成一棵内容树。
 //
 // 「当前」= 含未折叠的脏层。对端快照落地后，本端内容就是这棵树。
+// currentContentTree 返回某条分支「当前内容」对应的树 SHA。
+//
+// 「当前」= 已提交树叠加脏层，与 FlattenBranch 同义。
+//
+// 这条路径原来每次都从零重建：摊平整条分支（weft@main.record 实测
+// 2.1 万条、33ms）再重写全部 tree 对象，而它挂在每一次拉取（报
+// have_tree 给对端算差分）与每一次推送（导出批次）上。3060 冷页缓存下
+// 同一件事是几十秒——那正是流水里「0 条变化的拉取耗时 37 秒」的来源。
+//
+// 现在按输入缓存：同一份（已提交树 + 脏层）不会算第二遍。
+// 失效不需要人管：脏层一改，指纹就变，键自然换掉。
 func (s *Server) currentContentTree(project, branch string) string {
 	repo, err := s.projects.Get(project)
 	if err != nil {
 		return ""
 	}
+	key, ok := contentTreeKeyFor(repo, project, branch)
+	if !ok {
+		// 脏层读不出来：不能猜一棵树，也不该把它缓存起来。
+		return ""
+	}
+	if tree, hit := s.contentTrees.get(key); hit {
+		return tree
+	}
+	tree := flattenBranchTree(repo, branch)
+	s.contentTrees.put(key, tree)
+	return tree
+}
+
+// flattenBranchTree 是「摊平整条分支再写出树对象」的慢路径。
+// 只在缓存没命中时跑。
+func flattenBranchTree(repo *gitstore.Repo, branch string) string {
 	flat, ferr := repo.FlattenBranch(branch)
 	if ferr != nil || len(flat) == 0 {
 		return ""
@@ -817,6 +844,27 @@ func postOpPullFrom(client *http.Client, baseURL, token, project, branch, node s
 	return batch, nil
 }
 
+// recordSyncFailure 把一次失败的同步也落进流水，并出声。
+//
+// 为什么必须记（2026-11-28 追问「为什么是 90 秒」时暴露的）：
+// 推送的所有失败路径都是「直接 return」，于是失败既没有流水行、
+// 也没有日志行，只有一个存在内存里、要主动查才看得到的 lastErr。
+// 表现就是：流水里空白 90 秒，事后完全无法回答「这 90 秒在等什么」。
+//
+// 静默失败是这个项目里最贵的故障类型，而这一处正是它的标准形状：
+// 不是「做错了」，是「什么都没留下」。
+func (s *Server) recordSyncFailure(dir, peer, project, branch string, start time.Time, err error) {
+	d := time.Since(start)
+	s.recordSync(syncRecord{
+		Dir: dir, Peer: peer, Node: s.resolvePeer(peer),
+		Project: project, Branch: branch,
+		Err:        err.Error(),
+		DurationMs: d.Milliseconds(),
+	})
+	s.logf("op-sync: %s %s@%s to/from %s FAILED after %s: %v",
+		dir, project, branch, peer, d.Round(time.Millisecond), err)
+}
+
 // batchLogThreshold 是「这批大到值得先说一声」的阈值（以路径数计）。
 //
 // 为什么按路径而不按命令条数：一条 opTree 可以带几万条路径，
@@ -876,11 +924,19 @@ func postOpPush(client *http.Client, baseURL, token string, batch opBatch) (opAp
 // pushOpsToPeer 把本地位点之后的命令推给对端，并按需补 blob。
 //
 // 与 pullOpsFromPeer 是严格对偶：两者都是「先命令、后对象、再重放」。
-func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, project, branch string) (opApplyResult, error) {
+func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, project, branch string) (out opApplyResult, outErr error) {
 	// 从函数入口开始计：一次推送的耗时里，真正贵的往往不是本端算差分，
 	// 而是把几万条路径送过去、对端逐条落地。只测本端那一段会把
 	// 「12 分钟的推送」记成「3 毫秒」。
 	pushStart := time.Now()
+	// 失败也落账：任何一条 return err 都经过这里。
+	// 早先失败路径什么都不写，实测表现为「流水空白 90 秒」，
+	// 事后无法回答那 90 秒在等谁。
+	defer func() {
+		if outErr != nil {
+			s.recordSyncFailure("push", peerName, project, branch, pushStart, outErr)
+		}
+	}()
 	var zero opApplyResult
 	if s.opLogs == nil {
 		return zero, fmt.Errorf("oplog is not initialised")
@@ -1244,8 +1300,14 @@ func isBaseTreeMismatch(err error) bool {
 }
 
 // pullOpsFromPeer 从对端拉命令，落地并补齐对象。
-func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, project, branch string) (opApplyResult, error) {
+func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, project, branch string) (out opApplyResult, outErr error) {
 	pullStart := time.Now()
+	// 失败也落账，理由同 pushOpsToPeer。
+	defer func() {
+		if outErr != nil {
+			s.recordSyncFailure("pull", peerName, project, branch, pullStart, outErr)
+		}
+	}()
 	var zero opApplyResult
 	// 拉的水位：对端日志属主的名字。
 	//

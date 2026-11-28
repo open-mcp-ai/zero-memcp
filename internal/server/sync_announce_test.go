@@ -172,3 +172,68 @@ func (c *logCatcher) Reset() {
 	c.drain()
 	c.lines = nil
 }
+
+// 失败的推送必须落进流水、并且出声。
+//
+// 起因（2026-11-28）：主人问「为什么是 90 秒」，而流水里那 90 秒是**空白**——
+// 推送的所有失败路径都是直接 return，既不写流水也不打日志，只有一个存在
+// 内存里、要主动查才看得到的 lastErr。于是「这 90 秒在等谁」事后无法回答。
+//
+// 静默失败是这个项目里最贵的故障类型，而这一处正是它的标准形状：
+// 不是做错了，是**什么都没留下**。
+func TestFailedPushIsRecordedAndAnnounced(t *testing.T) {
+	s, dataDir := setupMountServer(t)
+	_ = dataDir
+	const project, branch = "blackegg/me", "zero"
+	if _, err := s.projects.Ensure(project); err != nil {
+		t.Fatal(err)
+	}
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Write(branch, "a.md", []byte("x"), gitstore.ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := repo.Commit(branch, "seed"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.recordTreeOp(project, branch, opSet, "b.md", "", "100644", "sha-b"); err != nil {
+		t.Fatal(err)
+	}
+
+	logs := captureLogs(t, s)
+
+	// 指向一个已经关掉的服务器：连接必然失败。
+	dead := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	deadURL := dead.URL
+	dead.Close()
+
+	res, perr := s.pushOpsToPeer(&http.Client{Timeout: 3 * time.Second}, deadURL, "t", "dead-peer", project, branch)
+	if perr == nil {
+		t.Fatalf("推给已关闭的对端必须报错，实际返回 %+v", res)
+	}
+
+	// ① 流水里必须有一条 dir=push、err 非空的记录。
+	var failed *syncRecord
+	for _, r := range s.syncLog.snapshot().records {
+		if r.Dir == "push" && r.Err != "" {
+			r := r
+			failed = &r
+		}
+	}
+	if failed == nil {
+		t.Fatal("失败的推送必须写进流水（否则事后无法回答「那段时间在等谁」）")
+	}
+	if failed.Peer != "dead-peer" || failed.Branch != branch {
+		t.Fatalf("失败记录要指名对端与分支，实际 peer=%q branch=%q", failed.Peer, failed.Branch)
+	}
+	if failed.DurationMs < 0 {
+		t.Fatalf("失败记录必须带耗时，实际 %d", failed.DurationMs)
+	}
+
+	// ② 同时要出声（日志行），不能只躺在结构体里。
+	if !strings.Contains(logs.String(), "FAILED after") {
+		t.Fatalf("失败的推送必须打日志，实际日志:\n%s", logs.String())
+	}
+}

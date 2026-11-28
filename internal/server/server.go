@@ -174,6 +174,16 @@ type Server struct {
 	// 见 logf 的说明与 issue #14。
 	logOut atomic.Pointer[logSink]
 
+	// contentTrees 缓存「某条分支当前的内容树」。
+	//
+	// 内容树是「已提交树叠加脏层」的纯函数，而算一次要摊平整棵分支再
+	// 重写全部 tree 对象：weft@main.record 实测 33ms/次，而它挂在**每一次
+	// 拉取和每一次推送**的路径上。3060 冷页缓存下同一件事是几十秒
+	// （见 gittransport 里 DefaultStallTimeout 的注释）。
+	//
+	// 键取输入，所以不需要失效逻辑——见 contenttree.go。
+	contentTrees contentTreeCache
+
 	// indexProg 是索引构建进度。读者只看完整快照，不阻塞构建。
 	indexProg atomic.Pointer[indexProgress]
 	// indexBuildDone 在后台构建结束时关闭；Close 等它，避免关掉仓库后

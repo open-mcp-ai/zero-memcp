@@ -206,8 +206,41 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	//
 	// 对端报的基准是一棵真实的树（不是空树），且本地对象库里存着它，
 	// 就能直接算出差异。18,446 篇里改 1 篇就只发 1 条命令。
-	diffFrom := from
-	if diffFrom != gitstore.EmptyTreeSHA && batch.ContentTree != "" {
+	// 差分起点候选，按「本端更可能有」排序。
+	//
+	//   1. have_tree —— 对端工作层的真实内容（含未折叠的写入）。
+	//      它算出来的差分最准，但它同时也是本端**最不可能有**的一棵树：
+	//      对端每写一笔它就变一次，而那一笔还没推给本端。
+	//   2. base_tree —— 对端的命令流原点，也就是它上一次提交的内容。
+	//      那批内容通常正是它推给本端的，所以本端多半认得这棵树。
+	//
+	// 为什么必须多试这一步（2026-11-28 实测）：
+	// 只用 have_tree 试一次、失败就整树快照，而快照的代价是
+	// 「21,332 条路径里只有 23 条是新的」——落地端要重建整棵树（22.6 秒）、
+	// 重嵌 180 篇、存一份 70MB 的索引快照。日志里的形状是
+	// `pull ...: applying 21332 op(s)` 紧跟 `TREE REPLACE ... kept 142`。
+	//
+	// 退到 base_tree 是安全的：它的内容本端确实推过，差分算得出来，
+	// 而对端自己的脏层由它自己保留（不在这里发删除，见 diffTreesToOps）。
+	candidates := make([]string, 0, 2)
+	for _, t := range []string{from, baseTree} {
+		if t == "" || t == gitstore.EmptyTreeSHA {
+			continue
+		}
+		dup := false
+		for _, c := range candidates {
+			if c == t {
+				dup = true
+			}
+		}
+		if !dup {
+			candidates = append(candidates, t)
+		}
+	}
+	for _, diffFrom := range candidates {
+		if batch.ContentTree == "" {
+			break
+		}
 		if diffOps, derr := s.diffTreesToOps(project, branch, diffFrom, batch.ContentTree); derr == nil {
 			batch.BaseTree = diffFrom
 			batch.BaseCommit = s.commitForTree(project, branch, diffFrom)
@@ -223,8 +256,16 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 			if s.workSync != nil && peerNode != "" {
 				s.workSync.noteSentTree(project, branch, peerNode, batch.ContentTree)
 			}
-			s.logf("op-sync: %s@%s: peer base %s -> content %s: %d delta op(s) (tree diff, no full snapshot)",
-				project, branch, shortSHA(diffFrom), shortSHA(batch.ContentTree), len(diffOps))
+			// 走的不是首选的 have_tree 时要说明：那意味着对端有本端
+			// 还没收到的新内容，差分起点退到了它上一次提交。
+			// 不说明的话，「这一轮比平时多发了些」只能靠猜。
+			note := ""
+			if diffFrom != from {
+				note = fmt.Sprintf(" (from the requester's command-stream origin %s; its working tree %s is not known here)",
+					shortSHA(diffFrom), shortSHA(from))
+			}
+			s.logf("op-sync: %s@%s: peer base %s -> content %s: %d delta op(s) (tree diff, no full snapshot)%s",
+				project, branch, shortSHA(diffFrom), shortSHA(batch.ContentTree), len(diffOps), note)
 			return batch, nil
 		}
 	}

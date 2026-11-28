@@ -1,6 +1,7 @@
 package server
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
@@ -171,5 +172,108 @@ func TestEmptyPeerStillSendsFullSnapshot(t *testing.T) {
 	}
 	if batch.ContentTree == "" {
 		t.Fatal("整树快照也必须报内容树")
+	}
+}
+
+// 对端报了本端不认得的内容树时，不许直接退化成整树快照。
+//
+// 起因（2026-11-28 实测，v0.2.18 三端）：`weft@main.record` 的一次拉取
+// 耗时 22.6 秒，日志形状是
+//
+//	applying 21332 op(s) (this can take a while)
+//	TREE REPLACE ... kept 142 locally-present path(s)
+//	semantic: incremental: 180 changed/new
+//	index snapshot saved: 28612 docs, 70.3 MB
+//
+// 21,332 条路径的整树快照里，只有 23 条是对端真的没有的。
+//
+// 根因：差分的起点首选 `have_tree`——对端**工作层**的内容树，含它刚写完
+// 还没推给本端的东西。对端每写一笔它就变一次，本端对象库里永远不会有
+// 那棵树，于是 Diff 必然失败、必然退整树快照。
+//
+// 而那条路上还有一棵树是双方都认得的：`base_tree`（对端的命令流原点，
+// 也就是它上一次提交的内容，而那批内容正是它推给本端的）。退到它算差分，
+// 只发真的变化的那些路径。
+func TestUnknownPeerTreeFallsBackToBaseTreeNotFullSnapshot(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "boss", Cap: "rwx"})
+	repo, err := srv.projects.Ensure("blackegg/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 两次提交：让 base_tree（对端上次提交）与本端命令流原点不同，
+	// 否则请求会从「base_tree == 原点」那条位点增量捷径返回，走不到差分。
+	for _, p := range []string{"a.md", "b.md"} {
+		if err := repo.Write("zero", p, []byte("内容 "+p), gitstore.ModeContent); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m seed"); err != nil {
+		t.Fatal(err)
+	}
+	baseTree := srv.currentContentTree("blackegg/me", "zero")
+
+	// 本端又提交了一条（这就是对端将要看到的差异）。
+	if err := repo.Write("zero", "c.md", []byte("内容 c"), gitstore.ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m more"); err != nil {
+		t.Fatal(err)
+	}
+	cur := srv.currentContentTree("blackegg/me", "zero")
+	if cur == baseTree {
+		t.Fatal("两次提交后内容树必须不同")
+	}
+	// 造一棵本端对象库里不存在的树：真实场景里它是对端脏层算出来的树，
+	// 对本端而言与这个假 SHA 同性质——查不到对象。
+	unknown := strings.Repeat("ab", 20)
+
+	before := srv.flattenCalls.Load()
+	batch, err := srv.exportOpsFromPeer("blackegg/me", "zero", 0, baseTree, unknown, "peer-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := srv.flattenCalls.Load() - before; got != 0 {
+		t.Fatalf("不该摊平（整树快照才需要摊平），实际摊平 %d 次", got)
+	}
+	if len(batch.ContentPaths) != 0 {
+		t.Fatalf("不该发整树快照（ContentPaths 有 %d 条）", len(batch.ContentPaths))
+	}
+	if batch.BaseTree != baseTree {
+		t.Fatalf("差分起点必须是对端的命令流原点 %q，实际 %q", baseTree, batch.BaseTree)
+	}
+	if !batch.Rebase {
+		t.Fatal("差分批次必须带 Rebase")
+	}
+	// 差分里应当只有「本端有、对端没有」的那一条（c.md）。
+	// 对端工作层里那些本端还没收到的内容不在其中——那是它自己的事，
+	// 它会在推送时带给本端。
+	if n := countBatchOps(batch.Ops); n != 1 {
+		t.Fatalf("从对端命令流原点差出来的应该只有 1 条变化，实际 %d 条", n)
+	}
+}
+
+// 两棵树本端都不认得时，才允许退成整树快照。
+func TestBothTreesUnknownFallsBackToFullSnapshot(t *testing.T) {
+	srv, dataDir := setupMountServer(t)
+	tok := mintRestricted(t, dataDir, auth.Claims{Sub: "zero", Name: "boss", Cap: "rwx"})
+	repo, err := srv.projects.Ensure("blackegg/me")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := repo.Write("zero", "a.md", []byte("内容 a"), gitstore.ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m seed"); err != nil {
+		t.Fatal(err)
+	}
+	unknown1 := strings.Repeat("ab", 20)
+	unknown2 := strings.Repeat("cd", 20)
+	batch, err := srv.exportOpsFromPeer("blackegg/me", "zero", 0, unknown1, unknown2, "peer-x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(batch.ContentPaths) == 0 {
+		t.Fatal("两棵树都不认得时，只能整树快照——ContentPaths 必须有内容")
 	}
 }

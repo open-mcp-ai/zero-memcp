@@ -123,12 +123,23 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	// 发整树快照。实测 18990 条路径推给开着索引的 3060，逐条 refreshPath
 	// 抢分支写令牌，满屏「写令牌等待超时（1m0s）」，推送侧直接超时。
 	// 而那一刻两边内容可能只差一条。
-	batch.ContentTree = s.currentContentTree(project, branch)
+	contentTree, contentErr := s.currentContentTree(project, branch)
+	batch.ContentTree = contentTree
 	l, err := s.opLogs.For(project, branch)
 	if err != nil {
 		return batch, err
 	}
 	cur := l.BaseTree()
+
+	// 本端内容树算不出来：不许发任何东西。
+	//
+	// 「不知道」不等于「空的」。早先这里会把算失败当成空树，于是要么发空
+	// 快照抹掉对端，要么被空树安全阀挡成永久失败。正确做法是当场拒绝，
+	// 让对端看到一条明确的失败，而不是收到一份基于猜测的内容。
+	if contentErr != nil {
+		return batch, fmt.Errorf("refusing to export %s@%s: cannot compute local content tree (%v)",
+			project, branch, contentErr)
+	}
 
 	// 差分的起点是对端**实际手上的内容**，不是它的命令流原点。
 	//
@@ -168,7 +179,17 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	if baseTree != "" && baseTree == cur {
 		batch.BaseTree = cur
 		batch.BaseCommit = s.commitForTree(project, branch, cur)
-		return s.exportOpsTail(batch, l, after, cur)
+		batch, terr := s.exportOpsTail(batch, l, after, cur)
+		if terr != nil {
+			return batch, terr
+		}
+		// 位点增量同样要带上未送达的显式删除。
+		//
+		// 对端的位点是它自己报的，而差分批次会把 batch.To 推到 l.Last()，
+		// 于是「它报到了 N」并不等于「N 以前的每条命令它都收到了」。
+		// 只按位点发增量，那条 opDelete 就再也不会重发。
+		batch.Ops = s.appendExplicitDeletes(batch.Ops, l, project, branch)
+		return batch, nil
 	}
 
 	// 对端手上的内容已经和本端一模一样：一个字节都不发。
@@ -179,7 +200,7 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	// 判等摆在**摊平之前**：内容树在上面已经算好（且带缓存），
 	// 而为了得出「没有差异」去摊平 2 万条、再把同一棵树写第二遍，
 	// 是纯浪费。实测这条浪费的形状：`applied=0` 的拉取耗时 37 秒。
-	if batch.ContentTree != "" && batch.ContentTree == from {
+	if batch.ContentTree == from {
 		if s.workSync != nil && peerNode != "" {
 			s.workSync.noteSentTree(project, branch, peerNode, batch.ContentTree)
 		}
@@ -191,10 +212,32 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 	//
 	// 用内容树判而不是摊平后的条数：两者等价（没有文件就没有内容树），
 	// 而内容树已经算好了。
-	if batch.ContentTree == "" && from != gitstore.EmptyTreeSHA {
-		return batch, fmt.Errorf(
-			"refusing to send an empty-tree snapshot for %s@%s: peer has %s which is not empty, "+
-				"this would erase everything on the peer", project, branch, shortSHA(from))
+	// 本端确实一条内容都没有了（显式删除的结果），对端却还有内容。
+	//
+	// 这里**不发整树快照**：快照的语义是「照它重建」，会连对端自己独有的
+	// 内容一起抹掉。只发命令流——里面的 opDelete 才是被明确删掉的那几条，
+	// 对端独有的内容按「拉取不推断删除」留在原处。
+	//
+	// 早先这里是直接报错。错在两处：① 它把「算不出来」和「真的是空的」
+	// 混为一谈（见 currentContentTree）；② 即便是真的空了，永久报错也会
+	// 把这条分支的同步**彻底卡死**——实测：删掉分支上唯一一条内容后，
+	// 对端每 3 秒重试一次、每次都 500，此后新写的内容也到不了对端。
+	if batch.ContentTree == gitstore.EmptyTreeSHA && from != gitstore.EmptyTreeSHA {
+		// 基准取**对端声明的树**，并标 Rebase：位点不可比（两边命令流原点
+		// 不同，实测 B 的原点是空树、A 的不是），非 Rebase 批次会被对端
+		// 以 base tree mismatch 拒掉，又是一次永久失败。
+		//
+		// 命令只带**显式删除**，不带命令流里的 opSet：本端树是空的，
+		// 重放那些旧 set 等于把已经删掉的内容复活到对端。
+		batch.BaseTree = from
+		batch.BaseCommit = s.commitForTree(project, branch, from)
+		batch.Rebase = true
+		batch.Ops = s.explicitDeletesFrom(l, project, branch)
+		batch.To = l.Last()
+		s.logf("op-sync: export %s@%s: local content tree is empty while peer has %s; "+
+			"sending %d explicit delete(s) as a rebase batch, not a snapshot",
+			project, branch, shortSHA(from), len(batch.Ops))
+		return batch, nil
 	}
 
 	// 基准不同：算差多少。
@@ -251,7 +294,7 @@ func (s *Server) exportOpsFromPeer(project, branch string, after int64, baseTree
 			// 塞一份全量清单等于每轮多传整棵树（weft@main.record 实测
 			// 19,468 条 ≈ 1.2MB）。差分的完整性由「基准树 + 这批命令」
 			// 自算期望树来校验，见 verifyBatchContent。
-			batch.Ops = diffOps
+			batch.Ops = s.appendExplicitDeletes(diffOps, l, project, branch)
 			batch.To = l.Last()
 			if s.workSync != nil && peerNode != "" {
 				s.workSync.noteSentTree(project, branch, peerNode, batch.ContentTree)
@@ -331,6 +374,111 @@ func (s *Server) exportOpsTail(batch opBatch, l *opLog, after int64, cur string)
 	batch.Ops = l.Since(after)
 	batch.To = l.Last()
 	return batch, nil
+}
+
+// appendExplicitDeletes 把命令流里的**显式删除**补进差分批次。
+//
+// 为什么必须补（自狗粮抓到的真 bug，2026-11-28）：
+// 树到树差分按教条**不产生删除**（缺一个路径最常见的成因是「还没同步过去」，
+// 见 diffTreesToOps 里的注释），而删除的唯一合法载体是命令流里的 opDelete。
+// 可是差分这条路直接把 batch.Ops 换成 diffOps，把命令流整个丢掉了——
+// 于是 delete 动词记下的 opDelete **永远到不了对端**。
+//
+// 实测形状：A 删掉分支上唯一一条内容后，B 那边内容一直在；而且 A 的
+// 内容树变空之后，导出侧还被空树安全阀挡成永久 500，新写的内容也一起堵死。
+//
+// 补的范围是 (after, last] 这段位点里、且**目标路径确实已经不在本端内容
+// 里**的 opDelete。两个条件都要：
+//   - 只看这段位点：更早的删除早已被对端应用过（或者根本不在它的视野里），
+//     重发等于让一条老删除去删对端后来新建的同名路径。
+//   - 只认已经不在本端的：本端后来又把它写回来了（set 在后），
+//     这条删除就不该再生效——命令流里 set 会覆盖 delete，但差分只带
+//     最终内容，重放顺序不能靠猜。
+func (s *Server) explicitDeletesFrom(l *opLog, project, branch string) []treeOp {
+	if l == nil {
+		return nil
+	}
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return nil
+	}
+	present := make(map[string]bool)
+	flat, ferr := repo.FlattenBranch(branch)
+	if ferr != nil {
+		// 摊平失败就别猜：宁可不发删除，也不发一条可能删错东西的命令。
+		s.logf("op-sync: %s@%s: cannot flatten to confirm explicit deletes (%v); omitting them",
+			project, branch, ferr)
+		return nil
+	}
+	for _, e := range flat {
+		present[e.Path] = true
+	}
+	var out []treeOp
+	seen := make(map[string]bool)
+	// 位点过滤（l.Since(after)）在这里**不能用**。
+	//
+	// 原因：差分批次会把 batch.To 设成 l.Last()，于是对端回报的位点
+	// 已经越过那条 opDelete——按位点过滤就永远筛不出它。实测形状：
+	// A 删掉一条内容后，导出侧每轮都写「sending 0 explicit delete(s)」，
+	// 对端永远留着那份内容，还把旧快照每 3 秒推回来一次。
+	//
+	// 换成「整条命令流里、路径确实已经不在本端」的显式删除：
+	//   - 命令流在提交时归零，所以范围天然有界（就是未提交的那一段）；
+	//   - 重复投递是幂等的：对端删一个已经不存在的路径是空操作；
+	//   - present 过滤保证「本端后来又写回来了」的路径不会被误删。
+	//
+	// 代价是同一批删除可能连发几轮（直到本端提交）。宁可多发几条
+	// 幂等命令，也不要让删除永远传不到——后者是数据正确性问题。
+	for _, op := range l.Since(0) {
+		if op.Kind != opDelete || present[op.Path] || seen[op.Path] {
+			continue
+		}
+		seen[op.Path] = true
+		out = append(out, op)
+	}
+	return out
+}
+
+func (s *Server) appendExplicitDeletes(ops []treeOp, l *opLog, project, branch string) []treeOp {
+	if l == nil {
+		return ops
+	}
+	repo, err := s.projects.Get(project)
+	if err != nil {
+		return ops
+	}
+	// 本端当前内容里还有哪些路径——用它判断删除是否仍然有效。
+	present := make(map[string]bool)
+	if flat, ferr := repo.FlattenBranch(branch); ferr == nil {
+		for _, e := range flat {
+			present[e.Path] = true
+		}
+	} else {
+		// 摊平失败就别猜：宁可不补删除，也不发一条可能删错东西的命令。
+		s.logf("op-sync: %s@%s: cannot flatten to confirm explicit deletes (%v); "+
+			"omitting them from this delta", project, branch, ferr)
+		return ops
+	}
+	have := make(map[string]bool, len(ops))
+	for _, op := range ops {
+		if op.Kind == opDelete {
+			have[op.Path] = true
+		}
+	}
+	added := 0
+	for _, op := range l.Since(0) {
+		if op.Kind != opDelete || present[op.Path] || have[op.Path] {
+			continue
+		}
+		ops = append(ops, op)
+		have[op.Path] = true
+		added++
+	}
+	if added > 0 {
+		s.logf("op-sync: %s@%s: delta carries %d explicit delete(s) from the command stream "+
+			"(tree diff alone never deletes)", project, branch, added)
+	}
+	return ops
 }
 
 // commitForTree 返回当前分支上「树等于 tree」的那个提交（没有则空）。
@@ -709,40 +857,57 @@ func (s *Server) resetOpLogBaseTo(project, branch, tree string) {
 //
 // 现在按输入缓存：同一份（已提交树 + 脏层）不会算第二遍。
 // 失效不需要人管：脏层一改，指纹就变，键自然换掉。
-func (s *Server) currentContentTree(project, branch string) string {
+// currentContentTree 返回这条分支的内容树。
+//
+// **「算不出来」和「真的是空的」必须分开。**
+//
+// 早先这个函数把两种情况都返回 ""：算失败返回 ""，分支真的一条内容都没有
+// 也返回 ""。于是下游的空树安全阀（「本端是空的、对端有内容 → 拒绝发快照」）
+// 把「算不出来」当成了「本端空了」。实测后果是一个**永久卡死**：
+// 分支上唯一一条内容被显式删除后，导出侧看到空树就拒绝，对端每 3 秒重试
+// 一次、每次都 500，这条分支此后再也同步不动——包括它后来新写的内容。
+//
+// 所以返回 (tree, ok)：ok=false 才是「不知道」，此时不许猜、不许发。
+func (s *Server) currentContentTree(project, branch string) (string, error) {
 	repo, err := s.projects.Get(project)
 	if err != nil {
-		return ""
+		return "", err
 	}
 	key, ok := contentTreeKeyFor(repo, project, branch)
 	if !ok {
 		// 脏层读不出来：不能猜一棵树，也不该把它缓存起来。
-		return ""
+		return "", fmt.Errorf("cannot fingerprint dirty layer of %s@%s", project, branch)
 	}
 	if tree, hit := s.contentTrees.get(key); hit {
-		return tree
+		return tree, nil
 	}
-	tree := flattenBranchTree(repo, branch)
+	tree, terr := flattenBranchTree(repo, branch)
+	if terr != nil {
+		return "", terr
+	}
 	s.contentTrees.put(key, tree)
-	return tree
+	return tree, nil
 }
 
 // flattenBranchTree 是「摊平整条分支再写出树对象」的慢路径。
 // 只在缓存没命中时跑。
-func flattenBranchTree(repo *gitstore.Repo, branch string) string {
+func flattenBranchTree(repo *gitstore.Repo, branch string) (string, error) {
 	flat, ferr := repo.FlattenBranch(branch)
-	if ferr != nil || len(flat) == 0 {
-		return ""
+	if ferr != nil {
+		return "", fmt.Errorf("flatten %s: %w", branch, ferr)
 	}
+	// len(flat)==0 不是错误：这条分支真的一条内容都没有。
+	// 照常走 WriteTreeFromPaths，空 map 会写出标准空树对象——
+	// 那是**一个确定的事实**，与「算不出来」完全不同。
 	pathMap := make(map[string]gitstore.Entry, len(flat))
 	for _, e := range flat {
 		pathMap[e.Path] = gitstore.Entry{Path: e.Path, Mode: e.Mode, Hash: e.SHA}
 	}
 	tree, werr := repo.WriteTreeFromPaths(pathMap)
 	if werr != nil {
-		return ""
+		return "", fmt.Errorf("write tree for %s: %w", branch, werr)
 	}
-	return tree
+	return tree, nil
 }
 
 func (s *Server) rebaseLocalToContent(project, branch, peerNode, want string) {
@@ -1520,13 +1685,15 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 			baseTree = l.BaseTree()
 		}
 	}
-	haveTree := s.currentContentTree(project, branch)
-	if haveTree == "" && baseTree != gitstore.EmptyTreeSHA {
+	haveTree, haveTreeErr := s.currentContentTree(project, branch)
+	// 内容树算不出来时**不报**给对端（传空），但对端会退回按原点理解、
+	// 发来整树快照。这是一次退让，必须点名，否则表现为「同步很慢」。
+	if haveTreeErr != nil && baseTree != gitstore.EmptyTreeSHA {
 		// 内容树算不出来是个**安静的失败**：对端只能退回按原点理解，
 		// 然后发来整树快照。必须点名，否则表现为「同步很慢」。
-		s.logf("op-sync: pull %s@%s to %s: cannot compute local content tree; "+
+		s.logf("op-sync: pull %s@%s to %s: cannot compute local content tree (%v); "+
 			"peer will fall back to a full snapshot (base_tree=%s)",
-			project, branch, peerName, shortSHA(baseTree))
+			project, branch, peerName, haveTreeErr, shortSHA(baseTree))
 	}
 	batch, err := postOpPullFrom(client, baseURL, token, project, branch, s.instanceID(), after, baseTree, haveTree)
 	if err != nil {
@@ -1700,7 +1867,7 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 		if s.workSync != nil {
 			// 本端基准 = 本端自己的内容树，必须重算：ingestOps 里那次
 			// rebase 发生在补正文之前，那时缺正文的路径还不存在。
-			if mine := s.currentContentTree(project, branch); mine != "" {
+			if mine, merr := s.currentContentTree(project, branch); merr == nil && mine != "" {
 				s.workSync.noteBase(project, branch, batch.Node, mine)
 			}
 			// 对端手上是哪棵树，由它自己声明（batch.ContentTree）——

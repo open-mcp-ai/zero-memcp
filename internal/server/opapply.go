@@ -264,6 +264,27 @@ func (s *Server) applyOp(project, branch, peerNode string, ctx *opContext, op tr
 			// 而且爆在完全无关的地方。
 			return op.SHA, nil
 		}
+		// 本地有显式墓碑：对端的 set **不许把它复活**。
+		//
+		// 这是「防复活不变量」的另一半。opDelete 那侧早就写着「墓碑仍然落地
+		// （防复活不变量不可破）」，但反向这一半漏了：冲突判定里排除了
+		// Deleted 的本地改动（`!lch.Deleted`），于是对端那份陈旧内容的 set
+		// 直接把墓碑覆盖掉——
+		// 实测形状（2026-11-28 自狗粮）：A 删掉一条内容，B 还没收到删除就把
+		// 旧快照推回 A，A 应用后那文件原地复活，日志里 applied 1、0 conflicted，
+		// 一声不响。用户看到的是「我删了它又回来了」。
+		//
+		// 显式删除是本地动作，不能被推断性的输入覆盖；同时把证据记下来，
+		// 让「有东西没落地」这件事可查。
+		if lch, ok := ctx.local[op.Path]; ok && lch.Deleted {
+			res.Conflicted = append(res.Conflicted, workConflict{
+				Path: op.Path, LocalSHA: "", RemoteSHA: op.SHA, Peer: peerNode,
+			})
+			s.recordWorkConflict(project, branch, op.Path, "", op.SHA, peerNode, ConflictDelete)
+			s.logf("op-sync: DELETE WINS %s@%s:%s (peer %s tried to re-add %s; local tombstone kept)",
+				project, branch, op.Path, peerNode, shortSHA(op.SHA))
+			return "", nil
+		}
 		// 相同内容不算冲突：那是同一份改动的重复投递，幂等即可。
 		if lch, ok := ctx.local[op.Path]; ok && !lch.Deleted && lch.SHA != op.SHA {
 			res.Conflicted = append(res.Conflicted, workConflict{

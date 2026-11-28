@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/open-mcp-ai/zero-memcp/internal/auth"
+	"github.com/open-mcp-ai/zero-memcp/internal/gitstore"
 )
 
 // 整树快照发过一次就必须收敛，不许每轮重发。
@@ -169,14 +170,78 @@ func TestRefusesToWipePeerWithEmptySnapshot(t *testing.T) {
 		s.notePeerTree("daily", "zero", "down", "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef")
 	}
 
-	// 本端树是空的，对端基准非空 → 必须拒绝，不许把它清空
-	_, perr := up.pushOpsToPeer(client, ts.URL, downTok, "down", "daily", "zero")
-	if perr == nil {
-		t.Fatalf("对着非空对端推空树快照必须报错拒绝")
+	// 本端树是空的，对端基准非空。
+	//
+	// 早先这里是**报错拒绝**。错在两处：① 它把「算不出来」和「真的是空的」
+	// 混为一谈（currentContentTree 早先两种都返回 ""）；② 即便是真的空了，
+	// 永久报错也会把这条分支的同步彻底卡死——实测删掉分支上唯一一条内容后，
+	// 对端每 3 秒重试一次、每次都 500，此后新写的内容也到不了对端。
+	//
+	// 现在改成：不发整树快照（快照的语义是「照它重建」，会抹掉对端独有的
+	// 内容），只发命令流。对端独有的内容按「拉取不推断删除」留在原处。
+	//
+	// 这里本端是用 repo.Delete 直接删的，**没有 opDelete 命令**，
+	// 所以命令流里没有删除——对端应该一条都不丢。
+	if _, perr := up.pushOpsToPeer(client, ts.URL, downTok, "down", "daily", "zero"); perr != nil {
+		t.Fatalf("空树不该再报错（那会把这条分支的同步永久卡死）：%v", perr)
 	}
 
-	// 对端内容必须还在
+	// 安全性质：对端自己的内容必须还在。
 	if !down.repoHas("daily", "zero", "keep.md") {
 		t.Fatalf("对端自己的内容被空树快照清掉了")
+	}
+	// 而且对端那份 seed.md 也不许被推断删除——本端没发过 opDelete。
+	if !down.repoHas("daily", "zero", "seed.md") {
+		t.Fatalf("对端内容被推断成删除（拉取只加只改，绝不按「对端没有」推断删除）")
+	}
+}
+
+// 显式删除必须**沿命令流传到对端**——这是「删除只认显式指令」的另一半：
+// 不显式删的不许丢，显式删的要真的删掉。
+//
+// 自狗粮抓到的形状：A 删掉分支上唯一一条内容后，导出侧被空树安全阀挡成
+// 永久 500，对端每 3 秒重试一次全失败——删除既没传过去，之后新写的内容
+// 也一起堵死在这条分支上。
+func TestExplicitDeleteTravelsOnTheCommandStream(t *testing.T) {
+	up, _ := newWatchTestServer(t)
+	down, downData := newWatchTestServer(t)
+	downTok := mintRestricted(t, downData, auth.Claims{Sub: "zero", Name: "down", Cap: "rwx"})
+
+	ts := httptest.NewServer(down.muxFor(ListenBlock{Addr: "127.0.0.1:0"}))
+	defer ts.Close()
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	// 本端先有两条，推给对端。
+	upRepo, err := up.projects.Get("daily")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := upRepo.Write("zero", "gone.md", []byte("要被显式删掉的"), gitstore.ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if err := upRepo.Write("zero", "stay.md", []byte("留下的"), gitstore.ModeContent); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := up.pushOpsToPeer(client, ts.URL, downTok, "down", "daily", "zero"); err != nil {
+		t.Fatal(err)
+	}
+	if !down.repoHas("daily", "zero", "gone.md") {
+		t.Fatal("首次推送没到对端")
+	}
+
+	// 走 delete 动词：这会记一条 opDelete 进命令流。
+	upRepo.Delete("zero", "gone.md")
+	if _, err := up.recordTreeOp("daily", "zero", opDelete, "gone.md", "", "", ""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := up.pushOpsToPeer(client, ts.URL, downTok, "down", "daily", "zero"); err != nil {
+		t.Fatalf("显式删除的推送不该失败：%v", err)
+	}
+
+	if down.repoHas("daily", "zero", "gone.md") {
+		t.Fatal("显式删除没有传到对端——对端会永远留着一份本端已经删掉的内容")
+	}
+	if !down.repoHas("daily", "zero", "stay.md") {
+		t.Fatal("显式删除只该删掉被点名的那条，别的都不许动")
 	}
 }

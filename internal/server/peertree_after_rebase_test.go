@@ -66,7 +66,7 @@ func TestPullRecordsPeerTreeAfterRebase(t *testing.T) {
 	if _, err := callMCP(t, dst, dstToken, "commit "+project+"@"+branch); err != nil {
 		t.Fatalf("封箱: %v", err)
 	}
-	bogus := dst.currentContentTree(project, branch)
+	bogus, _ := dst.currentContentTree(project, branch)
 	dst.workSync.notePeerTree(project, branch, dst.resolvePeer("src"), bogus)
 
 	client := &http.Client{Timeout: 10 * time.Second}
@@ -87,7 +87,7 @@ func TestPullRecordsPeerTreeAfterRebase(t *testing.T) {
 	// 早先断言两者相等，前提是「同步后两端内容必然一样」。并集语义下这个
 	// 前提不成立：本端可以有对端没有的内容（mine.md 就是），拿本端树去记
 	// 等于告诉推送侧「对端也有我刚写的东西」，下一轮就会漏推。
-	mine := dst.currentContentTree(project, branch)
+	mine, _ := dst.currentContentTree(project, branch)
 	if tree == mine {
 		t.Fatalf("并集语义下本端与对端内容本就不同，记成本端树说明记错了来源\n  记下=%s", tree)
 	}

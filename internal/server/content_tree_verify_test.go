@@ -69,7 +69,7 @@ func TestContentTreeDetectsDroppedCommand(t *testing.T) {
 	if len(res.Missing) != 0 {
 		t.Fatalf("本实例对象库同源，不应缺正文: %v", res.Missing)
 	}
-	if got := dst.currentContentTree(project, branch); got != batch.ContentTree {
+	if got, gerr := dst.currentContentTree(project, branch); gerr != nil || got != batch.ContentTree {
 		t.Fatalf("正常落地后内容应等于声明的树\n  声明=%s\n  实际=%s", batch.ContentTree, got)
 	}
 

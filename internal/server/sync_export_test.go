@@ -44,7 +44,7 @@ func TestEqualContentTreesSkipFlatteningEntirely(t *testing.T) {
 	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m seed"); err != nil {
 		t.Fatal(err)
 	}
-	oldTree := srv.currentContentTree("blackegg/me", "zero")
+	oldTree, _ := srv.currentContentTree("blackegg/me", "zero")
 	if err := repo.Write("zero", "c.md", []byte("内容 c.md"), gitstore.ModeContent); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +52,7 @@ func TestEqualContentTreesSkipFlatteningEntirely(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	mine := srv.currentContentTree("blackegg/me", "zero")
+	mine, _ := srv.currentContentTree("blackegg/me", "zero")
 	if mine == "" || mine == oldTree {
 		t.Fatalf("两次提交后内容树必须变化：old=%q now=%q", oldTree, mine)
 	}
@@ -94,7 +94,7 @@ func TestTreeDiffAlsoSkipsFlattening(t *testing.T) {
 	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m seed"); err != nil {
 		t.Fatal(err)
 	}
-	old := srv.currentContentTree("blackegg/me", "zero")
+	old, _ := srv.currentContentTree("blackegg/me", "zero")
 
 	// 改一条并提交：对端手里是 old，本端现在是新的。
 	if err := repo.Write("zero", "a.md", []byte("新 a.md"), gitstore.ModeContent); err != nil {
@@ -103,7 +103,7 @@ func TestTreeDiffAlsoSkipsFlattening(t *testing.T) {
 	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m change"); err != nil {
 		t.Fatal(err)
 	}
-	if now := srv.currentContentTree("blackegg/me", "zero"); now == old {
+	if now, _ := srv.currentContentTree("blackegg/me", "zero"); now == old {
 		t.Fatal("改了内容但内容树没变")
 	}
 
@@ -211,7 +211,7 @@ func TestUnknownPeerTreeFallsBackToBaseTreeNotFullSnapshot(t *testing.T) {
 	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m seed"); err != nil {
 		t.Fatal(err)
 	}
-	baseTree := srv.currentContentTree("blackegg/me", "zero")
+	baseTree, _ := srv.currentContentTree("blackegg/me", "zero")
 
 	// 本端又提交了一条（这就是对端将要看到的差异）。
 	if err := repo.Write("zero", "c.md", []byte("内容 c"), gitstore.ModeContent); err != nil {
@@ -220,7 +220,7 @@ func TestUnknownPeerTreeFallsBackToBaseTreeNotFullSnapshot(t *testing.T) {
 	if _, err := callMCP(t, srv, tok, "commit blackegg/me@zero -m more"); err != nil {
 		t.Fatal(err)
 	}
-	cur := srv.currentContentTree("blackegg/me", "zero")
+	cur, _ := srv.currentContentTree("blackegg/me", "zero")
 	if cur == baseTree {
 		t.Fatal("两次提交后内容树必须不同")
 	}

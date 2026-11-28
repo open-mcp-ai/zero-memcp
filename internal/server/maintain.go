@@ -2,6 +2,7 @@ package server
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -416,8 +417,24 @@ func (s *Server) checkExternalUpdates() {
 
 // logf 是带前缀的日志输出。
 func (s *Server) logf(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "zero-memcp: "+format+"\n", args...)
+	var w io.Writer = os.Stderr
+	// 输出端可换，只为一件事：**让「有没有出声」能被测试断言**。
+	//
+	// 早先这里直接写 os.Stderr，于是「大批次开始时必须打印一行」这类
+	// 要求根本没法验证——issue #14 就是它的代价：一次 1 万条的推送跑了
+	// 12.5 分钟而日志里一个字都没有，我据此断定「同步卡住了」，查错方向。
+	// 不能断言的可见性，等于没有可见性。
+	if sk := s.logOut.Load(); sk != nil && sk.w != nil {
+		w = sk.w
+	}
+	fmt.Fprintf(w, "zero-memcp: "+format+"\n", args...)
 }
+
+// logSink 是日志输出端的容器。
+//
+// 用 atomic.Pointer 而不是普通字段：日志由多个协程并发写，
+// 换输出端（测试里）不能被 -race 抓成数据竞争，也不能靠锁——全局无锁。
+type logSink struct{ w io.Writer }
 
 // startAnchorWriter 在后台补锚点，不阻塞调用方（维护环）。
 //

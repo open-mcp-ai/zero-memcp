@@ -701,10 +701,15 @@ func (s *Server) handleOpPull(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, s.denyReason(c, req.Project, req.Branch, configBitRead), http.StatusForbidden)
 		return
 	}
+	t0 := time.Now()
 	batch, err := s.exportOpsFromPeer(req.Project, req.Branch, req.After, req.BaseTree, req.HaveTree, req.Node)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if n := countBatchOps(batch.Ops); n >= batchLogThreshold {
+		s.logf("op-sync: served %d op(s) of %s@%s to %s in %s",
+			n, req.Project, req.Branch, req.Node, time.Since(t0).Round(time.Millisecond))
 	}
 	// 上游视角：谁在什么时候把我拉到了哪一位。
 	//
@@ -714,7 +719,8 @@ func (s *Server) handleOpPull(w http.ResponseWriter, r *http.Request) {
 		Dir: "served", Peer: req.Node, Node: req.Node,
 		Project: req.Project, Branch: req.Branch,
 		From: req.After, To: batch.To, PeerHead: int(batch.From),
-		Applied: len(batch.Ops),
+		Applied:    len(batch.Ops),
+		DurationMs: time.Since(t0).Milliseconds(),
 	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(batch)
@@ -736,10 +742,19 @@ func (s *Server) handleOpPush(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, s.denyReason(c, batch.Project, batch.Branch, configBitWrite), http.StatusForbidden)
 		return
 	}
+	t0 := time.Now()
+	if n := countBatchOps(batch.Ops); n >= batchLogThreshold {
+		s.logf("op-sync: receiving %d op(s) of %s@%s from %s (this can take a while)",
+			n, batch.Project, batch.Branch, batch.Node)
+	}
 	res, err := s.ingestOps(batch.Project, batch.Branch, batch)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	if n := countBatchOps(batch.Ops); n >= batchLogThreshold {
+		s.logf("op-sync: received %d op(s) of %s@%s from %s in %s",
+			n, batch.Project, batch.Branch, batch.Node, time.Since(t0).Round(time.Millisecond))
 	}
 	// 被推方视角：某个下游把它的命令推给了我。
 	s.recordSync(syncRecord{
@@ -748,7 +763,8 @@ func (s *Server) handleOpPush(w http.ResponseWriter, r *http.Request) {
 		From: batch.From, To: batch.To,
 		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
 		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
-		Rejected: len(res.Rejected),
+		Rejected:   len(res.Rejected),
+		DurationMs: time.Since(t0).Milliseconds(),
 	})
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(res)
@@ -800,6 +816,29 @@ func postOpPullFrom(client *http.Client, baseURL, token, project, branch, node s
 	return batch, nil
 }
 
+// batchLogThreshold 是「这批大到值得先说一声」的阈值（以路径数计）。
+//
+// 为什么按路径而不按命令条数：一条 opTree 可以带几万条路径，
+// 命令条数 1 而实际工作是几万次落地——按条数判断会把最大的那批
+// 判成最小的一批。
+const batchLogThreshold = 500
+
+// countBatchOps 数一批命令实际会碰多少条路径。
+//
+// 单条命令各自算 1；批量命令按载荷长度算。它只用于「要不要出声」
+// 与日志文案，不参与任何一致性判断——一致性判据只能是树。
+func countBatchOps(ops []treeOp) int {
+	n := 0
+	for _, op := range ops {
+		if len(op.Batch) > 0 {
+			n += len(op.Batch)
+			continue
+		}
+		n++
+	}
+	return n
+}
+
 func postOpPush(client *http.Client, baseURL, token string, batch opBatch) (opApplyResult, error) {
 	var res opApplyResult
 	body, err := json.Marshal(batch)
@@ -837,6 +876,10 @@ func postOpPush(client *http.Client, baseURL, token string, batch opBatch) (opAp
 //
 // 与 pullOpsFromPeer 是严格对偶：两者都是「先命令、后对象、再重放」。
 func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, project, branch string) (opApplyResult, error) {
+	// 从函数入口开始计：一次推送的耗时里，真正贵的往往不是本端算差分，
+	// 而是把几万条路径送过去、对端逐条落地。只测本端那一段会把
+	// 「12 分钟的推送」记成「3 毫秒」。
+	pushStart := time.Now()
 	var zero opApplyResult
 	if s.opLogs == nil {
 		return zero, fmt.Errorf("oplog is not initialised")
@@ -936,6 +979,15 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 	batch, err := exportBatch()
 	if err != nil {
 		return zero, err
+	}
+	// 「要推多少、推给谁」必须在**动手之前**说出来。
+	//
+	// 实测（2026-11-28）：一次 10,007 条的推送花了 12.5 分钟，这段时间
+	// 日志里一个字都没有，我据此断定「同步卡住了、提交出不去」——查错方向。
+	// 一句「正在推 10007 条给 X」就能省掉那一轮。
+	if n := countBatchOps(batch.Ops); n >= batchLogThreshold {
+		s.logf("op-sync: pushing %d op(s) of %s@%s to %s (this can take a while)",
+			n, project, branch, peerName)
 	}
 	if len(batch.Ops) == 0 {
 		// 零传输也要记水位：内容已经对齐到 l.Last()，对端拥有全部内容。
@@ -1065,6 +1117,10 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		s.workSync.notePeerTree(project, branch, peerKey, newPeerTree)
 	}
 	s.workSync.noteBase(project, branch, peerKey, curBase)
+	if n := countBatchOps(batch.Ops); n >= batchLogThreshold {
+		s.logf("op-sync: pushed %d op(s) of %s@%s to %s in %s (applied %d)",
+			n, project, branch, peerName, time.Since(pushStart).Round(time.Millisecond), res.Applied)
+	}
 	s.recordSync(syncRecord{
 		// PeerHead 在所有记录里都必须是「对端拥有到哪一位」，不能是别的。
 		//
@@ -1081,7 +1137,8 @@ func (s *Server) pushOpsToPeer(client *http.Client, baseURL, token, peerName, pr
 		From: after, To: l.Last(), PeerHead: int(l.Last()),
 		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
 		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
-		Rejected: len(res.Rejected),
+		Rejected:   len(res.Rejected),
+		DurationMs: time.Since(pushStart).Milliseconds(),
 	})
 	// 每轮推进后立即落盘：进程被 kill 不会走 Close，
 	// 水位留在内存就等于下次重启全量重拉。
@@ -1187,6 +1244,7 @@ func isBaseTreeMismatch(err error) bool {
 
 // pullOpsFromPeer 从对端拉命令，落地并补齐对象。
 func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, project, branch string) (opApplyResult, error) {
+	pullStart := time.Now()
 	var zero opApplyResult
 	// 拉的水位：对端日志属主的名字。
 	//
@@ -1250,12 +1308,29 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 			Dir: "pull", Peer: peerName, Node: batch.Node,
 			Project: project, Branch: branch,
 			From: after, To: after, PeerHead: int(batch.To),
+			DurationMs: time.Since(pullStart).Milliseconds(),
 		})
 		return zero, nil
+	}
+	// 大批次必须出声：它可能跑十几分钟，而这段时间里同步流水
+	// 一条记录都没有——表现和「同步死掉了」完全一样。
+	//
+	// 实测（2026-11-28）：一次 10,007 条的推送耗时 12.5 分钟，期间我
+	// 把「日志停了」误判成「提交卡住不出去」，白查一轮。日志不说自己
+	// 在忙，等于让人用相邻两条记录的时间差去猜。
+	applied0 := time.Now()
+	batchOps := countBatchOps(batch.Ops)
+	if batchOps >= batchLogThreshold {
+		s.logf("op-sync: pull %s@%s from %s: applying %d op(s) (this can take a while)",
+			project, branch, peerName, batchOps)
 	}
 	res, err := s.ingestOps(project, branch, batch)
 	if err != nil {
 		return res, err
+	}
+	if batchOps >= batchLogThreshold {
+		s.logf("op-sync: pull %s@%s from %s: applied %d op(s) in %s",
+			project, branch, peerName, res.Applied, time.Since(applied0).Round(time.Millisecond))
 	}
 	if len(res.Missing) > 0 {
 		seen := map[string]bool{}
@@ -1369,6 +1444,7 @@ func (s *Server) pullOpsFromPeer(client *http.Client, baseURL, token, peerName, 
 		Project: project, Branch: branch,
 		From: after, To: batch.To, PeerHead: int(batch.To),
 		Applied: res.Applied, Deleted: res.Deleted, Kept: len(res.Kept),
+		DurationMs: time.Since(pullStart).Milliseconds(),
 		Conflicted: len(res.Conflicted), Missing: len(res.Missing),
 		Rejected: len(res.Rejected),
 	})

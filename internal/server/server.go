@@ -161,6 +161,12 @@ type Server struct {
 	// ACL 回答「这格开没开」，role 回答「这一次只让它看多小」。
 	roles *acl.RoleStore
 
+	// logOut 是日志输出端（默认 os.Stderr）。
+	//
+	// 唯一用途是让「该出声的地方有没有出声」可被测试断言——
+	// 见 logf 的说明与 issue #14。
+	logOut atomic.Pointer[logSink]
+
 	// indexProg 是索引构建进度。读者只看完整快照，不阻塞构建。
 	indexProg atomic.Pointer[indexProgress]
 	// indexBuildDone 在后台构建结束时关闭；Close 等它，避免关掉仓库后
